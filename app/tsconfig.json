@@ -1,0 +1,17 @@
+{
+  "extends": "@hambros/tsconfig/base.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "outDir": "./dist",
+    "rootDir": ".",
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"],
+      "@server/*": ["./server/*"],
+      "@modules/*": ["./modules/*"]
+    },
+    "noEmit": true
+  },
+  "include": ["src", "server", "modules", "vite-env.d.ts"],
+  "exclude": ["node_modules", "dist"]
+}

@@ -1,0 +1,16 @@
+{
+  "extends": "@hambros/tsconfig/base.json",
+  "compilerOptions": {
+    "lib": ["ES2021"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "outDir": "./dist-server",
+    "rootDir": ".",
+    "noEmit": false,
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false
+  },
+  "include": ["server", "modules/**/*.ts"],
+  "exclude": ["node_modules", "dist", "modules/**/__tests__/**", "modules/**/*.test.ts", "modules/**/*.tsx", "modules/**/hooks/**"]
+}

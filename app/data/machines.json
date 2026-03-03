@@ -1,0 +1,25 @@
+{
+  "machines": [
+    {
+      "id": "local",
+      "label": "Hammurabi Server",
+      "host": null
+    },
+    {
+      "id": "yus-mac-mini",
+      "label": "Yu's Mac Mini",
+      "host": "yus-mac-mini",
+      "user": "yugu",
+      "port": 22,
+      "cwd": "/Users/yugu"
+    },
+    {
+      "id": "pmai",
+      "label": "PMAI",
+      "host": "ec2-34-229-138-226.compute-1.amazonaws.com",
+      "user": "ubuntu",
+      "port": 22,
+      "cwd": "/home/ubuntu"
+    }
+  ]
+}

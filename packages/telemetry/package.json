@@ -1,0 +1,36 @@
+{
+  "name": "@hambros/telemetry",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Telemetry and AI usage cost tracking with pluggable storage adapters.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@prisma/client": "*",
+    "@supabase/supabase-js": "*"
+  },
+  "peerDependenciesMeta": {
+    "@prisma/client": {
+      "optional": true
+    },
+    "@supabase/supabase-js": {
+      "optional": true
+    }
+  },
+  "scripts": {
+    "build": "npx --yes -p typescript tsc -p tsconfig.json",
+    "typecheck": "npx --yes -p typescript tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test tests/*.test.mjs"
+  }
+}
