@@ -1,0 +1,33 @@
+{
+  "name": "@hambros/cli",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Hammurabi onboarding CLI — configure agents to send telemetry.",
+  "type": "module",
+  "bin": {
+    "hammurabi": "./bin/hammurabi.mjs"
+  },
+  "main": "./dist/onboard.js",
+  "exports": {
+    ".": {
+      "import": "./dist/onboard.js"
+    }
+  },
+  "files": [
+    "bin",
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@hambros/tsconfig": "workspace:*",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.0"
+  },
+  "dependencies": {
+    "smol-toml": "^1.6.0"
+  }
+}

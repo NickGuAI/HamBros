@@ -1,0 +1,27 @@
+
+> @gehirn/auth-providers@0.1.0 test /home/ec2-user/App/packages/auth-providers
+> npm run build && node --test tests/*.test.mjs
+
+npm warn Unknown env config "npm-globalconfig". This will stop working in the next major version of npm.
+npm warn Unknown env config "verify-deps-before-run". This will stop working in the next major version of npm.
+npm warn Unknown env config "_jsr-registry". This will stop working in the next major version of npm.
+npm warn Unknown env config "ignore-workspace-root-check". This will stop working in the next major version of npm.
+
+> @gehirn/auth-providers@0.1.0 build
+> npx --yes -p typescript tsc -p tsconfig.json
+
+npm warn Unknown env config "npm-globalconfig". This will stop working in the next major version of npm.
+npm warn Unknown env config "verify-deps-before-run". This will stop working in the next major version of npm.
+npm warn Unknown env config "_jsr-registry". This will stop working in the next major version of npm.
+npm warn Unknown env config "ignore-workspace-root-check". This will stop working in the next major version of npm.
+✔ bearerTokenFromHeader extracts token (1.306054ms)
+✔ decodeJwtPayload decodes base64url payload (0.437714ms)
+✔ createAuthMiddleware attaches user from provider (0.423327ms)
+ℹ tests 3
+ℹ suites 0
+ℹ pass 3
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 198.023496

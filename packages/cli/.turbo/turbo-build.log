@@ -1,0 +1,4 @@
+
+> @gehirn/hammurabi-cli@0.1.0 build /home/ec2-user/App/packages/hammurabi-cli
+> tsc -p tsconfig.json
+

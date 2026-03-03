@@ -1,0 +1,26 @@
+
+> @gehirn/telemetry@0.1.0 test /home/ec2-user/App/packages/telemetry
+> npm run build && node --test tests/*.test.mjs
+
+npm warn Unknown env config "npm-globalconfig". This will stop working in the next major version of npm.
+npm warn Unknown env config "verify-deps-before-run". This will stop working in the next major version of npm.
+npm warn Unknown env config "_jsr-registry". This will stop working in the next major version of npm.
+npm warn Unknown env config "ignore-workspace-root-check". This will stop working in the next major version of npm.
+
+> @gehirn/telemetry@0.1.0 build
+> npx --yes -p typescript tsc -p tsconfig.json
+
+npm warn Unknown env config "npm-globalconfig". This will stop working in the next major version of npm.
+npm warn Unknown env config "verify-deps-before-run". This will stop working in the next major version of npm.
+npm warn Unknown env config "_jsr-registry". This will stop working in the next major version of npm.
+npm warn Unknown env config "ignore-workspace-root-check". This will stop working in the next major version of npm.
+✔ extractOpenRouterCost parses numeric and currency-like values (41.97476ms)
+✔ tracker aggregates usage and enforces quota (1.50727ms)
+ℹ tests 2
+ℹ suites 0
+ℹ pass 2
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 256.712933

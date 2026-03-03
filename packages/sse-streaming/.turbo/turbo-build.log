@@ -1,0 +1,4 @@
+
+> @gehirn/sse-streaming@0.1.0 build /home/ec2-user/App/packages/sse-streaming
+> tsc -p tsconfig.json
+

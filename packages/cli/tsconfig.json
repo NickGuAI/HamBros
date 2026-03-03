@@ -1,0 +1,10 @@
+{
+  "extends": "@hambros/tsconfig/base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "sourceMap": false
+  },
+  "include": ["src"],
+  "exclude": ["**/__tests__/**"]
+}

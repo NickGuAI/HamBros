@@ -1,0 +1,18 @@
+
+> @gehirn/hammurabi-cli@0.1.0 test /home/ec2-user/App/packages/hammurabi-cli
+> vitest run
+
+
+ RUN  v2.1.9 /home/ec2-user/App/packages/hammurabi-cli
+
+ ✓ src/__tests__/cursor-settings.test.ts (4 tests) 130ms
+ ✓ src/__tests__/claude-settings.test.ts (4 tests) 62ms
+ ✓ src/__tests__/config.test.ts (3 tests) 83ms
+ ✓ src/__tests__/validate.test.ts (4 tests) 46ms
+ ✓ src/__tests__/codex-settings.test.ts (5 tests) 84ms
+
+ Test Files  5 passed (5)
+      Tests  20 passed (20)
+   Start at  16:41:41
+   Duration  2.89s (transform 1.20s, setup 0ms, collect 2.66s, tests 405ms, environment 2ms, prepare 4.82s)
+
