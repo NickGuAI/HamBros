@@ -86,6 +86,45 @@ function describeSchedule(expression: string): string {
   return expression
 }
 
+function detectBrowserTimezone(): string {
+  const resolved = Intl.DateTimeFormat().resolvedOptions().timeZone
+  return resolved && resolved.trim().length > 0 ? resolved : 'UTC'
+}
+
+function listIanaTimezones(): string[] {
+  const supportedValuesOf = (
+    Intl as typeof Intl & { supportedValuesOf?: (key: string) => string[] }
+  ).supportedValuesOf
+  if (typeof supportedValuesOf !== 'function') {
+    return []
+  }
+
+  try {
+    return supportedValuesOf('timeZone')
+  } catch {
+    return []
+  }
+}
+
+function formatNextRun(nextRun: string | null | undefined, timezone?: string): string {
+  if (!nextRun) {
+    return 'pending'
+  }
+
+  const parsed = new Date(nextRun)
+  if (Number.isNaN(parsed.getTime())) {
+    return 'pending'
+  }
+
+  try {
+    return parsed.toLocaleString(undefined, timezone ? { timeZone: timezone } : undefined)
+  } catch {
+    return parsed.toLocaleString()
+  }
+}
+
+const TIMEZONE_OPTIONS = listIanaTimezones()
+
 export function TaskList({
   tasks,
   selectedTaskId,
@@ -109,6 +148,7 @@ export function TaskList({
   const [cwd, setCwd] = useState('')
   const [mode, setMode] = useState<ClaudePermissionMode>('acceptEdits')
   const [task, setTask] = useState('')
+  const [timezone, setTimezone] = useState(() => detectBrowserTimezone())
   const [agentType, setAgentType] = useState<AgentType>('claude')
   const [sessionType, setSessionType] = useState<SessionType>('stream')
   const [selectedHost, setSelectedHost] = useState('')
@@ -121,6 +161,7 @@ export function TaskList({
       await onCreate({
         name: name.trim(),
         schedule: schedule.trim(),
+        timezone: timezone.trim() || undefined,
         machine: selectedHost,
         workDir: cwd.trim(),
         agentType: agentType as CommandRoomAgentType,
@@ -131,6 +172,7 @@ export function TaskList({
       })
       setName('')
       setSchedule('')
+      setTimezone(detectBrowserTimezone())
       setCwd('')
       setMode('acceptEdits')
       setTask('')
@@ -187,6 +229,34 @@ export function TaskList({
             taskPlaceholder="Run the nightly test suite and report results"
             taskRequired
           />
+          <div className="mt-3">
+            <label className="section-title block mb-2">Timezone</label>
+            {TIMEZONE_OPTIONS.length > 0 ? (
+              <select
+                value={timezone}
+                onChange={(event) => setTimezone(event.target.value)}
+                className="w-full px-3 py-2 rounded-lg border border-ink-border bg-washi-aged text-[16px] md:text-sm focus:outline-none focus:border-ink-border-hover"
+              >
+                {!TIMEZONE_OPTIONS.includes(timezone) && timezone ? (
+                  <option value={timezone}>{timezone}</option>
+                ) : null}
+                <option value="">Server default</option>
+                {TIMEZONE_OPTIONS.map((zone) => (
+                  <option key={zone} value={zone}>
+                    {zone}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                value={timezone}
+                onChange={(event) => setTimezone(event.target.value)}
+                className="w-full px-3 py-2 rounded-lg border border-ink-border bg-washi-aged font-mono text-[16px] md:text-sm focus:outline-none focus:border-ink-border-hover"
+                placeholder="America/Los_Angeles"
+              />
+            )}
+            <p className="mt-1 text-whisper text-sumi-mist">Defaults to your browser timezone</p>
+          </div>
         </section>
       )}
 
@@ -244,6 +314,10 @@ export function TaskList({
                     <p className="inline-flex items-center gap-1">
                       <Clock3 size={12} />
                       {describeSchedule(task.schedule)}
+                    </p>
+                    <p className="font-mono truncate">{task.timezone || 'Server timezone'}</p>
+                    <p className="text-whisper text-sumi-mist">
+                      next run: {task.enabled ? formatNextRun(task.nextRun, task.timezone) : 'paused'}
                     </p>
                     <p className="font-mono truncate">{task.machine || 'local'}</p>
                     <p className="font-mono truncate">{task.workDir || '~'}</p>

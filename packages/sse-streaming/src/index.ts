@@ -21,7 +21,7 @@ export interface ServerSentEventResponse {
 
 function notImplemented(api: string): never {
   throw new Error(
-    `@hambros/sse-streaming scaffold: "${api}" is not implemented yet.`
+    `@gehirn/sse-streaming scaffold: "${api}" is not implemented yet.`
   );
 }
 

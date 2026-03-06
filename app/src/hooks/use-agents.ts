@@ -6,6 +6,7 @@ import type {
   CreateSessionInput,
   Machine,
   SessionType,
+  WorldAgent,
 } from '@/types'
 
 export interface DirectoryListing {
@@ -29,6 +30,10 @@ async function fetchMachines(): Promise<Machine[]> {
   return fetchJson<Machine[]>('/api/agents/machines')
 }
 
+export async function fetchWorldAgents(): Promise<WorldAgent[]> {
+  return fetchJson<WorldAgent[]>('/api/agents/world')
+}
+
 export function useAgentSessions() {
   return useQuery({
     queryKey: ['agents', 'sessions'],
@@ -41,6 +46,14 @@ export function useMachines() {
   return useQuery({
     queryKey: ['agents', 'machines'],
     queryFn: fetchMachines,
+  })
+}
+
+export function useWorldAgents() {
+  return useQuery({
+    queryKey: ['agents', 'world'],
+    queryFn: fetchWorldAgents,
+    refetchInterval: 1000,
   })
 }
 

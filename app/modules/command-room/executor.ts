@@ -23,6 +23,7 @@ export interface CommandRoomExecutorOptions {
   now?: () => Date
   monitorOptions?: AgentSessionMonitorOptions
   agentSessionFactory?: () => AgentSessionClientLike
+  internalToken?: string
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -102,11 +103,16 @@ function resolveApiKey(): string | undefined {
   return apiKey || undefined
 }
 
-function defaultAgentSessionFactory(): () => AgentSessionClientLike {
+function defaultAgentSessionFactory(internalToken?: string): () => AgentSessionClientLike {
+  if (!resolveApiKey() && !internalToken) {
+    console.warn('[command-room] WARNING: No internal token or HAMBROS_INTERNAL_API_KEY set - cron triggers may fail')
+  }
+
   return () =>
     new AgentSessionClient({
       baseUrl: resolveBaseUrl(),
       apiKey: resolveApiKey(),
+      internalToken,
     })
 }
 
@@ -130,6 +136,7 @@ export class CommandRoomExecutor {
   private readonly now: () => Date
   private readonly monitorOptions?: AgentSessionMonitorOptions
   private readonly agentSessionFactory: () => AgentSessionClientLike
+  private readonly internalToken?: string
   private readonly inFlightByTaskId = new Map<string, Promise<WorkflowRun | null>>()
 
   constructor(options: CommandRoomExecutorOptions = {}) {
@@ -137,16 +144,21 @@ export class CommandRoomExecutor {
     this.runStore = options.runStore ?? new CommandRoomRunStore()
     this.now = options.now ?? (() => new Date())
     this.monitorOptions = options.monitorOptions
-    this.agentSessionFactory = options.agentSessionFactory ?? defaultAgentSessionFactory()
+    this.internalToken = options.internalToken
+    this.agentSessionFactory = options.agentSessionFactory ?? defaultAgentSessionFactory(options.internalToken)
   }
 
-  async executeTask(taskId: string, source: WorkflowTriggerSource): Promise<WorkflowRun | null> {
+  async executeTask(
+    taskId: string,
+    source: WorkflowTriggerSource,
+    opts?: { authToken?: string },
+  ): Promise<WorkflowRun | null> {
     const inFlight = this.inFlightByTaskId.get(taskId)
     if (inFlight) {
       return inFlight
     }
 
-    const execution = this.executeTaskInternal(taskId, source).finally(() => {
+    const execution = this.executeTaskInternal(taskId, source, opts?.authToken).finally(() => {
       this.inFlightByTaskId.delete(taskId)
     })
     this.inFlightByTaskId.set(taskId, execution)
@@ -156,6 +168,7 @@ export class CommandRoomExecutor {
   private async executeTaskInternal(
     taskId: string,
     source: WorkflowTriggerSource,
+    authToken?: string,
   ): Promise<WorkflowRun | null> {
     const task = await this.taskStore.getTask(taskId)
     if (!task) {
@@ -179,7 +192,9 @@ export class CommandRoomExecutor {
 
     let sessionId = ''
     try {
-      const client = this.agentSessionFactory()
+      const client = authToken
+        ? new AgentSessionClient({ baseUrl: resolveBaseUrl(), bearerToken: authToken })
+        : this.agentSessionFactory()
       const created = await client.createSession({
         name: resolveSessionName(task.id, this.now()),
         task: task.instruction,

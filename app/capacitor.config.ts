@@ -5,7 +5,7 @@ const config: CapacitorConfig = {
   appName: 'HamBros',
   webDir: 'dist',
   // Bundled mode: app loads from built assets. API/WebSocket use getApiBase/getWsBase
-  // to target VITE_APP_URL when Capacitor.isNativePlatform().
+  // to target https://hammurabi.gehirn.ai when Capacitor.isNativePlatform().
   ios: {
     contentInset: 'automatic',
   },

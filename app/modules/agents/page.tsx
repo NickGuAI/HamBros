@@ -1032,11 +1032,17 @@ function MobileSessionView({
         break
       }
       case 'user': {
-        const blocks = event.message?.content
-        if (!Array.isArray(blocks)) {
+        const content = event.message?.content
+        // Handle plain text user messages — only during replay to avoid
+        // duplicating the optimistic message already added by handleSend
+        if (typeof content === 'string' && content.trim() && isReplay) {
+          setMessages((prev) => capMessages([...prev, { id: nextId(), kind: 'user', text: content.trim() }]))
           break
         }
-        const toolResults = blocks.filter((b) => b.type === 'tool_result')
+        if (!Array.isArray(content)) {
+          break
+        }
+        const toolResults = content.filter((b) => b.type === 'tool_result')
         if (toolResults.length === 0) {
           break
         }
@@ -1587,7 +1593,10 @@ function MobileSessionView({
         />
         <button
           type="button"
-          className="p-2 text-sumi-diluted hover:text-sumi-black transition-colors"
+          className={cn(
+            'p-2 transition-colors',
+            showSkills ? 'text-sumi-black' : 'text-sumi-diluted hover:text-sumi-black',
+          )}
           onClick={() => setShowSkills(true)}
           aria-label="Skills"
         >
@@ -1643,6 +1652,8 @@ export default function AgentsPage() {
   const [createError, setCreateError] = useState<string | null>(null)
   const [killError, setKillError] = useState<string | null>(null)
   const [showFilePanel, setShowFilePanel] = useState(false)
+  type SessionTab = 'all' | 'regular' | 'factory' | 'command-room'
+  const [sessionTab, setSessionTab] = useState<SessionTab>('all')
   const machineList = machines ?? []
   const machineMap = new Map(machineList.map((machine) => [machine.id, machine]))
 
@@ -1722,6 +1733,13 @@ export default function AgentsPage() {
   }
 
   const selectedSessionData = sessions?.find((s) => s.name === selectedSession)
+
+  const filteredSessions = sessions?.filter((s) => {
+    if (sessionTab === 'factory') return s.name.startsWith('factory-')
+    if (sessionTab === 'command-room') return s.name.startsWith('command-room-')
+    if (sessionTab === 'regular') return !s.name.startsWith('factory-') && !s.name.startsWith('command-room-')
+    return true
+  })
 
   return (
     <div className="flex h-full">
@@ -1824,17 +1842,35 @@ export default function AgentsPage() {
           )}
         </div>
 
+        {/* Session type tabs */}
+        {sessions && sessions.length > 0 && (
+          <div className="px-4 pb-3 flex gap-1">
+            {(['all', 'regular', 'factory', 'command-room'] as SessionTab[]).map((tab) => (
+              <button
+                key={tab}
+                onClick={() => setSessionTab(tab)}
+                className={cn(
+                  'badge-sumi capitalize transition-colors',
+                  sessionTab === tab ? 'bg-sumi-black text-white' : 'hover:bg-washi-shadow',
+                )}
+              >
+                {tab}
+              </button>
+            ))}
+          </div>
+        )}
+
         <div className="px-4 pb-4 space-y-3">
           {isLoading ? (
             <div className="flex justify-center py-12">
               <div className="w-3 h-3 rounded-full bg-sumi-mist animate-breathe" />
             </div>
-          ) : sessions?.length === 0 ? (
+          ) : filteredSessions?.length === 0 ? (
             <div className="text-center py-12 text-sumi-diluted text-sm">
-              No active sessions
+              No {sessionTab === 'all' ? '' : sessionTab + ' '}sessions
             </div>
           ) : (
-            sessions?.map((session) => (
+            filteredSessions?.map((session) => (
               <SessionCard
                 key={session.name}
                 session={session}
@@ -1850,10 +1886,10 @@ export default function AgentsPage() {
           )}
         </div>
 
-        {sessions && (
+        {filteredSessions && (
           <div className="px-6 py-3 mt-auto border-t border-ink-border">
             <p className="text-whisper text-sumi-mist">
-              {sessions.length} session{sessions.length !== 1 ? 's' : ''} &middot; auto-refreshing
+              {filteredSessions.length} session{filteredSessions.length !== 1 ? 's' : ''} &middot; auto-refreshing
             </p>
           </div>
         )}

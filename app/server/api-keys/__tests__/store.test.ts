@@ -188,36 +188,6 @@ describe('ApiKeyJsonStore', () => {
     })
   })
 
-  it('seeds the HAMBROS! master key when store is empty, skips if keys already exist', async () => {
-    const filePath = await createTempStoreFilePath()
-    const store = new ApiKeyJsonStore(filePath)
-
-    await store.seedMasterKeyIfEmpty()
-
-    const keys = await store.listKeys()
-    expect(keys).toHaveLength(1)
-    expect(keys[0]).toMatchObject({
-      id: 'hambros-master',
-      name: 'Master Key',
-      prefix: 'HAMB',
-      scopes: expect.arrayContaining(['telemetry:read', 'telemetry:write', 'agents:read', 'agents:write']),
-    })
-
-    const verification = await store.verifyKey('HAMBROS!')
-    expect(verification.ok).toBe(true)
-
-    // Second call is a no-op
-    await store.seedMasterKeyIfEmpty()
-    expect(await store.listKeys()).toHaveLength(1)
-
-    // Seed is skipped if any key already exists
-    const store2 = new ApiKeyJsonStore(filePath)
-    await store2.createKey({ name: 'existing', scopes: [], createdBy: 'test', now: new Date() })
-    const store3 = new ApiKeyJsonStore(filePath)
-    await store3.seedMasterKeyIfEmpty()
-    expect(await store3.listKeys()).toHaveLength(2) // existing + master already seeded
-  })
-
   it('handles malformed persisted hashes without throwing during verification', async () => {
     const filePath = await createTempStoreFilePath()
     const store = new ApiKeyJsonStore(filePath)

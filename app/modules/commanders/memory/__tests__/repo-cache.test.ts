@@ -135,6 +135,6 @@ describe('RepoCacheManager', () => {
     )
 
     const repos = await manager.listCachedRepos()
-    expect(repos).toEqual(expect.arrayContaining(['example-user/legion', 'example-user/example-repo']))
+    expect(repos).toEqual(['example-user/legion', 'example-user/example-repo'])
   })
 })

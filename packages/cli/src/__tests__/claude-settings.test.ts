@@ -33,7 +33,7 @@ describe('mergeClaudeCodeEnv', () => {
       CLAUDE_CODE_ENABLE_TELEMETRY: '1',
       OTEL_EXPORTER_OTLP_ENDPOINT: 'https://hammurabi.gehirn.ai',
       OTEL_EXPORTER_OTLP_PROTOCOL: 'http/json',
-      OTEL_EXPORTER_OTLP_HEADERS: 'x-hambros-api-key=hmrb_test_key',
+      OTEL_EXPORTER_OTLP_HEADERS: 'x-hammurabi-api-key=hmrb_test_key',
     })
     // Legacy keys should NOT be present
     expect(result.env).not.toHaveProperty('HAMMURABI_ENDPOINT')

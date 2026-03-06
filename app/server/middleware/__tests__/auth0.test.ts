@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import express from 'express'
 import { auth0Middleware } from '../auth0'
 
@@ -38,17 +38,10 @@ async function startServer(options: Parameters<typeof auth0Middleware>[0]): Prom
 }
 
 describe('auth0Middleware', () => {
-  beforeEach(() => {
+  it('returns 503 when Auth0 is not configured', async () => {
     vi.stubEnv('AUTH0_DOMAIN', '')
     vi.stubEnv('AUTH0_AUDIENCE', '')
     vi.stubEnv('AUTH0_CLIENT_ID', '')
-  })
-
-  afterEach(() => {
-    vi.unstubAllEnvs()
-  })
-
-  it('returns 503 when Auth0 is not configured', async () => {
     const server = await startServer({})
 
     const response = await fetch(`${server.baseUrl}/protected`)
@@ -58,6 +51,7 @@ describe('auth0Middleware', () => {
     })
 
     await server.close()
+    vi.unstubAllEnvs()
   })
 
   it('returns 401 when bearer token is missing', async () => {

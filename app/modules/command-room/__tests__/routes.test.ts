@@ -10,7 +10,7 @@ import { CommandRoomRunStore } from '../run-store.js'
 import { CommandRoomTaskStore } from '../task-store.js'
 
 const AUTH_HEADERS = {
-  'x-hambros-api-key': 'test-key',
+  'x-hammurabi-api-key': 'test-key',
 }
 
 interface RunningServer {
@@ -153,6 +153,7 @@ describe('createCommandRoomRouter', () => {
       body: JSON.stringify({
         name: 'Nightly summary',
         schedule: '0 1 * * *',
+        timezone: 'America/Los_Angeles',
         machine: 'machine-1',
         workDir: '/tmp/example-repo',
         agentType: 'claude',
@@ -161,9 +162,10 @@ describe('createCommandRoomRouter', () => {
       }),
     })
     expect(createResponse.status).toBe(201)
-    const created = await readJson<{ id: string }>(createResponse)
+    const created = await readJson<{ id: string; timezone?: string }>(createResponse)
     const taskId = created.id
     expect(taskId).toBeTruthy()
+    expect(created.timezone).toBe('America/Los_Angeles')
 
     const listResponse = await fetch(`${server.baseUrl}/api/command-room/tasks`, {
       headers: AUTH_HEADERS,
@@ -182,11 +184,13 @@ describe('createCommandRoomRouter', () => {
       },
       body: JSON.stringify({
         enabled: false,
+        timezone: 'America/New_York',
       }),
     })
     expect(updateResponse.status).toBe(200)
-    const updated = await readJson<{ enabled: boolean }>(updateResponse)
+    const updated = await readJson<{ enabled: boolean; timezone?: string }>(updateResponse)
     expect(updated.enabled).toBe(false)
+    expect(updated.timezone).toBe('America/New_York')
 
     const triggerResponse = await fetch(
       `${server.baseUrl}/api/command-room/tasks/${taskId}/trigger`,
@@ -217,5 +221,80 @@ describe('createCommandRoomRouter', () => {
 
     expect(createSession).toHaveBeenCalledTimes(1)
     expect(monitorSession).toHaveBeenCalledWith('session-1', undefined)
+  })
+
+  it('rejects invalid timezone values on create and update', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'command-room-routes-'))
+    cleanupDirs.push(dir)
+    const taskStore = new CommandRoomTaskStore(join(dir, 'tasks.json'))
+    const runStore = new CommandRoomRunStore(join(dir, 'runs.json'))
+
+    const server = await startServer({
+      taskStore,
+      runStore,
+      createSession: vi.fn(async () => ({ sessionId: 'session-1' })),
+      monitorSession: vi.fn(async () => ({
+        sessionId: 'session-1',
+        status: 'SUCCESS' as const,
+        finalComment: 'Run done.',
+        filesChanged: 0,
+        durationMin: 1,
+        raw: { total_cost_usd: 0.11 },
+      })),
+    })
+    servers.push(server)
+
+    const createInvalidTimezone = await fetch(`${server.baseUrl}/api/command-room/tasks`, {
+      method: 'POST',
+      headers: {
+        ...AUTH_HEADERS,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: 'Nightly summary',
+        schedule: '0 1 * * *',
+        timezone: 'Mars/Olympus_Mons',
+        machine: 'machine-1',
+        workDir: '/tmp/example-repo',
+        agentType: 'claude',
+        instruction: 'Summarize open issues',
+        enabled: true,
+      }),
+    })
+    expect(createInvalidTimezone.status).toBe(400)
+
+    const createResponse = await fetch(`${server.baseUrl}/api/command-room/tasks`, {
+      method: 'POST',
+      headers: {
+        ...AUTH_HEADERS,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: 'Nightly summary',
+        schedule: '0 1 * * *',
+        machine: 'machine-1',
+        workDir: '/tmp/example-repo',
+        agentType: 'claude',
+        instruction: 'Summarize open issues',
+        enabled: true,
+      }),
+    })
+    expect(createResponse.status).toBe(201)
+    const created = await readJson<{ id: string }>(createResponse)
+
+    const updateInvalidTimezone = await fetch(
+      `${server.baseUrl}/api/command-room/tasks/${created.id}`,
+      {
+        method: 'PATCH',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          timezone: 'not/a-real-timezone',
+        }),
+      },
+    )
+    expect(updateInvalidTimezone.status).toBe(400)
   })
 })

@@ -149,7 +149,7 @@ describe('realtime proxy routes', () => {
     const server = await startServer()
     const response = await fetch(`${server.baseUrl}/api/realtime/config`, {
       headers: {
-        'x-hambros-api-key': 'test-key',
+        'x-hammurabi-api-key': 'test-key',
       },
     })
 

@@ -39,7 +39,7 @@ describe('mergeCodexOtelConfig', () => {
     expect(httpConfig.protocol).toBe('json')
 
     const headers = httpConfig.headers as Record<string, string>
-    expect(headers['x-hambros-api-key']).toBe('hmrb_test_key')
+    expect(headers['x-hammurabi-api-key']).toBe('hmrb_test_key')
   })
 
   it('adds otel section when file exists without one', async () => {
@@ -100,7 +100,7 @@ describe('mergeCodexOtelConfig', () => {
     expect(httpConfig.endpoint).toBe('https://new-hammurabi.gehirn.ai/v1/logs')
 
     const headers = httpConfig.headers as Record<string, string>
-    expect(headers['x-hambros-api-key']).toBe('hmrb_new_key')
+    expect(headers['x-hammurabi-api-key']).toBe('hmrb_new_key')
   })
 
   it('preserves project trust levels and other config', async () => {

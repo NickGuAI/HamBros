@@ -190,7 +190,7 @@ describe('telemetry routes', () => {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-hambros-api-key': 'test-key',
+        'x-hammurabi-api-key': 'test-key',
       },
       body: JSON.stringify({
         sessionId: 'session-1',
@@ -208,7 +208,7 @@ describe('telemetry routes', () => {
 
     const sessionsResponse = await fetch(`${server.baseUrl}/api/telemetry/sessions`, {
       headers: {
-        'x-hambros-api-key': 'test-key',
+        'x-hammurabi-api-key': 'test-key',
       },
     })
     const sessions = (await sessionsResponse.json()) as Array<{
@@ -231,7 +231,7 @@ describe('telemetry routes', () => {
     now = new Date('2026-02-10T10:02:00.000Z')
     const idleResponse = await fetch(`${server.baseUrl}/api/telemetry/sessions`, {
       headers: {
-        'x-hambros-api-key': 'test-key',
+        'x-hammurabi-api-key': 'test-key',
       },
     })
     const idleSessions = (await idleResponse.json()) as Array<{ status: string }>
@@ -240,7 +240,7 @@ describe('telemetry routes', () => {
     now = new Date('2026-02-10T10:04:59.000Z')
     const almostStaleResponse = await fetch(`${server.baseUrl}/api/telemetry/sessions`, {
       headers: {
-        'x-hambros-api-key': 'test-key',
+        'x-hammurabi-api-key': 'test-key',
       },
     })
     const almostStaleSessions = (await almostStaleResponse.json()) as Array<{
@@ -251,7 +251,7 @@ describe('telemetry routes', () => {
     now = new Date('2026-02-10T10:05:00.000Z')
     const staleResponse = await fetch(`${server.baseUrl}/api/telemetry/sessions`, {
       headers: {
-        'x-hambros-api-key': 'test-key',
+        'x-hammurabi-api-key': 'test-key',
       },
     })
     const staleSessions = (await staleResponse.json()) as Array<{ status: string }>
@@ -262,7 +262,7 @@ describe('telemetry routes', () => {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-hambros-api-key': 'test-key',
+        'x-hammurabi-api-key': 'test-key',
       },
       body: JSON.stringify({
         sessionId: 'session-1',
@@ -274,7 +274,7 @@ describe('telemetry routes', () => {
 
     const activeResponse = await fetch(`${server.baseUrl}/api/telemetry/sessions`, {
       headers: {
-        'x-hambros-api-key': 'test-key',
+        'x-hammurabi-api-key': 'test-key',
       },
     })
     const activeSessions = (await activeResponse.json()) as Array<{
@@ -290,7 +290,7 @@ describe('telemetry routes', () => {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          'x-hambros-api-key': 'test-key',
+          'x-hammurabi-api-key': 'test-key',
         },
         body: JSON.stringify({
           sessionId: 'session-1',
@@ -303,7 +303,7 @@ describe('telemetry routes', () => {
 
     const completedSessionsResponse = await fetch(`${server.baseUrl}/api/telemetry/sessions`, {
       headers: {
-        'x-hambros-api-key': 'test-key',
+        'x-hammurabi-api-key': 'test-key',
       },
     })
     const completedSessions = (await completedSessionsResponse.json()) as Array<{
@@ -313,7 +313,7 @@ describe('telemetry routes', () => {
 
     const detailResponse = await fetch(`${server.baseUrl}/api/telemetry/sessions/session-1`, {
       headers: {
-        'x-hambros-api-key': 'test-key',
+        'x-hammurabi-api-key': 'test-key',
       },
     })
     const detail = (await detailResponse.json()) as {
@@ -330,7 +330,7 @@ describe('telemetry routes', () => {
 
     const summaryResponse = await fetch(`${server.baseUrl}/api/telemetry/summary`, {
       headers: {
-        'x-hambros-api-key': 'test-key',
+        'x-hammurabi-api-key': 'test-key',
       },
     })
     const summary = (await summaryResponse.json()) as {
@@ -362,7 +362,7 @@ describe('telemetry routes', () => {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-hambros-api-key': 'test-key',
+        'x-hammurabi-api-key': 'test-key',
       },
       body: JSON.stringify({
         sessionId: 'restart-session',
@@ -386,7 +386,7 @@ describe('telemetry routes', () => {
 
     const sessionsResponse = await fetch(`${secondServer.baseUrl}/api/telemetry/sessions`, {
       headers: {
-        'x-hambros-api-key': 'test-key',
+        'x-hammurabi-api-key': 'test-key',
       },
     })
     const sessions = (await sessionsResponse.json()) as Array<{
@@ -418,7 +418,7 @@ describe('telemetry routes', () => {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-hambros-api-key': 'test-key',
+        'x-hammurabi-api-key': 'test-key',
       },
       body: JSON.stringify({
         sessionId: 's-old',
@@ -436,7 +436,7 @@ describe('telemetry routes', () => {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-hambros-api-key': 'test-key',
+        'x-hammurabi-api-key': 'test-key',
       },
       body: JSON.stringify({
         sessionId: 's-new',
@@ -452,7 +452,7 @@ describe('telemetry routes', () => {
 
     const summaryResponse = await fetch(`${server.baseUrl}/api/telemetry/summary`, {
       headers: {
-        'x-hambros-api-key': 'test-key',
+        'x-hammurabi-api-key': 'test-key',
       },
     })
     expect(summaryResponse.status).toBe(200)
@@ -496,7 +496,7 @@ describe('telemetry routes', () => {
     const scanResponse = await fetch(`${server.baseUrl}/api/telemetry/scan`, {
       method: 'POST',
       headers: {
-        'x-hambros-api-key': 'test-key',
+        'x-hammurabi-api-key': 'test-key',
       },
     })
     expect(scanResponse.status).toBe(200)
@@ -515,6 +515,96 @@ describe('telemetry routes', () => {
       skipped: 6,
       durationMs: 123,
     })
+
+    await server.close()
+  })
+
+  it('summary includes dailyCosts sorted ascending by date', async () => {
+    const filePath = await createTempStoreFilePath()
+    const server = await startServer({
+      apiKeyStore: createTestApiKeyStore(),
+      storeFilePath: filePath,
+      now: () => new Date('2026-02-20T12:00:00.000Z'),
+    })
+
+    const days = ['2026-02-18', '2026-02-19', '2026-02-20']
+    for (const [i, day] of days.entries()) {
+      await fetch(`${server.baseUrl}/api/telemetry/ingest`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-hammurabi-api-key': 'test-key',
+        },
+        body: JSON.stringify({
+          sessionId: `s-${i}`,
+          agentName: 'codex',
+          model: 'o3',
+          inputTokens: 10,
+          outputTokens: 5,
+          cost: 0.01 * (i + 1),
+          timestamp: `${day}T10:00:00.000Z`,
+        }),
+      })
+    }
+
+    const summaryResponse = await fetch(`${server.baseUrl}/api/telemetry/summary`, {
+      headers: { 'x-hammurabi-api-key': 'test-key' },
+    })
+    const summary = (await summaryResponse.json()) as {
+      dailyCosts: { date: string; costUsd: number }[]
+    }
+
+    expect(Array.isArray(summary.dailyCosts)).toBe(true)
+    expect(summary.dailyCosts.length).toBe(3)
+    // Sorted ascending
+    expect(summary.dailyCosts[0]?.date).toBe('2026-02-18')
+    expect(summary.dailyCosts[1]?.date).toBe('2026-02-19')
+    expect(summary.dailyCosts[2]?.date).toBe('2026-02-20')
+    // Costs match
+    expect(summary.dailyCosts[0]?.costUsd).toBeCloseTo(0.01)
+    expect(summary.dailyCosts[2]?.costUsd).toBeCloseTo(0.03)
+
+    await server.close()
+  })
+
+  it('POST /compact runs compaction and returns ok', async () => {
+    const filePath = await createTempStoreFilePath()
+    const server = await startServer({
+      apiKeyStore: createTestApiKeyStore(),
+      storeFilePath: filePath,
+      now: () => new Date('2026-02-20T12:00:00.000Z'),
+    })
+
+    // Ingest one entry so the file exists
+    await fetch(`${server.baseUrl}/api/telemetry/ingest`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-hammurabi-api-key': 'test-key',
+      },
+      body: JSON.stringify({
+        sessionId: 's-compact',
+        agentName: 'codex',
+        model: 'o3',
+        inputTokens: 5,
+        outputTokens: 5,
+        cost: 0.005,
+      }),
+    })
+
+    const compactResponse = await fetch(`${server.baseUrl}/api/telemetry/compact`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-hammurabi-api-key': 'test-key',
+      },
+      body: JSON.stringify({ retentionDays: 30 }),
+    })
+
+    expect(compactResponse.status).toBe(200)
+    const body = (await compactResponse.json()) as { ok: boolean; retentionDays: number }
+    expect(body.ok).toBe(true)
+    expect(body.retentionDays).toBe(30)
 
     await server.close()
   })

@@ -1,5 +1,5 @@
-import { createReadStream } from 'node:fs'
-import { appendFile, mkdir, readFile, stat } from 'node:fs/promises'
+import { createReadStream, createWriteStream } from 'node:fs'
+import { appendFile, mkdir, readFile, rename, stat, unlink } from 'node:fs/promises'
 import path from 'node:path'
 import { createInterface } from 'node:readline'
 import type { NormalizedCall } from './normalizer.js'
@@ -258,6 +258,57 @@ export class TelemetryJsonlStore {
     } finally {
       rl.close()
       fileStream.destroy()
+    }
+  }
+
+  /**
+   * Remove all entries older than `retentionDays` days via an atomic tmp-file swap.
+   * No-ops if the file does not exist.
+   */
+  async compact(retentionDays: number): Promise<void> {
+    try {
+      await stat(this.filePath)
+    } catch (err) {
+      if (isObject(err) && 'code' in err && err.code === 'ENOENT') return
+      throw err
+    }
+
+    const cutoff = new Date()
+    cutoff.setUTCDate(cutoff.getUTCDate() - retentionDays)
+    const cutoffISO = cutoff.toISOString()
+
+    const tmpPath = `${this.filePath}.tmp`
+    const writeStream = createWriteStream(tmpPath, { encoding: 'utf8' })
+    const fileStream = createReadStream(this.filePath, { encoding: 'utf8' })
+    const rl = createInterface({ input: fileStream, crlfDelay: Infinity })
+
+    try {
+      for await (const line of rl) {
+        if (!line.trim()) continue
+        let parsed: unknown
+        try {
+          parsed = JSON.parse(line)
+        } catch {
+          continue
+        }
+        if (isObject(parsed) && typeof parsed.recordedAt === 'string' && parsed.recordedAt >= cutoffISO) {
+          await new Promise<void>((resolve, reject) => {
+            writeStream.write(`${line}\n`, (err) => (err ? reject(err) : resolve()))
+          })
+        }
+      }
+    } finally {
+      rl.close()
+      fileStream.destroy()
+      await new Promise<void>((resolve) => writeStream.end(resolve))
+    }
+
+    try {
+      await rename(tmpPath, this.filePath)
+    } catch (err) {
+      // Clean up tmp on rename failure
+      await unlink(tmpPath).catch(() => undefined)
+      throw err
     }
   }
 }

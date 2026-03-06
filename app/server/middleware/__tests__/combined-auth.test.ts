@@ -91,7 +91,7 @@ describe('combinedAuth', () => {
     const response = await fetch(`${server.baseUrl}/protected`, {
       headers: {
         authorization: 'Bearer auth0-token',
-        'x-hambros-api-key': 'managed-key',
+        'x-hammurabi-api-key': 'managed-key',
       },
     })
     expect(response.status).toBe(200)
@@ -123,6 +123,43 @@ describe('combinedAuth', () => {
       authMode: 'api-key',
       userId: 'api-key',
     })
+
+    await server.close()
+  })
+
+  it('accepts valid internal token via x-hammurabi-internal-token header', async () => {
+    const middleware = combinedAuth({
+      internalToken: 'server-secret-abc',
+    })
+    const server = await startServer(middleware)
+
+    const response = await fetch(`${server.baseUrl}/protected`, {
+      headers: {
+        'x-hammurabi-internal-token': 'server-secret-abc',
+      },
+    })
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({
+      authMode: 'api-key',
+      userId: 'internal',
+    })
+
+    await server.close()
+  })
+
+  it('rejects invalid internal token and falls through to other auth', async () => {
+    const middleware = combinedAuth({
+      internalToken: 'server-secret-abc',
+      apiKeyStore: createManagedKeyStore(),
+    })
+    const server = await startServer(middleware)
+
+    const response = await fetch(`${server.baseUrl}/protected`, {
+      headers: {
+        'x-hammurabi-internal-token': 'wrong-token',
+      },
+    })
+    expect(response.status).toBe(401)
 
     await server.close()
   })

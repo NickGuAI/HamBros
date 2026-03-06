@@ -75,4 +75,69 @@ describe('CommandRoomExecutor', () => {
     expect(persisted).toHaveLength(1)
     expect(persisted[0]?.status).toBe('complete')
   })
+
+  it('does not warn when internalToken is provided', () => {
+    const previousInternalApiKey = process.env.HAMBROS_INTERNAL_API_KEY
+    const previousApiKey = process.env.HAMBROS_API_KEY
+    delete process.env.HAMBROS_INTERNAL_API_KEY
+    delete process.env.HAMBROS_API_KEY
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    try {
+      new CommandRoomExecutor({
+        taskStore,
+        runStore,
+        internalToken: 'auto-generated-token',
+      })
+
+      expect(warnSpy).not.toHaveBeenCalled()
+    } finally {
+      warnSpy.mockRestore()
+      if (previousInternalApiKey === undefined) {
+        delete process.env.HAMBROS_INTERNAL_API_KEY
+      } else {
+        process.env.HAMBROS_INTERNAL_API_KEY = previousInternalApiKey
+      }
+
+      if (previousApiKey === undefined) {
+        delete process.env.HAMBROS_API_KEY
+      } else {
+        process.env.HAMBROS_API_KEY = previousApiKey
+      }
+    }
+  })
+
+  it('warns at startup when no internal API key is configured', () => {
+    const previousInternalApiKey = process.env.HAMBROS_INTERNAL_API_KEY
+    const previousApiKey = process.env.HAMBROS_API_KEY
+    delete process.env.HAMBROS_INTERNAL_API_KEY
+    delete process.env.HAMBROS_API_KEY
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    try {
+      new CommandRoomExecutor({
+        taskStore,
+        runStore,
+      })
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        '[command-room] WARNING: No internal token or HAMBROS_INTERNAL_API_KEY set - cron triggers may fail',
+      )
+    } finally {
+      warnSpy.mockRestore()
+      if (previousInternalApiKey === undefined) {
+        delete process.env.HAMBROS_INTERNAL_API_KEY
+      } else {
+        process.env.HAMBROS_INTERNAL_API_KEY = previousInternalApiKey
+      }
+
+      if (previousApiKey === undefined) {
+        delete process.env.HAMBROS_API_KEY
+      } else {
+        process.env.HAMBROS_API_KEY = previousApiKey
+      }
+    }
+  })
 })

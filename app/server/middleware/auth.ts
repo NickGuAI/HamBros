@@ -29,7 +29,7 @@ function normalizeApiKey(value: string | undefined): string | null {
 
 export function extractApiKey(request: Request): string | null {
   const headerApiKey =
-    request.header('x-hambros-api-key') ?? request.header('x-api-key')
+    request.header('x-hammurabi-api-key') ?? request.header('x-api-key')
   const normalizedHeaderApiKey = normalizeApiKey(headerApiKey)
   if (normalizedHeaderApiKey) {
     return normalizedHeaderApiKey

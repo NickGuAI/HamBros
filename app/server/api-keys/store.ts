@@ -180,26 +180,6 @@ export class ApiKeyJsonStore implements ApiKeyStoreLike {
     return records.length > 0
   }
 
-  async seedMasterKeyIfEmpty(): Promise<void> {
-    return this.withMutationLock(async () => {
-      const records = await this.readRecords()
-      if (records.length > 0) {
-        return
-      }
-      const masterRecord: ApiKeyRecord = {
-        id: 'hambros-master',
-        name: 'Master Key',
-        keyHash: hashApiKey('HAMBROS!'),
-        prefix: 'HAMB',
-        createdBy: 'system',
-        createdAt: new Date().toISOString(),
-        lastUsedAt: null,
-        scopes: [...API_KEY_SCOPES],
-      }
-      await this.writeRecords([masterRecord])
-    })
-  }
-
   async createKey(input: CreateApiKeyInput): Promise<CreatedApiKey> {
     const nowIso = (input.now ?? new Date()).toISOString()
     const rawKey = createRawApiKey()

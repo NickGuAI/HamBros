@@ -13,11 +13,17 @@ const app = express()
 const port = parseInt(process.env.PORT ?? '20001', 10)
 const allowedCorsOrigins = parseAllowedCorsOrigins(process.env.HAMBROS_ALLOWED_ORIGINS)
 const apiKeyStore = new ApiKeyJsonStore()
-await apiKeyStore.seedMasterKeyIfEmpty()
 const transcriptionKeyStore = new OpenAITranscriptionKeyStore()
+const maxAgentSessions = process.env.HAMBROS_MAX_AGENT_SESSIONS
+  ? parseInt(process.env.HAMBROS_MAX_AGENT_SESSIONS, 10)
+  : undefined
 const { modules, otelRouter } = createModules({
   apiKeyStore,
   transcriptionKeyStore,
+  auth0Domain: process.env.AUTH0_DOMAIN,
+  auth0Audience: process.env.AUTH0_AUDIENCE,
+  auth0ClientId: process.env.AUTH0_CLIENT_ID,
+  maxAgentSessions,
 })
 
 app.use(

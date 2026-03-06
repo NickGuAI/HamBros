@@ -573,7 +573,7 @@ export function createServicesRouter(options: ServicesRouterOptions = {}): Servi
     const url = new URL(req.url ?? '', `http://${req.headers.host ?? 'localhost'}`)
     const accessToken = url.searchParams.get('access_token')
     const apiKeyParam = url.searchParams.get('api_key')
-    const apiKeyHeader = req.headers['x-hambros-api-key'] as string | undefined
+    const apiKeyHeader = req.headers['x-hammurabi-api-key'] as string | undefined
     const token = accessToken ?? apiKeyParam ?? apiKeyHeader
 
     if (!token) {

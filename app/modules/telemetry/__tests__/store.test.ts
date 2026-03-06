@@ -90,6 +90,87 @@ describe('TelemetryJsonlStore', () => {
   })
 })
 
+describe('TelemetryJsonlStore.compact()', () => {
+  it('removes entries older than retentionDays', async () => {
+    const filePath = await createTempStoreFilePath()
+    const store = new TelemetryJsonlStore(filePath)
+
+    const old: TelemetryStoreEntry = {
+      type: 'ingest',
+      recordedAt: '2026-01-01T00:00:00.000Z',
+      payload: {
+        id: 'old-1',
+        sessionId: 's1',
+        agentName: 'codex',
+        model: 'o3',
+        provider: 'openai',
+        inputTokens: 1,
+        outputTokens: 1,
+        cost: 0.01,
+        durationMs: 100,
+        currentTask: 'old task',
+        timestamp: '2026-01-01T00:00:00.000Z',
+      },
+    }
+    const recent: TelemetryStoreEntry = {
+      type: 'ingest',
+      recordedAt: '2026-02-28T00:00:00.000Z',
+      payload: {
+        id: 'new-1',
+        sessionId: 's2',
+        agentName: 'claude',
+        model: 'claude-sonnet',
+        provider: 'anthropic',
+        inputTokens: 10,
+        outputTokens: 5,
+        cost: 0.05,
+        durationMs: 200,
+        currentTask: 'new task',
+        timestamp: '2026-02-28T00:00:00.000Z',
+      },
+    }
+
+    await store.append(old)
+    await store.append(recent)
+
+    // Use a fixed "now" by patching: compact keeps entries where recordedAt >= cutoff.
+    // cutoff = now - 14d. We manually compact with retentionDays=14 and rely on
+    // the real Date.now() being 2026-03-04 (current date), so 2026-01-01 is ~62 days old.
+    await store.compact(14)
+
+    const kept = await store.load()
+    expect(kept).toHaveLength(1)
+    expect(kept[0]?.payload).toMatchObject({ id: 'new-1' })
+  })
+
+  it('no-ops gracefully when the file does not exist', async () => {
+    const filePath = await createTempStoreFilePath()
+    const store = new TelemetryJsonlStore(filePath)
+    await expect(store.compact(14)).resolves.toBeUndefined()
+  })
+
+  it('keeps all entries when all are within retention window', async () => {
+    const filePath = await createTempStoreFilePath()
+    const store = new TelemetryJsonlStore(filePath)
+
+    // Use today's date minus 1 day so everything is within 14-day window
+    const yesterday = new Date()
+    yesterday.setUTCDate(yesterday.getUTCDate() - 1)
+    const recentISO = yesterday.toISOString()
+
+    await store.append({
+      type: 'heartbeat',
+      recordedAt: recentISO,
+      payload: { sessionId: 'x', completed: false, timestamp: recentISO },
+    })
+
+    await store.compact(14)
+
+    const kept = await store.load()
+    expect(kept).toHaveLength(1)
+  })
+})
+
 describe('TelemetryJsonlStore.stream()', () => {
   it('yields no entries when the JSONL file is missing', async () => {
     const filePath = await createTempStoreFilePath()

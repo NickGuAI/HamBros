@@ -335,7 +335,7 @@ function resolveGitHubToken(explicit?: string): string | null {
 function buildGitHubHeaders(token: string | null): Record<string, string> {
   return {
     Accept: 'application/vnd.github+json',
-    'User-Agent': 'hambros-commanders',
+    'User-Agent': 'hammurabi-commanders',
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
   }
 }
@@ -539,7 +539,17 @@ export function createCommandersRouter(
   const sessionStore = options.sessionStore ?? new CommanderSessionStore(options.sessionStorePath)
   const runtimes = new Map<string, CommanderRuntime>()
 
-  const cronManager = options.cronManager ?? new CommanderCronManager()
+  const cronManager = options.cronManager ?? new CommanderCronManager({
+    dispatcher: {
+      sendInstruction: async (commanderId: string, instruction: string) => {
+        const runtime = runtimes.get(commanderId)
+        if (!runtime) return
+        const session = await sessionStore.get(commanderId)
+        if (!session) return
+        await queueTurn(commanderId, runtime, instruction, BASE_SYSTEM_PROMPT)
+      },
+    },
+  })
   const cronInitialized = cronManager.initialize().catch((error) => {
     console.error('[commanders] Failed to initialize cron manager:', error)
   })
@@ -1360,7 +1370,7 @@ export function createCommandersRouter(
     const url = new URL(req.url ?? '', `http://${req.headers.host ?? 'localhost'}`)
     const accessToken = url.searchParams.get('access_token')
     const apiKeyParam = url.searchParams.get('api_key')
-    const apiKeyHeader = req.headers['x-hambros-api-key'] as string | undefined
+    const apiKeyHeader = req.headers['x-hammurabi-api-key'] as string | undefined
     const token = accessToken ?? apiKeyParam ?? apiKeyHeader
 
     if (!token) {

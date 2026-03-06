@@ -85,7 +85,7 @@ function buildValidationPayload(): object {
       {
         resource: {
           attributes: [
-            { key: 'service.name', value: { stringValue: 'hambros-cli' } },
+            { key: 'service.name', value: { stringValue: 'hammurabi-cli' } },
             { key: 'session.id', value: { stringValue: 'onboard-validation' } },
           ],
         },
@@ -94,9 +94,9 @@ function buildValidationPayload(): object {
             logRecords: [
               {
                 timeUnixNano: String(Date.now() * 1_000_000),
-                body: { stringValue: 'hambros.onboard_validation' },
+                body: { stringValue: 'hammurabi.onboard_validation' },
                 attributes: [
-                  { key: 'event.name', value: { stringValue: 'hambros.onboard_validation' } },
+                  { key: 'event.name', value: { stringValue: 'hammurabi.onboard_validation' } },
                 ],
               },
             ],
@@ -139,7 +139,7 @@ export async function validateTelemetryWriteKey(
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-hambros-api-key': apiKey,
+        'x-hammurabi-api-key': apiKey,
       },
       body: JSON.stringify(buildValidationPayload()),
     })

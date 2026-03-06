@@ -2,7 +2,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
 
-export const HAMMURABI_CONFIG_FILENAME = '.hambros.json'
+export const HAMMURABI_CONFIG_FILENAME = '.hammurabi.json'
 
 export const HAMMURABI_AGENTS = [
   'claude-code',

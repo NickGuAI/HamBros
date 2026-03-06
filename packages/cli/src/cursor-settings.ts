@@ -53,7 +53,7 @@ export function buildCursorOtelEnv(endpoint: string, apiKey: string): CursorOtel
   return {
     OTEL_EXPORTER_OTLP_ENDPOINT: endpoint,
     OTEL_EXPORTER_OTLP_PROTOCOL: 'http/json',
-    OTEL_EXPORTER_OTLP_HEADERS: `x-hambros-api-key=${apiKey}`,
+    OTEL_EXPORTER_OTLP_HEADERS: `x-hammurabi-api-key=${apiKey}`,
   }
 }
 

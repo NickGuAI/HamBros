@@ -13,6 +13,7 @@ interface MockJob {
 interface ScheduledRegistration {
   expression: string
   task: () => Promise<void> | void
+  options?: { name?: string; timezone?: string }
   job: MockJob
 }
 
@@ -20,12 +21,12 @@ function createMockScheduler(): { scheduler: CronScheduler; scheduled: Scheduled
   const scheduled: ScheduledRegistration[] = []
   const scheduler: CronScheduler = {
     validate: vi.fn((expression: string) => expression !== 'invalid cron'),
-    schedule: vi.fn((expression, task) => {
+    schedule: vi.fn((expression, task, options) => {
       const job: MockJob = {
         stop: vi.fn(),
         destroy: vi.fn(),
       }
-      scheduled.push({ expression, task, job })
+      scheduled.push({ expression, task, options, job })
       return job
     }),
   }
@@ -57,6 +58,7 @@ describe('CommandRoomScheduler', () => {
     const created = await manager.createTask({
       name: 'Nightly run',
       schedule: '0 1 * * *',
+      timezone: 'America/Los_Angeles',
       machine: 'local',
       workDir: '/tmp/example-repo',
       agentType: 'claude',
@@ -66,6 +68,7 @@ describe('CommandRoomScheduler', () => {
 
     expect(scheduled).toHaveLength(1)
     expect(scheduled[0]?.expression).toBe('0 1 * * *')
+    expect(scheduled[0]?.options?.timezone).toBe('America/Los_Angeles')
 
     const callback = scheduled[0]?.task
     if (!callback) {

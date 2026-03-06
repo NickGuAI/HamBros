@@ -10,6 +10,7 @@ export interface CronTask {
   id: string
   name: string
   schedule: string
+  timezone?: string
   machine: string
   workDir: string
   agentType: CommandRoomAgentType
@@ -27,6 +28,7 @@ interface PersistedTaskCollection {
 export interface CreateCronTaskInput {
   name: string
   schedule: string
+  timezone?: string
   machine: string
   workDir: string
   agentType: CommandRoomAgentType
@@ -39,6 +41,7 @@ export interface CreateCronTaskInput {
 export interface UpdateCronTaskInput {
   name?: string
   schedule?: string
+  timezone?: string
   machine?: string
   workDir?: string
   agentType?: CommandRoomAgentType
@@ -78,6 +81,7 @@ function isCronTask(value: unknown): value is CronTask {
     typeof value.id === 'string' &&
     typeof value.name === 'string' &&
     typeof value.schedule === 'string' &&
+    (value.timezone === undefined || typeof value.timezone === 'string') &&
     typeof value.machine === 'string' &&
     typeof value.workDir === 'string' &&
     AGENT_TYPES.has(value.agentType as CommandRoomAgentType) &&
@@ -139,6 +143,7 @@ export class CommandRoomTaskStore {
       id: randomUUID(),
       name: input.name,
       schedule: input.schedule,
+      ...(input.timezone ? { timezone: input.timezone } : {}),
       machine: input.machine,
       workDir: input.workDir,
       agentType: input.agentType,
@@ -178,6 +183,10 @@ export class CommandRoomTaskStore {
       const schedule = asTrimmedString(update.schedule)
       if (schedule) {
         nextTask.schedule = schedule
+      }
+      const timezone = asTrimmedString(update.timezone)
+      if (timezone) {
+        nextTask.timezone = timezone
       }
       const machine = asTrimmedString(update.machine)
       if (machine) {

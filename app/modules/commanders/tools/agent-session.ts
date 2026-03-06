@@ -50,6 +50,8 @@ export interface AgentSessionMonitorOptions {
 export interface AgentSessionClientOptions {
   baseUrl?: string
   apiKey?: string
+  bearerToken?: string
+  internalToken?: string
   fetchImpl?: typeof fetch
   pollIntervalMs?: number
   maxPollAttempts?: number
@@ -166,6 +168,8 @@ function parseCompletion(
 export class AgentSessionClient {
   private readonly baseUrl: string
   private readonly apiKey?: string
+  private readonly bearerToken?: string
+  private readonly internalToken?: string
   private readonly fetchImpl: typeof fetch
   private readonly pollIntervalMs: number
   private readonly maxPollAttempts: number
@@ -173,6 +177,8 @@ export class AgentSessionClient {
   constructor(options: AgentSessionClientOptions = {}) {
     this.baseUrl = options.baseUrl?.trim() || DEFAULT_BASE_URL
     this.apiKey = options.apiKey
+    this.bearerToken = options.bearerToken
+    this.internalToken = options.internalToken
     this.fetchImpl = options.fetchImpl ?? fetch
     this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS
     this.maxPollAttempts = options.maxPollAttempts ?? DEFAULT_MAX_POLL_ATTEMPTS
@@ -370,8 +376,13 @@ export class AgentSessionClient {
     if (!headers.has('content-type')) {
       headers.set('content-type', 'application/json')
     }
-    if (this.apiKey && !headers.has('x-hambros-api-key')) {
-      headers.set('x-hambros-api-key', this.apiKey)
+    if (this.internalToken) {
+      headers.set('x-hammurabi-internal-token', this.internalToken)
+    }
+    if (this.bearerToken && !headers.has('authorization')) {
+      headers.set('authorization', this.bearerToken)
+    } else if (this.apiKey && !headers.has('x-hammurabi-api-key')) {
+      headers.set('x-hammurabi-api-key', this.apiKey)
     }
     return headers
   }

@@ -26,7 +26,7 @@ describe('validateTelemetryWriteKey', () => {
       expect.objectContaining({
         method: 'POST',
         headers: expect.objectContaining({
-          'x-hambros-api-key': 'hmrb_test_key',
+          'x-hammurabi-api-key': 'hmrb_test_key',
           'content-type': 'application/json',
         }),
       }),

@@ -157,7 +157,7 @@ describe('api key auth routes', () => {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-hambros-api-key': created.key,
+        'x-hammurabi-api-key': created.key,
       },
       body: JSON.stringify({
         sessionId: 'session-with-key',
@@ -202,7 +202,7 @@ describe('api key auth routes', () => {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-hambros-api-key': created.key,
+        'x-hammurabi-api-key': created.key,
       },
       body: JSON.stringify({
         sessionId: 'session-after-revoke',

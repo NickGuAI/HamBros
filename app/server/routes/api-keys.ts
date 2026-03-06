@@ -9,8 +9,10 @@ import {
   OpenAITranscriptionKeyStore,
   type OpenAITranscriptionKeyStoreLike,
 } from '../api-keys/transcription-store.js'
-import { type Auth0Options } from '../middleware/auth0.js'
-import { combinedAuth } from '../middleware/combined-auth.js'
+import {
+  auth0Middleware,
+  type Auth0Options,
+} from '../middleware/auth0.js'
 
 interface ApiKeyView {
   id: string
@@ -89,7 +91,7 @@ export function createApiKeysRouter(options: ApiKeysRouterOptions = {}): Router 
     options.transcriptionKeyStore ?? new OpenAITranscriptionKeyStore()
   const now = options.now ?? (() => new Date())
 
-  router.use(combinedAuth({ ...options, apiKeyStore: store }))
+  router.use(auth0Middleware(options))
 
   router.post('/keys', async (req, res) => {
     const name = parseName(req.body?.name)

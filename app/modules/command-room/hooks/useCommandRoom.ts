@@ -12,12 +12,14 @@ export interface CronTask {
   id: string
   name: string
   schedule: string
+  timezone?: string
   machine: string
   workDir: string
   agentType: CommandRoomAgentType
   instruction: string
   enabled: boolean
   createdAt: string
+  nextRun?: string | null
   lastRunStatus: WorkflowRunStatus | null
   lastRunAt: string | null
   permissionMode?: string
@@ -38,6 +40,7 @@ export interface WorkflowRun {
 export interface CreateCronTaskInput {
   name: string
   schedule: string
+  timezone?: string
   machine: string
   workDir: string
   agentType: CommandRoomAgentType

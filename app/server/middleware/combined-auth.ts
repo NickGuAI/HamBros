@@ -12,12 +12,25 @@ export interface CombinedAuthOptions extends ApiKeyAuthOptions, Auth0Options {
   requiredApiKeyScopes?: readonly string[]
   unconfiguredApiKeyMessage?: string
   optional?: boolean
+  /** Server-generated token accepted via `x-hammurabi-internal-token` header. */
+  internalToken?: string
 }
 
 export function combinedAuth(options: CombinedAuthOptions = {}): RequestHandler {
   const verifyAuth0Token = createAuth0Verifier(options)
 
   return async (req, res, next) => {
+    // Internal server-to-self calls bypass all external auth
+    if (options.internalToken) {
+      const provided = req.header('x-hammurabi-internal-token')
+      if (provided && provided === options.internalToken) {
+        req.user = { id: 'internal', email: 'system' }
+        req.authMode = 'api-key'
+        next()
+        return
+      }
+    }
+
     // Support access_token query param for SSE (EventSource can't send headers)
     if (
       !req.headers.authorization &&

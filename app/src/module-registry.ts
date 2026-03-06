@@ -44,6 +44,13 @@ export const modules: FrontendModule[] = [
     component: () => import('@modules/command-room/page'),
   },
   {
+    name: 'rpg',
+    label: 'RPG',
+    icon: 'Swords',
+    path: '/rpg',
+    component: () => import('@modules/rpg/page'),
+  },
+  {
     name: 'api-keys',
     label: 'Settings',
     icon: 'Settings',

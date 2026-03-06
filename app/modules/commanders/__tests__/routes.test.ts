@@ -15,7 +15,7 @@ import {
 } from '../heartbeat'
 
 const AUTH_HEADERS = {
-  'x-hambros-api-key': 'test-key',
+  'x-hammurabi-api-key': 'test-key',
 }
 
 const NEXT_RUN_ISO = '2026-03-02T02:00:00.000Z'

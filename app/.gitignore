@@ -3,9 +3,3 @@ node_modules/
 dist/
 dist-server/
 .hambros.json
-data/api-keys/
-data/commanders/
-data/telemetry/
-data/command-room/
-data/agents/
-!data/**/.gitkeep

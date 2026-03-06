@@ -20,6 +20,33 @@ export interface AgentSession {
   host?: string
 }
 
+// hamRPG world types
+export const AGENT_PHASES = ['FORGE', 'LIBRARY', 'ARMORY', 'DUNGEON', 'THRONE_ROOM', 'GATE'] as const
+export type AgentPhase = (typeof AGENT_PHASES)[number]
+
+export type WorldAgentStatus = 'active' | 'idle' | 'stale' | 'completed'
+export type WorldAgentRuntimePhase = 'idle' | 'executing' | 'editing' | 'researching' | 'delegating'
+
+export interface WorldAgent {
+  id: string
+  sessionType: SessionType
+  agentType: AgentType
+  status: WorldAgentStatus
+  phase: WorldAgentRuntimePhase
+  zone?: AgentPhase
+  usage: {
+    inputTokens: number
+    outputTokens: number
+    costUsd: number
+  }
+  quest: string
+  lastUpdatedAt: string
+  spawnPos: {
+    x: number
+    y: number
+  }
+}
+
 export interface Machine {
   id: string
   label: string
@@ -154,6 +181,7 @@ export interface TelemetrySummary {
   totalSessions: number
   topModels: { model: string; cost: number; calls: number }[]
   topAgents: { agent: string; cost: number; sessions: number }[]
+  dailyCosts: { date: string; costUsd: number }[]
 }
 
 // Services types

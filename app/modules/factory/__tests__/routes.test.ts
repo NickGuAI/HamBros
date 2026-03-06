@@ -14,11 +14,11 @@ interface RunningServer {
 }
 
 const AUTH_HEADERS = {
-  'x-hambros-api-key': 'test-key',
+  'x-hammurabi-api-key': 'test-key',
 }
 
 const READ_ONLY_AUTH_HEADERS = {
-  'x-hambros-api-key': 'read-only-key',
+  'x-hammurabi-api-key': 'read-only-key',
 }
 
 function createTestApiKeyStore(): ApiKeyStoreLike {

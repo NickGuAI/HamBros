@@ -192,7 +192,7 @@ function buildOtelMetricsPayload(
 
 const AUTH_HEADERS = {
   'content-type': 'application/json',
-  'x-hambros-api-key': 'test-key',
+  'x-hammurabi-api-key': 'test-key',
 } as const
 
 // ---------------------------------------------------------------------------
@@ -353,7 +353,7 @@ describe('OTEL receiver', () => {
       headers: {
         'content-type': 'application/json',
         'content-encoding': 'gzip',
-        'x-hambros-api-key': 'test-key',
+        'x-hammurabi-api-key': 'test-key',
       },
       body: compressed,
     })
@@ -500,7 +500,7 @@ describe('OTEL receiver', () => {
       method: 'POST',
       headers: {
         'content-type': 'application/x-protobuf',
-        'x-hambros-api-key': 'test-key',
+        'x-hammurabi-api-key': 'test-key',
       },
       body: new Uint8Array([0x0a, 0x02, 0x08, 0x01]),
     })
@@ -516,7 +516,7 @@ describe('OTEL receiver', () => {
       method: 'POST',
       headers: {
         'content-type': 'application/x-protobuf',
-        'x-hambros-api-key': 'test-key',
+        'x-hammurabi-api-key': 'test-key',
       },
       body: new Uint8Array([0x0a, 0x02, 0x08, 0x01]),
     })
@@ -529,7 +529,7 @@ describe('OTEL receiver', () => {
       method: 'POST',
       headers: {
         'content-type': 'application/x-protobuf',
-        'x-hambros-api-key': 'test-key',
+        'x-hammurabi-api-key': 'test-key',
       },
       body: new Uint8Array([0x0a, 0x02, 0x08, 0x01]),
     })
@@ -542,7 +542,7 @@ describe('OTEL receiver', () => {
       method: 'POST',
       headers: {
         'content-type': 'text/plain',
-        'x-hambros-api-key': 'test-key',
+        'x-hammurabi-api-key': 'test-key',
       },
       body: 'hello',
     })
@@ -756,7 +756,7 @@ describe('OTEL receiver', () => {
       method: 'POST',
       headers: {
         'content-type': longType,
-        'x-hambros-api-key': 'test-key',
+        'x-hammurabi-api-key': 'test-key',
       },
       body: 'bad',
     })

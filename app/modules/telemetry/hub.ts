@@ -57,6 +57,7 @@ export interface TelemetrySummaryView {
   totalSessions: number
   topModels: { model: string; cost: number; calls: number }[]
   topAgents: { agent: string; cost: number; sessions: number }[]
+  dailyCosts: { date: string; costUsd: number }[]
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +89,8 @@ export interface HeartbeatInput {
 export interface TelemetryHubOptions {
   store: TelemetryJsonlStore
   now?: () => Date
+  /** Days to retain JSONL entries. Default: 14. Set to 0 to disable compaction. */
+  retentionDays?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -188,6 +191,19 @@ export class TelemetryHub {
   constructor(private readonly options: TelemetryHubOptions) {
     this.now = options.now ?? (() => new Date())
     this.ready = this.restoreFromStore()
+    // Run compaction after store is restored (non-blocking — does not delay ensureReady())
+    void this.ready.then(() => this.runCompaction())
+  }
+
+  private runCompaction(): void {
+    const retentionDays = this.options.retentionDays ?? 14
+    if (retentionDays <= 0) return
+    const compact = () =>
+      this.options.store.compact(retentionDays).catch((err) => {
+        console.warn('[telemetry] compaction failed', err)
+      })
+    void compact()
+    setInterval(() => void compact(), 24 * 60 * 60_000)
   }
 
   async ensureReady(): Promise<void> {
@@ -386,6 +402,12 @@ export class TelemetryHub {
       }))
       .sort((left, right) => right.cost - left.cost)
 
+    const ninetyDaysAgoKey = toUtcDayKey(new Date(now.getTime() - 90 * 24 * 60 * 60_000))
+    const dailyCosts = [...this.dailyCostByDay.entries()]
+      .filter(([date]) => date >= ninetyDaysAgoKey)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, costUsd]) => ({ date, costUsd: roundToMicros(costUsd) }))
+
     return {
       costToday: roundToMicros(costToday),
       costWeek: roundToMicros(costWeek),
@@ -394,6 +416,7 @@ export class TelemetryHub {
       totalSessions: sessions.length,
       topModels,
       topAgents,
+      dailyCosts,
     }
   }
 

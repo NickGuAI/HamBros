@@ -6,10 +6,12 @@ import {
   Clock,
   ArrowLeft,
   Circle,
+  Trash2,
 } from 'lucide-react'
 import {
   ComposedChart,
   Area,
+  AreaChart,
   Line,
   PieChart,
   Pie,
@@ -24,8 +26,162 @@ import {
   useTelemetrySessionDetail,
   useTelemetrySummary,
 } from '@/hooks/use-telemetry'
+import { fetchJson } from '@/lib/api'
 import { timeAgo, formatCost, formatTokens, cn } from '@/lib/utils'
 import type { SessionStatus, TelemetrySession } from '@/types'
+
+const RETENTION_STORAGE_KEY = 'hammurabi:telemetry:retentionDays'
+const DEFAULT_RETENTION_DAYS = 14
+
+function getStoredRetentionDays(): number {
+  try {
+    const raw = localStorage.getItem(RETENTION_STORAGE_KEY)
+    if (raw) {
+      const parsed = Number.parseInt(raw, 10)
+      if (Number.isFinite(parsed) && parsed > 0) return parsed
+    }
+  } catch {
+    // ignore
+  }
+  return DEFAULT_RETENTION_DAYS
+}
+
+type TrendPeriod = '7d' | '30d' | '90d'
+
+const PERIOD_DAYS: Record<TrendPeriod, number> = { '7d': 7, '30d': 30, '90d': 90 }
+
+function CostTrendChart({
+  dailyCosts,
+}: {
+  dailyCosts: { date: string; costUsd: number }[]
+}) {
+  const [period, setPeriod] = useState<TrendPeriod>('30d')
+  const [retentionDays, setRetentionDays] = useState(getStoredRetentionDays)
+  const [compacting, setCompacting] = useState(false)
+  const [compactMsg, setCompactMsg] = useState<string | null>(null)
+
+  const cutoff = new Date()
+  cutoff.setUTCDate(cutoff.getUTCDate() - PERIOD_DAYS[period])
+  const cutoffKey = cutoff.toISOString().slice(0, 10)
+
+  const chartData = dailyCosts
+    .filter((d) => d.date >= cutoffKey)
+    .map((d) => ({
+      date: d.date,
+      cost: d.costUsd,
+    }))
+
+  async function handleCompact() {
+    setCompacting(true)
+    setCompactMsg(null)
+    try {
+      localStorage.setItem(RETENTION_STORAGE_KEY, String(retentionDays))
+      await fetchJson('/api/telemetry/compact', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ retentionDays }),
+      })
+      setCompactMsg(`Compacted — entries older than ${retentionDays} days removed.`)
+    } catch {
+      setCompactMsg('Compaction failed.')
+    } finally {
+      setCompacting(false)
+    }
+  }
+
+  return (
+    <div className="card-sumi p-5">
+      <div className="flex items-center justify-between mb-4">
+        <h4 className="section-title">Cost over time</h4>
+        <div className="flex items-center gap-1">
+          {(['7d', '30d', '90d'] as TrendPeriod[]).map((p) => (
+            <button
+              key={p}
+              onClick={() => setPeriod(p)}
+              className={cn(
+                'badge-sumi text-[10px] cursor-pointer transition-colors',
+                period === p ? 'bg-sumi-black text-white' : 'hover:bg-washi-shadow',
+              )}
+            >
+              {p}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="h-40">
+        <ResponsiveContainer width="100%" height="100%">
+          <AreaChart data={chartData}>
+            <defs>
+              <linearGradient id="trendGradient" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="#1C1C1C" stopOpacity={0.15} />
+                <stop offset="100%" stopColor="#1C1C1C" stopOpacity={0} />
+              </linearGradient>
+            </defs>
+            <XAxis
+              dataKey="date"
+              tick={{ fontSize: 10, fill: '#8B8B8B' }}
+              axisLine={false}
+              tickLine={false}
+              tickFormatter={(v: string) => v.slice(5)}
+            />
+            <YAxis
+              tick={{ fontSize: 10, fill: '#8B8B8B' }}
+              axisLine={false}
+              tickLine={false}
+              tickFormatter={(v: number) => `$${v.toFixed(2)}`}
+            />
+            <Tooltip
+              formatter={(value: number) => [formatCost(value), 'Cost']}
+              contentStyle={{
+                background: '#FAF8F5',
+                border: '1px solid rgba(28,28,28,0.06)',
+                borderRadius: '4px 12px 4px 12px',
+                fontSize: 12,
+              }}
+            />
+            <Area
+              type="monotone"
+              dataKey="cost"
+              stroke="#1C1C1C"
+              strokeWidth={1.5}
+              fill="url(#trendGradient)"
+            />
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
+
+      {/* Retention management */}
+      <div className="mt-4 pt-4 border-t border-ink-border flex flex-wrap items-center gap-3">
+        <span className="text-xs text-sumi-diluted">Retention:</span>
+        <input
+          type="number"
+          min={1}
+          max={365}
+          value={retentionDays}
+          onChange={(e) => {
+            const v = Number.parseInt(e.target.value, 10)
+            if (v > 0) {
+              setRetentionDays(v)
+              try { localStorage.setItem(RETENTION_STORAGE_KEY, String(v)) } catch { /* ignore */ }
+            }
+          }}
+          className="w-16 text-xs px-2 py-1 rounded border border-ink-border bg-washi-aged/40 text-sumi-black text-center"
+        />
+        <span className="text-xs text-sumi-diluted">days</span>
+        <button
+          onClick={() => void handleCompact()}
+          disabled={compacting}
+          className="btn-ghost inline-flex items-center gap-1.5 text-xs"
+        >
+          <Trash2 size={12} />
+          {compacting ? 'Compacting…' : 'Compact now'}
+        </button>
+        {compactMsg && <span className="text-xs text-sumi-diluted">{compactMsg}</span>}
+      </div>
+    </div>
+  )
+}
 
 const STATUS_CLASSES: Record<SessionStatus, string> = {
   active: 'badge-active',
@@ -309,6 +465,9 @@ function GlobalSummary() {
           icon={Zap}
         />
       </div>
+
+      {/* Cost trend chart */}
+      <CostTrendChart dailyCosts={summary.dailyCosts} />
 
       {/* Model breakdown */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">

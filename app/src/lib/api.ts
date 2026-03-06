@@ -11,7 +11,7 @@ export function setAccessTokenResolver(resolver: AccessTokenResolver | null): vo
 function shouldInjectBearerToken(headers: Headers): boolean {
   return (
     !headers.has('authorization') &&
-    !headers.has('x-hambros-api-key') &&
+    !headers.has('x-hammurabi-api-key') &&
     !headers.has('x-api-key')
   )
 }

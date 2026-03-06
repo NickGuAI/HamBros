@@ -89,11 +89,11 @@ interface RunningServer {
 }
 
 const AUTH_HEADERS = {
-  'x-hambros-api-key': 'test-key',
+  'x-hammurabi-api-key': 'test-key',
 }
 
 const READ_ONLY_AUTH_HEADERS = {
-  'x-hambros-api-key': 'read-only-key',
+  'x-hammurabi-api-key': 'read-only-key',
 }
 
 function createTestApiKeyStore(): ApiKeyStoreLike {
@@ -273,6 +273,239 @@ describe('agents routes', () => {
 
     expect(response.status).toBe(200)
     expect(payload).toEqual([])
+
+    await server.close()
+  })
+
+  it('returns empty world agent list initially', async () => {
+    const { spawner } = createMockPtySpawner()
+    const server = await startServer({ ptySpawner: spawner })
+    const response = await fetch(`${server.baseUrl}/api/agents/world`, {
+      headers: AUTH_HEADERS,
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual([])
+
+    await server.close()
+  })
+
+  it('returns PTY world agent with idle phase, zero usage, empty task, and null lastToolUse', async () => {
+    const { spawner } = createMockPtySpawner()
+    const server = await startServer({ ptySpawner: spawner })
+
+    const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+      method: 'POST',
+      headers: {
+        ...AUTH_HEADERS,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: 'world-pty-01',
+        mode: 'default',
+      }),
+    })
+    expect(createResponse.status).toBe(201)
+
+    const response = await fetch(`${server.baseUrl}/api/agents/world`, {
+      headers: AUTH_HEADERS,
+    })
+    const payload = await response.json() as Array<{
+      id: string
+      agentType: string
+      sessionType: string
+      status: string
+      phase: string
+      usage: { inputTokens: number; outputTokens: number; costUsd: number }
+      task: string
+      lastToolUse: string | null
+      lastUpdatedAt: string
+    }>
+
+    expect(response.status).toBe(200)
+    expect(payload).toHaveLength(1)
+    expect(payload[0].id).toBe('world-pty-01')
+    expect(payload[0].agentType).toBe('claude')
+    expect(payload[0].sessionType).toBe('pty')
+    expect(payload[0].status).toBe('active')
+    expect(payload[0].phase).toBe('idle')
+    expect(payload[0].usage).toEqual({
+      inputTokens: 0,
+      outputTokens: 0,
+      costUsd: 0,
+    })
+    expect(payload[0].task).toBe('')
+    expect(payload[0].lastToolUse).toBeNull()
+    expect(payload[0].lastUpdatedAt).toEqual(expect.any(String))
+
+    await server.close()
+  })
+
+  it('returns stream world agent with tool_use phase and includes usage + task + lastToolUse', async () => {
+    const streamMock = createMockChildProcess()
+    mockedSpawn.mockReturnValueOnce(streamMock.cp as never)
+    const server = await startServer()
+
+    const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+      method: 'POST',
+      headers: {
+        ...AUTH_HEADERS,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: 'world-stream-01',
+        mode: 'default',
+        sessionType: 'stream',
+        task: 'Fix login retries',
+      }),
+    })
+    expect(createResponse.status).toBe(201)
+
+    streamMock.emitStdout('{"type":"message_start","message":{"id":"m1","role":"assistant"}}\n')
+    streamMock.emitStdout('{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tool_1","name":"Bash","input":{"command":"ls -la"}}]}}\n')
+
+    const response = await fetch(`${server.baseUrl}/api/agents/world`, {
+      headers: AUTH_HEADERS,
+    })
+    const payload = await response.json() as Array<{
+      id: string
+      phase: string
+      usage: { inputTokens: number; outputTokens: number; costUsd: number }
+      task: string
+      lastToolUse: string | null
+    }>
+
+    expect(response.status).toBe(200)
+    expect(payload).toHaveLength(1)
+    expect(payload[0].id).toBe('world-stream-01')
+    expect(payload[0].phase).toBe('tool_use')
+    expect(payload[0].usage).toEqual({
+      inputTokens: 0,
+      outputTokens: 0,
+      costUsd: 0,
+    })
+    expect(payload[0].task).toBe('Fix login retries')
+    expect(payload[0].lastToolUse).toBe('Bash')
+
+    await server.close()
+  })
+
+  it('classifies stream phase as blocked for pending AskUserQuestion and thinking after tool_result', async () => {
+    const streamMock = createMockChildProcess()
+    mockedSpawn.mockReturnValueOnce(streamMock.cp as never)
+    const server = await startServer()
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'world-blocked-01',
+          mode: 'default',
+          sessionType: 'stream',
+          task: 'Need clarification',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      streamMock.emitStdout('{"type":"message_start","message":{"id":"m1","role":"assistant"}}\n')
+      streamMock.emitStdout('{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"ask_1","name":"AskUserQuestion","input":{"questions":[{"question":"Pick one","multiSelect":false,"options":[{"label":"A","description":"A"}]}]}}]}}\n')
+
+      const blockedResponse = await fetch(`${server.baseUrl}/api/agents/world`, {
+        headers: AUTH_HEADERS,
+      })
+      expect(blockedResponse.status).toBe(200)
+      const blockedPayload = await blockedResponse.json() as Array<{ phase: string; lastToolUse: string | null }>
+      expect(blockedPayload).toHaveLength(1)
+      expect(blockedPayload[0].phase).toBe('blocked')
+      expect(blockedPayload[0].lastToolUse).toBe('AskUserQuestion')
+
+      streamMock.emitStdout('{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ask_1","content":"{\\"answers\\":{\\"Pick one\\":\\"A\\"},\\"annotations\\":{}}"}]}}\n')
+
+      const thinkingResponse = await fetch(`${server.baseUrl}/api/agents/world`, {
+        headers: AUTH_HEADERS,
+      })
+      expect(thinkingResponse.status).toBe(200)
+      const thinkingPayload = await thinkingResponse.json() as Array<{ phase: string; lastToolUse: string | null }>
+      expect(thinkingPayload).toHaveLength(1)
+      expect(thinkingPayload[0].phase).toBe('thinking')
+      expect(thinkingPayload[0].lastToolUse).toBe('AskUserQuestion')
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('classifies world status as active/idle/stale/completed based on event recency and completion', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      const baseTime = new Date('2026-03-05T00:00:00.000Z')
+      vi.setSystemTime(baseTime)
+
+      const streamMock = createMockChildProcess()
+      mockedSpawn.mockReturnValueOnce(streamMock.cp as never)
+      const server = await startServer()
+
+      try {
+        const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+          method: 'POST',
+          headers: {
+            ...AUTH_HEADERS,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            name: 'world-status-01',
+            mode: 'default',
+            sessionType: 'stream',
+          }),
+        })
+        expect(createResponse.status).toBe(201)
+
+        // Mark turn in-progress so status derives from recency windows.
+        streamMock.emitStdout('{"type":"message_start","message":{"id":"m1","role":"assistant"}}\n')
+
+        const statusAt = async (iso: string): Promise<string> => {
+          vi.setSystemTime(new Date(iso))
+          const response = await fetch(`${server.baseUrl}/api/agents/world`, {
+            headers: AUTH_HEADERS,
+          })
+          expect(response.status).toBe(200)
+          const payload = await response.json() as Array<{ status: string }>
+          expect(payload).toHaveLength(1)
+          return payload[0].status
+        }
+
+        expect(await statusAt('2026-03-05T00:00:30.000Z')).toBe('active')
+        expect(await statusAt('2026-03-05T00:01:00.000Z')).toBe('idle')
+        expect(await statusAt('2026-03-05T00:05:00.000Z')).toBe('idle')
+        expect(await statusAt('2026-03-05T00:05:01.000Z')).toBe('stale')
+
+        streamMock.emitStdout('{"type":"result","result":"done"}\n')
+        const completedResponse = await fetch(`${server.baseUrl}/api/agents/world`, {
+          headers: AUTH_HEADERS,
+        })
+        expect(completedResponse.status).toBe(200)
+        const completedPayload = await completedResponse.json() as Array<{ status: string; phase: string }>
+        expect(completedPayload[0].status).toBe('completed')
+        expect(completedPayload[0].phase).toBe('completed')
+      } finally {
+        await server.close()
+      }
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('requires authentication to access world agents', async () => {
+    const server = await startServer()
+    const response = await fetch(`${server.baseUrl}/api/agents/world`)
+
+    expect(response.status).toBe(401)
+    expect(await response.json()).toEqual({
+      error: 'Unauthorized',
+    })
 
     await server.close()
   })
@@ -563,7 +796,7 @@ describe('agents routes', () => {
       rows: 40,
     }))
     expect(lastHandle()!.write).toHaveBeenCalledWith(
-      'unset CLAUDECODE && claude --acceptEdits\r',
+      'unset CLAUDECODE && claude --permission-mode acceptEdits\r',
     )
 
     await server.close()
@@ -1540,6 +1773,137 @@ describe('stream sessions', () => {
     await server.close()
   })
 
+  it('reports command-room stream sessions as completed after result without waiting for exit', async () => {
+    const mock = installMockProcess()
+    const server = await startServer()
+
+    const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+      method: 'POST',
+      headers: {
+        ...AUTH_HEADERS,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: 'command-room-task-01',
+        mode: 'default',
+        sessionType: 'stream',
+        task: '/daily-review',
+      }),
+    })
+    expect(createResponse.status).toBe(201)
+
+    mock.emitStdout('{"type":"result","subtype":"success","result":"Daily review complete.","total_cost_usd":0.12}\n')
+
+    await vi.waitFor(async () => {
+      const response = await fetch(`${server.baseUrl}/api/agents/sessions/command-room-task-01`, {
+        headers: AUTH_HEADERS,
+      })
+      expect(response.status).toBe(200)
+      const payload = await response.json() as {
+        completed: boolean
+        status: string
+        result?: { status: string; finalComment: string; costUsd: number }
+      }
+      expect(payload.completed).toBe(true)
+      expect(payload.status).toBe('success')
+      expect(payload.result).toMatchObject({
+        status: 'success',
+        finalComment: 'Daily review complete.',
+        costUsd: 0.12,
+      })
+    })
+
+    const listResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+      headers: AUTH_HEADERS,
+    })
+    expect(listResponse.status).toBe(200)
+    const listed = await listResponse.json() as Array<{ name: string }>
+    expect(listed.some((session) => session.name === 'command-room-task-01')).toBe(false)
+
+    expect(mock.cp.kill).not.toHaveBeenCalled()
+
+    await server.close()
+  })
+
+  it('reports command-room stream sessions as completed on exit without result (cron fix)', async () => {
+    const mock = installMockProcess()
+    const server = await startServer()
+
+    const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+      method: 'POST',
+      headers: {
+        ...AUTH_HEADERS,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: 'command-room-task-exit-no-result',
+        mode: 'default',
+        sessionType: 'stream',
+        task: 'test',
+      }),
+    })
+    expect(createResponse.status).toBe(201)
+
+    // Exit without emitting result — e.g. AskUserQuestion block, crash, or Codex format.
+    mock.emitExit(0)
+
+    await vi.waitFor(async () => {
+      const response = await fetch(`${server.baseUrl}/api/agents/sessions/command-room-task-exit-no-result`, {
+        headers: AUTH_HEADERS,
+      })
+      expect(response.status).toBe(200)
+      const payload = (await response.json()) as {
+        completed: boolean
+        status: string
+        result?: { status: string; finalComment: string; costUsd: number }
+      }
+      expect(payload.completed).toBe(true)
+      expect(payload.status).toBe('success')
+      expect(payload.result?.finalComment).toContain('Process exited with code 0')
+    })
+
+    await server.close()
+  })
+
+  it('never persists command-room sessions for auto-resume', async () => {
+    const mock = installMockProcess()
+    const sessionStoreDir = await mkdtemp(join(tmpdir(), 'hammurabi-stream-session-store-'))
+    const sessionStorePath = join(sessionStoreDir, 'stream-sessions.json')
+    const server = await startServer({ sessionStorePath })
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'command-room-task-02',
+          mode: 'default',
+          sessionType: 'stream',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      mock.emitStdout('{"type":"system","subtype":"init","session_id":"claude-command-room-123"}\n')
+
+      mock.emitStdout('{"type":"result","subtype":"success","result":"done"}\n')
+
+      await vi.waitFor(async () => {
+        const raw = await readFile(sessionStorePath, 'utf8')
+        const parsed = JSON.parse(raw) as {
+          sessions: Array<{ name: string }>
+        }
+        const saved = parsed.sessions.find((session) => session.name === 'command-room-task-02')
+        expect(saved).toBeUndefined()
+      })
+    } finally {
+      await server.close()
+      await rm(sessionStoreDir, { recursive: true, force: true })
+    }
+  })
+
   it('auto-resumes persisted claude stream sessions on server restart', async () => {
     const firstMock = installMockProcess()
     const sessionStoreDir = await mkdtemp(join(tmpdir(), 'hammurabi-stream-session-store-'))
@@ -1853,7 +2217,7 @@ describe('stream sessions', () => {
 
     expect(mockedSpawn).toHaveBeenCalledWith(
       'claude',
-      ['-p', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json', '--acceptEdits'],
+      ['-p', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json', '--permission-mode', 'acceptEdits'],
       expect.any(Object),
     )
 
@@ -2130,6 +2494,103 @@ describe('stream sessions', () => {
       type: 'user',
       message: { role: 'user', content: 'What files handle auth?' },
     })
+
+    ws.close()
+    await server.close()
+  })
+
+  it('clears lastTurnCompleted immediately when WS input is received for completed session', async () => {
+    const mock = installMockProcess()
+    const server = await startServer()
+
+    await fetch(`${server.baseUrl}/api/agents/sessions`, {
+      method: 'POST',
+      headers: {
+        ...AUTH_HEADERS,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: 'completed-input-test',
+        mode: 'default',
+        sessionType: 'stream',
+      }),
+    })
+
+    // Drive the session through a full turn so lastTurnCompleted is set.
+    mock.emitStdout('{"type":"message_start","message":{"id":"m1","role":"assistant"}}\n')
+    mock.emitStdout('{"type":"result","subtype":"success","result":"done"}\n')
+
+    // Confirm session is 'completed' before sending new input.
+    await vi.waitFor(async () => {
+      const resp = await fetch(`${server.baseUrl}/api/agents/world`, {
+        headers: AUTH_HEADERS,
+      })
+      const payload = await resp.json() as Array<{ id: string; status: string }>
+      const entry = payload.find((e) => e.id === 'completed-input-test')
+      expect(entry?.status).toBe('completed')
+    })
+
+    // Connect via WebSocket and send new input.
+    const ws = await connectWs(server.baseUrl, 'completed-input-test')
+    ws.send(JSON.stringify({ type: 'input', text: 'new task after completion' }))
+
+    // World status should immediately flip back to non-completed after input.
+    await vi.waitFor(async () => {
+      const resp = await fetch(`${server.baseUrl}/api/agents/world`, {
+        headers: AUTH_HEADERS,
+      })
+      const payload = await resp.json() as Array<{ id: string; status: string }>
+      const entry = payload.find((e) => e.id === 'completed-input-test')
+      expect(entry?.status).not.toBe('completed')
+    })
+
+    ws.close()
+    await server.close()
+  })
+
+  it('does not clear lastTurnCompleted for command-room sessions on WS input', async () => {
+    const mock = installMockProcess()
+    const server = await startServer()
+
+    await fetch(`${server.baseUrl}/api/agents/sessions`, {
+      method: 'POST',
+      headers: {
+        ...AUTH_HEADERS,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: 'command-room-no-clear-test',
+        mode: 'default',
+        sessionType: 'stream',
+      }),
+    })
+
+    // Drive to completed.
+    mock.emitStdout('{"type":"message_start","message":{"id":"m1","role":"assistant"}}\n')
+    mock.emitStdout('{"type":"result","subtype":"success","result":"done"}\n')
+
+    await vi.waitFor(async () => {
+      const resp = await fetch(`${server.baseUrl}/api/agents/world`, {
+        headers: AUTH_HEADERS,
+      })
+      const payload = await resp.json() as Array<{ id: string; status: string }>
+      const entry = payload.find((e) => e.id === 'command-room-no-clear-test')
+      expect(entry?.status).toBe('completed')
+    })
+
+    // Send input — command-room sessions should stay completed.
+    const ws = await connectWs(server.baseUrl, 'command-room-no-clear-test')
+    ws.send(JSON.stringify({ type: 'input', text: 'more input' }))
+
+    // Wait briefly to let the WS message be processed.
+    await new Promise((r) => setTimeout(r, 100))
+
+    const resp = await fetch(`${server.baseUrl}/api/agents/world`, {
+      headers: AUTH_HEADERS,
+    })
+    const payload = await resp.json() as Array<{ id: string; status: string }>
+    const entry = payload.find((e) => e.id === 'command-room-no-clear-test')
+    expect(entry?.status).toBe('completed')
 
     ws.close()
     await server.close()

@@ -108,7 +108,7 @@ describe('apiKeyAuth', () => {
 
     const byPrimaryHeader = await fetch(`${server.baseUrl}/protected`, {
       headers: {
-        'x-hambros-api-key': 'managed-key',
+        'x-hammurabi-api-key': 'managed-key',
       },
     })
     expect(byPrimaryHeader.status).toBe(200)
@@ -156,7 +156,7 @@ describe('apiKeyAuth', () => {
 
     const response = await fetch(`${server.baseUrl}/protected`, {
       headers: {
-        'x-hambros-api-key': 'managed-key',
+        'x-hammurabi-api-key': 'managed-key',
       },
     })
     expect(response.status).toBe(403)

@@ -38,7 +38,7 @@ export function buildClaudeCodeOtelEnv(endpoint: string, apiKey: string): Claude
     CLAUDE_CODE_ENABLE_TELEMETRY: '1',
     OTEL_EXPORTER_OTLP_ENDPOINT: endpoint,
     OTEL_EXPORTER_OTLP_PROTOCOL: 'http/json',
-    OTEL_EXPORTER_OTLP_HEADERS: `x-hambros-api-key=${apiKey}`,
+    OTEL_EXPORTER_OTLP_HEADERS: `x-hammurabi-api-key=${apiKey}`,
     OTEL_METRICS_EXPORTER: 'otlp',
     OTEL_LOGS_EXPORTER: 'otlp',
     OTEL_METRIC_EXPORT_INTERVAL: '5000',

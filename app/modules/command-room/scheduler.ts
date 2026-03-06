@@ -12,7 +12,7 @@ export interface CronScheduler {
   schedule(
     expression: string,
     task: () => Promise<void> | void,
-    options?: { name?: string },
+    options?: { name?: string; timezone?: string },
   ): CronScheduledJob
   validate(expression: string): boolean
 }
@@ -43,6 +43,7 @@ function defaultScheduler(): CronScheduler {
     schedule(expression, task, options) {
       return cron.schedule(expression, task, {
         name: options?.name,
+        timezone: options?.timezone,
       })
     },
     validate(expression) {
@@ -135,6 +136,7 @@ export class CommandRoomScheduler {
       },
       {
         name: `command-room-${task.id}`,
+        timezone: task.timezone,
       },
     )
     this.activeJobs.set(task.id, job)

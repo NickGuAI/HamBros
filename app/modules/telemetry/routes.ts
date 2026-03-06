@@ -34,6 +34,8 @@ export interface TelemetryRouterOptions {
   verifyAuth0Token?: (token: string) => Promise<AuthUser>
   localScan?: LocalScanOptions
   localScanner?: LocalScannerLike
+  /** Days to retain JSONL entries (passed to TelemetryHub). Default: 14. */
+  retentionDays?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -204,7 +206,7 @@ export function createTelemetryRouterWithHub(
   const store =
     options.store ??
     new TelemetryJsonlStore(options.dataFilePath ?? defaultTelemetryStorePath())
-  const hub = new TelemetryHub({ store, now })
+  const hub = new TelemetryHub({ store, now, retentionDays: options.retentionDays })
   const localScanEnabled = options.localScan?.enabled ?? true
   const localScanner =
     options.localScanner ??
@@ -346,6 +348,21 @@ export function createTelemetryRouterWithHub(
       res.json(await hub.getSummary())
     } catch {
       res.status(500).json({ error: 'Failed to build telemetry summary' })
+    }
+  })
+
+  router.post('/compact', requireWriteAccess, async (req, res) => {
+    const body = asObject(req.body)
+    const retentionDays =
+      typeof body?.retentionDays === 'number' && Number.isFinite(body.retentionDays) && body.retentionDays > 0
+        ? body.retentionDays
+        : (options.retentionDays ?? 14)
+    try {
+      await hub.ensureReady()
+      await store.compact(retentionDays)
+      res.json({ ok: true, retentionDays })
+    } catch {
+      res.status(500).json({ error: 'Compaction failed' })
     }
   })
 

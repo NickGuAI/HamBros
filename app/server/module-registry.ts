@@ -1,4 +1,5 @@
 import type { Router } from 'express'
+import { randomBytes } from 'node:crypto'
 import type { IncomingMessage } from 'node:http'
 import type { Duplex } from 'node:stream'
 import { createAgentsRouter } from '../modules/agents/routes.js'
@@ -23,6 +24,11 @@ export interface HammurabiModule {
 interface ModuleRegistryOptions {
   apiKeyStore?: ApiKeyStoreLike
   transcriptionKeyStore?: OpenAITranscriptionKeyStoreLike
+  auth0Domain?: string
+  auth0Audience?: string
+  auth0ClientId?: string
+  /** Max concurrent agent sessions (default 10). Set via HAMBROS_MAX_AGENT_SESSIONS. */
+  maxAgentSessions?: number
 }
 
 export interface ModuleRegistryResult {
@@ -32,16 +38,24 @@ export interface ModuleRegistryResult {
 }
 
 export function createModules(options: ModuleRegistryOptions = {}): ModuleRegistryResult {
+  const internalToken = randomBytes(32).toString('hex')
+
   const agents = createAgentsRouter({
     apiKeyStore: options.apiKeyStore,
+    maxSessions: options.maxAgentSessions,
+    internalToken,
   })
 
   const commanders = createCommandersRouter({
     apiKeyStore: options.apiKeyStore,
+    auth0Domain: options.auth0Domain,
+    auth0Audience: options.auth0Audience,
+    auth0ClientId: options.auth0ClientId,
   })
 
   const commandRoom = createCommandRoomRouter({
     apiKeyStore: options.apiKeyStore,
+    internalToken,
   })
 
   const services = createServicesRouter({

@@ -38,7 +38,7 @@ describe('mergeCursorEnv', () => {
     expect(result[expectedEnvKey()]).toMatchObject({
       OTEL_EXPORTER_OTLP_ENDPOINT: 'https://hammurabi.gehirn.ai',
       OTEL_EXPORTER_OTLP_PROTOCOL: 'http/json',
-      OTEL_EXPORTER_OTLP_HEADERS: 'x-hambros-api-key=hmrb_test_key',
+      OTEL_EXPORTER_OTLP_HEADERS: 'x-hammurabi-api-key=hmrb_test_key',
     })
     expect(result[expectedEnvKey()]).not.toHaveProperty('HAMMURABI_ENDPOINT')
     expect(result[expectedEnvKey()]).not.toHaveProperty('HAMMURABI_API_KEY')

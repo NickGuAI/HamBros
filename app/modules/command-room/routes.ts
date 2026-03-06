@@ -57,6 +57,26 @@ function parseOptionalEnabled(raw: unknown): boolean | null | undefined {
   return null
 }
 
+function parseOptionalTimezone(raw: unknown): string | null | undefined {
+  if (raw === undefined) {
+    return undefined
+  }
+  if (typeof raw !== 'string') {
+    return null
+  }
+  const timezone = raw.trim()
+  if (!timezone) {
+    return undefined
+  }
+
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: timezone })
+  } catch {
+    return null
+  }
+  return timezone
+}
+
 function isInvalidCronError(error: unknown): error is InvalidCronExpressionError {
   return error instanceof InvalidCronExpressionError
 }
@@ -71,6 +91,7 @@ export interface CommandRoomRouterOptions extends Pick<CommandRoomExecutorOption
   auth0Audience?: string
   auth0ClientId?: string
   verifyAuth0Token?: (token: string) => Promise<AuthUser>
+  internalToken?: string
 }
 
 export function createCommandRoomRouter(options: CommandRoomRouterOptions = {}): Router {
@@ -83,6 +104,7 @@ export function createCommandRoomRouter(options: CommandRoomRouterOptions = {}):
     now: options.now,
     monitorOptions: options.monitorOptions,
     agentSessionFactory: options.agentSessionFactory,
+    internalToken: options.internalToken,
   })
   const scheduler = options.scheduler ?? new CommandRoomScheduler({
     taskStore,
@@ -100,6 +122,7 @@ export function createCommandRoomRouter(options: CommandRoomRouterOptions = {}):
     audience: options.auth0Audience,
     clientId: options.auth0ClientId,
     verifyToken: options.verifyAuth0Token,
+    internalToken: options.internalToken,
   })
   const requireWriteAccess = combinedAuth({
     apiKeyStore: options.apiKeyStore,
@@ -108,6 +131,7 @@ export function createCommandRoomRouter(options: CommandRoomRouterOptions = {}):
     audience: options.auth0Audience,
     clientId: options.auth0ClientId,
     verifyToken: options.verifyAuth0Token,
+    internalToken: options.internalToken,
   })
 
   router.get('/tasks', requireReadAccess, async (_req, res) => {
@@ -169,6 +193,12 @@ export function createCommandRoomRouter(options: CommandRoomRouterOptions = {}):
       return
     }
 
+    const timezone = parseOptionalTimezone(req.body?.timezone)
+    if (timezone === null) {
+      res.status(400).json({ error: 'timezone must be a valid IANA timezone when provided' })
+      return
+    }
+
     const permissionMode = typeof req.body?.permissionMode === 'string' && req.body.permissionMode ? req.body.permissionMode as string : undefined
     const sessionType = req.body?.sessionType === 'pty' ? 'pty' : req.body?.sessionType === 'stream' ? 'stream' : undefined
 
@@ -177,6 +207,7 @@ export function createCommandRoomRouter(options: CommandRoomRouterOptions = {}):
       const created = await scheduler.createTask({
         name,
         schedule,
+        timezone,
         machine,
         workDir,
         agentType,
@@ -269,6 +300,15 @@ export function createCommandRoomRouter(options: CommandRoomRouterOptions = {}):
       update.enabled = enabled
     }
 
+    if ('timezone' in body) {
+      const timezone = parseOptionalTimezone(body.timezone)
+      if (timezone === null || timezone === undefined) {
+        res.status(400).json({ error: 'timezone must be a valid IANA timezone' })
+        return
+      }
+      update.timezone = timezone
+    }
+
     if (Object.keys(update).length === 0) {
       res.status(400).json({
         error: 'At least one updatable field is required',
@@ -325,7 +365,9 @@ export function createCommandRoomRouter(options: CommandRoomRouterOptions = {}):
 
     try {
       await initialized
-      const run = await executor.executeTask(taskId, 'manual')
+      const run = await executor.executeTask(taskId, 'manual', {
+        authToken: req.headers.authorization,
+      })
       if (!run) {
         res.status(404).json({ error: 'Task not found' })
         return

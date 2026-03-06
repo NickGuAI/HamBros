@@ -104,7 +104,7 @@
 
   /* ── Bottom Sheet (mobile) ──────────────────────── */
   .sheet-backdrop {
-    @apply fixed inset-0 z-30 opacity-0 pointer-events-none;
+    @apply fixed inset-0 z-[9998] opacity-0 pointer-events-none;
     background: rgba(28, 28, 28, 0.25);
     transition: opacity 0.35s;
   }
@@ -114,7 +114,7 @@
   }
 
   .sheet {
-    @apply fixed bottom-0 left-0 right-0 z-[31] overflow-y-auto;
+    @apply fixed bottom-0 left-0 right-0 z-[9999] overflow-y-auto;
     background: var(--washi-white, #FAF8F5);
     border-radius: 24px 24px 0 0;
     transform: translateY(100%);
@@ -146,7 +146,7 @@
     background: #1a1a1a;
     padding-top: env(safe-area-inset-top, 0px);
     padding-bottom: env(safe-area-inset-bottom, 0px);
-    animation: fade-in 0.3s cubic-bezier(0.23, 1, 0.32, 1) forwards;
+    animation: fade-in 0.3s cubic-bezier(0.23, 1, 0.32, 1);
   }
 
   /* ── Session View Overlay (mobile stream-json) ── */
@@ -171,7 +171,7 @@
     @apply fixed inset-0 z-40 flex flex-col;
     background: var(--msg-bg);
     color: var(--msg-text);
-    animation: fade-in 0.3s var(--ease-gentle) forwards;
+    animation: fade-in 0.3s var(--ease-gentle);
     -webkit-font-smoothing: antialiased;
   }
 

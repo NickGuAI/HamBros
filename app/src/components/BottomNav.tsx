@@ -7,6 +7,7 @@ import {
   Settings,
   Warehouse,
   Crown,
+  Swords,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -16,6 +17,7 @@ const iconMap: Record<string, React.ComponentType<LucideProps>> = {
   Server,
   Warehouse,
   Crown,
+  Swords,
   Settings,
 }
 
@@ -40,7 +42,7 @@ interface NavItem {
 export function BottomNav({ modules }: { modules: NavItem[] }) {
   return (
     <nav className="fixed bottom-0 left-0 right-0 z-20 flex items-stretch justify-around bg-washi-white border-t border-ink-border pb-[env(safe-area-inset-bottom,0px)] md:hidden">
-      {modules.map((mod) => {
+      {modules.filter((mod) => mod.name !== 'commanders').map((mod) => {
         const Icon = iconMap[mod.icon]
         return (
           <NavLink
