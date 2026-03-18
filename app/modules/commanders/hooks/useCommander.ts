@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { buildRequestHeaders, fetchJson, getAccessToken } from '../../../src/lib/api'
-import { getApiBase, getWsBase } from '../../../src/lib/api-base'
+import { fetchJson, fetchVoid, getAccessToken } from '../../../src/lib/api'
+import { getWsBase } from '../../../src/lib/api-base'
 import { createReconnectBackoff, shouldReconnectWebSocketClose } from '../../agents/ws-reconnect'
 
 const COMMANDERS_QUERY_KEY = ['commanders', 'sessions'] as const
@@ -9,6 +9,7 @@ const MAX_TERMINAL_LINES = 2000
 
 export type CommanderState = 'idle' | 'running' | 'paused' | 'stopped'
 export type CommanderWsStatus = 'connecting' | 'connected' | 'disconnected'
+export type CommanderAgentType = 'claude' | 'codex'
 
 export interface CommanderHeartbeatState {
   intervalMs: number
@@ -36,9 +37,10 @@ export interface CommanderSession {
   pid: number | null
   state: CommanderState
   created: string
+  agentType?: CommanderAgentType
   heartbeat: CommanderHeartbeatState
   lastHeartbeat: string | null
-  taskSource: CommanderTaskSource
+  taskSource: CommanderTaskSource | null
   currentTask: CommanderCurrentTask | null
   completedTasks: number
   totalCostUsd: number
@@ -71,7 +73,8 @@ export interface CommanderCronTask {
 
 export interface CommanderCreateInput {
   host: string
-  taskSource: { owner: string; repo: string; label?: string }
+  taskSource?: { owner: string; repo: string; label?: string }
+  cwd?: string
 }
 
 interface CommanderMessageInput {
@@ -82,6 +85,11 @@ interface CommanderMessageInput {
 interface CommanderTaskAssignInput {
   commanderId: string
   issueNumber: number
+}
+
+interface CommanderStartInput {
+  commanderId: string
+  agentType?: CommanderAgentType
 }
 
 interface CommanderCronCreateInput {
@@ -100,6 +108,13 @@ interface CommanderCronToggleInput {
   commanderId: string
   cronId: string
   enabled: boolean
+}
+
+interface CommanderCronUpdateInput {
+  commanderId: string
+  cronId: string
+  instruction?: string
+  schedule?: string
 }
 
 interface CommanderCronDeleteInput {
@@ -296,9 +311,15 @@ async function fetchCommanderCrons(commanderId: string): Promise<CommanderCronTa
   return fetchJson<CommanderCronTask[]>(`/api/commanders/${encodeURIComponent(commanderId)}/crons`)
 }
 
-async function startCommanderSession(commanderId: string): Promise<{ started: boolean }> {
-  return fetchJson<{ started: boolean }>(`/api/commanders/${encodeURIComponent(commanderId)}/start`, {
+async function startCommanderSession(input: CommanderStartInput): Promise<{ started: boolean }> {
+  return fetchJson<{ started: boolean }>(`/api/commanders/${encodeURIComponent(input.commanderId)}/start`, {
     method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      agentType: input.agentType,
+    }),
   })
 }
 
@@ -366,36 +387,33 @@ async function toggleCommanderCron(input: CommanderCronToggleInput): Promise<Com
   )
 }
 
-async function deleteCommanderCron(input: CommanderCronDeleteInput): Promise<void> {
-  const headers = await buildRequestHeaders()
-  const response = await fetch(
-    `${getApiBase()}/api/commanders/${encodeURIComponent(input.commanderId)}/crons/${encodeURIComponent(input.cronId)}`,
+async function updateCommanderCron(input: CommanderCronUpdateInput): Promise<CommanderCronTask> {
+  return fetchJson<CommanderCronTask>(
+    `/api/commanders/${encodeURIComponent(input.commanderId)}/crons/${encodeURIComponent(input.cronId)}`,
     {
-      method: 'DELETE',
-      headers,
+      method: 'PATCH',
+      headers: {
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        instruction: input.instruction,
+        schedule: input.schedule,
+      }),
     },
   )
+}
 
-  if (!response.ok) {
-    const body = await response.text()
-    throw new Error(`Request failed (${response.status}): ${body}`)
-  }
+async function deleteCommanderCron(input: CommanderCronDeleteInput): Promise<void> {
+  return fetchVoid(
+    `/api/commanders/${encodeURIComponent(input.commanderId)}/crons/${encodeURIComponent(input.cronId)}`,
+    { method: 'DELETE' },
+  )
 }
 
 async function deleteCommanderSession(commanderId: string): Promise<void> {
-  const headers = await buildRequestHeaders()
-  const response = await fetch(
-    `${getApiBase()}/api/commanders/${encodeURIComponent(commanderId)}`,
-    {
-      method: 'DELETE',
-      headers,
-    },
-  )
-
-  if (!response.ok) {
-    const body = await response.text()
-    throw new Error(`Request failed (${response.status}): ${body}`)
-  }
+  return fetchVoid(`/api/commanders/${encodeURIComponent(commanderId)}`, {
+    method: 'DELETE',
+  })
 }
 
 function commanderWsUrl(commanderId: string, token: string | null): string {
@@ -406,13 +424,14 @@ function commanderWsUrl(commanderId: string, token: string | null): string {
 
   const wsBase = getWsBase()
   const qs = query.toString()
+  const sessionPath = `/api/agents/sessions/commander-${encodeURIComponent(commanderId)}/ws`
 
   if (wsBase) {
-    return `${wsBase}/api/commanders/${encodeURIComponent(commanderId)}/ws?${qs}`
+    return `${wsBase}${sessionPath}?${qs}`
   }
 
   const scheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${scheme}//${window.location.host}/api/commanders/${encodeURIComponent(commanderId)}/ws?${qs}`
+  return `${scheme}//${window.location.host}${sessionPath}?${qs}`
 }
 
 function appendLines(current: string[], incoming: string[]): string[] {
@@ -655,6 +674,13 @@ export function useCommander() {
     },
   })
 
+  const updateCronMutation = useMutation({
+    mutationFn: updateCommanderCron,
+    onSuccess: async (_data, input) => {
+      await queryClient.invalidateQueries({ queryKey: ['commanders', 'crons', input.commanderId] })
+    },
+  })
+
   const deleteCronMutation = useMutation({
     mutationFn: deleteCommanderCron,
     onSuccess: async (_data, input) => {
@@ -677,8 +703,8 @@ export function useCommander() {
   )
 
   const startCommander = useCallback(
-    async (commanderId: string) => {
-      await startMutation.mutateAsync(commanderId)
+    async (commanderId: string, agentType?: CommanderAgentType) => {
+      await startMutation.mutateAsync({ commanderId, agentType })
     },
     [startMutation],
   )
@@ -716,6 +742,13 @@ export function useCommander() {
       await toggleCronMutation.mutateAsync(input)
     },
     [toggleCronMutation],
+  )
+
+  const updateCron = useCallback(
+    async (input: CommanderCronUpdateInput) => {
+      await updateCronMutation.mutateAsync(input)
+    },
+    [updateCronMutation],
   )
 
   const deleteCron = useCallback(
@@ -756,6 +789,7 @@ export function useCommander() {
     assignTask,
     addCron,
     toggleCron,
+    updateCron,
     deleteCron,
     deleteCommander,
     createCommanderPending: createSessionMutation.isPending,
@@ -765,6 +799,7 @@ export function useCommander() {
     assignTaskPending: assignTaskMutation.isPending,
     addCronPending: createCronMutation.isPending,
     toggleCronPending: toggleCronMutation.isPending,
+    updateCronPending: updateCronMutation.isPending,
     deleteCronPending: deleteCronMutation.isPending,
     deleteCommanderPending: deleteSessionMutation.isPending,
     actionError:
@@ -775,6 +810,7 @@ export function useCommander() {
       toErrorMessage(assignTaskMutation.error) ??
       toErrorMessage(createCronMutation.error) ??
       toErrorMessage(toggleCronMutation.error) ??
+      toErrorMessage(updateCronMutation.error) ??
       toErrorMessage(deleteCronMutation.error) ??
       toErrorMessage(deleteSessionMutation.error),
   }

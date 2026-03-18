@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { JournalWriter } from '../journal.js'
 import { NightlyConsolidation } from '../consolidation.js'
 import type { JournalEntry } from '../types.js'
+import { WorkingMemory } from '../working-memory.js'
 
 function block(args: {
   time: string
@@ -58,6 +59,8 @@ describe('NightlyConsolidation.run()', () => {
       }),
       'utf-8',
     )
+    const workingMemory = new WorkingMemory('cmdr-1', tmpDir)
+    await workingMemory.append('Investigating doctrine extraction edge case for hotwash parser.')
 
     await writeFile(
       join(journalDir, '2026-02-20.md'),
@@ -120,8 +123,6 @@ describe('NightlyConsolidation.run()', () => {
 
     const skillDistiller = { run: vi.fn() }
     skillDistiller.run.mockResolvedValue(undefined)
-    const repoCache = { updateFromConsolidation: vi.fn() }
-    repoCache.updateFromConsolidation.mockResolvedValue(undefined)
     const issueClient = {
       fetchClosedIssuesForDate: vi.fn(),
       postConsolidationComment: vi.fn(),
@@ -134,7 +135,6 @@ describe('NightlyConsolidation.run()', () => {
       debriefDir,
       now,
       skillDistiller,
-      repoCache,
       issueClient,
     })
 
@@ -143,11 +143,21 @@ describe('NightlyConsolidation.run()', () => {
     expect(report.factsExtracted).toBeGreaterThan(0)
     expect(report.debrifsProcessed).toBe(1)
     expect(report.entriesCompressed.routine).toBeGreaterThan(0)
+    expect(report.idleDay).toBe(false)
+    expect(report.incrementalRefreshTriggered).toBe(false)
 
     const memory = await readFile(join(memoryRoot, 'MEMORY.md'), 'utf-8')
     expect(memory).toContain('Doctrine: Keep memory entries short and actionable.')
     expect(memory).toContain('Avoid: No eviction rule for stale entries.')
     expect(memory).toContain('SPIKE: Fix consolidation bug')
+
+    const longTerm = await readFile(join(memoryRoot, 'LONG_TERM_MEM.md'), 'utf-8')
+    expect(longTerm).toContain('## 2026-03-01')
+    expect(longTerm).toContain('### Journal Narrative')
+    expect(longTerm).toContain('Fix consolidation bug')
+    expect(longTerm).toContain('### Working Memory Narrative')
+    expect(longTerm).toContain('Investigating doctrine extraction edge case for hotwash parser.')
+    expect(await workingMemory.read()).toBe('')
 
     const compressedRecent = await readFile(join(journalDir, '2026-02-20.md'), 'utf-8')
     expect(compressedRecent).toContain('🟡 NOTABLE')
@@ -167,7 +177,10 @@ describe('NightlyConsolidation.run()', () => {
     expect(log).toContain('## 2026-03-01')
 
     expect(skillDistiller.run).toHaveBeenCalledTimes(1)
-    expect(repoCache.updateFromConsolidation).toHaveBeenCalledTimes(1)
+    expect(skillDistiller.run).toHaveBeenCalledWith(expect.objectContaining({
+      journalEntries: expect.any(Array),
+      parsedDebriefs: expect.any(Array),
+    }))
     expect(issueClient.postConsolidationComment).toHaveBeenCalledTimes(1)
   })
 
@@ -182,6 +195,8 @@ describe('NightlyConsolidation.run()', () => {
       entriesCompressed: { spike: 0, notable: 0, routine: 0 },
       entriesDeleted: 0,
       debrifsProcessed: 0,
+      idleDay: true,
+      incrementalRefreshTriggered: false,
     })
     let job: (() => Promise<void> | void) | null = null
     const cron = {
@@ -237,5 +252,63 @@ describe('NightlyConsolidation.run()', () => {
     expect(thirtyDayCompression).not.toContain('- Repo:')
     expect(thirtyDayCompression).toContain('- Original diagnostic details from the incident.')
     expect(thirtyDayCompression).not.toContain('- - Original diagnostic details')
+  })
+
+  it('marks idle days and skips skill distillation when there is no new episodic input', async () => {
+    const now = () => new Date('2026-03-05T02:00:00.000Z')
+    const writer = new JournalWriter('cmdr-idle', tmpDir)
+    await writer.scaffold()
+    const skillDistiller = { run: vi.fn(async () => undefined) }
+    const consolidation = new NightlyConsolidation({
+      basePath: tmpDir,
+      debriefDir,
+      now,
+      skillDistiller,
+    })
+
+    const report = await consolidation.run('cmdr-idle')
+
+    expect(report.idleDay).toBe(true)
+    expect(report.incrementalRefreshTriggered).toBe(false)
+    expect(skillDistiller.run).not.toHaveBeenCalled()
+  })
+
+  it('triggers incremental refresh on high-activity days', async () => {
+    const now = () => new Date('2026-03-10T02:00:00.000Z')
+    const writer = new JournalWriter('cmdr-busy', tmpDir)
+    await writer.scaffold()
+    const memoryRoot = join(tmpDir, 'cmdr-busy', '.memory')
+    const journalDir = join(memoryRoot, 'journal')
+    const busyEntries = Array.from({ length: 20 }, (_, idx) =>
+      block({
+        time: `0${Math.floor(idx / 6)}:${String((idx % 6) * 10).padStart(2, '0')}`,
+        outcome: `Busy task ${idx + 1}`,
+        issue: 300 + idx,
+        salience: idx === 0 ? 'SPIKE' : 'NOTABLE',
+        body: 'High activity task execution note.',
+      }))
+    await writeFile(join(journalDir, '2026-03-10.md'), busyEntries.join(''), 'utf-8')
+
+    const skillDistiller = { run: vi.fn(async () => undefined) }
+    const consolidation = new NightlyConsolidation({
+      basePath: tmpDir,
+      debriefDir,
+      now,
+      skillDistiller,
+    })
+
+    const report = await consolidation.run('cmdr-busy')
+
+    expect(report.idleDay).toBe(false)
+    expect(report.incrementalRefreshTriggered).toBe(true)
+    expect(skillDistiller.run).toHaveBeenCalledTimes(1)
+    expect(skillDistiller.run).toHaveBeenCalledWith(expect.objectContaining({
+      journalEntries: expect.any(Array),
+      parsedDebriefs: expect.any(Array),
+    }))
+    const distillerArg = skillDistiller.run.mock.calls[0]?.[0] as {
+      journalEntries: JournalEntry[]
+    }
+    expect(distillerArg.journalEntries.length).toBeGreaterThanOrEqual(20)
   })
 })

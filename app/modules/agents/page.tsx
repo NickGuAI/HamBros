@@ -1,8 +1,6 @@
 import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
@@ -24,30 +22,26 @@ import {
   FolderOpen,
   Folder,
   Warehouse,
-  Brain,
-  Bot,
-  FileText,
-  Pencil,
-  TerminalSquare,
-  Search,
-  FilePlus,
-  Check,
   Coins,
   MessageSquare,
   Clock,
   ArrowUp,
-  Loader2,
   Zap,
   Mic,
+  Paperclip,
+  RotateCcw,
 } from 'lucide-react'
 import {
   createSession,
   killSession,
+  triggerPreKillDebrief,
+  getDebriefStatus,
+  resetSession,
   useAgentSessions,
   useMachines,
 } from '@/hooks/use-agents'
 import { timeAgo, formatCost, formatTokens, cn } from '@/lib/utils'
-import { getAccessToken } from '@/lib/api'
+import { fetchJson, getAccessToken } from '@/lib/api'
 import { getWsBase } from '@/lib/api-base'
 import { useIsMobile } from '@/hooks/use-is-mobile'
 import {
@@ -55,34 +49,145 @@ import {
   useOpenAITranscriptionConfig,
 } from '@/hooks/use-openai-transcription'
 import { useSpeechRecognition } from '@/hooks/use-speech-recognition'
-import type { AgentSession, AskOption, AskQuestion, AgentType, ClaudePermissionMode, Machine, SessionType, StreamEvent } from '@/types'
+import type { AgentSession, AgentType, ClaudePermissionMode, Machine, SessionType, StreamEvent } from '@/types'
 import { createReconnectBackoff, shouldReconnectWebSocketClose } from './ws-reconnect'
+import { DEFAULT_SESSION_TAB, filterSessionsByTab, SESSION_TABS, type SessionTab } from './session-tab'
 import { NewSessionForm } from './components/NewSessionForm'
+import { SessionMessageList } from './components/SessionMessageList'
 import { SkillsPicker } from './components/SkillsPicker'
 import { WorkingDirectoryPanel } from './components/WorkingDirectoryPanel'
+import { capMessages } from './components/session-messages'
+import { useStreamEventProcessor } from './components/use-stream-event-processor'
 
 const FolderPanelIcon = FolderOpen
+
+type WorkerStatus = 'running' | 'down' | 'starting' | 'done'
+
+interface WorkerInfo {
+  name: string
+  status: WorkerStatus
+  phase: 'starting' | 'running' | 'exited'
+}
+
+interface WorkerSummary {
+  total: number
+  running: number
+  down: number
+  starting: number
+  done: number
+}
+
+type AgentSessionWithWorkers = AgentSession & {
+  parentSession?: string
+  spawnedWorkers?: string[]
+  workerSummary?: WorkerSummary
+}
+
+function summarizeWorkers(workers: WorkerInfo[]): WorkerSummary {
+  const summary: WorkerSummary = {
+    total: workers.length,
+    running: 0,
+    down: 0,
+    starting: 0,
+    done: 0,
+  }
+  for (const worker of workers) {
+    if (worker.status === 'running') summary.running += 1
+    if (worker.status === 'down') summary.down += 1
+    if (worker.status === 'starting') summary.starting += 1
+    if (worker.status === 'done') summary.done += 1
+  }
+  return summary
+}
+
+function fallbackWorkerSummary(workerCount: number): WorkerSummary {
+  return {
+    total: workerCount,
+    running: 0,
+    down: 0,
+    starting: workerCount,
+    done: 0,
+  }
+}
+
+function workerStatusSymbol(status: WorkerStatus): string {
+  if (status === 'running') return '●'
+  if (status === 'down') return '⊘'
+  if (status === 'done') return '✓'
+  return '○'
+}
+
+function workerStatusClass(status: WorkerStatus): string {
+  if (status === 'running') return 'text-emerald-500'
+  if (status === 'down') return 'text-accent-vermillion'
+  if (status === 'done') return 'text-sumi-diluted'
+  return 'text-sumi-mist'
+}
+
+function isGitHubIssueUrl(value: string): boolean {
+  return /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+(?:\.git)?\/issues\/\d+/i.test(value.trim())
+}
+
+function shouldAttemptDebriefOnKill(agentType?: AgentType | null): boolean {
+  return agentType !== 'openclaw'
+}
+
+function getKillConfirmationMessage(sessionName: string, agentType?: AgentType | null): string {
+  if (!shouldAttemptDebriefOnKill(agentType)) {
+    return `Kill session "${sessionName}"?`
+  }
+  return `Kill session "${sessionName}"?\n\nA debrief will be attempted before termination.`
+}
 
 function SessionCard({
   session,
   machine,
   selected,
   onSelect,
+  onView,
+  onKill,
 }: {
-  session: AgentSession
+  session: AgentSessionWithWorkers
   machine?: Machine
   selected: boolean
   onSelect: () => void
+  onView: () => void
+  onKill: () => Promise<void> | void
 }) {
   const isFactory = session.name.startsWith('factory-')
   const Icon = isFactory ? Warehouse : Monitor
   const isRemote = Boolean(session.host)
+  const isStream = session.sessionType === 'stream'
+  const rawAgentType = typeof session.agentType === 'string' ? session.agentType : null
+  const agentBadge = rawAgentType && rawAgentType !== 'claude'
+    ? (rawAgentType === 'openclaw' ? 'OC' : rawAgentType)
+    : null
+  const isOpenclaw = rawAgentType === 'openclaw'
+  const workerSummary = isStream
+    ? (session.workerSummary ?? fallbackWorkerSummary(session.spawnedWorkers?.length ?? 0))
+    : null
+  const shouldShowWorkerSummary = Boolean(
+    isStream &&
+    workerSummary &&
+    (workerSummary.total > 0 || (session.spawnedWorkers?.length ?? 0) > 0),
+  )
 
   return (
-    <button
+    <div
+      role="button"
+      tabIndex={0}
       onClick={onSelect}
+      onKeyDown={(event) => {
+        if (event.target !== event.currentTarget) {
+          return
+        }
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault()
+          onSelect()
+        }
+      }}
       className={cn(
-        'w-full text-left p-5 card-sumi transition-all duration-300 ease-gentle',
+        'w-full text-left p-5 card-sumi transition-all duration-300 ease-gentle cursor-pointer',
         isFactory && 'border-l-2 border-l-accent-indigo',
         selected && 'ring-1 ring-sumi-black/10 shadow-ink-md',
       )}
@@ -90,15 +195,15 @@ function SessionCard({
       <div className="flex items-start justify-between">
         <div className="flex items-center gap-3">
           <Icon size={18} className={isFactory ? 'text-accent-indigo' : 'text-sumi-diluted'} />
-          <span className="font-mono text-sm text-sumi-black">{session.name}</span>
+          <span className="font-mono text-sm text-sumi-black">{session.label ?? session.name}</span>
           {isFactory && (
             <span className="badge-sumi bg-accent-indigo/10 text-accent-indigo">factory</span>
           )}
           {session.sessionType === 'pty' && (
             <span className="badge-sumi bg-ink-wash text-sumi-gray text-[10px]">pty</span>
           )}
-          {session.agentType === 'codex' && (
-            <span className="badge-sumi bg-accent-indigo/10 text-accent-indigo text-[10px]">codex</span>
+          {agentBadge && (
+            <span className={cn('badge-sumi text-[10px]', isOpenclaw ? 'bg-emerald-500/10 text-emerald-700' : 'bg-accent-indigo/10 text-accent-indigo')}>{agentBadge}</span>
           )}
           {isRemote && (
             <span className="badge-sumi bg-ink-wash text-sumi-gray text-[10px]">
@@ -106,13 +211,41 @@ function SessionCard({
             </span>
           )}
         </div>
-        <ChevronRight
-          size={16}
-          className={cn(
-            'text-sumi-mist transition-transform duration-300',
-            selected && 'rotate-90 text-sumi-gray',
-          )}
-        />
+        <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation()
+              onView()
+            }}
+            className="badge-sumi px-2 py-1 text-[10px] hover:bg-ink-wash text-sumi-gray transition-colors"
+          >
+            View
+          </button>
+          <button
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation()
+              const confirmed = window.confirm(getKillConfirmationMessage(session.name, rawAgentType))
+              if (!confirmed) {
+                return
+              }
+              void Promise.resolve(onKill()).catch(() => {
+                // error handled by handleKillSession (sets killError state)
+              })
+            }}
+            className="badge-sumi px-2 py-1 text-[10px] text-accent-vermillion hover:bg-accent-vermillion/10 transition-colors"
+          >
+            Kill
+          </button>
+          <ChevronRight
+            size={16}
+            className={cn(
+              'text-sumi-mist transition-transform duration-300',
+              selected && 'rotate-90 text-sumi-gray',
+            )}
+          />
+        </div>
       </div>
 
       <div className="mt-3 flex items-center gap-4 text-whisper text-sumi-diluted">
@@ -122,7 +255,33 @@ function SessionCard({
         </span>
         <span>{timeAgo(session.created)}</span>
       </div>
-    </button>
+
+      {shouldShowWorkerSummary && workerSummary && (
+        <div className="mt-2 flex flex-wrap items-center gap-3 text-whisper font-mono">
+          {workerSummary.running > 0 && (
+            <span className="text-emerald-600">● {workerSummary.running} running</span>
+          )}
+          {workerSummary.starting > 0 && (
+            <span className="text-sumi-mist">○ {workerSummary.starting} starting</span>
+          )}
+          {workerSummary.down > 0 && (
+            <span className="text-accent-vermillion">⊘ {workerSummary.down} down</span>
+          )}
+          {workerSummary.done > 0 &&
+            workerSummary.running === 0 &&
+            workerSummary.down === 0 &&
+            workerSummary.starting === 0 && (
+            <span className="text-sumi-diluted">✓ {workerSummary.done} done</span>
+          )}
+        </div>
+      )}
+
+      {isStream && session.parentSession && (
+        <div className="mt-2 text-whisper text-sumi-diluted">
+          ↖ spawned by: <span className="font-mono">{session.parentSession}</span>
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -136,14 +295,18 @@ function formatError(caughtError: unknown, fallback: string): string {
 
 function TerminalView({
   sessionName,
+  sessionLabel,
+  agentType,
   onClose,
   onKill,
   isMobileOverlay,
   onToggleFilePanel,
 }: {
   sessionName: string
+  sessionLabel?: string
+  agentType?: AgentType
   onClose: () => void
-  onKill: (sessionName: string) => Promise<void>
+  onKill: (sessionName: string, agentType?: AgentType) => Promise<void>
   isMobileOverlay?: boolean
   onToggleFilePanel?: () => void
 }) {
@@ -351,14 +514,14 @@ function TerminalView({
       return
     }
 
-    const confirmed = window.confirm(`Kill session "${sessionName}"?`)
+    const confirmed = window.confirm(getKillConfirmationMessage(sessionName, agentType))
     if (!confirmed) {
       return
     }
 
     setIsKilling(true)
     try {
-      await onKill(sessionName)
+      await onKill(sessionName, agentType)
     } catch {
       // Error is surfaced through parent state
     } finally {
@@ -370,7 +533,7 @@ function TerminalView({
     <div className={isMobileOverlay ? 'terminal-overlay' : 'flex flex-col h-full'}>
       <div className="flex items-center justify-between px-5 py-3 border-b border-ink-border bg-washi-aged">
         <div className="flex items-center gap-2">
-          <span className="font-mono text-sm text-sumi-black">{sessionName}</span>
+          <span className="font-mono text-sm text-sumi-black">{sessionLabel ?? sessionName}</span>
           <span
             className={cn(
               'badge-sumi',
@@ -425,367 +588,7 @@ function TerminalView({
   )
 }
 
-// ── Stream-JSON Message UI Types ─────────────────────────────────
-const MAX_CLIENT_MESSAGES = 500
-
-/** Cap an array of messages to prevent unbounded memory growth. */
-function capMessages(msgs: MsgItem[]): MsgItem[] {
-  return msgs.length > MAX_CLIENT_MESSAGES ? msgs.slice(-MAX_CLIENT_MESSAGES) : msgs
-}
-
-interface MsgItem {
-  id: string
-  kind: 'system' | 'user' | 'thinking' | 'agent' | 'tool' | 'ask'
-  text: string
-  timestamp?: string
-  // tool-specific
-  toolId?: string
-  toolName?: string
-  toolFile?: string
-  toolStatus?: 'running' | 'success' | 'error'
-  toolInput?: string
-  subagentDescription?: string
-  // diff for Edit tool
-  oldString?: string
-  newString?: string
-  // ask-specific (kind === 'ask')
-  askQuestions?: AskQuestion[]
-  askAnswered?: boolean
-  askSubmitting?: boolean
-}
-
-function extractToolDetails(toolName: string | undefined, rawInput: unknown): {
-  toolInput: string
-  toolFile?: string
-  oldString?: string
-  newString?: string
-} {
-  let rawJson = ''
-  if (typeof rawInput === 'string') {
-    rawJson = rawInput
-  } else if (rawInput !== undefined) {
-    try {
-      rawJson = JSON.stringify(rawInput)
-    } catch {
-      rawJson = String(rawInput)
-    }
-  }
-
-  let parsed: Record<string, unknown> | null = null
-  if (typeof rawInput === 'string') {
-    if (rawInput.trim().length > 0) {
-      try {
-        parsed = JSON.parse(rawInput) as Record<string, unknown>
-      } catch {
-        parsed = null
-      }
-    }
-  } else if (rawInput && typeof rawInput === 'object' && !Array.isArray(rawInput)) {
-    parsed = rawInput as Record<string, unknown>
-  }
-
-  let toolInput = rawJson
-  let toolFile: string | undefined
-  let oldString: string | undefined
-  let newString: string | undefined
-
-  if (parsed) {
-    toolFile = (parsed.file_path ?? parsed.path ?? parsed.command ?? parsed.pattern) as
-      | string
-      | undefined
-    if (toolName === 'Edit' || toolName === 'MultiEdit') {
-      oldString = parsed.old_string as string | undefined
-      newString = parsed.new_string as string | undefined
-      toolFile = parsed.file_path as string | undefined
-    }
-    if (toolName === 'Bash') {
-      toolInput = (parsed.command as string | undefined) ?? rawJson
-      toolFile = parsed.command as string | undefined
-    }
-  }
-
-  return { toolInput, toolFile, oldString, newString }
-}
-
-function extractSubagentDescription(rawInput: unknown): string | undefined {
-  let parsed: Record<string, unknown> | null = null
-
-  if (typeof rawInput === 'string') {
-    if (!rawInput.trim()) return undefined
-    try {
-      parsed = JSON.parse(rawInput) as Record<string, unknown>
-    } catch {
-      return undefined
-    }
-  } else if (rawInput && typeof rawInput === 'object' && !Array.isArray(rawInput)) {
-    parsed = rawInput as Record<string, unknown>
-  }
-
-  if (!parsed) return undefined
-  const description = parsed.description
-  if (typeof description === 'string' && description.trim()) {
-    return description
-  }
-  const prompt = parsed.prompt
-  if (typeof prompt === 'string' && prompt.trim()) {
-    return prompt
-  }
-
-  return undefined
-}
-
-// Map tool names to icon/color
-const TOOL_META: Record<string, { icon: typeof FileText; colorClass: string }> = {
-  Read: { icon: FileText, colorClass: 'read' },
-  Glob: { icon: Search, colorClass: 'search' },
-  Grep: { icon: Search, colorClass: 'search' },
-  Edit: { icon: Pencil, colorClass: 'edit' },
-  MultiEdit: { icon: Pencil, colorClass: 'edit' },
-  Write: { icon: FilePlus, colorClass: 'write' },
-  NotebookEdit: { icon: Pencil, colorClass: 'edit' },
-  Bash: { icon: TerminalSquare, colorClass: 'bash' },
-  WebFetch: { icon: Search, colorClass: 'search' },
-  WebSearch: { icon: Search, colorClass: 'search' },
-  LSP: { icon: FileText, colorClass: 'read' },
-  TodoWrite: { icon: FilePlus, colorClass: 'write' },
-  Agent: { icon: Bot, colorClass: 'agent' },
-}
-
-function getToolMeta(name: string) {
-  return TOOL_META[name] ?? { icon: TerminalSquare, colorClass: 'bash' }
-}
-
-// ── Sub-components ──────────────────────────────────────────────
-
-function SystemDivider({ text }: { text: string }) {
-  return (
-    <div className="message">
-      <div className="msg-system">
-        <div className="msg-system-line" />
-        <span className="msg-system-text">{text}</span>
-        <div className="msg-system-line" />
-      </div>
-    </div>
-  )
-}
-
-function UserMessage({ text }: { text: string }) {
-  return (
-    <div className="message">
-      <div className="msg-user">{text}</div>
-    </div>
-  )
-}
-
-function ThinkingBlock({ text }: { text: string }) {
-  return (
-    <div className="message">
-      <div className="msg-thinking">
-        <div className="msg-thinking-label">
-          <Brain size={11} />
-          Thinking
-        </div>
-        {text}
-      </div>
-    </div>
-  )
-}
-
-function AgentMessage({ text }: { text: string }) {
-  return (
-    <div className="message">
-      <div className="msg-agent msg-agent-md">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
-      </div>
-    </div>
-  )
-}
-
-function RunningAgentsPanel({ messages }: { messages: MsgItem[] }) {
-  const runningAgents = messages.filter(
-    (m) => m.kind === 'tool' && m.toolName === 'Agent' && m.toolStatus === 'running',
-  )
-
-  if (runningAgents.length === 0) {
-    return null
-  }
-
-  return (
-    <div className="running-agents-panel">
-      <div className="running-agents-label">
-        <Bot size={12} />
-        Running Sub-agents
-      </div>
-      {runningAgents.map((msg) => (
-        <div key={msg.id} className="running-agent-item">
-          <Loader2 size={11} className="animate-spin" />
-          <span>{msg.subagentDescription ?? 'Agent'}</span>
-        </div>
-      ))}
-    </div>
-  )
-}
-
-function ToolBlock({ msg }: { msg: MsgItem }) {
-  const [expanded, setExpanded] = useState(false)
-  const meta = getToolMeta(msg.toolName ?? '')
-  const ToolIcon = meta.icon
-
-  const hasEditDiff = (msg.toolName === 'Edit' || msg.toolName === 'MultiEdit') && (msg.oldString || msg.newString)
-
-  return (
-    <div className={cn('message')}>
-      <div className={cn('msg-tool', expanded && 'expanded')}>
-        <div className="msg-tool-header" onClick={() => setExpanded((p) => !p)}>
-          <div className="msg-tool-header-left">
-            <div className={cn('msg-tool-icon', meta.colorClass)}>
-              <ToolIcon size={14} />
-            </div>
-            <div>
-              <div className="msg-tool-name">{msg.toolName}</div>
-              {msg.toolFile && <div className="msg-tool-file">{msg.toolFile}</div>}
-            </div>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <div className={cn('msg-tool-status', msg.toolStatus ?? 'running')}>
-              {msg.toolStatus === 'running' ? (
-                <Loader2 size={11} className="animate-spin" />
-              ) : msg.toolStatus === 'error' ? (
-                <AlertTriangle size={11} />
-              ) : (
-                <Check size={11} />
-              )}
-              {msg.toolStatus ?? 'running'}
-            </div>
-            <ChevronRight
-              size={14}
-              className={cn('msg-tool-chevron', expanded && 'expanded')}
-            />
-          </div>
-        </div>
-        <div className="msg-tool-body">
-          {hasEditDiff ? (
-            <>
-              {msg.oldString && (
-                <div className="diff-line diff-remove">{msg.oldString}</div>
-              )}
-              {msg.newString && (
-                <div className="diff-line diff-add">{msg.newString}</div>
-              )}
-            </>
-          ) : (
-            msg.toolInput ?? ''
-          )}
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function AskUserQuestionBlock({
-  msg,
-  onAnswer,
-}: {
-  msg: MsgItem
-  onAnswer: (toolId: string, answers: Record<string, string[]>) => void
-}) {
-  const questions = msg.askQuestions ?? []
-  const [selections, setSelections] = useState<Record<number, string[]>>(() =>
-    Object.fromEntries(questions.map((_, i) => [i, []]))
-  )
-  const [customTexts, setCustomTexts] = useState<Record<number, string>>(() =>
-    Object.fromEntries(questions.map((_, i) => [i, '']))
-  )
-
-  if (msg.askAnswered) {
-    return (
-      <div className="message">
-        <div className="msg-ask msg-ask-done">
-          <Check size={12} />
-          <span>Response submitted</span>
-        </div>
-      </div>
-    )
-  }
-
-  function toggleOption(questionIdx: number, label: string, multiSelect: boolean) {
-    setSelections((prev) => {
-      const current = prev[questionIdx] ?? []
-      if (multiSelect) {
-        return {
-          ...prev,
-          [questionIdx]: current.includes(label)
-            ? current.filter((l) => l !== label)
-            : [...current, label],
-        }
-      }
-      return { ...prev, [questionIdx]: [label] }
-    })
-  }
-
-  function handleSubmit() {
-    const answers: Record<string, string[]> = {}
-    for (let i = 0; i < questions.length; i++) {
-      const q = questions[i]
-      const selected = selections[i] ?? []
-      const custom = customTexts[i]?.trim()
-      answers[q.question] = custom ? [...selected, custom] : selected
-    }
-    onAnswer(msg.toolId ?? '', answers)
-  }
-
-  const allAnswered = questions.every((_, i) => {
-    const sel = selections[i] ?? []
-    const custom = customTexts[i]?.trim()
-    return sel.length > 0 || Boolean(custom)
-  })
-
-  return (
-    <div className="message">
-      <div className="msg-ask">
-        {questions.map((q, qi) => (
-          <div key={qi} className="msg-ask-question">
-            <div className="msg-ask-question-text">{q.question}</div>
-            <div className="msg-ask-options">
-              {q.options.map((opt) => {
-                const selected = (selections[qi] ?? []).includes(opt.label)
-                return (
-                  <button
-                    key={opt.label}
-                    type="button"
-                    className={cn('msg-ask-chip', selected && 'selected')}
-                    onClick={() => toggleOption(qi, opt.label, q.multiSelect)}
-                    title={opt.description}
-                  >
-                    {selected && <Check size={10} />}
-                    {opt.label}
-                  </button>
-                )
-              })}
-            </div>
-            <input
-              type="text"
-              className="msg-ask-other"
-              placeholder="Other…"
-              value={customTexts[qi] ?? ''}
-              onChange={(e) =>
-                setCustomTexts((prev) => ({ ...prev, [qi]: e.target.value }))
-              }
-            />
-          </div>
-        ))}
-        <button
-          type="button"
-          className="msg-ask-submit"
-          onClick={handleSubmit}
-          disabled={!allAnswered || !!msg.askSubmitting}
-        >
-          {msg.askSubmitting ? 'Submitting…' : 'Submit'}
-        </button>
-      </div>
-    </div>
-  )
-}
+// ── Stream-JSON Message UI ───────────────────────────────────────
 
 function StreamingDots() {
   return (
@@ -832,33 +635,65 @@ function SessionStatsBar({
 
 function MobileSessionView({
   sessionName,
+  sessionLabel,
+  agentType,
   sessionCwd,
+  initialSpawnedWorkers,
   onClose,
   onKill,
+  onNavigateToSession,
+  onRefreshSessions,
   onToggleFilePanel,
 }: {
   sessionName: string
+  sessionLabel?: string
+  agentType?: AgentType
   sessionCwd?: string
+  initialSpawnedWorkers?: string[]
   onClose: () => void
-  onKill: (sessionName: string) => Promise<void>
+  onKill: (sessionName: string, agentType?: AgentType) => Promise<void>
+  onNavigateToSession?: (sessionName: string) => void
+  onRefreshSessions?: () => Promise<void>
   onToggleFilePanel?: () => void
 }) {
-  const [messages, setMessages] = useState<MsgItem[]>([])
+  const isMobile = useIsMobile()
+  const {
+    messages,
+    setMessages,
+    processEvent,
+    resetMessages,
+    isStreaming,
+    markAskAnswered,
+  } = useStreamEventProcessor()
   const [wsStatus, setWsStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting')
   const [isKilling, setIsKilling] = useState(false)
   const [inputText, setInputText] = useState('')
-  const [isStreaming, setIsStreaming] = useState(false)
   const [showSkills, setShowSkills] = useState(false)
   const [usage, setUsage] = useState({ inputTokens: 0, outputTokens: 0, costUsd: 0 })
   const [startedAt] = useState(() => Date.now())
   const [elapsedSec, setElapsedSec] = useState(0)
+  const [workers, setWorkers] = useState<WorkerInfo[]>([])
+  const [knownWorkerNames, setKnownWorkerNames] = useState<string[]>(initialSpawnedWorkers ?? [])
+  const [workersOpen, setWorkersOpen] = useState(false)
+  const [dispatchOpen, setDispatchOpen] = useState(false)
+  const [dispatchValue, setDispatchValue] = useState('')
+  const [dispatchPrefab, setDispatchPrefab] = useState<'none' | 'legion-implement'>('none')
+  const [dispatchTask, setDispatchTask] = useState('')
+  const [dispatchError, setDispatchError] = useState<string | null>(null)
+  const [isDispatching, setIsDispatching] = useState(false)
+  const [isResetting, setIsResetting] = useState(false)
+  const [resetError, setResetError] = useState<string | null>(null)
+  const [pendingImages, setPendingImages] = useState<{ mediaType: string; data: string }[]>([])
+  const [dismissedWorkers, setDismissedWorkers] = useState<Set<string>>(new Set())
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const messagesAreaRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const wsRef = useRef<WebSocket | null>(null)
   const autoScrollRef = useRef(true)
-  const idCounterRef = useRef(0)
+  const workersMenuRef = useRef<HTMLDivElement>(null)
+  const initialWorkersRef = useRef<string[]>(initialSpawnedWorkers ?? [])
   const { data: realtimeTranscriptionConfig } = useOpenAITranscriptionConfig()
   const openAITranscription = useOpenAITranscription({
     enabled: Boolean(realtimeTranscriptionConfig?.openaiConfigured),
@@ -875,18 +710,6 @@ function MobileSessionView({
     stopListening,
     isSupported: isMicSupported,
   } = activeTranscription
-  // Track current blocks being built
-  const currentBlockRef = useRef<{
-    type: 'text' | 'thinking' | 'tool_use'
-    msgId: string
-    toolName?: string
-    toolId?: string
-    inputJsonParts?: string[]
-  } | null>(null)
-
-  function nextId() {
-    return `msg-${++idCounterRef.current}`
-  }
 
   // Update elapsed time every second so the stats bar stays current
   useEffect(() => {
@@ -895,6 +718,11 @@ function MobileSessionView({
     }, 1000)
     return () => clearInterval(timer)
   }, [startedAt])
+
+  // Reset dismissed workers when switching sessions
+  useEffect(() => {
+    setDismissedWorkers(new Set())
+  }, [sessionName])
 
   useEffect(() => {
     const normalizedTranscript = speechTranscript.trim()
@@ -934,385 +762,103 @@ function MobileSessionView({
     autoScrollRef.current = atBottom
   }
 
-  // Process a single stream-json event into the messages state.
-  // Wrapped in useCallback with empty deps — all captured values are either
-  // refs (currentBlockRef, idCounterRef) or React state setters, both of
-  // which are stable across renders.  This ensures the WebSocket onmessage
-  // handler always calls the same function reference without stale closures.
-  const processEvent = useCallback((event: StreamEvent, isReplay = false) => {
-    switch (event.type) {
-      case 'assistant': {
-        const blocks = event.message?.content
-        if (!Array.isArray(blocks)) {
-          break
-        }
+  useEffect(() => {
+    initialWorkersRef.current = initialSpawnedWorkers ?? []
+  }, [initialSpawnedWorkers])
 
-        for (const block of blocks) {
-          if (block.type === 'text') {
-            const text = block.text ?? ''
-            if (!text) continue
-            const id = nextId()
-            setMessages((prev) => capMessages([...prev, { id, kind: 'agent', text }]))
-          } else if (block.type === 'thinking') {
-            const text =
-              (typeof block.thinking === 'string' ? block.thinking : undefined) ??
-              (typeof block.text === 'string' ? block.text : '')
-            if (!text) continue
-            const id = nextId()
-            setMessages((prev) => capMessages([...prev, { id, kind: 'thinking', text }]))
-          } else if (block.type === 'tool_use') {
-            const id = nextId()
-            if (block.name === 'AskUserQuestion') {
-              const input = block.input as { questions?: AskQuestion[] } | undefined
-              setMessages((prev) => {
-                const existingAskIndex = prev.findIndex(
-                  (m) => m.kind === 'ask' && m.toolId === block.id,
-                )
-                if (existingAskIndex !== -1) {
-                  const nextQuestions = input?.questions
-                  if (!nextQuestions || nextQuestions.length === 0) {
-                    return prev
-                  }
-                  const existing = prev[existingAskIndex]
-                  if ((existing.askQuestions?.length ?? 0) > 0) {
-                    return prev
-                  }
-                  const updated = [...prev]
-                  updated[existingAskIndex] = { ...existing, askQuestions: nextQuestions }
-                  return updated
-                }
+  useEffect(() => {
+    setWorkers([])
+    setKnownWorkerNames(initialWorkersRef.current)
+    setWorkersOpen(false)
+    setDispatchOpen(false)
+    setDispatchError(null)
+    setDispatchValue('')
+    setIsResetting(false)
+    setResetError(null)
+  }, [sessionName])
 
-                return capMessages([
-                  ...prev,
-                  {
-                    id,
-                    kind: 'ask',
-                    text: '',
-                    toolId: block.id,
-                    toolName: block.name,
-                    askQuestions: input?.questions ?? [],
-                    askAnswered: false,
-                  },
-                ])
-              })
-            } else {
-              const { toolInput, toolFile, oldString, newString } = extractToolDetails(
-                block.name,
-                block.input,
-              )
-              const subagentDescription =
-                block.name === 'Agent' ? extractSubagentDescription(block.input) : undefined
-              setMessages((prev) => capMessages([
-                ...prev,
-                {
-                  id,
-                  kind: 'tool',
-                  text: '',
-                  toolId: block.id,
-                  toolName: block.name,
-                  toolStatus: 'running',
-                  toolInput,
-                  toolFile,
-                  oldString,
-                  newString,
-                  subagentDescription,
-                },
-              ]))
-            }
-          }
-        }
+  const isCommanderSession = sessionName.startsWith('commander-')
 
-        if (event.message.usage && !isReplay) {
-          setUsage((prev) => ({
-            inputTokens: prev.inputTokens + (event.message.usage?.input_tokens ?? 0),
-            outputTokens: prev.outputTokens + (event.message.usage?.output_tokens ?? 0),
-            costUsd: prev.costUsd,
-          }))
-        }
-        break
-      }
-      case 'user': {
-        const content = event.message?.content
-        // Handle plain text user messages — only during replay to avoid
-        // duplicating the optimistic message already added by handleSend
-        if (typeof content === 'string' && content.trim() && isReplay) {
-          setMessages((prev) => capMessages([...prev, { id: nextId(), kind: 'user', text: content.trim() }]))
-          break
-        }
-        if (!Array.isArray(content)) {
-          break
-        }
-        const toolResults = content.filter((b) => b.type === 'tool_result')
-        if (toolResults.length === 0) {
-          break
-        }
-
-        setMessages((prev) => {
-          const updated = [...prev]
-
-          for (const result of toolResults) {
-            const status = result.is_error ? ('error' as const) : ('success' as const)
-            let matched = false
-
-            if (result.tool_use_id) {
-              for (let i = updated.length - 1; i >= 0; i--) {
-                const msg = updated[i]
-                if (
-                  msg.kind === 'tool' &&
-                  msg.toolStatus === 'running' &&
-                  msg.toolId === result.tool_use_id
-                ) {
-                  updated[i] = { ...msg, toolStatus: status }
-                  matched = true
-                  break
-                }
-              }
-            }
-
-            if (!matched) {
-              for (let i = updated.length - 1; i >= 0; i--) {
-                const msg = updated[i]
-                if (msg.kind === 'tool' && msg.toolStatus === 'running') {
-                  updated[i] = { ...msg, toolStatus: status }
-                  break
-                }
-              }
-            }
-          }
-
-          return capMessages(updated)
-        })
-        break
-      }
-      case 'content_block_start': {
-        const block = event.content_block
-        if (block.type === 'text') {
-          const id = nextId()
-          currentBlockRef.current = { type: 'text', msgId: id }
-          setMessages((prev) => capMessages([...prev, { id, kind: 'agent', text: '' }]))
-          if (!isReplay) setIsStreaming(true)
-        } else if (block.type === 'thinking') {
-          const id = nextId()
-          currentBlockRef.current = { type: 'thinking', msgId: id }
-          setMessages((prev) => capMessages([...prev, { id, kind: 'thinking', text: '' }]))
-          if (!isReplay) setIsStreaming(true)
-        } else if (block.type === 'tool_use') {
-          const id = nextId()
-          currentBlockRef.current = {
-            type: 'tool_use',
-            msgId: id,
-            toolName: block.name,
-            toolId: block.id,
-            inputJsonParts: [],
-          }
-          if (block.name !== 'AskUserQuestion') {
-            setMessages((prev) => capMessages([
-              ...prev,
-              {
-                id,
-                kind: 'tool',
-                text: '',
-                toolId: block.id,
-                toolName: block.name,
-                toolStatus: 'running',
-                toolInput: '',
-              },
-            ]))
-            if (!isReplay) setIsStreaming(true)
-          }
-        }
-        break
-      }
-      case 'content_block_delta': {
-        const cur = currentBlockRef.current
-        if (!cur) break
-        const delta = event.delta
-        if (delta.type === 'text_delta' && cur.type === 'text') {
-          const appendText = delta.text
-          setMessages((prev) => {
-            // The target message is almost always the last element (streaming
-            // appends to the most recently added bubble).  Check the tail
-            // first to avoid an O(n) scan on every delta.
-            const last = prev.length - 1
-            if (last >= 0 && prev[last].id === cur.msgId) {
-              const updated = [...prev]
-              updated[last] = { ...prev[last], text: prev[last].text + appendText }
-              return updated
-            }
-            return prev.map((m) =>
-              m.id === cur.msgId ? { ...m, text: m.text + appendText } : m,
-            )
-          })
-        } else if (delta.type === 'thinking_delta' && cur.type === 'thinking') {
-          const appendText = delta.thinking
-          setMessages((prev) => {
-            const last = prev.length - 1
-            if (last >= 0 && prev[last].id === cur.msgId) {
-              const updated = [...prev]
-              updated[last] = { ...prev[last], text: prev[last].text + appendText }
-              return updated
-            }
-            return prev.map((m) =>
-              m.id === cur.msgId ? { ...m, text: m.text + appendText } : m,
-            )
-          })
-        } else if (delta.type === 'input_json_delta' && cur.type === 'tool_use') {
-          cur.inputJsonParts!.push(delta.partial_json)
-        }
-        break
-      }
-      case 'content_block_stop': {
-        const cur = currentBlockRef.current
-        if (cur?.type === 'tool_use') {
-          const rawJson = cur.inputJsonParts?.join('') ?? ''
-          if (cur.toolName === 'AskUserQuestion') {
-            let questions: AskQuestion[] = []
-            try {
-              const input = JSON.parse(rawJson) as { questions?: AskQuestion[] }
-              questions = input.questions ?? []
-            } catch {
-              // Ignore parse errors — AskUserQuestion data can already come from envelope events.
-            }
-            setMessages((prev) => {
-              const existingAskIndex = prev.findIndex(
-                (m) => m.kind === 'ask' && m.toolId === cur.toolId,
-              )
-              if (existingAskIndex !== -1) {
-                const existing = prev[existingAskIndex]
-                if (questions.length === 0 || (existing.askQuestions?.length ?? 0) > 0) {
-                  return prev
-                }
-                const updated = [...prev]
-                updated[existingAskIndex] = { ...existing, askQuestions: questions }
-                return updated
-              }
-
-              return capMessages([
-                ...prev,
-                {
-                  id: cur.msgId,
-                  kind: 'ask',
-                  text: '',
-                  toolId: cur.toolId,
-                  toolName: cur.toolName,
-                  askQuestions: questions,
-                  askAnswered: false,
-                },
-              ])
-            })
-          } else {
-            const { toolInput, toolFile, oldString, newString } = extractToolDetails(
-              cur.toolName,
-              rawJson,
-            )
-            const subagentDescription =
-              cur.toolName === 'Agent' ? extractSubagentDescription(rawJson) : undefined
-            setMessages((prev) =>
-              prev.map((m) =>
-                m.id === cur.msgId
-                  ? { ...m, toolInput, toolFile, oldString, newString, subagentDescription }
-                  : m,
-              ),
-            )
-          }
-        }
-        currentBlockRef.current = null
-        break
-      }
-      case 'message_start': {
-        // Mark any running tool as success (new turn means tool completed)
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.kind === 'tool' && m.toolStatus === 'running'
-              ? { ...m, toolStatus: 'success' }
-              : m,
-          ),
-        )
-        setIsStreaming(false)
-        break
-      }
-      case 'message_delta': {
-        // message_delta.usage contains per-message token counts (cumulative
-        // within that single message, not across the session). We accumulate
-        // (`+=`) across turns to build session totals. The `result` event
-        // carries session-level cumulative totals and overrides directly.
-        // Skip during replay — the replay message includes pre-accumulated totals.
-        if (event.usage && !isReplay) {
-          setUsage((prev) => ({
-            inputTokens: prev.inputTokens + (event.usage?.input_tokens ?? 0),
-            outputTokens: prev.outputTokens + (event.usage?.output_tokens ?? 0),
-            costUsd: prev.costUsd,
-          }))
-        }
-        break
-      }
-      case 'message_stop': {
-        setIsStreaming(false)
-        break
-      }
-      case 'result': {
-        // result.usage is session-level cumulative — override accumulated
-        // totals from message_delta events. Merge cost and usage into a
-        // single setUsage call to avoid React batching issues.
-        // Skip during replay — the replay message includes pre-accumulated totals.
-        if ((event.cost_usd !== undefined || event.total_cost_usd !== undefined || event.usage) && !isReplay) {
-          setUsage((prev) => ({
-            inputTokens: event.usage?.input_tokens ?? prev.inputTokens,
-            outputTokens: event.usage?.output_tokens ?? prev.outputTokens,
-            costUsd: event.total_cost_usd ?? event.cost_usd ?? prev.costUsd,
-          }))
-        }
-        // Mark running tools as error/success AND append "Awaiting input" in
-        // a single setMessages call to avoid batching issues where the second
-        // call could see stale state.
-        const resultToolStatus = event.is_error ? 'error' as const : 'success' as const
-        setMessages((prev) => capMessages([
-          ...prev.map((m) =>
-            m.kind === 'tool' && m.toolStatus === 'running'
-              ? { ...m, toolStatus: resultToolStatus }
-              : m,
-          ),
-          { id: nextId(), kind: 'system', text: 'Awaiting input' },
-        ]))
-        setIsStreaming(false)
-        break
-      }
-      case 'exit': {
-        // Mark any still-running tools as error (process exited before completing)
-        setMessages((prev) => {
-          const hasRunningTools = prev.some((m) => m.kind === 'tool' && m.toolStatus === 'running')
-          if (!hasRunningTools) return capMessages([...prev, { id: nextId(), kind: 'system', text: 'Session ended' }])
-          return capMessages([
-            ...prev.map((m) =>
-              m.kind === 'tool' && m.toolStatus === 'running'
-                ? { ...m, toolStatus: 'error' as const }
-                : m,
-            ),
-            { id: nextId(), kind: 'system', text: 'Session ended' },
-          ])
-        })
-        setIsStreaming(false)
-        break
-      }
-      case 'system': {
-        setMessages((prev) => capMessages([
-          ...prev,
-          { id: nextId(), kind: 'system', text: event.text },
-        ]))
-        break
-      }
-      default:
-        break
+  useEffect(() => {
+    if (!initialSpawnedWorkers || initialSpawnedWorkers.length === 0) {
+      return
     }
-  }, []) // stable: only uses refs + state setters
+    setKnownWorkerNames((prev) => {
+      const merged = new Set([...prev, ...initialSpawnedWorkers])
+      if (merged.size === prev.length) {
+        return prev
+      }
+      return [...merged]
+    })
+  }, [initialSpawnedWorkers])
+
+  const refreshWorkers = useCallback(async () => {
+    const nextWorkers = await fetchJson<WorkerInfo[]>(
+      `/api/agents/sessions/${encodeURIComponent(sessionName)}/workers`,
+    )
+    setWorkers(nextWorkers)
+    setKnownWorkerNames((prev) => {
+      const merged = new Set(prev)
+      for (const worker of nextWorkers) {
+        merged.add(worker.name)
+      }
+      if (merged.size === prev.length) {
+        return prev
+      }
+      return [...merged]
+    })
+    return nextWorkers
+  }, [sessionName])
+
+  useEffect(() => {
+    if (knownWorkerNames.length === 0) {
+      return
+    }
+
+    let cancelled = false
+    const fetchAndStore = async () => {
+      try {
+        if (cancelled) return
+        await refreshWorkers()
+      } catch {
+        // Keep stale worker state until next poll succeeds.
+      }
+    }
+
+    void fetchAndStore()
+    const interval = window.setInterval(() => {
+      void fetchAndStore()
+    }, 3000)
+
+    return () => {
+      cancelled = true
+      window.clearInterval(interval)
+    }
+  }, [knownWorkerNames.length, refreshWorkers])
+
+  useEffect(() => {
+    if (isMobile || !workersOpen) {
+      return
+    }
+
+    const handleOutsideClick = (event: MouseEvent) => {
+      const target = event.target as Node | null
+      if (!target) return
+      if (!workersMenuRef.current?.contains(target)) {
+        setWorkersOpen(false)
+      }
+    }
+
+    document.addEventListener('mousedown', handleOutsideClick)
+    return () => {
+      document.removeEventListener('mousedown', handleOutsideClick)
+    }
+  }, [isMobile, workersOpen])
 
   // WebSocket connection
   useEffect(() => {
-    // Reset block-tracking state from any previous connection so replay
-    // events don't target stale message IDs (P1: ghost running tools).
-    currentBlockRef.current = null
-
-    setMessages([{ id: nextId(), kind: 'system', text: 'Session started' }])
+    resetMessages()
+    setMessages([{ id: `system-${Date.now()}`, kind: 'system', text: 'Session started' }])
     setWsStatus('connecting')
     let disposed = false
     let reconnectTimer: number | null = null
@@ -1365,7 +911,6 @@ function MobileSessionView({
         if (disposed || wsRef.current !== nextSocket) return
 
         wsRef.current = null
-        setIsStreaming(false)
         if (shouldReconnectWebSocketClose(event)) {
           scheduleReconnect()
           return
@@ -1395,9 +940,10 @@ function MobileSessionView({
             toolId?: string
           }
           if (raw.type === 'replay' && Array.isArray(raw.events)) {
-            currentBlockRef.current = null
-            setMessages(raw.events.length === 0 ? [{ id: nextId(), kind: 'system', text: 'Session started' }] : [])
-            setIsStreaming(false)
+            resetMessages()
+            if (raw.events.length === 0) {
+              setMessages([{ id: `system-${Date.now()}`, kind: 'system', text: 'Session started' }])
+            }
 
             // Replay buffered events — pass isReplay=true so individual
             // message_delta/result events skip additive usage accumulation.
@@ -1408,15 +954,52 @@ function MobileSessionView({
             // avoid double-counting on reconnect.
             setUsage(raw.usage ?? { inputTokens: 0, outputTokens: 0, costUsd: 0 })
           } else if (raw.type === 'tool_answer_ack' && raw.toolId) {
-            setMessages((prev) => prev.map((m) =>
-              m.toolId === raw.toolId ? { ...m, askAnswered: true, askSubmitting: false } : m
-            ))
+            markAskAnswered(raw.toolId)
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.toolId === raw.toolId ? { ...m, askSubmitting: false } : m,
+              ),
+            )
           } else if (raw.type === 'tool_answer_error' && raw.toolId) {
-            setMessages((prev) => prev.map((m) =>
-              m.toolId === raw.toolId ? { ...m, askSubmitting: false } : m
-            ))
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.toolId === raw.toolId ? { ...m, askSubmitting: false } : m,
+              ),
+            )
           } else {
-            processEvent(raw as StreamEvent)
+            const streamEvent = raw as StreamEvent
+            if (streamEvent.type === 'assistant' && streamEvent.message.usage) {
+              setUsage((prev) => ({
+                inputTokens: prev.inputTokens + (streamEvent.message.usage?.input_tokens ?? 0),
+                outputTokens: prev.outputTokens + (streamEvent.message.usage?.output_tokens ?? 0),
+                costUsd: prev.costUsd,
+              }))
+            }
+            if (streamEvent.type === 'message_delta' && streamEvent.usage) {
+              const usageIsTotal = (streamEvent as StreamEvent & { usage_is_total?: boolean }).usage_is_total === true
+              setUsage((prev) => ({
+                inputTokens: usageIsTotal
+                  ? (streamEvent.usage?.input_tokens ?? prev.inputTokens)
+                  : prev.inputTokens + (streamEvent.usage?.input_tokens ?? 0),
+                outputTokens: usageIsTotal
+                  ? (streamEvent.usage?.output_tokens ?? prev.outputTokens)
+                  : prev.outputTokens + (streamEvent.usage?.output_tokens ?? 0),
+                costUsd: prev.costUsd,
+              }))
+            }
+            if (
+              streamEvent.type === 'result' &&
+              (streamEvent.cost_usd !== undefined ||
+                streamEvent.total_cost_usd !== undefined ||
+                streamEvent.usage)
+            ) {
+              setUsage((prev) => ({
+                inputTokens: streamEvent.usage?.input_tokens ?? prev.inputTokens,
+                outputTokens: streamEvent.usage?.output_tokens ?? prev.outputTokens,
+                costUsd: streamEvent.total_cost_usd ?? streamEvent.cost_usd ?? prev.costUsd,
+              }))
+            }
+            processEvent(streamEvent)
           }
         } catch {
           // Ignore non-JSON messages
@@ -1432,23 +1015,50 @@ function MobileSessionView({
       wsRef.current?.close()
       wsRef.current = null
     }
-  }, [sessionName, processEvent])
+  }, [markAskAnswered, processEvent, resetMessages, sessionName, setMessages])
 
   function handleSend() {
     const text = inputText.trim()
-    if (!text || wsRef.current?.readyState !== WebSocket.OPEN) return
+    if ((!text && pendingImages.length === 0) || wsRef.current?.readyState !== WebSocket.OPEN) return
 
-    setMessages((prev) => capMessages([
-      ...prev,
-      { id: nextId(), kind: 'user', text },
-    ]))
-    wsRef.current.send(JSON.stringify({ type: 'input', text }))
+    const images = pendingImages.slice()
+    setMessages((prev) =>
+      capMessages([
+        ...prev,
+        {
+          id: `user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          kind: 'user',
+          text: text || '[image]',
+          images: images.length > 0 ? images : undefined,
+        },
+      ]),
+    )
+    wsRef.current.send(JSON.stringify({ type: 'input', text, images: images.length > 0 ? images : undefined }))
     setInputText('')
-    setIsStreaming(true)
+    setPendingImages([])
     autoScrollRef.current = true
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto'
     }
+  }
+
+  function handleImageFiles(files: FileList | File[]) {
+    const arr = Array.from(files).filter((f) => f.type.startsWith('image/'))
+    if (arr.length === 0) return
+    arr.forEach((file) => {
+      const reader = new FileReader()
+      reader.onload = (ev) => {
+        const result = ev.target?.result as string | undefined
+        if (!result) return
+        const data = result.split(',')[1]
+        if (!data) return
+        setPendingImages((prev) => {
+          if (prev.length >= 5) return prev
+          return [...prev, { mediaType: file.type, data }]
+        })
+      }
+      reader.readAsDataURL(file)
+    })
   }
 
   function handleAnswer(toolId: string, answers: Record<string, string[]>) {
@@ -1461,6 +1071,21 @@ function MobileSessionView({
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
       handleSend()
+    }
+  }
+
+  function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
+    const items = e.clipboardData.items
+    const imageFiles: File[] = []
+    for (const item of items) {
+      if (item.kind === 'file' && item.type.startsWith('image/')) {
+        const file = item.getAsFile()
+        if (file) imageFiles.push(file)
+      }
+    }
+    if (imageFiles.length > 0) {
+      e.preventDefault()
+      handleImageFiles(imageFiles)
     }
   }
 
@@ -1482,17 +1107,139 @@ function MobileSessionView({
 
   async function handleKill() {
     if (isKilling) return
-    const confirmed = window.confirm(`Kill session "${sessionName}"?`)
+    const confirmed = window.confirm(getKillConfirmationMessage(sessionName, agentType))
     if (!confirmed) return
     setIsKilling(true)
     try {
-      await onKill(sessionName)
+      await onKill(sessionName, agentType)
     } catch {
       // Error surfaced through parent
     } finally {
       setIsKilling(false)
     }
   }
+
+  async function handleResetSession() {
+    if (isResetting) return
+    const confirmed = window.confirm(
+      "Are you sure? This will clear Claude's current context. Memory, journal, and quests are preserved.",
+    )
+    if (!confirmed) return
+
+    setIsResetting(true)
+    setResetError(null)
+
+    try {
+      await resetSession(sessionName)
+      setMessages((prev) => capMessages([
+        ...prev,
+        {
+          id: `system-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          kind: 'system',
+          text: 'Session rotated — Claude context cleared, memory preserved.',
+        },
+      ]))
+      autoScrollRef.current = true
+    } catch (caughtError) {
+      setResetError(formatError(caughtError, 'Failed to reset session'))
+    } finally {
+      setIsResetting(false)
+    }
+  }
+
+  async function handleDispatch(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (isDispatching) return
+
+    const value = dispatchValue.trim()
+    if (!value) {
+      setDispatchError('Issue URL or branch is required')
+      return
+    }
+
+    setIsDispatching(true)
+    setDispatchError(null)
+
+    try {
+      const created = await fetchJson<{ name: string; worktree: string }>(
+        '/api/agents/sessions/dispatch-worker',
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            parentSession: sessionName,
+            issueUrl: isGitHubIssueUrl(value) ? value : undefined,
+            branch: isGitHubIssueUrl(value) ? undefined : value,
+            cwd: sessionCwd,
+            prefab: dispatchPrefab !== 'none' ? dispatchPrefab : undefined,
+            task: dispatchTask || undefined,
+          }),
+        },
+      )
+
+      setKnownWorkerNames((prev) => (prev.includes(created.name) ? prev : [...prev, created.name]))
+      setWorkers((prev) => (
+        prev.some((worker) => worker.name === created.name)
+          ? prev
+          : [{ name: created.name, status: 'starting', phase: 'starting' }, ...prev]
+      ))
+      setDispatchValue('')
+      setDispatchPrefab('none')
+      setDispatchTask('')
+      setDispatchOpen(false)
+      setWorkersOpen(true)
+
+      if (onRefreshSessions) {
+        await onRefreshSessions()
+      }
+      void refreshWorkers()
+    } catch (caughtError) {
+      setDispatchError(formatError(caughtError, 'Failed to dispatch worker'))
+    } finally {
+      setIsDispatching(false)
+    }
+  }
+
+  function handleOpenWorker(workerSessionName: string) {
+    setWorkersOpen(false)
+    setDispatchOpen(false)
+    onNavigateToSession?.(workerSessionName)
+  }
+
+  const allWorkerRows = workers.length > 0
+    ? workers
+    : knownWorkerNames.map((name) => ({
+      name,
+      status: 'starting' as const,
+      phase: 'starting' as const,
+    }))
+  const workerRows = allWorkerRows.filter((w) => !dismissedWorkers.has(w.name))
+  const hasDoneWorkers = workerRows.some((w) => w.status === 'done')
+  function handleClearDone() {
+    const doneNames = allWorkerRows.filter((w) => w.status === 'done').map((w) => w.name)
+    setDismissedWorkers((prev) => {
+      const next = new Set(prev)
+      for (const n of doneNames) next.add(n)
+      return next
+    })
+  }
+  const workerSummary = workerRows.length > 0
+    ? summarizeWorkers(workerRows)
+    : workers.length > 0
+      ? { total: 0, running: 0, starting: 0, done: 0, down: 0 }
+      : fallbackWorkerSummary(knownWorkerNames.length)
+  const showWorkersPill = true
+  const workerPillText = (() => {
+    if (workerSummary.total === 0) return '+'
+    const parts: string[] = []
+    if (workerSummary.running > 0) parts.push(`●${workerSummary.running}`)
+    if (workerSummary.starting > 0) parts.push(`○${workerSummary.starting}`)
+    if (workerSummary.down > 0) parts.push(`⊘${workerSummary.down}`)
+    if (parts.length === 0) parts.push(`✓${workerSummary.done}`)
+    return parts.join(' ')
+  })()
 
   return (
     <div className="session-view-overlay">
@@ -1502,12 +1249,94 @@ function MobileSessionView({
           <button className="session-back" onClick={onClose} aria-label="Back">
             <ChevronLeft size={20} />
           </button>
-          <span className="session-name">{sessionName}</span>
+          <span className="session-name">{sessionLabel ?? sessionName}</span>
           <span className={cn('session-badge', wsStatus === 'connected' && 'connected')}>
             {wsStatus}
           </span>
+          {showWorkersPill && (
+            <div className="relative" ref={workersMenuRef}>
+              <button
+                type="button"
+                className="inline-flex items-center gap-1 rounded-lg border border-ink-border bg-ink-wash/30 px-2 py-1 text-[11px] text-sumi-diluted hover:bg-ink-wash transition-colors"
+                onClick={() => {
+                  setDispatchError(null)
+                  if (isMobile) {
+                    setWorkersOpen(true)
+                    return
+                  }
+                  setWorkersOpen((prev) => !prev)
+                }}
+                aria-label="Workers"
+              >
+                <span className="font-mono">Workers</span>
+                <span className="font-mono">{workerPillText}</span>
+                <ChevronUp size={12} className={cn('transition-transform', !workersOpen && 'rotate-180')} />
+              </button>
+
+              {!isMobile && workersOpen && (
+                <div className="absolute right-0 top-full z-50 mt-2 w-72 rounded-xl border border-ink-border bg-washi-white shadow-ink-md">
+                  <div className="px-3 py-2 border-b border-ink-border text-xs font-mono text-sumi-diluted">Workers</div>
+                  <div className="max-h-64 overflow-y-auto">
+                    {workerRows.map((worker) => (
+                      <button
+                        key={worker.name}
+                        type="button"
+                        className="w-full px-3 py-2 border-b border-ink-border last:border-b-0 flex items-center justify-between hover:bg-washi-shadow/60 text-left"
+                        onClick={() => handleOpenWorker(worker.name)}
+                      >
+                        <div className="min-w-0">
+                          <div className="truncate text-xs font-mono text-sumi-black">
+                            <span className={cn('mr-1', workerStatusClass(worker.status))}>
+                              {workerStatusSymbol(worker.status)}
+                            </span>
+                            {worker.name}
+                          </div>
+                          <div className="text-[10px] text-sumi-diluted">{worker.status}</div>
+                        </div>
+                        <ChevronRight size={14} className="text-sumi-mist" />
+                      </button>
+                    ))}
+                  </div>
+                  <div className="p-2 border-t border-ink-border space-y-1.5">
+                    {hasDoneWorkers && (
+                      <button
+                        type="button"
+                        className="w-full rounded-lg border border-ink-border px-2 py-1.5 text-xs text-sumi-diluted hover:bg-washi-shadow/60"
+                        onClick={handleClearDone}
+                      >
+                        Clear done
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="w-full rounded-lg border border-ink-border px-2 py-1.5 text-xs text-sumi-black hover:bg-washi-shadow/60"
+                      onClick={() => {
+                        setDispatchError(null)
+                        setDispatchOpen(true)
+                      }}
+                    >
+                      + Dispatch
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </div>
         <div className="session-header-actions">
+          {isCommanderSession && (
+            <button
+              className="p-2 rounded-lg hover:bg-ink-wash transition-colors inline-flex items-center gap-1.5"
+              onClick={() => {
+                setInputText('Create a new quest on your quest board: ')
+                textareaRef.current?.focus()
+              }}
+              aria-label="Add quest"
+            >
+              <Plus size={14} className="text-sumi-diluted" />
+              <span className="text-xs text-sumi-diluted font-mono">+ Quest</span>
+            </button>
+          )}
           {onToggleFilePanel && (
             <button
               className="p-2 rounded-lg hover:bg-ink-wash transition-colors inline-flex items-center gap-1.5"
@@ -1516,6 +1345,16 @@ function MobileSessionView({
             >
               <FolderPanelIcon size={14} className="text-sumi-diluted" />
               <span className="text-xs text-sumi-diluted font-mono">Workspace</span>
+            </button>
+          )}
+          {isCommanderSession && (
+            <button
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs text-amber-500 hover:bg-amber-500/10 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+              onClick={handleResetSession}
+              disabled={isResetting}
+            >
+              <RotateCcw size={14} />
+              {isResetting ? '...' : 'Reset Session'}
             </button>
           )}
           <button
@@ -1539,6 +1378,13 @@ function MobileSessionView({
         duration={getDuration()}
       />
 
+      {resetError && (
+        <div className="mx-3 mt-2 flex items-start gap-2 rounded border border-accent-vermillion/40 bg-accent-vermillion/10 px-3 py-2 text-whisper text-accent-vermillion">
+          <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+          <span>{resetError}</span>
+        </div>
+      )}
+
       {sessionCwd && (
         <WorkingDirectoryPanel
           cwd={sessionCwd}
@@ -1557,72 +1403,303 @@ function MobileSessionView({
         ref={messagesAreaRef}
         onScroll={handleScroll}
       >
-        {isStreaming && <RunningAgentsPanel messages={messages} />}
-        {messages.map((msg) => {
-          switch (msg.kind) {
-            case 'system':
-              return <SystemDivider key={msg.id} text={msg.text} />
-            case 'user':
-              return <UserMessage key={msg.id} text={msg.text} />
-            case 'thinking':
-              return <ThinkingBlock key={msg.id} text={msg.text} />
-            case 'agent':
-              return <AgentMessage key={msg.id} text={msg.text} />
-            case 'tool':
-              return <ToolBlock key={msg.id} msg={msg} />
-            case 'ask':
-              return <AskUserQuestionBlock key={msg.id} msg={msg} onAnswer={handleAnswer} />
-            default:
-              return null
-          }
-        })}
+        <SessionMessageList messages={messages} onAnswer={handleAnswer} emptyLabel="Session started" />
         {isStreaming && <StreamingDots />}
         <div ref={messagesEndRef} />
       </div>
 
       {/* Input bar */}
       <div className="input-bar">
-        <textarea
-          ref={textareaRef}
-          className="input-field"
-          rows={1}
-          placeholder="Send a message..."
-          value={inputText}
-          onChange={handleTextareaInput}
-          onKeyDown={handleKeyDown}
-        />
-        <button
-          type="button"
-          className={cn(
-            'p-2 transition-colors',
-            showSkills ? 'text-sumi-black' : 'text-sumi-diluted hover:text-sumi-black',
-          )}
-          onClick={() => setShowSkills(true)}
-          aria-label="Skills"
-        >
-          <Zap size={18} />
-        </button>
-        {isMicSupported && (
+        {pendingImages.length > 0 && (
+          <div className="flex flex-wrap gap-2 px-2 pb-2">
+            {pendingImages.map((img, i) => (
+              <div key={i} className="relative inline-block">
+                <img
+                  src={`data:${img.mediaType};base64,${img.data}`}
+                  className="h-16 w-16 rounded border object-cover"
+                  alt="attachment"
+                />
+                <button
+                  type="button"
+                  className="absolute -top-1 -right-1 flex h-4 w-4 items-center justify-center rounded-full bg-sumi-black text-washi-white text-xs leading-none"
+                  onClick={() => setPendingImages((prev) => prev.filter((_, j) => j !== i))}
+                  aria-label="Remove image"
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        <div className="flex items-end gap-2">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              if (e.target.files) handleImageFiles(e.target.files)
+              e.target.value = ''
+            }}
+          />
+          <textarea
+            ref={textareaRef}
+            className="input-field"
+            rows={1}
+            placeholder="Send a message..."
+            value={inputText}
+            onChange={handleTextareaInput}
+            onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
+          />
           <button
             type="button"
-            className={cn('mic-btn', isMicListening && 'recording')}
-            onClick={handleMicToggle}
-            aria-label={isMicListening ? 'Stop voice input' : 'Start voice input'}
-            aria-pressed={isMicListening}
-            title={isMicListening ? 'Stop listening' : 'Start voice input'}
+            className="p-2 text-sumi-diluted hover:text-sumi-black transition-colors"
+            onClick={() => fileInputRef.current?.click()}
+            aria-label="Attach image"
+            title="Attach image"
+            disabled={pendingImages.length >= 5}
           >
-            <Mic size={18} />
+            <Paperclip size={18} />
           </button>
-        )}
-        <button
-          className="send-btn"
-          onClick={handleSend}
-          disabled={!inputText.trim() || wsStatus !== 'connected'}
-          aria-label="Send"
-        >
-          <ArrowUp size={18} />
-        </button>
+          <button
+            type="button"
+            className={cn(
+              'p-2 transition-colors',
+              showSkills ? 'text-sumi-black' : 'text-sumi-diluted hover:text-sumi-black',
+            )}
+            onClick={() => setShowSkills(true)}
+            aria-label="Skills"
+          >
+            <Zap size={18} />
+          </button>
+          {isMicSupported && (
+            <button
+              type="button"
+              className={cn('mic-btn', isMicListening && 'recording')}
+              onClick={handleMicToggle}
+              aria-label={isMicListening ? 'Stop voice input' : 'Start voice input'}
+              aria-pressed={isMicListening}
+              title={isMicListening ? 'Stop listening' : 'Start voice input'}
+            >
+              <Mic size={18} />
+            </button>
+          )}
+          <button
+            className="send-btn"
+            onClick={handleSend}
+            disabled={(!inputText.trim() && pendingImages.length === 0) || wsStatus !== 'connected'}
+            aria-label="Send"
+          >
+            <ArrowUp size={18} />
+          </button>
+        </div>
       </div>
+
+      {!isMobile && dispatchOpen && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-sumi-black/50 px-4">
+          <div className="w-full max-w-md rounded-xl border border-ink-border bg-washi-white p-4 shadow-ink-md">
+            <div className="text-sm font-mono text-sumi-black mb-3">Dispatch Worker</div>
+            <form onSubmit={handleDispatch} className="space-y-3">
+              <div>
+                <label className="block text-whisper text-sumi-diluted mb-1">Prefab</label>
+                <select
+                  value={dispatchPrefab}
+                  onChange={(e) => setDispatchPrefab(e.target.value as 'none' | 'legion-implement')}
+                  className="w-full rounded-lg border border-ink-border px-3 py-2 text-sm text-sumi-black"
+                >
+                  <option value="none">None</option>
+                  <option value="legion-implement">legion-implement</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-whisper text-sumi-diluted mb-1">Issue URL or Branch</label>
+                <input
+                  value={dispatchValue}
+                  onChange={(e) => setDispatchValue(e.target.value)}
+                  className="w-full rounded-lg border border-ink-border px-3 py-2 text-sm text-sumi-black"
+                  placeholder="e.g. .../issues/311 or feat-auth"
+                />
+              </div>
+              {dispatchPrefab !== 'none' && (
+                <div>
+                  <label className="block text-whisper text-sumi-diluted mb-1">Additional instructions (optional)</label>
+                  <textarea
+                    value={dispatchTask}
+                    onChange={(e) => setDispatchTask(e.target.value)}
+                    rows={3}
+                    className="w-full rounded-lg border border-ink-border px-3 py-2 text-sm text-sumi-black resize-none"
+                    placeholder="Extra instructions appended after the prefab task..."
+                  />
+                </div>
+              )}
+              {dispatchError && (
+                <div className="text-whisper text-accent-vermillion">{dispatchError}</div>
+              )}
+              <div className="flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  className="rounded-lg border border-ink-border px-3 py-1.5 text-sm text-sumi-diluted"
+                  onClick={() => setDispatchOpen(false)}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="rounded-lg bg-sumi-black px-3 py-1.5 text-sm text-white disabled:opacity-60"
+                  disabled={isDispatching}
+                >
+                  {isDispatching ? 'Dispatching...' : 'Dispatch'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {isMobile && (
+        <>
+          <div
+            className={cn('sheet-backdrop', (workersOpen || dispatchOpen) && 'visible')}
+            onClick={() => {
+              setWorkersOpen(false)
+              setDispatchOpen(false)
+            }}
+          />
+
+          <div
+            className={cn('sheet', workersOpen && 'visible')}
+            style={{ maxHeight: '50vh', height: '50vh' }}
+          >
+            <div className="sheet-handle">
+              <div className="sheet-handle-bar" />
+            </div>
+            <div className="px-4 pb-4">
+              <div className="flex items-center justify-between mb-2">
+                <div className="text-sm font-mono text-sumi-black">Workers</div>
+                <button
+                  type="button"
+                  className="p-1 rounded-md hover:bg-ink-wash"
+                  onClick={() => setWorkersOpen(false)}
+                >
+                  <X size={16} className="text-sumi-diluted" />
+                </button>
+              </div>
+              <div className="space-y-2 max-h-[30vh] overflow-y-auto">
+                {workerRows.length === 0 ? (
+                  <div className="text-sm text-sumi-diluted py-3">No workers yet</div>
+                ) : (
+                  workerRows.map((worker) => (
+                    <button
+                      key={worker.name}
+                      type="button"
+                      className="w-full rounded-lg border border-ink-border px-3 py-2 text-left flex items-center justify-between"
+                      onClick={() => handleOpenWorker(worker.name)}
+                    >
+                      <div className="min-w-0">
+                        <div className="truncate text-sm font-mono text-sumi-black">
+                          <span className={cn('mr-1', workerStatusClass(worker.status))}>
+                            {workerStatusSymbol(worker.status)}
+                          </span>
+                          {worker.name}
+                        </div>
+                        <div className="text-whisper text-sumi-diluted">{worker.status}</div>
+                      </div>
+                      <ChevronRight size={16} className="text-sumi-mist" />
+                    </button>
+                  ))
+                )}
+              </div>
+              {hasDoneWorkers && (
+                <button
+                  type="button"
+                  className="mt-3 w-full rounded-lg border border-ink-border px-3 py-2 text-sm text-sumi-diluted"
+                  onClick={handleClearDone}
+                >
+                  Clear done
+                </button>
+              )}
+              <button
+                type="button"
+                className={cn('w-full rounded-lg border border-ink-border px-3 py-2 text-sm text-sumi-black', hasDoneWorkers ? 'mt-1.5' : 'mt-3')}
+                onClick={() => {
+                  setDispatchError(null)
+                  setDispatchOpen(true)
+                }}
+              >
+                + Dispatch New
+              </button>
+            </div>
+          </div>
+
+          <div
+            className={cn('sheet', dispatchOpen && 'visible')}
+            style={{ maxHeight: '42vh', height: '42vh' }}
+          >
+            <div className="sheet-handle">
+              <div className="sheet-handle-bar" />
+            </div>
+            <div className="px-4 pb-4">
+              <div className="flex items-center justify-between mb-2">
+                <div className="text-sm font-mono text-sumi-black">Dispatch Worker</div>
+                <button
+                  type="button"
+                  className="p-1 rounded-md hover:bg-ink-wash"
+                  onClick={() => setDispatchOpen(false)}
+                >
+                  <X size={16} className="text-sumi-diluted" />
+                </button>
+              </div>
+              <form onSubmit={handleDispatch} className="space-y-3">
+                <div>
+                  <label className="block text-whisper text-sumi-diluted mb-1">Prefab</label>
+                  <select
+                    value={dispatchPrefab}
+                    onChange={(e) => setDispatchPrefab(e.target.value as 'none' | 'legion-implement')}
+                    className="w-full rounded-lg border border-ink-border px-3 py-2 text-sm text-sumi-black"
+                  >
+                    <option value="none">None</option>
+                    <option value="legion-implement">legion-implement</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-whisper text-sumi-diluted mb-1">Issue URL or Branch</label>
+                  <input
+                    value={dispatchValue}
+                    onChange={(e) => setDispatchValue(e.target.value)}
+                    className="w-full rounded-lg border border-ink-border px-3 py-2 text-sm text-sumi-black"
+                    placeholder=".../issues/311 or feat-auth"
+                  />
+                </div>
+                {dispatchPrefab !== 'none' && (
+                  <div>
+                    <label className="block text-whisper text-sumi-diluted mb-1">Additional instructions (optional)</label>
+                    <textarea
+                      value={dispatchTask}
+                      onChange={(e) => setDispatchTask(e.target.value)}
+                      rows={2}
+                      className="w-full rounded-lg border border-ink-border px-3 py-2 text-sm text-sumi-black resize-none"
+                      placeholder="Extra instructions..."
+                    />
+                  </div>
+                )}
+                <div className="text-whisper text-sumi-diluted">Parent: {sessionName}</div>
+                {dispatchError && (
+                  <div className="text-whisper text-accent-vermillion">{dispatchError}</div>
+                )}
+                <button
+                  type="submit"
+                  className="w-full rounded-lg bg-sumi-black px-3 py-2 text-sm text-white disabled:opacity-60"
+                  disabled={isDispatching}
+                >
+                  {isDispatching ? 'Dispatching...' : 'Dispatch'}
+                </button>
+              </form>
+            </div>
+          </div>
+        </>
+      )}
 
       <SkillsPicker
         visible={showSkills}
@@ -1646,38 +1723,44 @@ export default function AgentsPage() {
   const [task, setTask] = useState('')
   const [cwd, setCwd] = useState('')
   const [agentType, setAgentType] = useState<AgentType>('claude')
+  const [openclawAgentId, setOpenclawAgentId] = useState('')
   const [sessionType, setSessionType] = useState<SessionType>('stream')
   const [selectedHost, setSelectedHost] = useState('')
   const [isCreating, setIsCreating] = useState(false)
   const [createError, setCreateError] = useState<string | null>(null)
   const [killError, setKillError] = useState<string | null>(null)
   const [showFilePanel, setShowFilePanel] = useState(false)
-  type SessionTab = 'all' | 'regular' | 'factory' | 'command-room'
-  const [sessionTab, setSessionTab] = useState<SessionTab>('all')
+  const [sessionTab, setSessionTab] = useState<SessionTab>(DEFAULT_SESSION_TAB)
   const machineList = machines ?? []
+  const sessionList = (sessions ?? []) as AgentSessionWithWorkers[]
   const machineMap = new Map(machineList.map((machine) => [machine.id, machine]))
 
   useEffect(() => {
     const paramCwd = searchParams.get('cwd')
     const paramName = searchParams.get('name')
-    if (paramCwd || paramName) {
+    const paramSession = searchParams.get('session')
+    if (paramCwd || paramName || paramSession) {
       if (paramCwd) setCwd(paramCwd)
       if (paramName) setName(paramName)
-      setShowNewSessionForm(true)
+      if (paramSession) setSelectedSession(paramSession)
+      if (paramCwd || paramName) setShowNewSessionForm(true)
       setSearchParams({}, { replace: true })
     }
   }, [searchParams, setSearchParams])
 
   useEffect(() => {
-    if (!selectedSession || !sessions) {
+    if (!selectedSession) {
+      return
+    }
+    if (isLoading) {
       return
     }
 
-    const stillExists = sessions.some((session) => session.name === selectedSession)
+    const stillExists = sessionList.some((session) => session.name === selectedSession)
     if (!stillExists) {
       setSelectedSession(null)
     }
-  }, [selectedSession, sessions])
+  }, [selectedSession, sessionList, isLoading])
 
   async function refreshSessions() {
     await queryClient.invalidateQueries({ queryKey: ['agents', 'sessions'] })
@@ -1701,6 +1784,7 @@ export default function AgentsPage() {
         sessionType,
         agentType,
         host: selectedHost || undefined,
+        agentId: agentType === 'openclaw' ? (openclawAgentId.trim() || 'main') : undefined,
       })
 
       setName('')
@@ -1708,6 +1792,7 @@ export default function AgentsPage() {
       setCwd('')
       setMode('default')
       setAgentType('claude')
+      setOpenclawAgentId('')
       setSessionType('stream')
       setSelectedHost('')
       setShowNewSessionForm(false)
@@ -1718,12 +1803,32 @@ export default function AgentsPage() {
     } finally {
       setIsCreating(false)
     }
-  }, [isCreating, name, mode, task, cwd, agentType, sessionType, selectedHost, isMobile, queryClient])
+  }, [isCreating, name, mode, task, cwd, agentType, openclawAgentId, sessionType, selectedHost, isMobile, queryClient])
 
-  async function handleKillSession(sessionName: string) {
+  async function handleKillSession(
+    sessionName: string,
+    agentType?: AgentType,
+    sessionType?: SessionType,
+  ) {
     try {
+      const isStream = sessionType === 'stream'
+      const shouldDebrief = isStream && shouldAttemptDebriefOnKill(agentType)
+
+      if (shouldDebrief) {
+        const preResp = await triggerPreKillDebrief(sessionName)
+        if (preResp.debriefStarted && preResp.timeoutMs) {
+          const deadline = Date.now() + preResp.timeoutMs
+          const pollIntervalMs = 2000
+          while (Date.now() < deadline) {
+            const { status } = await getDebriefStatus(sessionName)
+            if (status === 'completed' || status === 'timed-out') break
+            await new Promise((r) => setTimeout(r, pollIntervalMs))
+          }
+        }
+      }
+
       await killSession(sessionName)
-      setSelectedSession(null)
+      setSelectedSession((current) => (current === sessionName ? null : current))
       await refreshSessions()
     } catch (caughtError) {
       const message = formatError(caughtError, 'Failed to kill session')
@@ -1732,14 +1837,9 @@ export default function AgentsPage() {
     }
   }
 
-  const selectedSessionData = sessions?.find((s) => s.name === selectedSession)
+  const selectedSessionData = sessionList.find((s) => s.name === selectedSession)
 
-  const filteredSessions = sessions?.filter((s) => {
-    if (sessionTab === 'factory') return s.name.startsWith('factory-')
-    if (sessionTab === 'command-room') return s.name.startsWith('command-room-')
-    if (sessionTab === 'regular') return !s.name.startsWith('factory-') && !s.name.startsWith('command-room-')
-    return true
-  })
+  const filteredSessions = filterSessionsByTab(sessionList, sessionTab)
 
   return (
     <div className="flex h-full">
@@ -1795,6 +1895,8 @@ export default function AgentsPage() {
                     setTask={setTask}
                     agentType={agentType}
                     setAgentType={setAgentType}
+                    openclawAgentId={openclawAgentId}
+                    setOpenclawAgentId={setOpenclawAgentId}
                     sessionType={sessionType}
                     setSessionType={setSessionType}
                     machines={machineList}
@@ -1821,6 +1923,8 @@ export default function AgentsPage() {
                   setTask={setTask}
                   agentType={agentType}
                   setAgentType={setAgentType}
+                  openclawAgentId={openclawAgentId}
+                  setOpenclawAgentId={setOpenclawAgentId}
                   sessionType={sessionType}
                   setSessionType={setSessionType}
                   machines={machineList}
@@ -1843,9 +1947,9 @@ export default function AgentsPage() {
         </div>
 
         {/* Session type tabs */}
-        {sessions && sessions.length > 0 && (
+        {sessionList.length > 0 && (
           <div className="px-4 pb-3 flex gap-1">
-            {(['all', 'regular', 'factory', 'command-room'] as SessionTab[]).map((tab) => (
+            {SESSION_TABS.map((tab) => (
               <button
                 key={tab}
                 onClick={() => setSessionTab(tab)}
@@ -1881,6 +1985,8 @@ export default function AgentsPage() {
                     selectedSession === session.name ? null : session.name,
                   )
                 }
+                onView={() => setSelectedSession(session.name)}
+                onKill={() => handleKillSession(session.name, session.agentType, session.sessionType)}
               />
             ))
           )}
@@ -1901,18 +2007,28 @@ export default function AgentsPage() {
           isMobile ? (
             <MobileSessionView
               sessionName={selectedSession}
+              sessionLabel={selectedSessionData?.label}
+              agentType={selectedSessionData?.agentType}
               sessionCwd={selectedSessionData?.cwd}
+              initialSpawnedWorkers={selectedSessionData?.spawnedWorkers}
               onClose={() => setSelectedSession(null)}
-              onKill={handleKillSession}
+              onKill={(name, type) => handleKillSession(name, type, selectedSessionData?.sessionType)}
+              onNavigateToSession={(nextSessionName) => setSelectedSession(nextSessionName)}
+              onRefreshSessions={refreshSessions}
             />
           ) : (
             <div className="flex-1 flex animate-fade-in">
               <div className="flex-1 min-w-0">
                 <MobileSessionView
                   sessionName={selectedSession}
+                  sessionLabel={selectedSessionData?.label}
+                  agentType={selectedSessionData?.agentType}
                   sessionCwd={selectedSessionData?.cwd}
+                  initialSpawnedWorkers={selectedSessionData?.spawnedWorkers}
                   onClose={() => setSelectedSession(null)}
-                  onKill={handleKillSession}
+                  onKill={(name, type) => handleKillSession(name, type, selectedSessionData?.sessionType)}
+                  onNavigateToSession={(nextSessionName) => setSelectedSession(nextSessionName)}
+                  onRefreshSessions={refreshSessions}
                   onToggleFilePanel={() => setShowFilePanel((p) => !p)}
                 />
               </div>
@@ -1929,8 +2045,10 @@ export default function AgentsPage() {
           isMobile ? (
             <TerminalView
               sessionName={selectedSession}
+              sessionLabel={selectedSessionData?.label}
+              agentType={selectedSessionData?.agentType}
               onClose={() => setSelectedSession(null)}
-              onKill={handleKillSession}
+              onKill={(name, type) => handleKillSession(name, type, selectedSessionData?.sessionType)}
               isMobileOverlay
             />
           ) : (
@@ -1938,8 +2056,10 @@ export default function AgentsPage() {
               <div className="flex-1 min-w-0">
                 <TerminalView
                   sessionName={selectedSession}
+                  sessionLabel={selectedSessionData?.label}
+                  agentType={selectedSessionData?.agentType}
                   onClose={() => setSelectedSession(null)}
-                  onKill={handleKillSession}
+                  onKill={(name, type) => handleKillSession(name, type, selectedSessionData?.sessionType)}
                   onToggleFilePanel={() => setShowFilePanel((p) => !p)}
                 />
               </div>

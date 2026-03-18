@@ -8,6 +8,7 @@ import { CommandRoomScheduler, InvalidCronExpressionError } from './scheduler.js
 import { CommandRoomTaskStore, type CommandRoomAgentType, type UpdateCronTaskInput } from './task-store.js'
 
 const TASK_ID_PATTERN = /^[a-zA-Z0-9_-]+$/
+const COMMANDER_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/i
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
@@ -19,6 +20,24 @@ function parseTaskId(raw: unknown): string | null {
   }
   const trimmed = raw.trim()
   if (!trimmed || !TASK_ID_PATTERN.test(trimmed)) {
+    return null
+  }
+  return trimmed
+}
+
+function parseOptionalCommanderId(raw: unknown): string | null | undefined {
+  if (raw === undefined) {
+    return undefined
+  }
+  if (typeof raw !== 'string') {
+    return null
+  }
+
+  const trimmed = raw.trim()
+  if (!trimmed) {
+    return undefined
+  }
+  if (!COMMANDER_ID_PATTERN.test(trimmed)) {
     return null
   }
   return trimmed
@@ -40,6 +59,17 @@ function parseWorkDir(raw: unknown): string | null {
   return workDir
 }
 
+function parseOptionalString(raw: unknown): string | null | undefined {
+  if (raw === undefined) {
+    return undefined
+  }
+  if (typeof raw !== 'string') {
+    return null
+  }
+  const trimmed = raw.trim()
+  return trimmed.length > 0 ? trimmed : undefined
+}
+
 function parseAgentType(raw: unknown): CommandRoomAgentType | null {
   if (raw === 'claude' || raw === 'codex') {
     return raw
@@ -53,6 +83,23 @@ function parseOptionalEnabled(raw: unknown): boolean | null | undefined {
   }
   if (typeof raw === 'boolean') {
     return raw
+  }
+  return null
+}
+
+function parseOptionalSessionType(raw: unknown): 'stream' | 'pty' | null | undefined {
+  if (raw === undefined) {
+    return undefined
+  }
+  if (typeof raw !== 'string') {
+    return null
+  }
+  const trimmed = raw.trim()
+  if (!trimmed) {
+    return undefined
+  }
+  if (trimmed === 'pty' || trimmed === 'stream') {
+    return trimmed
   }
   return null
 }
@@ -86,6 +133,7 @@ export interface CommandRoomRouterOptions extends Pick<CommandRoomExecutorOption
   runStore?: CommandRoomRunStore
   executor?: CommandRoomExecutor
   scheduler?: CommandRoomScheduler
+  schedulerInitialized?: Promise<void>
   apiKeyStore?: ApiKeyStoreLike
   auth0Domain?: string
   auth0Audience?: string
@@ -97,7 +145,7 @@ export interface CommandRoomRouterOptions extends Pick<CommandRoomExecutorOption
 export function createCommandRoomRouter(options: CommandRoomRouterOptions = {}): Router {
   const router = Router()
   const taskStore = options.taskStore ?? new CommandRoomTaskStore()
-  const runStore = options.runStore ?? new CommandRoomRunStore()
+  const runStore = options.runStore ?? new CommandRoomRunStore({ taskStore })
   const executor = options.executor ?? new CommandRoomExecutor({
     taskStore,
     runStore,
@@ -111,9 +159,12 @@ export function createCommandRoomRouter(options: CommandRoomRouterOptions = {}):
     executor,
   })
 
-  const initialized = scheduler.initialize().catch((error) => {
-    console.error('[command-room] Failed to initialize scheduler:', error)
-  })
+  const initialized = options.schedulerInitialized ?? scheduler.initialize()
+  if (!options.schedulerInitialized) {
+    void initialized.catch((error) => {
+      console.error('[command-room] Failed to initialize scheduler:', error)
+    })
+  }
 
   const requireReadAccess = combinedAuth({
     apiKeyStore: options.apiKeyStore,
@@ -134,10 +185,16 @@ export function createCommandRoomRouter(options: CommandRoomRouterOptions = {}):
     internalToken: options.internalToken,
   })
 
-  router.get('/tasks', requireReadAccess, async (_req, res) => {
+  router.get('/tasks', requireReadAccess, async (req, res) => {
+    const commanderId = parseOptionalCommanderId(req.query.commanderId)
+    if (commanderId === null) {
+      res.status(400).json({ error: 'commanderId must be a valid commander id when provided' })
+      return
+    }
+
     try {
       await initialized
-      const tasks = await scheduler.listTasks()
+      const tasks = await taskStore.listTasks(commanderId ? { commanderId } : {})
       const latestByTask = await runStore.listLatestRunsByTaskIds(tasks.map((task) => task.id))
       res.json(
         tasks.map((task) => {
@@ -198,7 +255,17 @@ export function createCommandRoomRouter(options: CommandRoomRouterOptions = {}):
       res.status(400).json({ error: 'timezone must be a valid IANA timezone when provided' })
       return
     }
+    const commanderId = parseOptionalCommanderId(req.body?.commanderId)
+    if (commanderId === null) {
+      res.status(400).json({ error: 'commanderId must be a valid commander id when provided' })
+      return
+    }
 
+    const description = parseOptionalString(req.body?.description)
+    if (description === null) {
+      res.status(400).json({ error: 'description must be a string when provided' })
+      return
+    }
     const permissionMode = typeof req.body?.permissionMode === 'string' && req.body.permissionMode ? req.body.permissionMode as string : undefined
     const sessionType = req.body?.sessionType === 'pty' ? 'pty' : req.body?.sessionType === 'stream' ? 'stream' : undefined
 
@@ -206,6 +273,7 @@ export function createCommandRoomRouter(options: CommandRoomRouterOptions = {}):
       await initialized
       const created = await scheduler.createTask({
         name,
+        description,
         schedule,
         timezone,
         machine,
@@ -213,6 +281,7 @@ export function createCommandRoomRouter(options: CommandRoomRouterOptions = {}):
         agentType,
         instruction,
         enabled: enabled ?? true,
+        commanderId,
         permissionMode,
         sessionType,
       })
@@ -244,6 +313,15 @@ export function createCommandRoomRouter(options: CommandRoomRouterOptions = {}):
         return
       }
       update.name = name
+    }
+
+    if ('description' in body) {
+      const description = parseOptionalString(body.description)
+      if (description === null) {
+        res.status(400).json({ error: 'description must be a string when provided' })
+        return
+      }
+      update.description = description
     }
 
     if ('schedule' in body) {
@@ -307,6 +385,24 @@ export function createCommandRoomRouter(options: CommandRoomRouterOptions = {}):
         return
       }
       update.timezone = timezone
+    }
+
+    if ('permissionMode' in body) {
+      const permissionMode = parseOptionalString(body.permissionMode)
+      if (permissionMode === null) {
+        res.status(400).json({ error: 'permissionMode must be a string when provided' })
+        return
+      }
+      update.permissionMode = permissionMode
+    }
+
+    if ('sessionType' in body) {
+      const sessionType = parseOptionalSessionType(body.sessionType)
+      if (sessionType === null) {
+        res.status(400).json({ error: 'sessionType must be stream or pty when provided' })
+        return
+      }
+      update.sessionType = sessionType
     }
 
     if (Object.keys(update).length === 0) {

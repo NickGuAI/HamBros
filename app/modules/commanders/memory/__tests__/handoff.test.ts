@@ -9,6 +9,7 @@ import {
   type SubagentResult,
 } from '../handoff.js'
 import type { JournalWriter } from '../journal.js'
+import { WorkingMemoryStore } from '../working-memory.js'
 
 describe('SubagentHandoff.buildHandoffPackage()', () => {
   let tmpDir: string
@@ -18,30 +19,27 @@ describe('SubagentHandoff.buildHandoffPackage()', () => {
     tmpDir = await mkdtemp(join(tmpdir(), 'subagent-handoff-test-'))
     handoff = new SubagentHandoff('test-commander', tmpDir)
 
+    const commanderRoot = join(tmpDir, 'test-commander')
     const memoryRoot = join(tmpDir, 'test-commander', '.memory')
-    await mkdir(join(memoryRoot, 'repos'), { recursive: true })
-    await mkdir(join(memoryRoot, 'skills', 'auth-fix'), { recursive: true })
-    await mkdir(join(memoryRoot, 'skills', 'unrelated-skill'), { recursive: true })
+    await mkdir(join(memoryRoot, 'journal'), { recursive: true })
+    await mkdir(join(commanderRoot, 'skills', 'auth-fix'), { recursive: true })
+    await mkdir(join(commanderRoot, 'skills', 'unrelated-skill'), { recursive: true })
   })
 
   afterEach(async () => {
     await rm(tmpDir, { recursive: true, force: true })
   })
 
-  it('assembles task context, repo knowledge, skills, and memory excerpts', async () => {
+  it('assembles task context, skill suggestions, working memory, and recollection excerpts', async () => {
+    const commanderRoot = join(tmpDir, 'test-commander')
     const memoryRoot = join(tmpDir, 'test-commander', '.memory')
     await writeFile(
-      join(memoryRoot, 'repos', 'example-user_example-repo.md'),
-      '# Repo Notes\n\nUse pnpm --filter for package-scoped checks.\n',
-      'utf-8',
-    )
-    await writeFile(
-      join(memoryRoot, 'skills', 'auth-fix', 'SKILL.md'),
+      join(commanderRoot, 'skills', 'auth-fix', 'SKILL.md'),
       '# Auth Fix\n\nUse this when fixing auth token refresh issues.\n',
       'utf-8',
     )
     await writeFile(
-      join(memoryRoot, 'skills', 'unrelated-skill', 'SKILL.md'),
+      join(commanderRoot, 'skills', 'unrelated-skill', 'SKILL.md'),
       '# Deployment\n\nUse this for deployment cutovers.\n',
       'utf-8',
     )
@@ -61,6 +59,29 @@ describe('SubagentHandoff.buildHandoffPackage()', () => {
       ].join('\n'),
       'utf-8',
     )
+    await writeFile(
+      join(memoryRoot, 'journal', '2026-03-01.md'),
+      [
+        '## 09:00 — Investigated auth refresh race (#247) 🔴 SPIKE',
+        '',
+        '**Repo:** example-user/example-repo',
+        '**Outcome:** Investigated auth refresh race',
+        '',
+        'Found middleware ordering problem in auth refresh pipeline.',
+        '',
+        '---',
+        '',
+      ].join('\n'),
+      'utf-8',
+    )
+    const workingMemory = new WorkingMemoryStore('test-commander', tmpDir)
+    await workingMemory.update({
+      source: 'message',
+      summary: 'Current hypothesis: auth middleware ordering causes refresh failures.',
+      hypothesis: 'Auth middleware order bug',
+      files: ['modules/auth/middleware.ts'],
+      tags: ['hypothesis'],
+    })
 
     const task: GHIssue = {
       number: 247,
@@ -83,9 +104,11 @@ describe('SubagentHandoff.buildHandoffPackage()', () => {
     expect(pkg.taskContext).toContain('Watch for middleware side effects')
     expect(pkg.taskContext).toContain('Last comment should be included')
     expect(pkg.taskContext).not.toContain('First comment to ignore')
-    expect(pkg.repoKnowledge).toContain('Use pnpm --filter for package-scoped checks.')
-    expect(pkg.matchedSkills).toHaveLength(1)
-    expect(pkg.matchedSkills[0].name).toBe('auth-fix')
+    expect(pkg.skillSuggestions.length).toBeGreaterThan(0)
+    expect(pkg.skillSuggestions[0]?.name).toBe('auth-fix')
+    expect(pkg.skillSuggestions[0]?.reason).toContain('lexical')
+    expect(pkg.workingMemory).toContain('Working Memory Scratchpad')
+    expect(pkg.workingMemory).toContain('Auth middleware order bug')
     expect(pkg.memoryExcerpts).toContain('# Commander Standing Orders')
     expect(pkg.memoryExcerpts).toContain('example-user/example-repo uses pnpm workspaces.')
     expect(pkg.memoryExcerpts).toContain('auth token refresh touched middleware last month.')
@@ -111,9 +134,10 @@ describe('SubagentHandoff.buildHandoffPackage()', () => {
     }
 
     const pkg = await handoff.buildHandoffPackage(task)
-    const lineCount = pkg.memoryExcerpts.split('\n').length
-    expect(lineCount).toBeLessThanOrEqual(50)
-    expect(pkg.memoryExcerpts).toContain('# Commander Standing Orders')
+    const lines = pkg.memoryExcerpts.split('\n')
+    const recollectionBullets = lines.filter((line) => line.startsWith('- ['))
+    expect(recollectionBullets.length).toBeLessThanOrEqual(6)
+    expect(pkg.memoryExcerpts).toContain('Repo Notes')
   })
 })
 
@@ -122,8 +146,15 @@ describe('SubagentHandoff.formatAsSystemContext()', () => {
     const handoff = new SubagentHandoff('test-commander')
     const pkg: HandoffPackage = {
       taskContext: '**Issue #10**: Fix parser\nIssue body',
-      repoKnowledge: 'Repo cache body',
-      matchedSkills: [{ name: 'parser-skill', fullContent: '# Parser Skill\n\nSteps...' }],
+      skillSuggestions: [
+        {
+          name: 'parser-skill',
+          path: '/tmp/test-commander/skills/parser-skill/SKILL.md',
+          reason: 'lexical 3.0',
+          excerpt: 'Use for parser issues.',
+        },
+      ],
+      workingMemory: '### Working Memory Scratchpad\n- Active hypothesis: Parser state mismatch',
       memoryExcerpts: '# Memory\n- excerpt',
       sourceCommanderId: 'test-commander',
     }
@@ -131,10 +162,10 @@ describe('SubagentHandoff.formatAsSystemContext()', () => {
     const formatted = handoff.formatAsSystemContext(pkg)
     expect(formatted).toContain('## Handoff from Commander test-commander')
     expect(formatted).toContain('### Task')
-    expect(formatted).toContain('### What I Know About This Repo')
-    expect(formatted).toContain('### Applicable Skills')
-    expect(formatted).toContain('#### parser-skill')
-    expect(formatted).toContain('### Relevant Memory')
+    expect(formatted).toContain('### Suggested Skills (manual invoke only)')
+    expect(formatted).toContain('**parser-skill**')
+    expect(formatted).toContain('### Working Memory Scratchpad')
+    expect(formatted).toContain('### Relevant Memory Recollection')
     expect(formatted).toContain('### Standing Instructions')
     expect(formatted).toContain('Tag your final status: SUCCESS | PARTIAL | BLOCKED')
   })

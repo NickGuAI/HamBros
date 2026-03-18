@@ -1,21 +1,21 @@
-import type { Dirent } from 'node:fs'
-import { readFile, readdir } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
 import * as path from 'node:path'
+import { GoalsStore } from './goals-store.js'
 import { JournalWriter } from './journal.js'
+import { MemoryRecollection, type RecollectionHit } from './recollection.js'
+import { WorkingMemoryStore } from './working-memory.js'
 import type { JournalEntry } from './types.js'
-import {
-  loadSkillManifests,
-  rankMatchingSkills,
-  type GHIssue,
-  type SkillManifest,
-} from './skill-matcher.js'
+import { type GHIssue } from './skill-matcher.js'
+import { resolveCommanderPaths } from '../paths.js'
 
 const DEFAULT_TOKEN_BUDGET = 8_000
 const MAX_LONG_TERM_LINES = 200
+const MAX_LONG_TERM_NARRATIVE_LINES = 100
 
-const PRIORITY_ORDER = [1, 2, 3, 4, 5, 6] as const
-const RENDER_ORDER = [2, 1, 3, 4, 5, 6] as const
-const LAYER_DROP_ORDER = [6, 5, 4] as const
+const LAYER_GOALS = 1.5
+const PRIORITY_ORDER = [1, LAYER_GOALS, 2, 3, 4, 5, 6] as const
+const RENDER_ORDER = [2, LAYER_GOALS, 1, 3, 4, 5, 6] as const
+const LAYER_DROP_ORDER = [6, 5, 4, 3] as const
 
 export interface Message {
   role: string
@@ -35,22 +35,13 @@ export interface BuiltContext {
   tokenEstimate: number
 }
 
-interface RepoRef {
-  owner: string
-  repo: string
-}
-
-interface Layer3Result {
-  markdown: string | null
-  skills: SkillManifest[]
+interface Layer4Result {
+  content: string | null
+  skillsMatched: string[]
 }
 
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4)
-}
-
-function toDateString(d: Date): string {
-  return d.toISOString().slice(0, 10)
 }
 
 function trimLines(content: string, maxLines: number): string {
@@ -62,6 +53,19 @@ function trimLines(content: string, maxLines: number): string {
   return `${trimmed}\n\n_...truncated to first ${maxLines} lines._`
 }
 
+function trimLastLines(content: string, maxLines: number): string {
+  const lines = content.split(/\r?\n/)
+  if (lines.length <= maxLines) {
+    return content.trim()
+  }
+  const trimmed = lines.slice(-maxLines).join('\n').trim()
+  return `${trimmed}\n\n_...truncated to last ${maxLines} lines._`
+}
+
+function compactText(text: string): string {
+  return text.replace(/\s+/g, ' ').trim()
+}
+
 function indentBulletBody(text: string): string {
   return text
     .trim()
@@ -70,73 +74,54 @@ function indentBulletBody(text: string): string {
     .join('\n')
 }
 
-function compactText(text: string): string {
-  return text.replace(/\s+/g, ' ').trim()
-}
-
-function parseRepoRef(task: GHIssue | null): RepoRef | null {
+function toRepo(task: GHIssue | null): string | null {
   if (!task) return null
-
-  if (task.owner && task.repo) {
-    return { owner: task.owner, repo: task.repo }
-  }
-
-  const fromRepository = task.repository?.split('/')
-  if (fromRepository && fromRepository.length === 2) {
-    const [owner, repo] = fromRepository
-    if (owner && repo) return { owner, repo }
-  }
-
-  return null
-}
-
-function repoSlug(repoRef: RepoRef | null): string | null {
-  if (!repoRef) return null
-  return `${repoRef.owner}/${repoRef.repo}`
-}
-
-function isRepoRelevant(entryRepo: string | null, currentRepo: string | null): boolean {
-  if (!entryRepo || !currentRepo) return false
-  const normalizedEntry = entryRepo.toLowerCase()
-  const normalizedCurrent = currentRepo.toLowerCase()
-  return normalizedEntry === normalizedCurrent || normalizedEntry.includes(normalizedCurrent)
+  if (task.owner && task.repo) return `${task.owner}/${task.repo}`
+  return task.repository ?? null
 }
 
 export class MemoryContextBuilder {
   private readonly memoryRoot: string
   private readonly journal: JournalWriter
+  private readonly recollection: MemoryRecollection
+  private readonly workingMemory: WorkingMemoryStore
+  private readonly goalsStore: GoalsStore
 
   constructor(
-    private readonly commanderId: string,
+    commanderId: string,
     basePath?: string,
   ) {
-    this.memoryRoot = basePath
-      ? path.join(basePath, commanderId, '.memory')
-      : path.resolve(process.cwd(), 'data', 'commanders', commanderId, '.memory')
+    this.memoryRoot = resolveCommanderPaths(commanderId, basePath).memoryRoot
     this.journal = new JournalWriter(commanderId, basePath)
+    this.recollection = new MemoryRecollection(commanderId, basePath)
+    this.workingMemory = new WorkingMemoryStore(commanderId, basePath)
+    this.goalsStore = new GoalsStore(commanderId, basePath)
   }
 
   async build(options: ContextBuildOptions): Promise<BuiltContext> {
     const tokenBudget = options.tokenBudget ?? DEFAULT_TOKEN_BUDGET
     const task = options.currentTask
 
-    const layer1 = await this.buildLayer1(task)
-    const layer2 = await this.buildLayer2()
-    const layer3 = await this.buildLayer3(task)
-    const layer4 = await this.buildLayer4(task)
-    const layer5 = await this.buildLayer5(task)
+    const [layer1, layerGoals, layer2, layer3, layer4, layer5] = await Promise.all([
+      this.buildLayer1(task),
+      this.goalsStore.buildContextSection(),
+      this.buildLayer2(),
+      this.buildLayer3(),
+      this.buildLayer4(task, options.recentConversation),
+      this.buildLayer5(),
+    ])
     const layer6 = this.buildLayer6(options.recentConversation)
 
     const layers = new Map<number, string>([
       [1, layer1],
       [2, layer2],
     ])
-    if (layer3.markdown) layers.set(3, layer3.markdown)
-    if (layer4) layers.set(4, layer4)
+    if (layerGoals) layers.set(LAYER_GOALS, layerGoals)
+    if (layer3) layers.set(3, layer3)
+    if (layer4.content) layers.set(4, layer4.content)
     if (layer5) layers.set(5, layer5)
     if (layer6) layers.set(6, layer6)
 
-    let injectedSkills = layer3.skills.map((skill) => skill.name)
     let systemPromptSection = this.renderSection(layers)
     let tokenEstimate = estimateTokens(systemPromptSection)
 
@@ -148,22 +133,11 @@ export class MemoryContextBuilder {
       tokenEstimate = estimateTokens(systemPromptSection)
     }
 
-    if (tokenEstimate > tokenBudget && layer3.skills.length > 1 && layers.has(3)) {
-      const topSkill = layer3.skills[0]
-      if (topSkill) {
-        layers.set(3, this.renderSkillsLayer([topSkill]))
-        injectedSkills = [topSkill.name]
-        systemPromptSection = this.renderSection(layers)
-        tokenEstimate = estimateTokens(systemPromptSection)
-      }
-    }
-
     const layersIncluded = PRIORITY_ORDER.filter((layerId) => layers.has(layerId))
-
     return {
       systemPromptSection,
       layersIncluded,
-      skillsMatched: injectedSkills,
+      skillsMatched: layer4.skillsMatched,
       tokenEstimate,
     }
   }
@@ -180,21 +154,17 @@ export class MemoryContextBuilder {
 
   private async buildLayer1(task: GHIssue | null): Promise<string> {
     const lines: string[] = ['### Current Task']
-    const repo = parseRepoRef(task)
-    const repoName = repoSlug(repo) ?? 'unknown/unknown'
-
-    if (task) {
-      lines.push(
-        `**Issue #${task.number}**: ${task.title} — ${repoName}`,
-      )
+    const repo = toRepo(task) ?? 'unknown/unknown'
+    if (!task) {
+      lines.push('_No active task._')
+    } else {
+      lines.push(`**Issue #${task.number}**: ${task.title} — ${repo}`)
       if (task.body?.trim()) {
         lines.push('', task.body.trim())
       }
-
       const comments = (task.comments ?? [])
         .filter((comment) => comment.body.trim().length > 0)
         .slice(-5)
-
       if (comments.length > 0) {
         lines.push('', '#### Recent Comments')
         for (const comment of comments) {
@@ -205,8 +175,6 @@ export class MemoryContextBuilder {
           lines.push(`- ${meta}${compactText(comment.body)}`)
         }
       }
-    } else {
-      lines.push('_No active task._')
     }
 
     const thinIndex = await this.readThinIndex()
@@ -216,92 +184,98 @@ export class MemoryContextBuilder {
     } else {
       lines.push('_No local thin index found._')
     }
-
     return lines.join('\n').trim()
   }
 
   private async buildLayer2(): Promise<string> {
     const memoryPath = path.join(this.memoryRoot, 'MEMORY.md')
+    const longTermPath = path.join(this.memoryRoot, 'LONG_TERM_MEM.md')
     let memoryContent = ''
+    let longTermNarrativeContent = ''
     try {
       memoryContent = await readFile(memoryPath, 'utf-8')
     } catch {
-      // Optional: layer remains with fallback text if memory file is missing.
+      // Optional layer fallback
     }
-
-    const trimmed = trimLines(memoryContent, MAX_LONG_TERM_LINES)
-    return [
-      '### Long-term Memory',
-      trimmed || '_No long-term memory found._',
-    ].join('\n')
-  }
-
-  private async buildLayer3(task: GHIssue | null): Promise<Layer3Result> {
-    if (!task) {
-      return { markdown: null, skills: [] }
-    }
-
-    const skillsRoot = path.join(this.memoryRoot, 'skills')
-    const manifests = await loadSkillManifests(skillsRoot)
-    const matchedSkills = rankMatchingSkills(manifests, task)
-    if (matchedSkills.length === 0) {
-      return { markdown: null, skills: [] }
-    }
-
-    return {
-      markdown: this.renderSkillsLayer(matchedSkills),
-      skills: matchedSkills,
-    }
-  }
-
-  private renderSkillsLayer(skills: SkillManifest[]): string {
-    const lines: string[] = ['### Applicable Skills']
-    for (const skill of skills) {
-      lines.push('', `#### ${skill.name}`, skill.content)
-    }
-    return lines.join('\n').trim()
-  }
-
-  private async buildLayer4(task: GHIssue | null): Promise<string | null> {
-    const repo = parseRepoRef(task)
-    if (!repo) return null
-
-    const repoPath = path.join(this.memoryRoot, 'repos', `${repo.owner}_${repo.repo}.md`)
-    let content = ''
     try {
-      content = await readFile(repoPath, 'utf-8')
+      longTermNarrativeContent = await readFile(longTermPath, 'utf-8')
+    } catch {
+      // Optional layer fallback
+    }
+
+    const factual = trimLines(memoryContent, MAX_LONG_TERM_LINES)
+    const narrative = trimLastLines(longTermNarrativeContent, MAX_LONG_TERM_NARRATIVE_LINES)
+    const lines = [
+      '### Long-term Memory',
+      '#### Facts (MEMORY.md)',
+      factual || '_No fact memory found._',
+      '',
+      '#### Narrative (LONG_TERM_MEM.md)',
+      narrative || '_No narrative long-term memory found._',
+    ]
+    return lines.join('\n')
+  }
+
+  private async buildLayer3(): Promise<string | null> {
+    try {
+      return await this.workingMemory.render(6)
     } catch {
       return null
     }
-
-    const trimmed = content.trim()
-    if (!trimmed) return null
-    return `### Repo Knowledge: ${repo.owner}/${repo.repo}\n${trimmed}`
   }
 
-  private async buildLayer5(task: GHIssue | null): Promise<string | null> {
-    const recentEntries = await this.journal.readRecent()
-    const currentRepo = repoSlug(parseRepoRef(task))
-    const olderSpikes = await this.readOlderRepoSpikes(currentRepo)
+  private async buildLayer4(
+    task: GHIssue | null,
+    recentConversation: Message[],
+  ): Promise<Layer4Result> {
+    const cues = recentConversation
+      .slice(-4)
+      .map((message) => `${message.role}: ${message.content}`)
+      .join('\n')
+    const recollection = await this.recollection.recall({
+      cue: cues,
+      task,
+      recentConversation,
+      topK: 8,
+    })
 
-    if (recentEntries.length === 0 && olderSpikes.length === 0) {
+    const contextualHits = recollection.hits.filter((hit) => hit.type !== 'skill')
+    if (contextualHits.length === 0) {
+      return {
+        content: '### Cue-based Recollection\n_No relevant recollections found._',
+        skillsMatched: [],
+      }
+    }
+
+    const lines: string[] = ['### Cue-based Recollection']
+    for (const hit of contextualHits) {
+      const score = hit.score.toFixed(2)
+      const issueSuffix = hit.issueNumber != null ? ` #${hit.issueNumber}` : ''
+      const repoSuffix = hit.repo ? ` [${hit.repo}]` : ''
+      const salienceSuffix = hit.salience ? ` ${hit.salience}` : ''
+      lines.push(`- [${hit.type}] ${hit.title}${issueSuffix}${repoSuffix}${salienceSuffix} (score ${score})`)
+      lines.push(`  reason: ${hit.reason}`)
+      lines.push(`  excerpt: ${hit.excerpt}`)
+      if (hit.stale && hit.staleReason) {
+        lines.push(`  stale-signal: ${hit.staleReason}`)
+      }
+      if (hit.path) {
+        lines.push(`  source: ${hit.path}`)
+      }
+    }
+
+    return {
+      content: lines.join('\n'),
+      skillsMatched: [],
+    }
+  }
+
+  private async buildLayer5(): Promise<string | null> {
+    const recentEntries = await this.journal.readRecent()
+    if (recentEntries.length === 0) {
       return null
     }
-
-    const lines: string[] = ['### Recent Journal (last 2 days)']
-
-    if (recentEntries.length > 0) {
-      lines.push(this.formatJournalEntries(recentEntries))
-    } else {
-      lines.push('_No journal entries in the last 2 days._')
-    }
-
-    if (olderSpikes.length > 0) {
-      lines.push('', `#### Older SPIKE Entries${currentRepo ? ` (${currentRepo})` : ''}`)
-      lines.push(this.formatJournalEntries(olderSpikes))
-    }
-
-    return lines.join('\n').trim()
+    return ['### Recent Journal (last 2 days)', this.formatJournalEntries(recentEntries)].join('\n')
   }
 
   private buildLayer6(recentConversation: Message[]): string | null {
@@ -345,42 +319,7 @@ export class MemoryContextBuilder {
     } catch {
       return null
     }
-
     const trimmed = content.trim()
     return trimmed || null
-  }
-
-  private async readOlderRepoSpikes(currentRepo: string | null): Promise<JournalEntry[]> {
-    if (!currentRepo) return []
-
-    let journalEntries: Dirent<string>[]
-    try {
-      journalEntries = await readdir(path.join(this.memoryRoot, 'journal'), { withFileTypes: true })
-    } catch {
-      return []
-    }
-
-    const today = toDateString(new Date())
-    const yesterdayDate = new Date()
-    yesterdayDate.setDate(yesterdayDate.getDate() - 1)
-    const yesterday = toDateString(yesterdayDate)
-
-    const dates = journalEntries
-      .filter((entry) => entry.isFile() && /^\d{4}-\d{2}-\d{2}\.md$/.test(entry.name))
-      .map((entry) => entry.name.replace(/\.md$/, ''))
-      .filter((date) => date !== today && date !== yesterday)
-      .sort((a, b) => b.localeCompare(a))
-
-    const spikes: JournalEntry[] = []
-    for (const date of dates) {
-      const dayEntries = await this.journal.readDate(date)
-      for (const entry of dayEntries) {
-        if (entry.salience !== 'SPIKE') continue
-        if (!isRepoRelevant(entry.repo, currentRepo)) continue
-        spikes.push(entry)
-      }
-    }
-
-    return spikes
   }
 }

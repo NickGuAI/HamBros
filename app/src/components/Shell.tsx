@@ -32,6 +32,7 @@ interface NavItem {
   label: string
   icon: string
   path: string
+  hideFromNav?: boolean
 }
 
 export function Shell({
@@ -70,7 +71,7 @@ export function Shell({
 
         {/* Navigation */}
         <nav className="flex-1 py-4 space-y-1 px-2">
-          {modules.filter((mod) => mod.name !== 'commanders').map((mod) => {
+          {modules.filter((mod) => !mod.hideFromNav).map((mod) => {
             const Icon = iconMap[mod.icon]
             return (
               <NavLink

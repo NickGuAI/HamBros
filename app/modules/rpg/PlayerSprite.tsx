@@ -1,7 +1,7 @@
 import { type MutableRefObject, useEffect, useMemo, useRef } from 'react'
 import { useTick } from '@pixi/react'
 import { Rectangle, Texture } from 'pixi.js'
-import { ROOM_WIDTH, ROOM_HEIGHT, TILE_SIZE, resolveMovement } from './room-layout'
+import { ROOM_WIDTH, ROOM_HEIGHT, TILE_SIZE, resolveMovement, isWalkable } from './room-layout'
 
 // tiny-creatures tileset: 10 cols × 18 rows, 16×16px packed (no spacing)
 const CREATURES_COLS = 10
@@ -14,6 +14,8 @@ const SPAWN_Y = ROOM_HEIGHT - 28    // 148
 
 const PLAYER_SPEED = 1.5
 const PLAYER_RADIUS = 6
+const PLAYER_POS_KEY = 'rpg:playerPos'
+const SAVE_INTERVAL_FRAMES = 60
 
 function makeFrame(source: Texture, index: number, cols: number): Texture {
   return new Texture({
@@ -38,6 +40,29 @@ function isSpaceKey(key: string, code: string): boolean {
   return key === ' ' || key === 'spacebar' || code === 'Space'
 }
 
+function loadSavedPos(): { x: number; y: number } {
+  try {
+    const raw = localStorage.getItem(PLAYER_POS_KEY)
+    if (raw) {
+      const parsed = JSON.parse(raw) as unknown
+      if (
+        parsed !== null &&
+        typeof parsed === 'object' &&
+        'x' in parsed &&
+        'y' in parsed &&
+        typeof (parsed as { x: unknown }).x === 'number' &&
+        typeof (parsed as { y: unknown }).y === 'number'
+      ) {
+        const { x, y } = parsed as { x: number; y: number }
+        if (isWalkable(x, y, PLAYER_RADIUS)) return { x, y }
+      }
+    }
+  } catch {
+    // ignore parse errors
+  }
+  return { x: SPAWN_X, y: SPAWN_Y }
+}
+
 export function PlayerSprite({
   creaturesTexture,
   sharedPosRef,
@@ -45,9 +70,10 @@ export function PlayerSprite({
   frozen = false,
 }: PlayerSpriteProps) {
   const spriteRef = useRef<any>(null)
-  const posRef = useRef({ x: SPAWN_X, y: SPAWN_Y })
+  const posRef = useRef(loadSavedPos())
   const keysRef = useRef<Set<string>>(new Set())
   const interactDownRef = useRef(false)
+  const frameCountRef = useRef(0)
 
   const texture = useMemo(
     () => makeFrame(creaturesTexture, PLAYER_TILE, CREATURES_COLS),
@@ -122,6 +148,16 @@ export function PlayerSprite({
     sprite.y = Math.round(posRef.current.y)
     sharedPosRef.current.x = posRef.current.x
     sharedPosRef.current.y = posRef.current.y
+
+    frameCountRef.current += 1
+    if (frameCountRef.current >= SAVE_INTERVAL_FRAMES) {
+      frameCountRef.current = 0
+      try {
+        localStorage.setItem(PLAYER_POS_KEY, JSON.stringify(posRef.current))
+      } catch {
+        // ignore storage errors
+      }
+    }
   })
 
   return (

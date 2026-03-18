@@ -1,7 +1,7 @@
 import { readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { JournalWriter } from './journal.js'
-import type { SalienceLevel } from './types.js'
+import type { JournalEntry, SalienceLevel } from './types.js'
 
 export interface FlushContext {
   currentIssue: {
@@ -19,8 +19,14 @@ export interface GitHubClient {
   postIssueComment(input: { repo: string; issueNumber: number; body: string }): Promise<void>
 }
 
+export interface RemoteMemorySyncClient {
+  appendJournal(input: { date: string; entries: JournalEntry[] }): Promise<void>
+  syncMemory(input: { memoryMd: string }): Promise<void>
+}
+
 interface EmergencyFlusherOptions {
   now?: () => Date
+  remoteMemoryClient?: RemoteMemorySyncClient
 }
 
 function normalizeText(value: string): string {
@@ -33,6 +39,7 @@ function cleanObservations(values: string[]): string[] {
 
 export class EmergencyFlusher {
   private readonly now: () => Date
+  private readonly remoteMemoryClient?: RemoteMemorySyncClient
 
   constructor(
     private readonly commanderId: string,
@@ -41,6 +48,7 @@ export class EmergencyFlusher {
     options: EmergencyFlusherOptions = {},
   ) {
     this.now = options.now ?? (() => new Date())
+    this.remoteMemoryClient = options.remoteMemoryClient
   }
 
   async preCompactionFlush(ctx: FlushContext): Promise<void> {
@@ -67,32 +75,17 @@ export class EmergencyFlusher {
 
   private async appendCurrentStateToJournal(ctx: FlushContext): Promise<void> {
     const nowIso = this.now().toISOString()
-    const spikes = cleanObservations(ctx.pendingSpikeObservations)
-    const salience: SalienceLevel = spikes.length > 0 ? 'SPIKE' : 'ROUTINE'
+    const entry = this.buildJournalEntry(ctx, nowIso)
 
-    const bodyLines: string[] = [
-      `- Trigger: \`${ctx.trigger}\``,
-      `- Commander: \`${this.commanderId}\``,
-      '',
-      '### Task State',
-      normalizeText(ctx.taskState) || '_No task state provided._',
-    ]
-    if (spikes.length > 0) {
-      bodyLines.push('', '### SPIKE Observations', ...spikes.map((item) => `- ${item}`))
+    if (this.remoteMemoryClient) {
+      await this.remoteMemoryClient.appendJournal({
+        date: nowIso.slice(0, 10),
+        entries: [entry],
+      })
+      return
     }
 
-    await this.journal.append({
-      timestamp: nowIso,
-      issueNumber: ctx.currentIssue?.number ?? null,
-      repo: ctx.currentIssue?.repo ?? null,
-      outcome:
-        ctx.trigger === 'pre-compaction'
-          ? 'Emergency flush before context compaction'
-          : 'Emergency flush between tasks',
-      durationMin: null,
-      salience,
-      body: bodyLines.join('\n'),
-    })
+    await this.journal.append(entry)
   }
 
   private async postProgressToGitHub(ctx: FlushContext): Promise<void> {
@@ -147,6 +140,41 @@ export class EmergencyFlusher {
       // Keep default header if missing.
     }
 
-    await writeFile(memoryPath, `${existing.trimEnd()}\n\n${additions}\n`, 'utf-8')
+    const nextMemory = `${existing.trimEnd()}\n\n${additions}\n`
+    if (this.remoteMemoryClient) {
+      await this.remoteMemoryClient.syncMemory({ memoryMd: nextMemory })
+      return
+    }
+
+    await writeFile(memoryPath, nextMemory, 'utf-8')
+  }
+
+  private buildJournalEntry(ctx: FlushContext, nowIso: string): JournalEntry {
+    const spikes = cleanObservations(ctx.pendingSpikeObservations)
+    const salience: SalienceLevel = spikes.length > 0 ? 'SPIKE' : 'ROUTINE'
+
+    const bodyLines: string[] = [
+      `- Trigger: \`${ctx.trigger}\``,
+      `- Commander: \`${this.commanderId}\``,
+      '',
+      '### Task State',
+      normalizeText(ctx.taskState) || '_No task state provided._',
+    ]
+    if (spikes.length > 0) {
+      bodyLines.push('', '### SPIKE Observations', ...spikes.map((item) => `- ${item}`))
+    }
+
+    return {
+      timestamp: nowIso,
+      issueNumber: ctx.currentIssue?.number ?? null,
+      repo: ctx.currentIssue?.repo ?? null,
+      outcome:
+        ctx.trigger === 'pre-compaction'
+          ? 'Emergency flush before context compaction'
+          : 'Emergency flush between tasks',
+      durationMin: null,
+      salience,
+      body: bodyLines.join('\n'),
+    }
   }
 }

@@ -196,7 +196,7 @@ export class SkillDistiller {
         maxTurns: 1,
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
-        ...(this.model ? { model: this.model } : {}),
+        model: 'claude-opus-4-6',
       },
     })
 

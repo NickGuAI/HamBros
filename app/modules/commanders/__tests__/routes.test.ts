@@ -1,24 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import express from 'express'
 import { createServer, type Server } from 'node:http'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { WebSocket } from 'ws'
 import type { ApiKeyStoreLike } from '../../../server/api-keys/store'
-import { CommanderCronManager, type CronScheduler } from '../cron-manager.js'
-import { CommanderCronTaskStore } from '../cron-store.js'
 import { createCommandersRouter, type CommandersRouterOptions } from '../routes'
+import type { CommanderSessionsInterface } from '../../agents/routes'
+import { CommanderSessionStore } from '../store'
+import { JournalWriter } from '../memory/journal'
 import {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   DEFAULT_HEARTBEAT_MESSAGE,
 } from '../heartbeat'
+import { THIN_HEARTBEAT_PROMPT } from '../choose-heartbeat-mode'
 
 const AUTH_HEADERS = {
   'x-hammurabi-api-key': 'test-key',
 }
-
-const NEXT_RUN_ISO = '2026-03-02T02:00:00.000Z'
+const PRE_COMPACTION_OUTCOME = 'Emergency flush before context compaction'
 
 interface RunningServer {
   baseUrl: string
@@ -26,32 +26,27 @@ interface RunningServer {
   close: () => Promise<void>
 }
 
-interface QueuedQueryCall {
-  prompt: string
-  options?: Record<string, unknown>
+interface MockSessionEntry {
+  name: string
+  systemPrompt: string
+  agentType: 'claude' | 'codex'
+  cwd?: string
+  resumeSessionId?: string
+  resumeCodexThreadId?: string
+  maxTurns?: number
 }
 
-interface MockClaudeQuery {
-  query: NonNullable<CommandersRouterOptions['queryFn']>
-  calls: QueuedQueryCall[]
-  enqueue: (events: unknown[]) => void
-}
-
-interface CronRunningServer {
-  baseUrl: string
-  close: () => Promise<void>
-}
-
-interface MockJob {
-  stop: ReturnType<typeof vi.fn>
-  destroy: ReturnType<typeof vi.fn>
-  getNextRun: ReturnType<typeof vi.fn>
-}
-
-interface ScheduledRegistration {
-  expression: string
-  task: () => Promise<void> | void
-  job: MockJob
+interface MockSessionsInterface {
+  interface: CommanderSessionsInterface
+  createCalls: MockSessionEntry[]
+  sendCalls: Array<{ name: string; text: string }>
+  activeSessions: Set<string>
+  triggerEvent: (sessionName: string, event: unknown) => void
+  setUsage: (usage: {
+    inputTokens?: number
+    outputTokens?: number
+    costUsd?: number
+  }) => void
 }
 
 const tempDirs: string[] = []
@@ -89,53 +84,93 @@ function createTestApiKeyStore(): ApiKeyStoreLike {
   }
 }
 
-function createMockClaudeQuery(): MockClaudeQuery {
-  const queue: unknown[][] = []
-  const calls: QueuedQueryCall[] = []
-  const query = vi.fn((input: { prompt: string; options?: Record<string, unknown> }) => {
-    calls.push({ prompt: input.prompt, options: input.options })
-    const events = queue.shift() ?? []
-    return (async function* () {
-      for (const event of events) {
-        yield event
-      }
-    })()
-  })
+function createMockSessionsInterface(opts: {
+  /** Cost that getSession() reports for each active session's usage.costUsd */
+  sessionCostUsd?: number
+  /** input token count that getSession() reports */
+  sessionInputTokens?: number
+  /** output token count that getSession() reports */
+  sessionOutputTokens?: number
+  /** claudeSessionId that getSession() reports for each active session */
+  sessionClaudeSessionId?: string
+  /** codexThreadId that getSession() reports for each active session */
+  sessionCodexThreadId?: string
+  /** sessions that should be treated as already active (e.g. reconciled after restart) */
+  initialActiveSessions?: string[]
+} = {}): MockSessionsInterface {
+  const createCalls: MockSessionEntry[] = []
+  const sendCalls: Array<{ name: string; text: string }> = []
+  const activeSessions = new Set<string>(opts.initialActiveSessions ?? [])
+  const agentTypeBySessionName = new Map<string, 'claude' | 'codex'>(
+    (opts.initialActiveSessions ?? []).map((sessionName) => [sessionName, 'claude']),
+  )
+  const eventHandlers = new Map<string, Set<(event: unknown) => void>>()
+  const usage = {
+    inputTokens: opts.sessionInputTokens ?? 0,
+    outputTokens: opts.sessionOutputTokens ?? 0,
+    costUsd: opts.sessionCostUsd ?? 0,
+  }
 
-  return {
-    query,
-    calls,
-    enqueue: (events: unknown[]) => {
-      queue.push(events)
+  const mock: CommanderSessionsInterface = {
+    async createCommanderSession(params) {
+      createCalls.push(params)
+      activeSessions.add(params.name)
+      agentTypeBySessionName.set(params.name, params.agentType)
+      // Return a minimal fake StreamSession (interface uses opaque return type)
+      return { kind: 'stream', name: params.name } as unknown as Awaited<ReturnType<
+        CommanderSessionsInterface['createCommanderSession']
+      >>
+    },
+    async sendToSession(name, text) {
+      sendCalls.push({ name, text })
+      return activeSessions.has(name)
+    },
+    deleteSession(name) {
+      activeSessions.delete(name)
+      agentTypeBySessionName.delete(name)
+    },
+    getSession(name) {
+      if (!activeSessions.has(name)) return undefined
+      const agentType = agentTypeBySessionName.get(name) ?? 'claude'
+      return {
+        kind: 'stream',
+        name,
+        agentType,
+        claudeSessionId: agentType === 'claude' ? opts.sessionClaudeSessionId : undefined,
+        codexThreadId: agentType === 'codex' ? opts.sessionCodexThreadId : undefined,
+        usage: { ...usage },
+      } as unknown as ReturnType<CommanderSessionsInterface['getSession']>
+    },
+    subscribeToEvents(name, handler) {
+      if (!eventHandlers.has(name)) eventHandlers.set(name, new Set())
+      eventHandlers.get(name)!.add(handler as (event: unknown) => void)
+      return () => {
+        eventHandlers.get(name)?.delete(handler as (event: unknown) => void)
+      }
     },
   }
-}
-
-function createMockScheduler(): {
-  scheduler: CronScheduler
-  scheduled: ScheduledRegistration[]
-} {
-  const scheduled: ScheduledRegistration[] = []
-  const scheduler: CronScheduler = {
-    validate: vi.fn((expression: string) => expression !== 'invalid cron'),
-    schedule: vi.fn((expression, task) => {
-      const job: MockJob = {
-        stop: vi.fn(),
-        destroy: vi.fn(),
-        getNextRun: vi.fn(() => new Date(NEXT_RUN_ISO)),
-      }
-      scheduled.push({
-        expression,
-        task,
-        job,
-      })
-      return job
-    }),
-  }
 
   return {
-    scheduler,
-    scheduled,
+    interface: mock,
+    createCalls,
+    sendCalls,
+    activeSessions,
+    triggerEvent(sessionName, event) {
+      for (const handler of eventHandlers.get(sessionName) ?? []) {
+        handler(event)
+      }
+    },
+    setUsage(nextUsage) {
+      if (typeof nextUsage.inputTokens === 'number' && Number.isFinite(nextUsage.inputTokens)) {
+        usage.inputTokens = nextUsage.inputTokens
+      }
+      if (typeof nextUsage.outputTokens === 'number' && Number.isFinite(nextUsage.outputTokens)) {
+        usage.outputTokens = nextUsage.outputTokens
+      }
+      if (typeof nextUsage.costUsd === 'number' && Number.isFinite(nextUsage.costUsd)) {
+        usage.costUsd = nextUsage.costUsd
+      }
+    },
   }
 }
 
@@ -152,13 +187,6 @@ async function startServer(
   app.use('/api/commanders', commanders.router)
 
   const httpServer = createServer(app)
-  httpServer.on('upgrade', (req, socket, head) => {
-    if (req.url?.startsWith('/api/commanders/')) {
-      commanders.handleUpgrade(req, socket, head)
-      return
-    }
-    socket.destroy()
-  })
 
   await new Promise<void>((resolve) => {
     httpServer.listen(0, () => resolve())
@@ -189,43 +217,6 @@ async function startServer(
   }
 }
 
-async function startCronServer(options: {
-  store: CommanderCronTaskStore
-  manager: CommanderCronManager
-}): Promise<CronRunningServer> {
-  const app = express()
-  app.use(express.json())
-  const { router } = createCommandersRouter({
-    cronManager: options.manager,
-    apiKeyStore: createTestApiKeyStore(),
-  })
-  app.use('/api/commanders', router)
-
-  const server = await new Promise<ReturnType<typeof app.listen>>((resolve) => {
-    const listener = app.listen(0, () => resolve(listener))
-  })
-
-  const address = server.address()
-  if (!address || typeof address === 'string') {
-    throw new Error('Unable to resolve test server address')
-  }
-
-  return {
-    baseUrl: `http://127.0.0.1:${address.port}`,
-    close: async () => {
-      await new Promise<void>((resolve, reject) => {
-        server.close((error) => {
-          if (error) {
-            reject(error)
-            return
-          }
-          resolve()
-        })
-      })
-    },
-  }
-}
-
 async function createTempDir(prefix: string): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), prefix))
   tempDirs.push(dir)
@@ -238,92 +229,15 @@ async function sleep(ms: number): Promise<void> {
   })
 }
 
-async function connectWs(baseUrl: string, commanderId: string, apiKey = 'test-key'): Promise<WebSocket> {
-  const wsUrl = baseUrl.replace('http://', 'ws://') +
-    `/api/commanders/${encodeURIComponent(commanderId)}/ws?api_key=${apiKey}`
-  const ws = new WebSocket(wsUrl)
-  return await new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      cleanup()
-      reject(new Error('Timed out opening commander websocket'))
-    }, 3_000)
-
-    const cleanup = () => {
-      clearTimeout(timeout)
-      ws.off('open', onOpen)
-      ws.off('error', onError)
-      ws.off('unexpected-response', onUnexpectedResponse)
-    }
-
-    const onOpen = () => {
-      cleanup()
-      resolve(ws)
-    }
-
-    const onError = (error: Error) => {
-      cleanup()
-      reject(error)
-    }
-
-    const onUnexpectedResponse = (_req: unknown, res: { statusCode?: number }) => {
-      cleanup()
-      reject(new Error(`WebSocket upgrade rejected with status ${res.statusCode}`))
-    }
-
-    ws.on('open', onOpen)
-    ws.on('error', onError)
-    ws.on('unexpected-response', (_req, res) => {
-      onUnexpectedResponse(_req, res)
-    })
-  })
-}
-
-function waitForWsJson(
-  ws: WebSocket,
-  predicate: (payload: Record<string, unknown>) => boolean,
-): Promise<Record<string, unknown>> {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      cleanup()
-      reject(new Error('Timed out waiting for WebSocket message'))
-    }, 3_000)
-
-    const onMessage = (raw: WebSocket.RawData) => {
-      let parsed: Record<string, unknown>
-      try {
-        parsed = JSON.parse(raw.toString()) as Record<string, unknown>
-      } catch {
-        return
-      }
-
-      if (!predicate(parsed)) {
-        return
-      }
-
-      cleanup()
-      resolve(parsed)
-    }
-
-    const onError = (error: Error) => {
-      cleanup()
-      reject(error)
-    }
-
-    const cleanup = () => {
-      clearTimeout(timeout)
-      ws.off('message', onMessage)
-      ws.off('error', onError)
-    }
-
-    ws.on('message', onMessage)
-    ws.on('error', onError)
-  })
-}
-
 afterEach(async () => {
   vi.clearAllMocks()
+  // Small drain to allow any in-flight async heartbeat log writes to complete
+  // before deleting temp directories, preventing ENOTEMPTY race conditions.
+  await sleep(20)
   await Promise.all(
-    tempDirs.splice(0).map((directory) => rm(directory, { recursive: true, force: true })),
+    tempDirs.splice(0).map((directory) =>
+      rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }),
+    ),
   )
 })
 
@@ -439,6 +353,9 @@ describe('commanders routes', () => {
 
       const persisted = JSON.parse(await readFile(storePath, 'utf8')) as { sessions: unknown[] }
       expect(persisted.sessions).toHaveLength(1)
+
+      const names = JSON.parse(await readFile(join(dir, 'names.json'), 'utf8')) as Record<string, string>
+      expect(names[created.id]).toBe('worker-1')
     } finally {
       await server.close()
     }
@@ -447,10 +364,10 @@ describe('commanders routes', () => {
   it('updates heartbeat config without starting commander runtime', async () => {
     const dir = await createTempDir('hammurabi-commanders-heartbeat-config-')
     const storePath = join(dir, 'sessions.json')
-    const mockQuery = createMockClaudeQuery()
+    const mock = createMockSessionsInterface()
     const server = await startServer({
       sessionStorePath: storePath,
-      queryFn: mockQuery.query,
+      sessionsInterface: mock.interface,
     })
 
     try {
@@ -494,7 +411,8 @@ describe('commanders routes', () => {
       })
 
       await sleep(60)
-      expect(mockQuery.calls).toHaveLength(0)
+      // No start was called, so no session sends should have occurred
+      expect(mock.sendCalls).toHaveLength(0)
     } finally {
       await server.close()
     }
@@ -504,14 +422,12 @@ describe('commanders routes', () => {
     const dir = await createTempDir('hammurabi-commanders-heartbeat-loop-')
     const storePath = join(dir, 'sessions.json')
     const memoryBasePath = join(dir, 'memory')
-    const mockQuery = createMockClaudeQuery()
-    mockQuery.enqueue([{ type: 'system', subtype: 'init', session_id: 'claude-cmdr-heartbeat' }])
-    mockQuery.enqueue([{ type: 'assistant', message: { content: [{ type: 'text', text: 'heartbeat' }] } }])
+    const mock = createMockSessionsInterface()
 
     const server = await startServer({
       sessionStorePath: storePath,
       memoryBasePath,
-      queryFn: mockQuery.query,
+      sessionsInterface: mock.interface,
     })
 
     try {
@@ -553,10 +469,11 @@ describe('commanders routes', () => {
       })
       expect(startResponse.status).toBe(200)
 
+      // Wait for at least a startup send + one heartbeat send
       await vi.waitFor(() => {
-        expect(mockQuery.calls.length).toBeGreaterThanOrEqual(2)
+        expect(mock.sendCalls.length).toBeGreaterThanOrEqual(2)
       })
-      expect(mockQuery.calls.some((call) => call.prompt.includes('[HEARTBEAT QUICK '))).toBe(true)
+      expect(mock.sendCalls.some((call) => call.text.includes('[HEARTBEAT QUICK '))).toBe(true)
 
       const listResponse = await fetch(`${server.baseUrl}/api/commanders`, {
         headers: AUTH_HEADERS,
@@ -588,9 +505,111 @@ describe('commanders routes', () => {
       expect(stopResponse.status).toBe(200)
 
       await sleep(40)
-      const callsAfterStopSettled = mockQuery.calls.length
+      const sendsAfterStopSettled = mock.sendCalls.length
       await sleep(80)
-      expect(mockQuery.calls.length).toBe(callsAfterStopSettled)
+      expect(mock.sendCalls.length).toBe(sendsAfterStopSettled)
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('writes a heartbeat error entry when commander is not running when heartbeat fires', async () => {
+    const dir = await createTempDir('hammurabi-commanders-heartbeat-stop-log-')
+    const storePath = join(dir, 'sessions.json')
+    const memoryBasePath = join(dir, 'memory')
+    const sessionStore = new CommanderSessionStore(storePath)
+    const mock = createMockSessionsInterface()
+
+    const server = await startServer({
+      sessionStore,
+      memoryBasePath,
+      sessionsInterface: mock.interface,
+    })
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          host: 'worker-heartbeat-stop-log',
+          taskSource: { owner: 'example-user', repo: 'example-repo', label: 'commander' },
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+      const created = (await createResponse.json()) as { id: string }
+
+      const patchResponse = await fetch(
+        `${server.baseUrl}/api/commanders/${created.id}/heartbeat`,
+        {
+          method: 'PATCH',
+          headers: {
+            ...AUTH_HEADERS,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            intervalMs: 10,
+            messageTemplate: '[HEARTBEAT QUICK {{timestamp}}]',
+          }),
+        },
+      )
+      expect(patchResponse.status).toBe(200)
+
+      const startResponse = await fetch(`${server.baseUrl}/api/commanders/${created.id}/start`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+      })
+      expect(startResponse.status).toBe(200)
+
+      // Wait for at least one send (startup prompt) confirming commander is running
+      await vi.waitFor(() => {
+        expect(mock.sendCalls.length).toBeGreaterThanOrEqual(1)
+      })
+
+      // Simulate the commander's session being stopped externally (state → stopped)
+      const sessions = await sessionStore.list()
+      const session = sessions[0]
+      if (session) {
+        await sessionStore.update(session.id, (current) => ({
+          ...current,
+          state: 'stopped',
+          pid: null,
+          currentTask: null,
+        }))
+      }
+
+      // Wait for the heartbeat log to record an error after detecting non-running state
+      await vi.waitFor(async () => {
+        const heartbeatLogResponse = await fetch(
+          `${server.baseUrl}/api/commanders/${created.id}/heartbeat-log`,
+          { headers: AUTH_HEADERS },
+        )
+        const payload = (await heartbeatLogResponse.json()) as {
+          entries: Array<{ outcome: string; errorMessage?: string }>
+        }
+        expect(payload.entries.some((entry) => entry.outcome === 'error')).toBe(true)
+      }, { timeout: 2000 })
+
+      const heartbeatLogResponse = await fetch(
+        `${server.baseUrl}/api/commanders/${created.id}/heartbeat-log`,
+        { headers: AUTH_HEADERS },
+      )
+      expect(heartbeatLogResponse.status).toBe(200)
+      const payload = (await heartbeatLogResponse.json()) as {
+        entries: Array<{
+          outcome: string
+          errorMessage?: string
+        }>
+      }
+
+      expect(payload.entries.some((entry) =>
+        entry.outcome === 'error' &&
+        entry.errorMessage === 'Commander session was not running when heartbeat fired')).toBe(true)
     } finally {
       await server.close()
     }
@@ -600,13 +619,12 @@ describe('commanders routes', () => {
     const dir = await createTempDir('hammurabi-commanders-heartbeat-live-patch-')
     const storePath = join(dir, 'sessions.json')
     const memoryBasePath = join(dir, 'memory')
-    const mockQuery = createMockClaudeQuery()
-    mockQuery.enqueue([{ type: 'system', subtype: 'init', session_id: 'claude-cmdr-heartbeat-live' }])
+    const mock = createMockSessionsInterface()
 
     const server = await startServer({
       sessionStorePath: storePath,
       memoryBasePath,
-      queryFn: mockQuery.query,
+      sessionsInterface: mock.interface,
     })
 
     try {
@@ -649,7 +667,7 @@ describe('commanders routes', () => {
       expect(patchFirst.status).toBe(200)
 
       await vi.waitFor(() => {
-        expect(mockQuery.calls.some((call) => call.prompt.includes('[HB1 '))).toBe(true)
+        expect(mock.sendCalls.some((call) => call.text.includes('[HB1 '))).toBe(true)
       })
 
       const patchSecond = await fetch(
@@ -668,7 +686,7 @@ describe('commanders routes', () => {
       expect(patchSecond.status).toBe(200)
 
       await vi.waitFor(() => {
-        expect(mockQuery.calls.some((call) => call.prompt.includes('[HB2 '))).toBe(true)
+        expect(mock.sendCalls.some((call) => call.text.includes('[HB2 '))).toBe(true)
       })
 
       const stopResponse = await fetch(`${server.baseUrl}/api/commanders/${created.id}/stop`, {
@@ -684,20 +702,16 @@ describe('commanders routes', () => {
     }
   })
 
-  it('starts and stops commander lifecycle with SDK query', async () => {
+  it('starts and stops commander lifecycle with sessionsInterface', async () => {
     const dir = await createTempDir('hammurabi-commanders-lifecycle-')
     const storePath = join(dir, 'sessions.json')
     const memoryBasePath = join(dir, 'memory')
-    const mockQuery = createMockClaudeQuery()
-    mockQuery.enqueue([
-      { type: 'system', subtype: 'init', session_id: 'claude-cmdr-1' },
-      { type: 'result', total_cost_usd: 1.25 },
-    ])
+    const mock = createMockSessionsInterface()
 
     const server = await startServer({
       sessionStorePath: storePath,
       memoryBasePath,
-      queryFn: mockQuery.query,
+      sessionsInterface: mock.interface,
     })
 
     try {
@@ -728,24 +742,27 @@ describe('commanders routes', () => {
         started: true,
       })
 
+      // createCommanderSession should be called once with the system prompt
       await vi.waitFor(() => {
-        expect(mockQuery.calls).toHaveLength(1)
+        expect(mock.createCalls).toHaveLength(1)
       })
-      expect(mockQuery.calls[0]?.options?.systemPrompt).toEqual(expect.stringContaining('## Commander Memory'))
+      expect(mock.createCalls[0]?.systemPrompt).toEqual(
+        expect.stringContaining('## Commander Memory'),
+      )
+      // Session name should match commander id pattern
+      expect(mock.createCalls[0]?.name).toBe(`commander-${created.id}`)
+      expect(mock.createCalls[0]?.agentType).toBe('claude')
 
-      await vi.waitFor(async () => {
-        const listResponse = await fetch(`${server.baseUrl}/api/commanders`, {
-          headers: AUTH_HEADERS,
-        })
-        const sessions = (await listResponse.json()) as Array<{
-          id: string
-          state: string
-          totalCostUsd: number
-        }>
-        const started = sessions.find((entry) => entry.id === created.id)
-        expect(started?.state).toBe('running')
-        expect(started?.totalCostUsd).toBe(1.25)
+      // State should be running
+      const listResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+        headers: AUTH_HEADERS,
       })
+      const sessions = (await listResponse.json()) as Array<{
+        id: string
+        state: string
+      }>
+      const started = sessions.find((entry) => entry.id === created.id)
+      expect(started?.state).toBe('running')
 
       const stopResponse = await fetch(`${server.baseUrl}/api/commanders/${created.id}/stop`, {
         method: 'POST',
@@ -769,18 +786,741 @@ describe('commanders routes', () => {
     }
   })
 
-  it('sends message to running commander', async () => {
-    const dir = await createTempDir('hammurabi-commanders-message-')
+  it('uses per-commander COMMANDER.md as authoritative with workspace fallback', async () => {
+    const dir = await createTempDir('hammurabi-commanders-workflow-source-')
     const storePath = join(dir, 'sessions.json')
     const memoryBasePath = join(dir, 'memory')
-    const mockQuery = createMockClaudeQuery()
-    mockQuery.enqueue([{ type: 'system', subtype: 'init', session_id: 'claude-cmdr-msg' }])
-    mockQuery.enqueue([{ type: 'assistant', message: { content: [{ type: 'text', text: 'Working' }] } }])
+    const workspaceDir = join(dir, 'workspace')
+    await mkdir(workspaceDir, { recursive: true })
+    await writeFile(
+      join(workspaceDir, 'COMMANDER.md'),
+      [
+        '---',
+        'maxTurns: 3',
+        '---',
+        'WORKSPACE PROMPT SOURCE',
+      ].join('\n'),
+      'utf8',
+    )
+    const mock = createMockSessionsInterface()
 
     const server = await startServer({
       sessionStorePath: storePath,
       memoryBasePath,
-      queryFn: mockQuery.query,
+      sessionsInterface: mock.interface,
+    })
+
+    try {
+      const firstCreate = await fetch(`${server.baseUrl}/api/commanders`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          host: 'worker-workflow-fallback',
+          cwd: workspaceDir,
+          taskSource: { owner: 'example-user', repo: 'example-repo', label: 'commander' },
+        }),
+      })
+      const firstCommander = (await firstCreate.json()) as { id: string }
+      const firstStart = await fetch(
+        `${server.baseUrl}/api/commanders/${firstCommander.id}/start`,
+        {
+          method: 'POST',
+          headers: {
+            ...AUTH_HEADERS,
+            'content-type': 'application/json',
+          },
+        },
+      )
+      expect(firstStart.status).toBe(200)
+
+      await vi.waitFor(() => {
+        expect(mock.createCalls).toHaveLength(1)
+      })
+      expect(mock.createCalls[0]?.systemPrompt).toContain('WORKSPACE PROMPT SOURCE')
+      expect(mock.createCalls[0]?.maxTurns).toBe(3)
+
+      const secondCreate = await fetch(`${server.baseUrl}/api/commanders`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          host: 'worker-workflow-authoritative',
+          cwd: workspaceDir,
+          taskSource: { owner: 'example-user', repo: 'example-repo', label: 'commander' },
+        }),
+      })
+      const secondCommander = (await secondCreate.json()) as { id: string }
+      const commanderRoot = join(memoryBasePath, secondCommander.id)
+      await mkdir(commanderRoot, { recursive: true })
+      await writeFile(
+        join(commanderRoot, 'COMMANDER.md'),
+        [
+          '---',
+          'maxTurns: 7',
+          '---',
+          'COMMANDER-DIR PROMPT SOURCE',
+        ].join('\n'),
+        'utf8',
+      )
+
+      const secondStart = await fetch(
+        `${server.baseUrl}/api/commanders/${secondCommander.id}/start`,
+        {
+          method: 'POST',
+          headers: {
+            ...AUTH_HEADERS,
+            'content-type': 'application/json',
+          },
+        },
+      )
+      expect(secondStart.status).toBe(200)
+
+      await vi.waitFor(() => {
+        expect(mock.createCalls).toHaveLength(2)
+      })
+      expect(mock.createCalls[1]?.systemPrompt).toContain('COMMANDER-DIR PROMPT SOURCE')
+      expect(mock.createCalls[1]?.systemPrompt).not.toContain('WORKSPACE PROMPT SOURCE')
+      expect(mock.createCalls[1]?.maxTurns).toBe(7)
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('reloads authoritative COMMANDER.md before fat heartbeats', async () => {
+    const dir = await createTempDir('hammurabi-commanders-workflow-heartbeat-reload-')
+    const storePath = join(dir, 'sessions.json')
+    const memoryBasePath = join(dir, 'memory')
+    const mock = createMockSessionsInterface()
+
+    const server = await startServer({
+      sessionStorePath: storePath,
+      memoryBasePath,
+      sessionsInterface: mock.interface,
+    })
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          host: 'worker-workflow-reload',
+          taskSource: { owner: 'example-user', repo: 'example-repo', label: 'commander' },
+        }),
+      })
+      const commander = (await createResponse.json()) as { id: string }
+      const commanderRoot = join(memoryBasePath, commander.id)
+      await mkdir(commanderRoot, { recursive: true })
+      await writeFile(
+        join(commanderRoot, 'COMMANDER.md'),
+        'COMMANDER PROMPT V1',
+        'utf8',
+      )
+
+      const startResponse = await fetch(`${server.baseUrl}/api/commanders/${commander.id}/start`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+      })
+      expect(startResponse.status).toBe(200)
+
+      await writeFile(
+        join(commanderRoot, 'COMMANDER.md'),
+        'COMMANDER PROMPT V2',
+        'utf8',
+      )
+
+      const heartbeatResponse = await fetch(
+        `${server.baseUrl}/api/commanders/${commander.id}/heartbeat`,
+        {
+          method: 'POST',
+          headers: {
+            ...AUTH_HEADERS,
+            'content-type': 'application/json',
+          },
+        },
+      )
+      expect(heartbeatResponse.status).toBe(200)
+
+      await vi.waitFor(() => {
+        expect(mock.sendCalls.length).toBeGreaterThanOrEqual(2)
+      })
+      const lastSend = mock.sendCalls[mock.sendCalls.length - 1]
+      expect(lastSend?.text).toContain('COMMANDER PROMPT V2')
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('rehydrates heartbeat prompt after restart reconciliation without runtime state', async () => {
+    const dir = await createTempDir('hammurabi-commanders-restart-rehydrate-')
+    const storePath = join(dir, 'sessions.json')
+    const memoryBasePath = join(dir, 'memory')
+    const agentsSessionStorePath = join(dir, 'agents-sessions.json')
+    const commanderId = 'cmdr-rehydrate'
+    const commanderSessionName = `commander-${commanderId}`
+
+    await writeFile(
+      storePath,
+      JSON.stringify({
+        sessions: [
+          {
+            id: commanderId,
+            host: 'worker-rehydrate',
+            pid: null,
+            state: 'running',
+            created: '2026-03-01T00:00:00.000Z',
+            heartbeat: {
+              intervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
+              messageTemplate: DEFAULT_HEARTBEAT_MESSAGE,
+              lastSentAt: null,
+            },
+            lastHeartbeat: null,
+            taskSource: { owner: 'example-user', repo: 'example-repo', label: 'commander' },
+            currentTask: null,
+            completedTasks: 0,
+            totalCostUsd: 0,
+          },
+        ],
+      }),
+      'utf8',
+    )
+    await writeFile(
+      agentsSessionStorePath,
+      JSON.stringify({
+        sessions: [
+          { name: commanderSessionName },
+        ],
+      }),
+      'utf8',
+    )
+    const commanderRoot = join(memoryBasePath, commanderId)
+    await mkdir(commanderRoot, { recursive: true })
+    await writeFile(
+      join(commanderRoot, 'COMMANDER.md'),
+      'RESTART REHYDRATED PROMPT',
+      'utf8',
+    )
+
+    const mock = createMockSessionsInterface({
+      initialActiveSessions: [commanderSessionName],
+    })
+
+    const server = await startServer({
+      sessionStorePath: storePath,
+      memoryBasePath,
+      sessionsInterface: mock.interface,
+      agentsSessionStorePath,
+    })
+
+    try {
+      await vi.waitFor(async () => {
+        const heartbeatResponse = await fetch(
+          `${server.baseUrl}/api/commanders/${commanderId}/heartbeat`,
+          {
+            method: 'POST',
+            headers: {
+              ...AUTH_HEADERS,
+              'content-type': 'application/json',
+            },
+          },
+        )
+        expect(heartbeatResponse.status).toBe(200)
+      }, { timeout: 3000 })
+
+      await vi.waitFor(() => {
+        expect(
+          mock.sendCalls.some((call) =>
+            call.text.includes('RESTART REHYDRATED PROMPT') &&
+            call.text.includes('## Commander Memory')),
+        ).toBe(true)
+      })
+      expect(mock.createCalls).toHaveLength(0)
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('preserves thin heartbeat cadence after restart reconciliation without runtime state', async () => {
+    const dir = await createTempDir('hammurabi-commanders-restart-thin-cadence-')
+    const storePath = join(dir, 'sessions.json')
+    const memoryBasePath = join(dir, 'memory')
+    const agentsSessionStorePath = join(dir, 'agents-sessions.json')
+    const commanderId = 'cmdr-thin-rehydrate'
+    const commanderSessionName = `commander-${commanderId}`
+
+    await writeFile(
+      storePath,
+      JSON.stringify({
+        sessions: [
+          {
+            id: commanderId,
+            host: 'worker-thin-rehydrate',
+            pid: null,
+            state: 'running',
+            created: '2026-03-01T00:00:00.000Z',
+            heartbeat: {
+              intervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
+              messageTemplate: DEFAULT_HEARTBEAT_MESSAGE,
+              lastSentAt: '2026-03-01T00:05:00.000Z',
+            },
+            lastHeartbeat: '2026-03-01T00:05:00.000Z',
+            heartbeatTickCount: 1,
+            contextConfig: {
+              fatPinInterval: 4,
+            },
+            taskSource: { owner: 'example-user', repo: 'example-repo', label: 'commander' },
+            currentTask: null,
+            completedTasks: 0,
+            totalCostUsd: 0,
+          },
+        ],
+      }),
+      'utf8',
+    )
+    await writeFile(
+      agentsSessionStorePath,
+      JSON.stringify({
+        sessions: [
+          { name: commanderSessionName },
+        ],
+      }),
+      'utf8',
+    )
+
+    const mock = createMockSessionsInterface({
+      initialActiveSessions: [commanderSessionName],
+    })
+
+    const server = await startServer({
+      sessionStorePath: storePath,
+      memoryBasePath,
+      sessionsInterface: mock.interface,
+      agentsSessionStorePath,
+    })
+
+    try {
+      await vi.waitFor(async () => {
+        const heartbeatResponse = await fetch(
+          `${server.baseUrl}/api/commanders/${commanderId}/heartbeat`,
+          {
+            method: 'POST',
+            headers: {
+              ...AUTH_HEADERS,
+              'content-type': 'application/json',
+            },
+          },
+        )
+        expect(heartbeatResponse.status).toBe(200)
+      }, { timeout: 3000 })
+
+      await vi.waitFor(() => {
+        expect(mock.sendCalls.some((call) => call.text === THIN_HEARTBEAT_PROMPT)).toBe(true)
+      })
+
+      await vi.waitFor(async () => {
+        const persisted = JSON.parse(await readFile(storePath, 'utf8')) as {
+          sessions?: Array<{ id?: string; heartbeatTickCount?: number }>
+        }
+        const updated = persisted.sessions?.find((session) => session.id === commanderId)
+        expect(updated?.heartbeatTickCount).toBe(2)
+      })
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('triggers pre-compaction flush from message_delta usage pressure events', async () => {
+    const dir = await createTempDir('hammurabi-commanders-message-delta-pressure-')
+    const storePath = join(dir, 'sessions.json')
+    const memoryBasePath = join(dir, 'memory')
+    const mock = createMockSessionsInterface()
+
+    const server = await startServer({
+      sessionStorePath: storePath,
+      memoryBasePath,
+      sessionsInterface: mock.interface,
+    })
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          host: 'worker-message-delta-pressure',
+          taskSource: { owner: 'example-user', repo: 'example-repo', label: 'commander' },
+        }),
+      })
+      const created = (await createResponse.json()) as { id: string }
+
+      const startResponse = await fetch(`${server.baseUrl}/api/commanders/${created.id}/start`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+      })
+      expect(startResponse.status).toBe(200)
+
+      const journal = new JournalWriter(created.id, memoryBasePath)
+      const sessionName = `commander-${created.id}`
+
+      mock.setUsage({ inputTokens: 1 })
+      mock.triggerEvent(sessionName, {
+        type: 'message_delta',
+        usage: { input_tokens: 1, output_tokens: 1 },
+      })
+
+      await sleep(50)
+      const beforeThreshold = await journal.readRecent()
+      expect(
+        beforeThreshold.some((entry) => entry.outcome === PRE_COMPACTION_OUTCOME),
+      ).toBe(false)
+
+      mock.setUsage({ inputTokens: 900_000 })
+      mock.triggerEvent(sessionName, {
+        type: 'message_delta',
+        usage: { input_tokens: 900_000, output_tokens: 900_000 },
+      })
+
+      await vi.waitFor(async () => {
+        const entries = await journal.readRecent()
+        expect(
+          entries.some((entry) =>
+            entry.outcome === PRE_COMPACTION_OUTCOME &&
+            entry.body.includes('- Trigger: `pre-compaction`')),
+        ).toBe(true)
+      }, { timeout: 3000 })
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('triggers pre-compaction flush from result usage pressure events', async () => {
+    const dir = await createTempDir('hammurabi-commanders-result-pressure-')
+    const storePath = join(dir, 'sessions.json')
+    const memoryBasePath = join(dir, 'memory')
+    const mock = createMockSessionsInterface()
+
+    const server = await startServer({
+      sessionStorePath: storePath,
+      memoryBasePath,
+      sessionsInterface: mock.interface,
+    })
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          host: 'worker-result-pressure',
+          taskSource: { owner: 'example-user', repo: 'example-repo', label: 'commander' },
+        }),
+      })
+      const created = (await createResponse.json()) as { id: string }
+
+      const startResponse = await fetch(`${server.baseUrl}/api/commanders/${created.id}/start`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+      })
+      expect(startResponse.status).toBe(200)
+
+      const journal = new JournalWriter(created.id, memoryBasePath)
+      const sessionName = `commander-${created.id}`
+
+      mock.setUsage({ inputTokens: 1_200_000 })
+      mock.triggerEvent(sessionName, {
+        type: 'result',
+        usage: { input_tokens: 1_200_000, output_tokens: 1_100_000 },
+        total_cost_usd: 0.25,
+      })
+
+      await vi.waitFor(async () => {
+        const entries = await journal.readRecent()
+        expect(
+          entries.some((entry) =>
+            entry.outcome === PRE_COMPACTION_OUTCOME &&
+            entry.body.includes('- Trigger: `pre-compaction`')),
+        ).toBe(true)
+      }, { timeout: 3000 })
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('persists cwd when creating a commander with cwd in request body', async () => {
+    const dir = await createTempDir('hammurabi-commanders-cwd-create-')
+    const storePath = join(dir, 'sessions.json')
+    const server = await startServer({ sessionStorePath: storePath })
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          host: 'worker-cwd',
+          taskSource: { owner: 'example-user', repo: 'example-repo', label: 'commander' },
+          cwd: '/tmp/my-project',
+        }),
+      })
+
+      expect(createResponse.status).toBe(201)
+      const created = (await createResponse.json()) as { id: string; cwd?: string }
+      expect(created.cwd).toBe('/tmp/my-project')
+
+      // Persisted in the store
+      const listResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+        headers: AUTH_HEADERS,
+      })
+      const sessions = (await listResponse.json()) as Array<{ id: string; cwd?: string }>
+      const found = sessions.find((s) => s.id === created.id)
+      expect(found?.cwd).toBe('/tmp/my-project')
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('accumulates totalCostUsd from agent session usage on stop', async () => {
+    const dir = await createTempDir('hammurabi-commanders-cost-stop-')
+    const storePath = join(dir, 'sessions.json')
+    const memoryBasePath = join(dir, 'memory')
+    // Mock reports 1.5 USD of session cost when getSession is called during stop
+    const mock = createMockSessionsInterface({
+      sessionCostUsd: 1.5,
+      sessionClaudeSessionId: 'claude-test-session-id',
+    })
+
+    const server = await startServer({
+      sessionStorePath: storePath,
+      memoryBasePath,
+      sessionsInterface: mock.interface,
+    })
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          host: 'worker-cost-stop',
+          taskSource: { owner: 'example-user', repo: 'example-repo', label: 'commander' },
+        }),
+      })
+      const created = (await createResponse.json()) as { id: string }
+
+      const startResponse = await fetch(`${server.baseUrl}/api/commanders/${created.id}/start`, {
+        method: 'POST',
+        headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+      })
+      expect(startResponse.status).toBe(200)
+
+      const stopResponse = await fetch(`${server.baseUrl}/api/commanders/${created.id}/stop`, {
+        method: 'POST',
+        headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+      })
+      expect(stopResponse.status).toBe(200)
+
+      // totalCostUsd should be accumulated from agentSession.usage.costUsd (1.5)
+      const listResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+        headers: AUTH_HEADERS,
+      })
+      const sessions = (await listResponse.json()) as Array<{
+        id: string
+        totalCostUsd: number
+        claudeSessionId?: string
+      }>
+      const stopped = sessions.find((s) => s.id === created.id)
+      expect(stopped?.totalCostUsd).toBe(1.5)
+      expect(stopped?.claudeSessionId).toBe('claude-test-session-id')
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('reuses persisted claude session id when restarting commander chat', async () => {
+    const dir = await createTempDir('hammurabi-commanders-claude-restart-')
+    const storePath = join(dir, 'sessions.json')
+    const memoryBasePath = join(dir, 'memory')
+    const mock = createMockSessionsInterface({
+      sessionClaudeSessionId: 'claude-resume-123',
+    })
+
+    const server = await startServer({
+      sessionStorePath: storePath,
+      memoryBasePath,
+      sessionsInterface: mock.interface,
+    })
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          host: 'worker-claude-restart',
+          taskSource: { owner: 'example-user', repo: 'example-repo', label: 'commander' },
+        }),
+      })
+      const created = (await createResponse.json()) as { id: string }
+
+      const firstStartResponse = await fetch(`${server.baseUrl}/api/commanders/${created.id}/start`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+      })
+      expect(firstStartResponse.status).toBe(200)
+
+      const stopResponse = await fetch(`${server.baseUrl}/api/commanders/${created.id}/stop`, {
+        method: 'POST',
+        headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+      })
+      expect(stopResponse.status).toBe(200)
+
+      const secondStartResponse = await fetch(`${server.baseUrl}/api/commanders/${created.id}/start`, {
+        method: 'POST',
+        headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+      })
+      expect(secondStartResponse.status).toBe(200)
+
+      expect(mock.createCalls).toHaveLength(2)
+      expect(mock.createCalls[0]?.agentType).toBe('claude')
+      expect(mock.createCalls[1]).toEqual(
+        expect.objectContaining({
+          agentType: 'claude',
+          resumeSessionId: 'claude-resume-123',
+        }),
+      )
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('reuses persisted codex thread id when restarting commander chat', async () => {
+    const dir = await createTempDir('hammurabi-commanders-codex-restart-')
+    const storePath = join(dir, 'sessions.json')
+    const memoryBasePath = join(dir, 'memory')
+    const mock = createMockSessionsInterface({
+      sessionCodexThreadId: 'codex-thread-123',
+    })
+
+    const server = await startServer({
+      sessionStorePath: storePath,
+      memoryBasePath,
+      sessionsInterface: mock.interface,
+    })
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          host: 'worker-codex-restart',
+          taskSource: { owner: 'example-user', repo: 'example-repo', label: 'commander' },
+        }),
+      })
+      const created = (await createResponse.json()) as { id: string }
+
+      const firstStartResponse = await fetch(`${server.baseUrl}/api/commanders/${created.id}/start`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ agentType: 'codex' }),
+      })
+      expect(firstStartResponse.status).toBe(200)
+      await vi.waitFor(() => {
+        expect(mock.createCalls).toHaveLength(1)
+        expect(mock.sendCalls.length).toBeGreaterThanOrEqual(1)
+      })
+      expect(mock.createCalls[0]).toEqual(
+        expect.objectContaining({
+          agentType: 'codex',
+          resumeSessionId: undefined,
+          resumeCodexThreadId: undefined,
+        }),
+      )
+      expect(mock.sendCalls[0]?.text).toBe(
+        'Commander runtime started. Acknowledge readiness and await instructions.',
+      )
+
+      const stopResponse = await fetch(`${server.baseUrl}/api/commanders/${created.id}/stop`, {
+        method: 'POST',
+        headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+      })
+      expect(stopResponse.status).toBe(200)
+
+      const listResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+        headers: AUTH_HEADERS,
+      })
+      const sessions = (await listResponse.json()) as Array<{
+        id: string
+        agentType?: 'claude' | 'codex'
+        codexThreadId?: string
+      }>
+      const stopped = sessions.find((session) => session.id === created.id)
+      expect(stopped?.agentType).toBe('codex')
+      expect(stopped?.codexThreadId).toBe('codex-thread-123')
+
+      const secondStartResponse = await fetch(`${server.baseUrl}/api/commanders/${created.id}/start`, {
+        method: 'POST',
+        headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+      })
+      expect(secondStartResponse.status).toBe(200)
+
+      expect(mock.createCalls).toHaveLength(2)
+      expect(mock.createCalls[0]?.agentType).toBe('codex')
+      expect(mock.createCalls[1]).toEqual(
+        expect.objectContaining({
+          agentType: 'codex',
+          resumeCodexThreadId: 'codex-thread-123',
+        }),
+      )
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('sends message to running commander', async () => {
+    const dir = await createTempDir('hammurabi-commanders-message-')
+    const storePath = join(dir, 'sessions.json')
+    const memoryBasePath = join(dir, 'memory')
+    const mock = createMockSessionsInterface()
+
+    const server = await startServer({
+      sessionStorePath: storePath,
+      memoryBasePath,
+      sessionsInterface: mock.interface,
     })
 
     try {
@@ -808,7 +1548,7 @@ describe('commanders routes', () => {
 
       const message = 'Please investigate issue #167'
 
-      const messageResponse = await fetch(`${server.baseUrl}/api/commanders/${created.id}/message`, {
+      const messageResponse = await fetch(`${server.baseUrl}/api/commanders/${created.id}/message?mode=followup`, {
         method: 'POST',
         headers: {
           ...AUTH_HEADERS,
@@ -822,10 +1562,32 @@ describe('commanders routes', () => {
       expect(messageResponse.status).toBe(200)
       expect(await messageResponse.json()).toEqual({ accepted: true })
 
+      // The message should appear in sendCalls (startup prompt + the explicit message)
       await vi.waitFor(() => {
-        expect(mockQuery.calls).toHaveLength(2)
+        expect(mock.sendCalls.some((call) => call.text === message)).toBe(true)
       })
-      expect(mockQuery.calls[1]?.prompt).toBe(message)
+
+      const journal = new JournalWriter(created.id, memoryBasePath)
+      await vi.waitFor(async () => {
+        const entries = await journal.readRecent()
+        expect(entries.some((entry) =>
+          entry.outcome === 'Commander instruction received' &&
+          entry.body.includes(message))).toBe(true)
+      })
+
+      const workingMemoryPath = join(
+        memoryBasePath,
+        created.id,
+        '.memory',
+        'working-memory.json',
+      )
+      const workingMemory = JSON.parse(await readFile(workingMemoryPath, 'utf-8')) as {
+        checkpoints?: Array<{ source?: string; summary?: string }>
+      }
+      const checkpoints = workingMemory.checkpoints ?? []
+      expect(
+        checkpoints.some((entry) => entry.source === 'message' && entry.summary?.includes(message)),
+      ).toBe(true)
     } finally {
       await server.close()
     }
@@ -982,40 +1744,176 @@ describe('commanders routes', () => {
     }
   })
 
-  it('streams live events over websocket', async () => {
-    const dir = await createTempDir('hammurabi-commanders-ws-')
-    const storePath = join(dir, 'sessions.json')
-    const memoryBasePath = join(dir, 'memory')
-    const mockQuery = createMockClaudeQuery()
-    mockQuery.enqueue([
-      { type: 'system', subtype: 'init', session_id: 'claude-cmdr-ws' },
-      { type: 'assistant', message: { content: [{ type: 'text', text: 'Session started' }] } },
-    ])
-    mockQuery.enqueue([
-      { type: 'assistant', message: { content: [{ type: 'text', text: 'Live reply' }] } },
-    ])
+  // NOTE: WebSocket live-event streaming is no longer tested here.
+  // The WS endpoint for commander sessions has moved to the agents router:
+  //   /api/agents/sessions/commander-{id}/ws
+  // End-to-end WS streaming is verified via agents router integration tests.
+  it.skip('streams live events over websocket', () => {
+    // Skipped: commander WS endpoint was removed as part of the stream-session migration.
+    // See apps/hammurabi/modules/agents/routes.ts for the agents WS handler.
+  })
 
-    const server = await startServer({
-      sessionStorePath: storePath,
-      memoryBasePath,
-      queryFn: mockQuery.query,
-    })
+  it('supports quest CRUD routes including note appends', async () => {
+    const dir = await createTempDir('hammurabi-commanders-quest-routes-')
+    const storePath = join(dir, 'sessions.json')
+    const server = await startServer({ sessionStorePath: storePath })
 
     try {
-      const createResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+      const createCommanderResponse = await fetch(`${server.baseUrl}/api/commanders`, {
         method: 'POST',
         headers: {
           ...AUTH_HEADERS,
           'content-type': 'application/json',
         },
         body: JSON.stringify({
-          host: 'worker-ws',
+          host: 'worker-quest-routes',
           taskSource: { owner: 'example-user', repo: 'example-repo', label: 'commander' },
         }),
       })
-      const created = (await createResponse.json()) as { id: string }
+      const commander = (await createCommanderResponse.json()) as { id: string }
 
-      const startResponse = await fetch(`${server.baseUrl}/api/commanders/${created.id}/start`, {
+      const createQuestResponse = await fetch(`${server.baseUrl}/api/commanders/${commander.id}/quests`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          source: 'manual',
+          instruction: 'Draft implementation plan',
+          contract: {
+            cwd: '/tmp/example-repo',
+            permissionMode: 'bypassPermissions',
+            agentType: 'claude',
+            skillsToUse: ['issue-finder'],
+          },
+        }),
+      })
+      expect(createQuestResponse.status).toBe(201)
+      const createdQuest = (await createQuestResponse.json()) as {
+        id: string
+        status: string
+      }
+      expect(createdQuest.status).toBe('pending')
+
+      const listResponse = await fetch(`${server.baseUrl}/api/commanders/${commander.id}/quests`, {
+        headers: AUTH_HEADERS,
+      })
+      expect(listResponse.status).toBe(200)
+      const listed = (await listResponse.json()) as Array<{ id: string }>
+      expect(listed).toHaveLength(1)
+      expect(listed[0]?.id).toBe(createdQuest.id)
+
+      const patchResponse = await fetch(
+        `${server.baseUrl}/api/commanders/${commander.id}/quests/${createdQuest.id}`,
+        {
+          method: 'PATCH',
+          headers: {
+            ...AUTH_HEADERS,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            status: 'active',
+            note: 'Started working on the route implementation',
+          }),
+        },
+      )
+      expect(patchResponse.status).toBe(200)
+      const patched = (await patchResponse.json()) as { status: string; note?: string }
+      expect(patched.status).toBe('active')
+      expect(patched.note).toBe('Started working on the route implementation')
+
+      const appendNoteResponse = await fetch(
+        `${server.baseUrl}/api/commanders/${commander.id}/quests/${createdQuest.id}/notes`,
+        {
+          method: 'POST',
+          headers: {
+            ...AUTH_HEADERS,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            note: 'Added tests and confirmed passing status',
+          }),
+        },
+      )
+      expect(appendNoteResponse.status).toBe(200)
+      const noted = (await appendNoteResponse.json()) as { note?: string }
+      expect(noted.note).toContain('Started working on the route implementation')
+      expect(noted.note).toContain('Added tests and confirmed passing status')
+
+      const deleteResponse = await fetch(
+        `${server.baseUrl}/api/commanders/${commander.id}/quests/${createdQuest.id}`,
+        {
+          method: 'DELETE',
+          headers: AUTH_HEADERS,
+        },
+      )
+      expect(deleteResponse.status).toBe(204)
+
+      const emptyListResponse = await fetch(`${server.baseUrl}/api/commanders/${commander.id}/quests`, {
+        headers: AUTH_HEADERS,
+      })
+      expect(emptyListResponse.status).toBe(200)
+      expect(await emptyListResponse.json()).toEqual([])
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('resets active quests to pending when commander starts', async () => {
+    const dir = await createTempDir('hammurabi-commanders-quest-stale-guard-')
+    const storePath = join(dir, 'sessions.json')
+    const memoryBasePath = join(dir, 'memory')
+    const mock = createMockSessionsInterface()
+    const server = await startServer({
+      sessionStorePath: storePath,
+      memoryBasePath,
+      sessionsInterface: mock.interface,
+    })
+
+    try {
+      const createCommanderResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          host: 'worker-quest-stale-guard',
+          taskSource: { owner: 'example-user', repo: 'example-repo', label: 'commander' },
+        }),
+      })
+      const commander = (await createCommanderResponse.json()) as { id: string }
+
+      const createQuestResponse = await fetch(`${server.baseUrl}/api/commanders/${commander.id}/quests`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          source: 'manual',
+          instruction: 'Fix stale quest state',
+        }),
+      })
+      const createdQuest = (await createQuestResponse.json()) as { id: string }
+
+      const patchToActiveResponse = await fetch(
+        `${server.baseUrl}/api/commanders/${commander.id}/quests/${createdQuest.id}`,
+        {
+          method: 'PATCH',
+          headers: {
+            ...AUTH_HEADERS,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            status: 'active',
+          }),
+        },
+      )
+      expect(patchToActiveResponse.status).toBe(200)
+
+      const startResponse = await fetch(`${server.baseUrl}/api/commanders/${commander.id}/start`, {
         method: 'POST',
         headers: {
           ...AUTH_HEADERS,
@@ -1024,35 +1922,180 @@ describe('commanders routes', () => {
       })
       expect(startResponse.status).toBe(200)
 
-      await vi.waitFor(() => {
-        expect(mockQuery.calls).toHaveLength(1)
+      const questsResponse = await fetch(`${server.baseUrl}/api/commanders/${commander.id}/quests`, {
+        headers: AUTH_HEADERS,
       })
+      const quests = (await questsResponse.json()) as Array<{ id: string; status: string }>
+      expect(quests).toEqual([
+        expect.objectContaining({
+          id: createdQuest.id,
+          status: 'pending',
+        }),
+      ])
+    } finally {
+      await server.close()
+    }
+  })
 
-      const ws = await connectWs(server.baseUrl, created.id)
+  it('prepends pending quests to heartbeat messages', async () => {
+    const dir = await createTempDir('hammurabi-commanders-quest-heartbeat-')
+    const storePath = join(dir, 'sessions.json')
+    const memoryBasePath = join(dir, 'memory')
+    const mock = createMockSessionsInterface()
 
-      const livePromise = waitForWsJson(
-        ws,
-        (payload) =>
-          payload.type === 'assistant' &&
-          JSON.stringify(payload).includes('Live reply'),
-      )
+    const server = await startServer({
+      sessionStorePath: storePath,
+      memoryBasePath,
+      sessionsInterface: mock.interface,
+    })
 
-      const messageResponse = await fetch(`${server.baseUrl}/api/commanders/${created.id}/message`, {
+    try {
+      const createCommanderResponse = await fetch(`${server.baseUrl}/api/commanders`, {
         method: 'POST',
         headers: {
           ...AUTH_HEADERS,
           'content-type': 'application/json',
         },
         body: JSON.stringify({
-          message: 'Send live update',
+          host: 'worker-quest-heartbeat',
+          taskSource: { owner: 'example-user', repo: 'example-repo', label: 'commander' },
         }),
       })
-      expect(messageResponse.status).toBe(200)
+      const commander = (await createCommanderResponse.json()) as { id: string }
 
-      const live = await livePromise
-      expect(live.type).toBe('assistant')
+      const instructions = [
+        'First pending quest',
+        'Second pending quest',
+        'Third pending quest',
+        'Fourth pending quest',
+      ]
+      for (const instruction of instructions) {
+        const createQuestResponse = await fetch(`${server.baseUrl}/api/commanders/${commander.id}/quests`, {
+          method: 'POST',
+          headers: {
+            ...AUTH_HEADERS,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            source: 'manual',
+            instruction,
+          }),
+        })
+        expect(createQuestResponse.status).toBe(201)
+      }
 
-      ws.close()
+      const patchHeartbeatResponse = await fetch(
+        `${server.baseUrl}/api/commanders/${commander.id}/heartbeat`,
+        {
+          method: 'PATCH',
+          headers: {
+            ...AUTH_HEADERS,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            intervalMs: 25,
+            messageTemplate: '[HB {{timestamp}}]',
+          }),
+        },
+      )
+      expect(patchHeartbeatResponse.status).toBe(200)
+
+      const startResponse = await fetch(`${server.baseUrl}/api/commanders/${commander.id}/start`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+      })
+      expect(startResponse.status).toBe(200)
+
+      // Wait for at least a startup send + one heartbeat with quest board
+      await vi.waitFor(() => {
+        expect(
+          mock.sendCalls.some((call) => call.text.includes('[QUEST BOARD] Top pending quests:')),
+        ).toBe(true)
+      })
+
+      const heartbeatCall = mock.sendCalls.find((call) =>
+        call.text.includes('[QUEST BOARD] Top pending quests:'),
+      )
+
+      expect(heartbeatCall).toBeDefined()
+      const heartbeatText = heartbeatCall?.text ?? ''
+      expect(heartbeatText).toContain('1. First pending quest')
+      expect(heartbeatText).toContain('2. Second pending quest')
+      const hasThirdQuest = heartbeatText.includes('3. Third pending quest')
+      const hasFourthQuest = heartbeatText.includes('3. Fourth pending quest')
+      expect(hasThirdQuest || hasFourthQuest).toBe(true)
+      expect(hasThirdQuest && hasFourthQuest).toBe(false)
+
+      const stopResponse = await fetch(`${server.baseUrl}/api/commanders/${commander.id}/stop`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+      })
+      expect(stopResponse.status).toBe(200)
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('imports instruction text from githubIssueUrl', async () => {
+    const dir = await createTempDir('hammurabi-commanders-quest-github-import-')
+    const storePath = join(dir, 'sessions.json')
+    const readTask = vi.fn(async () => ({
+      number: 331,
+      title: 'Implement quest board backend',
+      body: 'Add store, routes, and tests for commander quests.',
+      labels: ['commander'],
+      assignees: [],
+      comments: [],
+      url: 'https://github.com/example-user/example-repo/issues/331',
+    }))
+    const ghTasksFactory = vi.fn((_repo: string) => ({ readTask }))
+
+    const server = await startServer({
+      sessionStorePath: storePath,
+      ghTasksFactory,
+    })
+
+    try {
+      const createCommanderResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          host: 'worker-quest-github-import',
+          taskSource: { owner: 'example-user', repo: 'example-repo', label: 'commander' },
+        }),
+      })
+      const commander = (await createCommanderResponse.json()) as { id: string }
+
+      const createQuestResponse = await fetch(`${server.baseUrl}/api/commanders/${commander.id}/quests`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          githubIssueUrl: 'https://github.com/example-user/example-repo/issues/331',
+        }),
+      })
+
+      expect(createQuestResponse.status).toBe(201)
+      const createdQuest = (await createQuestResponse.json()) as {
+        source: string
+        instruction: string
+      }
+      expect(createdQuest.source).toBe('github-issue')
+      expect(createdQuest.instruction).toContain('Implement quest board backend')
+      expect(createdQuest.instruction).toContain('Add store, routes, and tests for commander quests.')
+      expect(ghTasksFactory).toHaveBeenCalledWith('example-user/example-repo')
+      expect(readTask).toHaveBeenCalledWith(331)
     } finally {
       await server.close()
     }
@@ -1093,242 +2136,180 @@ describe('commanders routes', () => {
       await secondServer.close()
     }
   })
-})
 
-describe('commanders cron routes', () => {
-  let tmpDir: string
-  let store: CommanderCronTaskStore
-  let manager: CommanderCronManager
-  let scheduled: ScheduledRegistration[]
-  let dispatcher: { sendInstruction: ReturnType<typeof vi.fn> }
-
-  beforeEach(async () => {
-    tmpDir = await mkdtemp(join(tmpdir(), 'hammurabi-commanders-routes-test-'))
-    store = new CommanderCronTaskStore(join(tmpDir, 'cron-tasks.json'))
-    const mockScheduler = createMockScheduler()
-    scheduled = mockScheduler.scheduled
-    dispatcher = {
-      sendInstruction: vi.fn(async () => {}),
-    }
-    manager = new CommanderCronManager({
-      store,
-      scheduler: mockScheduler.scheduler,
-      dispatcher,
-      now: () => new Date('2026-03-01T10:00:00.000Z'),
-    })
-  })
-
-  afterEach(async () => {
-    await rm(tmpDir, { recursive: true, force: true })
-  })
-
-  it('lists cron tasks for a commander', async () => {
-    await store.createTask({
-      commanderId: 'cmdr-1',
-      schedule: '0 2 * * *',
-      instruction: 'run nightly test suite',
-      enabled: true,
-      nextRun: null,
-    })
-    const server = await startCronServer({ store, manager })
-
-    try {
-      const response = await fetch(`${server.baseUrl}/api/commanders/cmdr-1/crons`, {
-        headers: AUTH_HEADERS,
-      })
-
-      expect(response.status).toBe(200)
-      const payload = (await response.json()) as Array<{
-        commanderId: string
-        schedule: string
-      }>
-      expect(payload).toHaveLength(1)
-      expect(payload[0]).toEqual(
-        expect.objectContaining({
-          commanderId: 'cmdr-1',
-          schedule: '0 2 * * *',
-        }),
-      )
-    } finally {
-      await server.close()
-    }
-  })
-
-  it('creates a cron task and schedules it immediately', async () => {
-    const server = await startCronServer({ store, manager })
-
-    try {
-      const response = await fetch(`${server.baseUrl}/api/commanders/cmdr-1/crons`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          schedule: '0 2 * * *',
-          instruction: 'run nightly test suite',
-        }),
-      })
-
-      expect(response.status).toBe(201)
-      expect(scheduled).toHaveLength(1)
-      const payload = (await response.json()) as {
-        commanderId: string
-        nextRun: string | null
-      }
-      expect(payload.commanderId).toBe('cmdr-1')
-      expect(payload.nextRun).toBe(NEXT_RUN_ISO)
-    } finally {
-      await server.close()
-    }
-  })
-
-  it('pauses a cron task when PATCH sets enabled=false', async () => {
-    const created = await store.createTask({
-      commanderId: 'cmdr-1',
-      schedule: '0 2 * * *',
-      instruction: 'run nightly test suite',
-      enabled: true,
-      nextRun: null,
-    })
-    const server = await startCronServer({ store, manager })
-
-    try {
-      const response = await fetch(
-        `${server.baseUrl}/api/commanders/cmdr-1/crons/${created.id}`,
-        {
-          method: 'PATCH',
-          headers: {
-            ...AUTH_HEADERS,
-            'content-type': 'application/json',
-          },
-          body: JSON.stringify({ enabled: false }),
-        },
-      )
-
-      expect(response.status).toBe(200)
-      const payload = (await response.json()) as {
-        id: string
-        enabled: boolean
-        nextRun: string | null
-      }
-      expect(payload.id).toBe(created.id)
-      expect(payload.enabled).toBe(false)
-      expect(payload.nextRun).toBeNull()
-
-      const listResponse = await fetch(`${server.baseUrl}/api/commanders/cmdr-1/crons`, {
-        headers: AUTH_HEADERS,
-      })
-      const tasks = (await listResponse.json()) as Array<{ id: string }>
-      expect(tasks).toHaveLength(1)
-      expect(tasks[0]?.id).toBe(created.id)
-    } finally {
-      await server.close()
-    }
-  })
-
-  it('deletes a cron task and removes it from the store', async () => {
-    const created = await store.createTask({
-      commanderId: 'cmdr-1',
-      schedule: '0 2 * * *',
-      instruction: 'run nightly test suite',
-      enabled: true,
-      nextRun: null,
-    })
-    const server = await startCronServer({ store, manager })
-
-    try {
-      const response = await fetch(
-        `${server.baseUrl}/api/commanders/cmdr-1/crons/${created.id}`,
-        {
-          method: 'DELETE',
-          headers: AUTH_HEADERS,
-        },
-      )
-      expect(response.status).toBe(204)
-
-      const listResponse = await fetch(`${server.baseUrl}/api/commanders/cmdr-1/crons`, {
-        headers: AUTH_HEADERS,
-      })
-      const tasks = (await listResponse.json()) as Array<{ id: string }>
-      expect(tasks).toEqual([])
-    } finally {
-      await server.close()
-    }
-  })
-
-  it('accepts cron-trigger payloads and dispatches instructions when present', async () => {
-    const server = await startCronServer({ store, manager })
-
-    try {
-      const triggeredResponse = await fetch(
-        `${server.baseUrl}/api/commanders/cmdr-1/cron-trigger`,
-        {
-          method: 'POST',
-          headers: {
-            ...AUTH_HEADERS,
-            'content-type': 'application/json',
-          },
-          body: JSON.stringify({
-            detail: {
-              instruction: 'run backup',
+  describe('memory CLI endpoints', () => {
+    async function createServerWithCommander(): Promise<{
+      server: RunningServer
+      commanderId: string
+      memoryBasePath: string
+    }> {
+      const dir = await createTempDir('hammurabi-memory-routes-')
+      const storePath = join(dir, 'sessions.json')
+      const memoryBasePath = join(dir, 'commanders')
+      const commanderId = 'cmdr-mem-1'
+      await writeFile(
+        storePath,
+        JSON.stringify({
+          sessions: [
+            {
+              id: commanderId,
+              host: 'test-host',
+              pid: null,
+              state: 'idle',
+              created: '2026-03-01T00:00:00.000Z',
+              lastHeartbeat: null,
+              taskSource: { owner: 'example-user', repo: 'example-repo', label: 'commander' },
+              currentTask: null,
+              completedTasks: 0,
+              totalCostUsd: 0,
             },
-          }),
-        },
-      )
-
-      expect(triggeredResponse.status).toBe(200)
-      expect(await triggeredResponse.json()).toEqual({
-        ok: true,
-        triggered: true,
-      })
-      expect(dispatcher.sendInstruction).toHaveBeenCalledWith('cmdr-1', 'run backup')
-
-      const noopResponse = await fetch(
-        `${server.baseUrl}/api/commanders/cmdr-1/cron-trigger`,
-        {
-          method: 'POST',
-          headers: {
-            ...AUTH_HEADERS,
-            'content-type': 'application/json',
-          },
-          body: JSON.stringify({
-            detail: {},
-          }),
-        },
-      )
-      expect(noopResponse.status).toBe(200)
-      expect(await noopResponse.json()).toEqual({
-        ok: true,
-        triggered: false,
-      })
-    } finally {
-      await server.close()
-    }
-  })
-
-  it('returns 400 for invalid cron expressions', async () => {
-    const server = await startCronServer({ store, manager })
-
-    try {
-      const response = await fetch(`${server.baseUrl}/api/commanders/cmdr-1/crons`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          schedule: 'invalid cron',
-          instruction: 'run nightly test suite',
+          ],
         }),
+      )
+      const server = await startServer({
+        sessionStorePath: storePath,
+        memoryBasePath,
+        agentsSessionStorePath: join(dir, 'agents-sessions.json'),
       })
-
-      expect(response.status).toBe(400)
-      expect(await response.json()).toEqual({
-        error: 'Invalid cron expression',
-      })
-    } finally {
-      await server.close()
+      return { server, commanderId, memoryBasePath }
     }
+
+    it('POST /:id/memory/compact returns consolidation report', async () => {
+      const { server, commanderId } = await createServerWithCommander()
+      try {
+        const response = await fetch(
+          `${server.baseUrl}/api/commanders/${commanderId}/memory/compact`,
+          {
+            method: 'POST',
+            headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+            body: JSON.stringify({}),
+          },
+        )
+        expect(response.status).toBe(200)
+        const body = await response.json()
+        expect(body).toHaveProperty('factsExtracted')
+        expect(body).toHaveProperty('memoryMdLineCount')
+        expect(body).toHaveProperty('entriesCompressed')
+        expect(body).toHaveProperty('debrifsProcessed')
+      } finally {
+        await server.close()
+      }
+    })
+
+    it('POST /:id/memory/compact returns 404 for unknown commander', async () => {
+      const { server } = await createServerWithCommander()
+      try {
+        const response = await fetch(
+          `${server.baseUrl}/api/commanders/nonexistent/memory/compact`,
+          {
+            method: 'POST',
+            headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+            body: JSON.stringify({}),
+          },
+        )
+        expect(response.status).toBe(404)
+      } finally {
+        await server.close()
+      }
+    })
+
+    it('POST /:id/memory/recall returns hits for a cue', async () => {
+      const { server, commanderId } = await createServerWithCommander()
+      try {
+        const response = await fetch(
+          `${server.baseUrl}/api/commanders/${commanderId}/memory/recall`,
+          {
+            method: 'POST',
+            headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+            body: JSON.stringify({ cue: 'prisma migration' }),
+          },
+        )
+        expect(response.status).toBe(200)
+        const body = await response.json()
+        expect(body).toHaveProperty('hits')
+        expect(body).toHaveProperty('queryTerms')
+        expect(Array.isArray(body.hits)).toBe(true)
+        expect(Array.isArray(body.queryTerms)).toBe(true)
+      } finally {
+        await server.close()
+      }
+    })
+
+    it('POST /:id/memory/recall returns 400 when cue is missing', async () => {
+      const { server, commanderId } = await createServerWithCommander()
+      try {
+        const response = await fetch(
+          `${server.baseUrl}/api/commanders/${commanderId}/memory/recall`,
+          {
+            method: 'POST',
+            headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+            body: JSON.stringify({}),
+          },
+        )
+        expect(response.status).toBe(400)
+        const body = await response.json()
+        expect(body.error).toContain('cue is required')
+      } finally {
+        await server.close()
+      }
+    })
+
+    it('POST /:id/memory/facts saves facts and returns result', async () => {
+      const { server, commanderId } = await createServerWithCommander()
+      try {
+        const response = await fetch(
+          `${server.baseUrl}/api/commanders/${commanderId}/memory/facts`,
+          {
+            method: 'POST',
+            headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+            body: JSON.stringify({ facts: ['Always use pnpm in monorepo'] }),
+          },
+        )
+        expect(response.status).toBe(200)
+        const body = await response.json()
+        expect(body).toHaveProperty('factsAdded')
+        expect(body).toHaveProperty('lineCount')
+        expect(body).toHaveProperty('evicted')
+        expect(body.factsAdded).toBe(1)
+      } finally {
+        await server.close()
+      }
+    })
+
+    it('POST /:id/memory/facts returns 400 when facts is empty', async () => {
+      const { server, commanderId } = await createServerWithCommander()
+      try {
+        const response = await fetch(
+          `${server.baseUrl}/api/commanders/${commanderId}/memory/facts`,
+          {
+            method: 'POST',
+            headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+            body: JSON.stringify({ facts: [] }),
+          },
+        )
+        expect(response.status).toBe(400)
+        const body = await response.json()
+        expect(body.error).toContain('facts array')
+      } finally {
+        await server.close()
+      }
+    })
+
+    it('POST /:id/memory/facts returns 404 for unknown commander', async () => {
+      const { server } = await createServerWithCommander()
+      try {
+        const response = await fetch(
+          `${server.baseUrl}/api/commanders/nonexistent/memory/facts`,
+          {
+            method: 'POST',
+            headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+            body: JSON.stringify({ facts: ['some fact'] }),
+          },
+        )
+        expect(response.status).toBe(404)
+      } finally {
+        await server.close()
+      }
+    })
   })
 })

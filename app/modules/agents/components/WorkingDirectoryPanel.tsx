@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   FolderOpen,
   Folder,
@@ -32,6 +32,11 @@ export function WorkingDirectoryPanel({
   const [uploadError, setUploadError] = useState<string | null>(null)
   const [isDragOver, setIsDragOver] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    setBrowsePath(cwd)
+  }, [cwd])
+
   const { data, refetch } = useFiles(browsePath, isOpen)
 
   async function handleUploadFiles(files: FileList | File[]) {

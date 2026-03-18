@@ -156,3 +156,108 @@ export function resolveMovement(
   if (dy !== 0 && isWalkable(x, y + dy, radius)) return { x, y: y + dy }
   return { x, y }
 }
+
+// ---------------------------------------------------------------------------
+// A* pathfinding on WALKABLE_GRID
+// ---------------------------------------------------------------------------
+
+/** pixel center of tile at (col, row) */
+function tilePx(col: number, row: number): { x: number; y: number } {
+  return { x: col * TILE_SIZE + TILE_SIZE / 2, y: row * TILE_SIZE + TILE_SIZE / 2 }
+}
+
+function heuristic(ac: number, ar: number, bc: number, br: number): number {
+  return Math.abs(ac - bc) + Math.abs(ar - br)
+}
+
+/**
+ * Find a walkable tile-center path from pixel (sx,sy) to (tx,ty).
+ * Returns an array of pixel-center waypoints (not including the start tile).
+ * If no path is found, returns a direct two-point array as fallback.
+ */
+export function findPath(
+  sx: number,
+  sy: number,
+  tx: number,
+  ty: number,
+): Array<{ x: number; y: number }> {
+  const sc = Math.floor(sx / TILE_SIZE)
+  const sr = Math.floor(sy / TILE_SIZE)
+  const tc2 = Math.floor(tx / TILE_SIZE)
+  const tr = Math.floor(ty / TILE_SIZE)
+
+  if (sc === tc2 && sr === tr) return [tilePx(tc2, tr)]
+
+  // Node key: row * ROOM_COLS + col
+  const key = (c: number, r: number) => r * ROOM_COLS + c
+
+  const gScore = new Float32Array(ROOM_ROWS * ROOM_COLS).fill(Infinity)
+  const fScore = new Float32Array(ROOM_ROWS * ROOM_COLS).fill(Infinity)
+  const cameFrom = new Int32Array(ROOM_ROWS * ROOM_COLS).fill(-1)
+  const closed = new Uint8Array(ROOM_ROWS * ROOM_COLS)
+
+  // Tiny min-heap via sorted array (small map, 625 nodes max — acceptable)
+  const open: number[] = []
+
+  const startKey = key(sc, sr)
+  gScore[startKey] = 0
+  fScore[startKey] = heuristic(sc, sr, tc2, tr)
+  open.push(startKey)
+
+  const DIRS = [
+    [0, -1], [0, 1], [-1, 0], [1, 0],
+    [-1, -1], [1, -1], [-1, 1], [1, 1],
+  ]
+  const COSTS = [1, 1, 1, 1, 1.414, 1.414, 1.414, 1.414]
+
+  while (open.length > 0) {
+    // Pop lowest fScore
+    let bestIdx = 0
+    for (let i = 1; i < open.length; i++) {
+      if (fScore[open[i]] < fScore[open[bestIdx]]) bestIdx = i
+    }
+    const current = open[bestIdx]
+    open.splice(bestIdx, 1)
+
+    if (current === key(tc2, tr)) {
+      // Reconstruct path
+      const path: Array<{ x: number; y: number }> = []
+      let node = current
+      while (node !== -1) {
+        const c = node % ROOM_COLS
+        const r = Math.floor(node / ROOM_COLS)
+        path.unshift(tilePx(c, r))
+        node = cameFrom[node]
+      }
+      // Skip the start tile (index 0) — return remaining waypoints
+      return path.length > 1 ? path.slice(1) : path
+    }
+
+    closed[current] = 1
+    const curC = current % ROOM_COLS
+    const curR = Math.floor(current / ROOM_COLS)
+
+    for (let d = 0; d < DIRS.length; d++) {
+      const nc = curC + DIRS[d][0]
+      const nr = curR + DIRS[d][1]
+      if (nc < 0 || nc >= ROOM_COLS || nr < 0 || nr >= ROOM_ROWS) continue
+      if (!WALKABLE_GRID[nr][nc]) continue
+      // For diagonals, both cardinal neighbours must be walkable too
+      if (d >= 4 && (!WALKABLE_GRID[curR][nc] || !WALKABLE_GRID[nr][curC])) continue
+
+      const nk = key(nc, nr)
+      if (closed[nk]) continue
+
+      const tentativeG = gScore[current] + COSTS[d]
+      if (tentativeG >= gScore[nk]) continue
+
+      cameFrom[nk] = current
+      gScore[nk] = tentativeG
+      fScore[nk] = tentativeG + heuristic(nc, nr, tc2, tr)
+      if (!open.includes(nk)) open.push(nk)
+    }
+  }
+
+  // No path found — fall back to direct target
+  return [{ x: tx, y: ty }]
+}

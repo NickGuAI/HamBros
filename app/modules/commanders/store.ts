@@ -4,8 +4,7 @@ import {
   normalizeHeartbeatState,
   type CommanderHeartbeatState,
 } from './heartbeat.js'
-
-const DEFAULT_SESSION_STORE_PATH = 'data/commanders/sessions.json'
+import { resolveCommanderSessionStorePath } from './paths.js'
 
 const COMMANDER_STATES = new Set<CommanderSession['state']>([
   'idle',
@@ -27,18 +26,37 @@ export interface CommanderCurrentTask {
   startedAt: string
 }
 
+export interface HeartbeatContextConfig {
+  fatPinInterval?: number
+}
+
+export interface CommanderRemoteOrigin {
+  machineId: string
+  label: string
+  syncToken: string
+}
+
 export interface CommanderSession {
   id: string
   host: string
+  avatarSeed?: string
+  persona?: string
   pid: number | null
   state: 'idle' | 'running' | 'paused' | 'stopped'
   created: string
+  agentType?: 'claude' | 'codex'
+  claudeSessionId?: string
+  codexThreadId?: string
+  cwd?: string
   heartbeat: CommanderHeartbeatState
   lastHeartbeat: string | null
-  taskSource: CommanderTaskSource
+  heartbeatTickCount?: number
+  contextConfig?: HeartbeatContextConfig
+  taskSource: CommanderTaskSource | null
   currentTask: CommanderCurrentTask | null
   completedTasks: number
   totalCostUsd: number
+  remoteOrigin?: CommanderRemoteOrigin
 }
 
 interface PersistedCommanderSessions {
@@ -101,6 +119,55 @@ function parseCurrentTask(raw: unknown): CommanderCurrentTask | null {
   }
 }
 
+function parseHeartbeatContextConfig(raw: unknown): HeartbeatContextConfig | undefined {
+  if (raw === undefined || raw === null) {
+    return undefined
+  }
+
+  if (!isObject(raw)) {
+    return undefined
+  }
+
+  const fatPinInterval = raw.fatPinInterval
+  if (
+    fatPinInterval === undefined ||
+    (
+      typeof fatPinInterval === 'number' &&
+      Number.isInteger(fatPinInterval) &&
+      fatPinInterval > 0
+    )
+  ) {
+    return fatPinInterval === undefined
+      ? {}
+      : { fatPinInterval }
+  }
+
+  return undefined
+}
+
+function parseRemoteOrigin(raw: unknown): CommanderRemoteOrigin | undefined {
+  if (!isObject(raw)) {
+    return undefined
+  }
+
+  const machineId = typeof raw.machineId === 'string' ? raw.machineId.trim() : ''
+  const label = typeof raw.label === 'string' ? raw.label.trim() : ''
+  const syncToken = typeof raw.syncToken === 'string' ? raw.syncToken.trim() : ''
+  if (!machineId || !label || !syncToken) {
+    return undefined
+  }
+
+  return {
+    machineId,
+    label,
+    syncToken,
+  }
+}
+
+function parseAgentType(raw: unknown): 'claude' | 'codex' {
+  return raw === 'codex' ? 'codex' : 'claude'
+}
+
 function parseCommanderSession(raw: unknown): CommanderSession | null {
   if (!isObject(raw)) {
     return null
@@ -108,16 +175,33 @@ function parseCommanderSession(raw: unknown): CommanderSession | null {
 
   const id = typeof raw.id === 'string' ? raw.id.trim() : ''
   const host = typeof raw.host === 'string' ? raw.host.trim() : ''
+  const avatarSeed = typeof raw.avatarSeed === 'string' && raw.avatarSeed.trim().length > 0
+    ? raw.avatarSeed.trim()
+    : undefined
+  const persona = typeof raw.persona === 'string' && raw.persona.trim().length > 0
+    ? raw.persona.trim()
+    : undefined
   const created = typeof raw.created === 'string' ? raw.created.trim() : ''
-  const taskSource = parseTaskSource(raw.taskSource)
+  const agentType = parseAgentType(raw.agentType)
+  const claudeSessionId = typeof raw.claudeSessionId === 'string' && raw.claudeSessionId.trim().length > 0
+    ? raw.claudeSessionId.trim()
+    : undefined
+  const codexThreadId = typeof raw.codexThreadId === 'string' && raw.codexThreadId.trim().length > 0
+    ? raw.codexThreadId.trim()
+    : undefined
+  const cwd = typeof raw.cwd === 'string' && raw.cwd.trim().length > 0
+    ? raw.cwd.trim()
+    : undefined
+  const taskSource = raw.taskSource != null ? parseTaskSource(raw.taskSource) : null
   const currentTask = parseCurrentTask(raw.currentTask)
+  const contextConfig = parseHeartbeatContextConfig(raw.contextConfig)
+  const remoteOrigin = parseRemoteOrigin(raw.remoteOrigin)
 
   const state = raw.state
   if (
     !id ||
     !host ||
     !created ||
-    !taskSource ||
     !COMMANDER_STATES.has(state as CommanderSession['state'])
   ) {
     return null
@@ -135,21 +219,33 @@ function parseCommanderSession(raw: unknown): CommanderSession | null {
   const lastHeartbeat = typeof raw.lastHeartbeat === 'string'
     ? raw.lastHeartbeat.trim()
     : null
+  const heartbeatTickCount = typeof raw.heartbeatTickCount === 'number' && Number.isFinite(raw.heartbeatTickCount)
+    ? Math.max(0, Math.floor(raw.heartbeatTickCount))
+    : 0
   const heartbeat = normalizeHeartbeatState(raw.heartbeat, lastHeartbeat || null)
   const synchronizedLastHeartbeat = heartbeat.lastSentAt ?? null
 
   return {
     id,
     host,
+    avatarSeed,
+    persona,
     pid,
     state: state as CommanderSession['state'],
     created,
+    agentType,
+    claudeSessionId,
+    codexThreadId,
+    cwd,
     heartbeat,
     lastHeartbeat: synchronizedLastHeartbeat,
+    heartbeatTickCount,
+    contextConfig,
     taskSource,
     currentTask,
     completedTasks,
     totalCostUsd,
+    ...(remoteOrigin ? { remoteOrigin } : {}),
   }
 }
 
@@ -177,13 +273,16 @@ function cloneSession(session: CommanderSession): CommanderSession {
   return {
     ...session,
     heartbeat: { ...session.heartbeat },
-    taskSource: { ...session.taskSource },
+    heartbeatTickCount: session.heartbeatTickCount ?? 0,
+    contextConfig: session.contextConfig ? { ...session.contextConfig } : undefined,
+    taskSource: session.taskSource ? { ...session.taskSource } : null,
     currentTask: session.currentTask ? { ...session.currentTask } : null,
+    ...(session.remoteOrigin ? { remoteOrigin: { ...session.remoteOrigin } } : {}),
   }
 }
 
 export function defaultCommanderSessionStorePath(): string {
-  return path.resolve(process.cwd(), DEFAULT_SESSION_STORE_PATH)
+  return resolveCommanderSessionStorePath()
 }
 
 export class CommanderSessionStore {
@@ -229,6 +328,7 @@ export class CommanderSessionStore {
     return this.update(id, (current) => ({
       ...current,
       lastHeartbeat: timestamp,
+      heartbeatTickCount: (current.heartbeatTickCount ?? 0) + 1,
       heartbeat: {
         ...current.heartbeat,
         lastSentAt: timestamp,

@@ -37,12 +37,13 @@ interface NavItem {
   label: string
   icon: string
   path: string
+  hideFromNav?: boolean
 }
 
 export function BottomNav({ modules }: { modules: NavItem[] }) {
   return (
     <nav className="fixed bottom-0 left-0 right-0 z-20 flex items-stretch justify-around bg-washi-white border-t border-ink-border pb-[env(safe-area-inset-bottom,0px)] md:hidden">
-      {modules.filter((mod) => mod.name !== 'commanders').map((mod) => {
+      {modules.filter((mod) => !mod.hideFromNav).map((mod) => {
         const Icon = iconMap[mod.icon]
         return (
           <NavLink

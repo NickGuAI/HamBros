@@ -338,12 +338,18 @@ describe('telemetry routes', () => {
       topModels: Array<{ model: string }>
       topAgents: Array<{ agent: string }>
       costToday: number
+      inputTokensToday: number
+      outputTokensToday: number
+      totalTokensToday: number
     }
 
     expect(summary.totalSessions).toBe(1)
     expect(summary.topModels[0]?.model).toBe('o3')
     expect(summary.topAgents[0]?.agent).toBe('codex')
     expect(summary.costToday).toBeGreaterThan(0)
+    expect(summary.inputTokensToday).toBe(200)
+    expect(summary.outputTokensToday).toBe(100)
+    expect(summary.totalTokensToday).toBe(300)
 
     await server.close()
   })
@@ -458,13 +464,33 @@ describe('telemetry routes', () => {
     expect(summaryResponse.status).toBe(200)
 
     const summary = (await summaryResponse.json()) as {
+      costToday: number
       costWeek: number
       costMonth: number
+      inputTokensToday: number
+      inputTokensWeek: number
+      inputTokensMonth: number
+      outputTokensToday: number
+      outputTokensWeek: number
+      outputTokensMonth: number
+      totalTokensToday: number
+      totalTokensWeek: number
+      totalTokensMonth: number
       topAgents: Array<{ agent: string; cost: number; sessions: number }>
     }
 
+    expect(summary.costToday).toBe(2)
     expect(summary.costWeek).toBe(2)
     expect(summary.costMonth).toBe(3)
+    expect(summary.inputTokensToday).toBe(100)
+    expect(summary.inputTokensWeek).toBe(100)
+    expect(summary.inputTokensMonth).toBe(200)
+    expect(summary.outputTokensToday).toBe(50)
+    expect(summary.outputTokensWeek).toBe(50)
+    expect(summary.outputTokensMonth).toBe(100)
+    expect(summary.totalTokensToday).toBe(150)
+    expect(summary.totalTokensWeek).toBe(150)
+    expect(summary.totalTokensMonth).toBe(300)
     expect(summary.topAgents).toEqual([
       {
         agent: 'codex',

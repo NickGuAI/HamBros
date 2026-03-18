@@ -53,6 +53,15 @@ export const NOTABLE_SIGNALS: SalienceSignalType[] = [
   'new-convention',
 ]
 
+export interface GoalEntry {
+  id: string
+  title: string
+  targetDate: string // YYYY-MM-DD
+  currentState: string
+  intendedState: string
+  reminders: string[]
+}
+
 /** Derive the SalienceLevel from a list of observed signals. */
 export function deriveSalience(signals: SalienceSignal[]): SalienceLevel {
   const types = signals.map((s) => s.type)

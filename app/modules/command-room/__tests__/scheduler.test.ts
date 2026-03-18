@@ -78,4 +78,42 @@ describe('CommandRoomScheduler', () => {
 
     expect(executor.executeTask).toHaveBeenCalledWith(created.id, 'cron')
   })
+
+  it('discovers commander-owned tasks during initialize and schedules them', async () => {
+    const commanderDataDir = join(tmpDir, 'commanders')
+    const routedStore = new CommandRoomTaskStore({
+      filePath: join(tmpDir, 'legacy-tasks.json'),
+      commanderDataDir,
+    })
+
+    const commanderTask = await routedStore.createTask({
+      name: 'Commander scheduled task',
+      schedule: '*/10 * * * *',
+      machine: 'local',
+      workDir: '/tmp/example-repo',
+      agentType: 'claude',
+      instruction: 'Run commander-owned schedule',
+      enabled: true,
+      commanderId: 'commander-init',
+    })
+
+    const { scheduler, scheduled } = createMockScheduler()
+    const executor = { executeTask: vi.fn(async () => null) }
+    const manager = new CommandRoomScheduler({
+      taskStore: routedStore,
+      scheduler,
+      executor,
+    })
+
+    await manager.initialize()
+
+    expect(scheduled).toHaveLength(1)
+    const callback = scheduled[0]?.task
+    if (!callback) {
+      throw new Error('Expected scheduled callback to exist')
+    }
+    await callback()
+
+    expect(executor.executeTask).toHaveBeenCalledWith(commanderTask.id, 'cron')
+  })
 })

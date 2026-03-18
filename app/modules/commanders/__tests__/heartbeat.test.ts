@@ -85,4 +85,65 @@ describe('CommanderHeartbeatManager', () => {
     await vi.advanceTimersByTimeAsync(30)
     expect(sendHeartbeat).toHaveBeenCalledTimes(1)
   })
+
+  it('triggers pre-compaction flush when entry count crosses threshold', async () => {
+    vi.useFakeTimers()
+
+    const sendHeartbeat = vi.fn().mockResolvedValue(true)
+    const sendFlushMessage = vi.fn().mockResolvedValue(true)
+    const getConversationEntryCount = vi.fn().mockResolvedValue(850) // above 80% of 1000
+
+    const manager = new CommanderHeartbeatManager({
+      sendHeartbeat,
+      preCompactionFlush: {
+        getConversationEntryCount,
+        sendFlushMessage,
+      },
+    })
+
+    manager.start('cmdr-flush', {
+      intervalMs: 10,
+      messageTemplate: '[HB {{timestamp}}]',
+    })
+
+    await vi.advanceTimersByTimeAsync(10)
+
+    expect(getConversationEntryCount).toHaveBeenCalledWith('cmdr-flush')
+    expect(sendFlushMessage).toHaveBeenCalledTimes(1)
+    expect(sendFlushMessage).toHaveBeenCalledWith('cmdr-flush', expect.stringContaining('Session nearing compaction'))
+
+    // Second tick should NOT trigger flush again
+    await vi.advanceTimersByTimeAsync(10)
+    expect(sendFlushMessage).toHaveBeenCalledTimes(1)
+
+    manager.stopAll()
+  })
+
+  it('does not trigger pre-compaction flush when below threshold', async () => {
+    vi.useFakeTimers()
+
+    const sendHeartbeat = vi.fn().mockResolvedValue(true)
+    const sendFlushMessage = vi.fn().mockResolvedValue(true)
+    const getConversationEntryCount = vi.fn().mockResolvedValue(50) // below threshold
+
+    const manager = new CommanderHeartbeatManager({
+      sendHeartbeat,
+      preCompactionFlush: {
+        getConversationEntryCount,
+        sendFlushMessage,
+      },
+    })
+
+    manager.start('cmdr-noflush', {
+      intervalMs: 10,
+      messageTemplate: '[HB {{timestamp}}]',
+    })
+
+    await vi.advanceTimersByTimeAsync(10)
+
+    expect(getConversationEntryCount).toHaveBeenCalled()
+    expect(sendFlushMessage).not.toHaveBeenCalled()
+
+    manager.stopAll()
+  })
 })

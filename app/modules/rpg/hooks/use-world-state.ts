@@ -10,6 +10,7 @@ export interface WorldAgent {
   id: string
   sessionType: SessionType
   agentType: AgentType
+  role: 'commander' | 'worker'
   status: WorldAgentStatus
   phase: WorldAgentPhase
   usage: {

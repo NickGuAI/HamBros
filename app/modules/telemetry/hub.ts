@@ -53,11 +53,29 @@ export interface TelemetrySummaryView {
   costToday: number
   costWeek: number
   costMonth: number
+  costPeriod?: number
+  inputTokensToday: number
+  inputTokensWeek: number
+  inputTokensMonth: number
+  inputTokensPeriod?: number
+  outputTokensToday: number
+  outputTokensWeek: number
+  outputTokensMonth: number
+  outputTokensPeriod?: number
+  totalTokensToday: number
+  totalTokensWeek: number
+  totalTokensMonth: number
+  totalTokensPeriod?: number
   activeSessions: number
   totalSessions: number
   topModels: { model: string; cost: number; calls: number }[]
   topAgents: { agent: string; cost: number; sessions: number }[]
   dailyCosts: { date: string; costUsd: number }[]
+  period?: string
+  periodStartKey?: string
+  periodEndKey?: string
+  retentionDays?: number
+  periodOutsideRetention?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -89,7 +107,14 @@ export interface HeartbeatInput {
 export interface TelemetryHubOptions {
   store: TelemetryJsonlStore
   now?: () => Date
-  /** Days to retain JSONL entries. Default: 14. Set to 0 to disable compaction. */
+  /** Days to retain JSONL entries. Default: 90. Set to 0 to disable compaction. */
+  retentionDays?: number
+}
+
+export interface TelemetrySummaryOptions {
+  startKey?: string
+  endKey?: string
+  period?: string
   retentionDays?: number
 }
 
@@ -118,6 +143,7 @@ interface SessionState {
 
 const ACTIVE_WINDOW_MS = 60_000
 const IDLE_WINDOW_MS = 5 * 60_000
+const DEFAULT_RETENTION_DAYS = 90
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -173,8 +199,25 @@ function startOfWeek(now: Date): Date {
   return new Date(today.getTime() - daysSinceMonday * 24 * 60 * 60_000)
 }
 
-function startOfMonth(now: Date): Date {
-  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))
+function startOfMonth(now: Date): Date
+function startOfMonth(month: string): Date | null
+function startOfMonth(value: Date | string): Date | null {
+  if (value instanceof Date) {
+    return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), 1))
+  }
+
+  const match = /^(\d{4})-(\d{2})$/.exec(value)
+  if (!match) {
+    return null
+  }
+
+  const year = Number.parseInt(match[1], 10)
+  const month = Number.parseInt(match[2], 10)
+  if (!Number.isFinite(year) || !Number.isFinite(month) || month < 1 || month > 12) {
+    return null
+  }
+
+  return new Date(Date.UTC(year, month - 1, 1))
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +239,7 @@ export class TelemetryHub {
   }
 
   private runCompaction(): void {
-    const retentionDays = this.options.retentionDays ?? 14
+    const retentionDays = this.options.retentionDays ?? DEFAULT_RETENTION_DAYS
     if (retentionDays <= 0) return
     const compact = () =>
       this.options.store.compact(retentionDays).catch((err) => {
@@ -336,18 +379,62 @@ export class TelemetryHub {
     }
   }
 
-  async getSummary(now = this.now()): Promise<TelemetrySummaryView> {
+  async getSummary(now?: Date): Promise<TelemetrySummaryView>
+  async getSummary(
+    options?: TelemetrySummaryOptions,
+    now?: Date,
+  ): Promise<TelemetrySummaryView>
+  async getSummary(
+    optionsOrNow: Date | TelemetrySummaryOptions = {},
+    nowArg?: Date,
+  ): Promise<TelemetrySummaryView> {
     await this.ensureReady()
+
+    const options =
+      optionsOrNow instanceof Date
+        ? ({} as TelemetrySummaryOptions)
+        : optionsOrNow
+    const now = optionsOrNow instanceof Date ? optionsOrNow : (nowArg ?? this.now())
 
     const sessions = this.getSessions(now)
     const calls = [...this.callsBySession.values()].flat()
     const weekStartKey = toUtcDayKey(startOfWeek(now))
     const todayStartKey = toUtcDayKey(startOfToday(now))
     const monthStartKey = toUtcDayKey(startOfMonth(now))
+    const fallbackPeriod = `month:${now.toISOString().slice(0, 7)}`
+    const rawPeriodStartKey = options.startKey ?? monthStartKey
+    const rawPeriodEndKey = options.endKey ?? toUtcDayKey(now)
+    const periodStartKey =
+      rawPeriodStartKey <= rawPeriodEndKey ? rawPeriodStartKey : rawPeriodEndKey
+    const periodEndKey =
+      rawPeriodStartKey <= rawPeriodEndKey ? rawPeriodEndKey : rawPeriodStartKey
+    const retentionDays =
+      options.retentionDays ?? this.options.retentionDays ?? DEFAULT_RETENTION_DAYS
+    const retentionStartKey =
+      retentionDays > 0
+        ? toUtcDayKey(
+            new Date(
+              startOfToday(now).getTime() - (retentionDays - 1) * 24 * 60 * 60_000,
+            ),
+          )
+        : null
 
     let costToday = 0
     let costWeek = 0
     let costMonth = 0
+    let costPeriod = 0
+    let inputTokensToday = 0
+    let inputTokensWeek = 0
+    let inputTokensMonth = 0
+    let inputTokensPeriod = 0
+    let outputTokensToday = 0
+    let outputTokensWeek = 0
+    let outputTokensMonth = 0
+    let outputTokensPeriod = 0
+    let totalTokensToday = 0
+    let totalTokensWeek = 0
+    let totalTokensMonth = 0
+    let totalTokensPeriod = 0
     for (const [dayKey, cost] of this.dailyCostByDay.entries()) {
       if (dayKey >= todayStartKey) {
         costToday += cost
@@ -357,6 +444,33 @@ export class TelemetryHub {
       }
       if (dayKey >= monthStartKey) {
         costMonth += cost
+      }
+      if (dayKey >= periodStartKey && dayKey <= periodEndKey) {
+        costPeriod += cost
+      }
+    }
+    for (const call of calls) {
+      const dayKey = toUtcDayKey(new Date(call.timestamp))
+      const totalTokens = call.inputTokens + call.outputTokens
+      if (dayKey >= todayStartKey) {
+        inputTokensToday += call.inputTokens
+        outputTokensToday += call.outputTokens
+        totalTokensToday += totalTokens
+      }
+      if (dayKey >= weekStartKey) {
+        inputTokensWeek += call.inputTokens
+        outputTokensWeek += call.outputTokens
+        totalTokensWeek += totalTokens
+      }
+      if (dayKey >= monthStartKey) {
+        inputTokensMonth += call.inputTokens
+        outputTokensMonth += call.outputTokens
+        totalTokensMonth += totalTokens
+      }
+      if (dayKey >= periodStartKey && dayKey <= periodEndKey) {
+        inputTokensPeriod += call.inputTokens
+        outputTokensPeriod += call.outputTokens
+        totalTokensPeriod += totalTokens
       }
     }
 
@@ -412,11 +526,30 @@ export class TelemetryHub {
       costToday: roundToMicros(costToday),
       costWeek: roundToMicros(costWeek),
       costMonth: roundToMicros(costMonth),
+      costPeriod: roundToMicros(costPeriod),
+      inputTokensToday,
+      inputTokensWeek,
+      inputTokensMonth,
+      inputTokensPeriod,
+      outputTokensToday,
+      outputTokensWeek,
+      outputTokensMonth,
+      outputTokensPeriod,
+      totalTokensToday,
+      totalTokensWeek,
+      totalTokensMonth,
+      totalTokensPeriod,
       activeSessions: sessions.filter((session) => session.status === 'active').length,
       totalSessions: sessions.length,
       topModels,
       topAgents,
       dailyCosts,
+      period: options.period ?? fallbackPeriod,
+      periodStartKey,
+      periodEndKey,
+      retentionDays: retentionDays > 0 ? retentionDays : undefined,
+      periodOutsideRetention:
+        retentionStartKey !== null ? periodStartKey < retentionStartKey : false,
     }
   }
 

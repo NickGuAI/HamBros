@@ -1,3 +1,8 @@
+import {
+  checkPreCompactionFlush,
+  type PreCompactionFlushState,
+} from './memory/pre-compaction-flush.js'
+
 export interface HeartbeatConfig {
   intervalMs: number
   messageTemplate: string
@@ -22,7 +27,7 @@ export type HeartbeatPatchParseResult =
       error: string
     }
 
-export const DEFAULT_HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000
+export const DEFAULT_HEARTBEAT_INTERVAL_MS = 15 * 60 * 1000
 export const DEFAULT_HEARTBEAT_MESSAGE = `[HEARTBEAT {{timestamp}}]
 Check your task list. Current status? What needs to be done next?
 If current task is complete, mark it done and pick up the next one.`
@@ -153,8 +158,23 @@ export function renderHeartbeatMessage(
   return messageTemplate.split('{{timestamp}}').join(timestamp)
 }
 
+export interface PreCompactionFlushHook {
+  /**
+   * Return the conversation entry count for this commander's active session.
+   * Return `null` if entry count is unavailable (flush will be skipped).
+   */
+  getConversationEntryCount(commanderId: string): Promise<number | null> | number | null
+
+  /**
+   * Called when the flush message should be sent to the session.
+   * Return `true` if the message was sent successfully.
+   */
+  sendFlushMessage(commanderId: string, message: string): Promise<boolean> | boolean
+}
+
 export interface CommanderHeartbeatManagerOptions {
   now?: () => Date
+  preCompactionFlush?: PreCompactionFlushHook
   sendHeartbeat(input: {
     commanderId: string
     renderedMessage: string
@@ -176,6 +196,7 @@ interface HeartbeatLoop {
   timer: ReturnType<typeof setInterval>
   config: HeartbeatConfig
   inFlight: boolean
+  preCompactionFlushed: boolean
 }
 
 function normalizeHeartbeatConfig(config: HeartbeatConfig): HeartbeatConfig {
@@ -208,6 +229,7 @@ export class CommanderHeartbeatManager {
       config: normalized,
       inFlight: false,
       timer,
+      preCompactionFlushed: false,
     }
 
     this.loops.set(commanderId, loop)
@@ -241,16 +263,63 @@ export class CommanderHeartbeatManager {
     return this.loops.has(commanderId)
   }
 
-  private async tick(commanderId: string): Promise<void> {
+  isInFlight(commanderId: string): boolean {
+    return this.loops.get(commanderId)?.inFlight ?? false
+  }
+
+  fireManual(commanderId: string, timestamp: string = this.now().toISOString()): boolean {
+    const loop = this.loops.get(commanderId)
+    if (!loop || loop.inFlight) {
+      return false
+    }
+
+    this.launchHeartbeat(commanderId, loop, timestamp)
+    return true
+  }
+
+  private tick(commanderId: string): void {
     const loop = this.loops.get(commanderId)
     if (!loop || loop.inFlight) {
       return
     }
 
-    loop.inFlight = true
     const timestamp = this.now().toISOString()
-    const renderedMessage = renderHeartbeatMessage(loop.config.messageTemplate, timestamp)
+    this.launchHeartbeat(commanderId, loop, timestamp)
+  }
 
+  private launchHeartbeat(commanderId: string, loop: HeartbeatLoop, timestamp: string): void {
+    loop.inFlight = true
+    void this.dispatchHeartbeat(commanderId, loop, timestamp).finally(() => {
+      const current = this.loops.get(commanderId)
+      if (current === loop) {
+        current.inFlight = false
+      }
+    })
+  }
+
+  private async dispatchHeartbeat(
+    commanderId: string,
+    loop: HeartbeatLoop,
+    timestamp: string,
+  ): Promise<void> {
+    // Pre-compaction flush: check if session is nearing context compaction
+    if (this.options.preCompactionFlush && !loop.preCompactionFlushed) {
+      try {
+        const entryCount = await this.options.preCompactionFlush.getConversationEntryCount(commanderId)
+        if (entryCount != null) {
+          const flushState: PreCompactionFlushState = { flushed: loop.preCompactionFlushed }
+          const flushMsg = checkPreCompactionFlush(entryCount, flushState)
+          if (flushMsg) {
+            const sent = await this.options.preCompactionFlush.sendFlushMessage(commanderId, flushMsg)
+            if (sent) loop.preCompactionFlushed = true
+          }
+        }
+      } catch {
+        // Non-fatal: pre-compaction flush is best-effort
+      }
+    }
+
+    const renderedMessage = renderHeartbeatMessage(loop.config.messageTemplate, timestamp)
     try {
       const sent = await this.options.sendHeartbeat({
         commanderId,
@@ -271,11 +340,6 @@ export class CommanderHeartbeatManager {
       })
     } catch (error) {
       this.options.onHeartbeatError?.({ commanderId, error })
-    } finally {
-      const current = this.loops.get(commanderId)
-      if (current) {
-        current.inFlight = false
-      }
     }
   }
 }

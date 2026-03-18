@@ -1,14 +1,23 @@
+import { createHash } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import * as path from 'node:path'
 import { SALIENCE_EMOJI, type JournalEntry, type SalienceLevel } from './types.js'
+import { AssociationStore } from './associations.js'
+import { WorkingMemoryStore } from './working-memory.js'
+import { resolveCommanderPaths } from '../paths.js'
 
 export class JournalWriter {
   private readonly memoryRoot: string
+  private readonly skillsRoot: string
+  private readonly associations: AssociationStore
+  private readonly workingMemory: WorkingMemoryStore
 
   constructor(commanderId: string, basePath?: string) {
-    this.memoryRoot = basePath
-      ? path.join(basePath, commanderId, '.memory')
-      : path.resolve(process.cwd(), 'data', 'commanders', commanderId, '.memory')
+    const resolved = resolveCommanderPaths(commanderId, basePath)
+    this.memoryRoot = resolved.memoryRoot
+    this.skillsRoot = resolved.skillsRoot
+    this.associations = new AssociationStore(commanderId, basePath)
+    this.workingMemory = new WorkingMemoryStore(commanderId, basePath)
   }
 
   /** Ensure the full .memory/ directory scaffold exists. Idempotent. */
@@ -16,20 +25,27 @@ export class JournalWriter {
     const dirs = [
       this.memoryRoot,
       path.join(this.memoryRoot, 'journal'),
-      path.join(this.memoryRoot, 'repos'),
-      path.join(this.memoryRoot, 'skills'),
+      this.skillsRoot,
       path.join(this.memoryRoot, 'archive'),
       path.join(this.memoryRoot, 'archive', 'journal'),
     ]
     for (const dir of dirs) {
       await mkdir(dir, { recursive: true })
     }
-    // Touch MEMORY.md and consolidation-log.md if they don't exist
+    // Touch long-term memory surfaces and consolidation log if absent.
     await this._touchIfAbsent(path.join(this.memoryRoot, 'MEMORY.md'), '# Commander Memory\n\n')
+    await this._touchIfAbsent(
+      path.join(this.memoryRoot, 'LONG_TERM_MEM.md'),
+      '# Commander Long-Term Memory\n\n',
+    )
     await this._touchIfAbsent(
       path.join(this.memoryRoot, 'consolidation-log.md'),
       '# Consolidation Log\n\n',
     )
+    await Promise.all([
+      this.workingMemory.ensure(),
+      this.associations.ensure(),
+    ])
   }
 
   /** Absolute path to this commander's `.memory` directory. */
@@ -49,6 +65,63 @@ export class JournalWriter {
       // File doesn't exist yet — start fresh
     }
     await writeFile(journalPath, existing + formatted, 'utf-8')
+    try {
+      await this.associations.upsertJournalEntry(entry)
+    } catch {
+      // Journal durability should not fail due to association index maintenance.
+    }
+  }
+
+  /**
+   * Append a batch of entries to a specific date file, deduplicating by
+   * timestamp + content hash.
+   */
+  async appendBatch(
+    date: string,
+    entries: JournalEntry[],
+  ): Promise<{ appended: number; skipped: number }> {
+    const journalPath = this._journalPath(date)
+    await mkdir(path.dirname(journalPath), { recursive: true })
+
+    let existing = ''
+    try {
+      existing = await readFile(journalPath, 'utf-8')
+    } catch {
+      // File may not exist yet.
+    }
+
+    const existingEntries = this._parseEntries(existing, date)
+    const dedupeKeys = new Set(existingEntries.map((entry) => this._dedupeKey(entry)))
+    const newEntries: JournalEntry[] = []
+    let skipped = 0
+
+    for (const entry of entries) {
+      const dedupeKey = this._dedupeKey(entry)
+      if (dedupeKeys.has(dedupeKey)) {
+        skipped += 1
+        continue
+      }
+
+      dedupeKeys.add(dedupeKey)
+      newEntries.push(entry)
+    }
+
+    if (newEntries.length > 0) {
+      const formatted = newEntries.map((entry) => this._formatEntry(entry)).join('')
+      await writeFile(journalPath, existing + formatted, 'utf-8')
+      for (const entry of newEntries) {
+        try {
+          await this.associations.upsertJournalEntry(entry)
+        } catch {
+          // Journal durability should not fail due to association index maintenance.
+        }
+      }
+    }
+
+    return {
+      appended: newEntries.length,
+      skipped,
+    }
   }
 
   /** Return entries from today and yesterday. */
@@ -132,6 +205,23 @@ export class JournalWriter {
     }
     lines.push('', '---', '')
     return lines.join('\n') + '\n'
+  }
+
+  private _contentHash(entry: JournalEntry): string {
+    const normalize = (value: string): string => value.replace(/\s+/g, ' ').trim()
+    const normalized = JSON.stringify({
+      issueNumber: entry.issueNumber,
+      repo: entry.repo ? normalize(entry.repo) : null,
+      outcome: normalize(entry.outcome),
+      durationMin: entry.durationMin,
+      salience: entry.salience,
+      body: normalize(entry.body),
+    })
+    return createHash('sha256').update(normalized).digest('hex')
+  }
+
+  private _dedupeKey(entry: JournalEntry): string {
+    return `${entry.timestamp}|${this._contentHash(entry)}`
   }
 
   /**

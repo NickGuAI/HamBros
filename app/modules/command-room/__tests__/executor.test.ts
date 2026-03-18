@@ -76,6 +76,91 @@ describe('CommandRoomExecutor', () => {
     expect(persisted[0]?.status).toBe('complete')
   })
 
+  it('kills command-room session after monitorSession completion', async () => {
+    const task = await taskStore.createTask({
+      name: 'One-shot stream cleanup',
+      schedule: '0 1 * * *',
+      machine: 'local-machine',
+      workDir: '/tmp/example-repo',
+      agentType: 'claude',
+      instruction: 'Run one-shot command',
+      enabled: true,
+      sessionType: 'stream',
+    })
+
+    const createSession = vi.fn(async () => ({ sessionId: 'session-cleanup-1' }))
+    const monitorSession = vi.fn(async () => ({
+      sessionId: 'session-cleanup-1',
+      status: 'SUCCESS' as const,
+      finalComment: 'Cleanup done.',
+      filesChanged: 0,
+      durationMin: 0.5,
+      raw: { total_cost_usd: 0.01 },
+    }))
+    const killSession = vi.fn(async () => undefined)
+
+    const executor = new CommandRoomExecutor({
+      taskStore,
+      runStore,
+      now: () => new Date('2026-03-02T01:00:00.000Z'),
+      agentSessionFactory: () => ({
+        createSession,
+        monitorSession,
+        killSession,
+      }),
+    })
+
+    const run = await executor.executeTask(task.id, 'manual')
+    expect(run?.status).toBe('complete')
+    expect(monitorSession).toHaveBeenCalledWith('session-cleanup-1', undefined)
+    expect(killSession).toHaveBeenCalledTimes(1)
+    expect(killSession).toHaveBeenCalledWith('session-cleanup-1')
+  })
+
+  it('retries kill cleanup in finally when first kill attempt fails', async () => {
+    const task = await taskStore.createTask({
+      name: 'One-shot stream cleanup retry',
+      schedule: '0 1 * * *',
+      machine: 'local-machine',
+      workDir: '/tmp/example-repo',
+      agentType: 'claude',
+      instruction: 'Run one-shot command',
+      enabled: true,
+      sessionType: 'stream',
+    })
+
+    const createSession = vi.fn(async () => ({ sessionId: 'session-cleanup-2' }))
+    const monitorSession = vi.fn(async () => ({
+      sessionId: 'session-cleanup-2',
+      status: 'SUCCESS' as const,
+      finalComment: 'Cleanup done.',
+      filesChanged: 0,
+      durationMin: 0.5,
+      raw: {},
+    }))
+    const killSession = vi
+      .fn(async (_sessionId: string) => undefined)
+      .mockRejectedValueOnce(new Error('temporary cleanup error'))
+      .mockResolvedValueOnce(undefined)
+
+    const executor = new CommandRoomExecutor({
+      taskStore,
+      runStore,
+      now: () => new Date('2026-03-02T01:00:00.000Z'),
+      agentSessionFactory: () => ({
+        createSession,
+        monitorSession,
+        killSession,
+      }),
+    })
+
+    const run = await executor.executeTask(task.id, 'manual')
+    expect(run?.status).toBe('complete')
+    expect(killSession).toHaveBeenCalledTimes(2)
+    expect(killSession).toHaveBeenNthCalledWith(1, 'session-cleanup-2')
+    expect(killSession).toHaveBeenNthCalledWith(2, 'session-cleanup-2')
+  })
+
   it('does not warn when internalToken is provided', () => {
     const previousInternalApiKey = process.env.HAMBROS_INTERNAL_API_KEY
     const previousApiKey = process.env.HAMBROS_API_KEY

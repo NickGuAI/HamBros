@@ -1,7 +1,27 @@
-import { Clock3, ExternalLink, Trash2 } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { Clock3, ExternalLink, MessageSquare, Square, Trash2, Triangle } from 'lucide-react'
 import { cn, formatCost, timeAgo } from '@/lib/utils'
-import type { CommanderCreateInput, CommanderSession } from '../hooks/useCommander'
+import { fetchJson } from '../../../src/lib/api'
+import type {
+  CommanderAgentType,
+  CommanderCreateInput,
+  CommanderSession,
+} from '../hooks/useCommander'
 import { CreateCommanderForm } from './CreateCommanderForm'
+
+declare module '../hooks/useCommander' {
+  interface CommanderSession {
+    persona?: string
+  }
+}
+
+type CommanderSessionCard = CommanderSession & {
+  remoteOrigin?: {
+    machineId: string
+    label: string
+  }
+}
 
 const STATE_BADGE_CLASSES: Record<CommanderSession['state'], string> = {
   idle: 'badge-idle',
@@ -23,6 +43,35 @@ function currentTaskLabel(session: CommanderSession): string | null {
   return `#${session.currentTask.issueNumber}`
 }
 
+interface ManualHeartbeatTriggerResponse {
+  runId: string
+  timestamp: string
+  sessionName: string
+  triggered: boolean
+}
+
+async function triggerManualHeartbeat(commanderId: string): Promise<ManualHeartbeatTriggerResponse> {
+  return fetchJson<ManualHeartbeatTriggerResponse>(
+    `/api/commanders/${encodeURIComponent(commanderId)}/heartbeat`,
+    {
+      method: 'POST',
+    },
+  )
+}
+
+function removeKey(record: Record<string, string>, key: string): Record<string, string> {
+  if (!(key in record)) {
+    return record
+  }
+  const next = { ...record }
+  delete next[key]
+  return next
+}
+
+function resolveAgentType(agentType: CommanderSession['agentType']): CommanderAgentType {
+  return agentType === 'codex' ? 'codex' : 'claude'
+}
+
 export function CommanderList({
   commanders,
   selectedCommanderId,
@@ -32,8 +81,13 @@ export function CommanderList({
   isAddingCommander,
   onDeleteCommander,
   isDeletePending,
+  onOpenChat,
+  onStartCommander,
+  onStopCommander,
+  isStartPending,
+  isStopPending,
 }: {
-  commanders: CommanderSession[]
+  commanders: CommanderSessionCard[]
   selectedCommanderId: string | null
   onSelect: (commanderId: string) => void
   loading: boolean
@@ -41,12 +95,71 @@ export function CommanderList({
   isAddingCommander: boolean
   onDeleteCommander: (commanderId: string) => Promise<void>
   isDeletePending: boolean
+  onOpenChat?: (commanderId: string, agentType: CommanderAgentType) => Promise<void>
+  onStartCommander?: (commanderId: string, agentType: CommanderAgentType) => Promise<void>
+  onStopCommander?: (commanderId: string) => Promise<void>
+  isStartPending?: boolean
+  isStopPending?: boolean
 }) {
+  const queryClient = useQueryClient()
+  const [agentTypeByCommander, setAgentTypeByCommander] = useState<Record<string, CommanderAgentType>>({})
+  const [manualHeartbeatRunIdByCommander, setManualHeartbeatRunIdByCommander] = useState<Record<string, string>>({})
+  const [manualHeartbeatErrorByCommander, setManualHeartbeatErrorByCommander] = useState<Record<string, string>>({})
+  const [manualHeartbeatToast, setManualHeartbeatToast] = useState<string | null>(null)
+  const manualHeartbeatToastTimer = useRef<number | null>(null)
+
+  function showManualHeartbeatToast(message: string): void {
+    if (manualHeartbeatToastTimer.current !== null) {
+      window.clearTimeout(manualHeartbeatToastTimer.current)
+    }
+    setManualHeartbeatToast(message)
+    manualHeartbeatToastTimer.current = window.setTimeout(() => {
+      setManualHeartbeatToast(null)
+      manualHeartbeatToastTimer.current = null
+    }, 5000)
+  }
+
+  useEffect(() => {
+    return () => {
+      if (manualHeartbeatToastTimer.current !== null) {
+        window.clearTimeout(manualHeartbeatToastTimer.current)
+      }
+    }
+  }, [])
+
+  const manualHeartbeatMutation = useMutation({
+    mutationFn: triggerManualHeartbeat,
+    onSuccess: async (payload, commanderId) => {
+      setManualHeartbeatRunIdByCommander((current) => ({
+        ...current,
+        [commanderId]: payload.runId,
+      }))
+      setManualHeartbeatErrorByCommander((current) => removeKey(current, commanderId))
+      showManualHeartbeatToast(`Heartbeat run queued: ${payload.runId}`)
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['commanders', 'sessions'] }),
+        queryClient.invalidateQueries({ queryKey: ['commanders', 'heartbeat-log', commanderId] }),
+      ])
+    },
+    onError: (error, commanderId) => {
+      setManualHeartbeatErrorByCommander((current) => ({
+        ...current,
+        [commanderId]: error instanceof Error ? error.message : 'Failed to trigger heartbeat.',
+      }))
+    },
+  })
+
   return (
-    <section className="h-full card-sumi overflow-hidden flex flex-col">
+    <section className="relative min-h-[16rem] xl:h-full card-sumi overflow-hidden flex flex-col">
       <header className="px-4 py-3 border-b border-ink-border bg-washi-aged/60">
         <h3 className="section-title">Commander List</h3>
       </header>
+
+      {manualHeartbeatToast && (
+        <div className="absolute right-3 top-3 z-10 max-w-[20rem] rounded-lg border border-ink-border bg-washi-white/95 px-2.5 py-1.5 text-whisper text-sumi-black shadow-ink-sm">
+          {manualHeartbeatToast}
+        </div>
+      )}
 
       <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-3">
         {loading && commanders.length === 0 && (
@@ -63,6 +176,11 @@ export function CommanderList({
           const selected = selectedCommanderId === session.id
           const taskLabel = currentTaskLabel(session)
           const isRunning = session.state === 'running'
+          const selectedAgentType = agentTypeByCommander[session.id] ?? resolveAgentType(session.agentType)
+          const isManualHeartbeatPending = manualHeartbeatMutation.isPending &&
+            manualHeartbeatMutation.variables === session.id
+          const manualHeartbeatRunId = manualHeartbeatRunIdByCommander[session.id]
+          const manualHeartbeatError = manualHeartbeatErrorByCommander[session.id]
 
           return (
             <div
@@ -84,7 +202,15 @@ export function CommanderList({
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <p className="font-mono text-sm text-sumi-black truncate">{session.host}</p>
+                  {session.persona && (
+                    <p className="mt-1 text-sumi-diluted text-xs truncate">{session.persona}</p>
+                  )}
                   <p className="mt-1 text-whisper text-sumi-mist truncate">{session.id}</p>
+                  {session.remoteOrigin?.label && (
+                    <p className="mt-1 text-whisper text-sumi-diluted truncate">
+                      remote {session.remoteOrigin.label}
+                    </p>
+                  )}
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
                   <span className={cn('badge-sumi', STATE_BADGE_CLASSES[session.state])}>
@@ -130,6 +256,97 @@ export function CommanderList({
                 </div>
               ) : (
                 <p className="mt-3 text-whisper text-sumi-mist">No task assigned</p>
+              )}
+
+              <div className="mt-3 flex items-center gap-2 flex-wrap">
+                <label className="inline-flex items-center gap-1 rounded-lg border border-ink-border px-2 py-1 text-xs text-sumi-diluted">
+                  <span>agentType</span>
+                  <select
+                    value={selectedAgentType}
+                    onChange={(event) => {
+                      event.stopPropagation()
+                      const nextAgentType = event.target.value === 'codex' ? 'codex' : 'claude'
+                      setAgentTypeByCommander((current) => ({
+                        ...current,
+                        [session.id]: nextAgentType,
+                      }))
+                    }}
+                    onClick={(event) => event.stopPropagation()}
+                    className="bg-transparent text-sumi-black focus:outline-none"
+                  >
+                    <option value="claude">claude</option>
+                    <option value="codex">codex</option>
+                  </select>
+                </label>
+                {!isRunning && onStartCommander && (
+                  <button
+                    type="button"
+                    disabled={isStartPending}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      void onStartCommander(session.id, selectedAgentType)
+                    }}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-accent-moss/40 px-2.5 py-1 text-xs text-accent-moss hover:bg-accent-moss/10 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+                  >
+                    <Triangle size={10} className="fill-current" />
+                    Start
+                  </button>
+                )}
+                {isRunning && onStopCommander && (
+                  <button
+                    type="button"
+                    disabled={isStopPending}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      void onStopCommander(session.id)
+                    }}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-accent-vermillion/40 px-2.5 py-1 text-xs text-accent-vermillion hover:bg-accent-vermillion/10 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+                  >
+                    <Square size={10} className="fill-current" />
+                    Stop
+                  </button>
+                )}
+                {isRunning && (
+                  <button
+                    type="button"
+                    disabled={isManualHeartbeatPending}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      setManualHeartbeatErrorByCommander((current) => removeKey(current, session.id))
+                      void manualHeartbeatMutation.mutateAsync(session.id)
+                    }}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-ink-border px-2.5 py-1 text-xs hover:bg-ink-wash disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+                  >
+                    {isManualHeartbeatPending ? 'Triggering...' : 'Trigger Heartbeat'}
+                  </button>
+                )}
+                {onOpenChat && (
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      void onOpenChat(session.id, selectedAgentType)
+                    }}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-ink-border px-2.5 py-1 text-xs hover:bg-ink-wash transition-colors"
+                  >
+                    <MessageSquare size={12} />
+                    Open Chat
+                  </button>
+                )}
+              </div>
+
+              {isRunning && manualHeartbeatRunId && (
+                <p
+                  className="mt-2 text-whisper text-sumi-diluted truncate"
+                  title={manualHeartbeatRunId}
+                >
+                  runId: {manualHeartbeatRunId}
+                </p>
+              )}
+              {isRunning && manualHeartbeatError && (
+                <p className="mt-2 text-whisper text-accent-vermillion">
+                  {manualHeartbeatError}
+                </p>
               )}
 
               <div className="mt-3 flex items-center justify-between gap-2 text-whisper text-sumi-diluted">

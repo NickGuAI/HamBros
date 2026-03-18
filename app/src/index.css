@@ -89,6 +89,11 @@
     color: #C23B22;
   }
 
+  .badge-error {
+    background: rgba(194, 59, 34, 0.15);
+    color: #C23B22;
+  }
+
   .badge-completed {
     background: rgba(28, 28, 28, 0.04);
     color: #8B8B8B;
@@ -192,6 +197,7 @@
     align-items: center;
     gap: 10px;
     min-width: 0;
+    flex: 1;
   }
   .session-view-overlay .session-back {
     display: flex;
@@ -216,6 +222,7 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    min-width: 0;
   }
   .session-view-overlay .session-badge {
     display: inline-flex;
@@ -344,15 +351,37 @@
     to { opacity: 1; transform: translateY(0); }
   }
 
+  /* ── Agent Avatar Row ─────────────────────────── */
+  .session-view-overlay .msg-agent-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  .session-view-overlay .msg-agent-avatar {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    border-radius: 8px;
+    background: rgba(123, 175, 212, 0.15);
+    color: var(--msg-accent-blue);
+    flex-shrink: 0;
+    margin-top: 2px;
+  }
+
   /* ── Agent Text ────────────────────────────────── */
   .session-view-overlay .msg-agent {
     padding: 14px 16px;
     background: var(--msg-surface);
-    border: 1px solid var(--msg-border);
-    border-radius: 4px 16px 16px 16px;
+    border: 1px solid rgba(224, 221, 213, 0.12);
+    border-left: 3px solid var(--msg-accent-blue);
+    border-radius: 2px 16px 16px 16px;
     font-size: 14px;
     line-height: 1.65;
     color: var(--msg-text);
+    min-width: 0;
+    flex: 1;
   }
   .session-view-overlay .msg-agent strong { font-weight: 600; color: #f0ede5; }
   .session-view-overlay .msg-agent-md > * + * {
@@ -512,6 +541,17 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  .session-view-overlay .msg-tool-service {
+    font-size: 10px;
+    font-weight: 400;
+    color: var(--msg-text-muted);
+    margin-right: 4px;
+  }
+  .session-view-overlay .msg-tool-service::after {
+    content: '/';
+    margin-left: 4px;
+    opacity: 0.5;
+  }
   .session-view-overlay .msg-tool-file {
     font-family: var(--font-mono);
     font-size: 11px;
@@ -558,6 +598,53 @@
   .session-view-overlay .diff-line { padding: 1px 0; }
   .session-view-overlay .diff-add { color: var(--msg-accent-green); }
   .session-view-overlay .diff-remove { color: var(--msg-accent-red); text-decoration: line-through; opacity: 0.7; }
+
+  /* ── Tool Call Group (collapsed) ────────────────── */
+  .session-view-overlay .msg-tool-group {
+    border: 1px solid var(--msg-border);
+    border-radius: 4px 14px 14px 14px;
+    overflow: hidden;
+  }
+  .session-view-overlay .msg-tool-group-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    background: var(--msg-surface);
+    border: none;
+    width: 100%;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    font-family: var(--font-mono);
+    color: var(--msg-text-secondary);
+  }
+  .session-view-overlay .msg-tool-group-header:active {
+    background: var(--msg-surface-elevated);
+  }
+  .session-view-overlay .msg-tool-group-icon {
+    color: var(--msg-text-muted);
+    flex-shrink: 0;
+  }
+  .session-view-overlay .msg-tool-group-count {
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .session-view-overlay .msg-tool-group-progress {
+    font-size: 10px;
+    color: var(--msg-text-muted);
+  }
+  .session-view-overlay .msg-tool-group-body {
+    display: none;
+    padding: 6px;
+    background: var(--msg-bg);
+    border-top: 1px solid var(--msg-border-subtle);
+  }
+  .session-view-overlay .msg-tool-group-body > * + * {
+    margin-top: 4px;
+  }
+  .session-view-overlay .msg-tool-group.expanded .msg-tool-group-body {
+    display: block;
+  }
 
   /* ── User Message ──────────────────────────────── */
   .session-view-overlay .msg-user {
@@ -711,8 +798,8 @@
   /* ── Input Bar ─────────────────────────────────── */
   .session-view-overlay .input-bar {
     display: flex;
-    align-items: flex-end;
-    gap: 8px;
+    flex-direction: column;
+    gap: 0;
     padding: 10px 12px;
     padding-bottom: calc(10px + var(--safe-bottom));
     background: var(--msg-surface);

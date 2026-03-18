@@ -1,0 +1,652 @@
+import { useCallback, useRef, useState } from 'react'
+import type { AskQuestion, StreamEvent } from '@/types'
+import {
+  capMessages,
+  extractAgentMessageText,
+  extractSubagentDescription,
+  extractToolDetails,
+  extractToolResultOutput,
+  SUBAGENT_WORKING_LABEL,
+  type MsgItem,
+} from './session-messages'
+
+function normalizeDescription(value: string | undefined): string {
+  return value?.trim().toLowerCase() ?? ''
+}
+
+type CurrentBlock = {
+  type: 'text' | 'thinking' | 'tool_use'
+  msgId: string
+  toolName?: string
+  toolId?: string
+  inputJsonParts?: string[]
+}
+
+export function useStreamEventProcessor() {
+  const idCounterRef = useRef(0)
+  const currentBlockRef = useRef<CurrentBlock | null>(null)
+  const activeAgentMessageIdsRef = useRef<string[]>([])
+
+  const [messages, setMessages] = useState<MsgItem[]>([])
+  const [isStreaming, setIsStreaming] = useState(false)
+
+  const nextId = useCallback(() => `msg-${++idCounterRef.current}`, [])
+
+  const resetMessages = useCallback(() => {
+    idCounterRef.current = 0
+    currentBlockRef.current = null
+    activeAgentMessageIdsRef.current = []
+    setMessages([])
+    setIsStreaming(false)
+  }, [])
+
+  const pushActiveAgentMessageId = useCallback((messageId: string) => {
+    if (!messageId) return
+    const active = activeAgentMessageIdsRef.current
+    if (!active.includes(messageId)) {
+      active.push(messageId)
+    }
+  }, [])
+
+  const removeActiveAgentMessageId = useCallback((messageId: string) => {
+    if (!messageId) return
+    activeAgentMessageIdsRef.current = activeAgentMessageIdsRef.current.filter(
+      (id) => id !== messageId,
+    )
+  }, [])
+
+  const clearActiveAgentMessageIds = useCallback(() => {
+    activeAgentMessageIdsRef.current = []
+  }, [])
+
+  const appendSubagentSystemMessage = useCallback(
+    (
+      text: string,
+      {
+        toolUseId,
+        descriptionHint,
+      }: {
+        toolUseId?: string
+        descriptionHint?: string
+      } = {},
+    ) => {
+      if (!text.trim()) return
+      const childMsg: MsgItem = { id: nextId(), kind: 'system', text }
+      const normalizedHint = normalizeDescription(descriptionHint)
+      const normalizedToolUseId = typeof toolUseId === 'string' ? toolUseId.trim() : ''
+
+      setMessages((prev) => {
+        // Keep only active running agent ids in the stack.
+        if (activeAgentMessageIdsRef.current.length > 0) {
+          const runningAgentIds = new Set(
+            prev
+              .filter(
+                (m) => m.kind === 'tool' && m.toolName === 'Agent' && m.toolStatus === 'running',
+              )
+              .map((m) => m.id),
+          )
+          activeAgentMessageIdsRef.current = activeAgentMessageIdsRef.current.filter((id) =>
+            runningAgentIds.has(id),
+          )
+        }
+
+        let parentIndex = -1
+
+        // Deterministic correlation for parallel subagents.
+        // task_* system events include tool_use_id that matches Agent tool_use ids.
+        if (normalizedToolUseId) {
+          for (let i = prev.length - 1; i >= 0; i--) {
+            const msg = prev[i]
+            if (
+              msg.kind === 'tool' &&
+              msg.toolName === 'Agent' &&
+              msg.toolId === normalizedToolUseId
+            ) {
+              parentIndex = i
+              break
+            }
+          }
+        }
+
+        // Fallback for older payloads without tool_use_id.
+        if (parentIndex === -1 && normalizedHint) {
+          const activeIds = activeAgentMessageIdsRef.current
+          for (let i = activeIds.length - 1; i >= 0; i--) {
+            const idx = prev.findIndex((m) => m.id === activeIds[i])
+            if (idx === -1) continue
+            const parent = prev[idx]
+            if (
+              parent.kind === 'tool' &&
+              parent.toolName === 'Agent' &&
+              parent.toolStatus === 'running' &&
+              normalizeDescription(parent.subagentDescription) === normalizedHint
+            ) {
+              parentIndex = idx
+              break
+            }
+          }
+        }
+
+        if (parentIndex === -1) {
+          const activeIds = activeAgentMessageIdsRef.current
+          for (let i = activeIds.length - 1; i >= 0; i--) {
+            const idx = prev.findIndex((m) => m.id === activeIds[i])
+            if (idx === -1) continue
+            const parent = prev[idx]
+            if (
+              parent.kind === 'tool' &&
+              parent.toolName === 'Agent' &&
+              parent.toolStatus === 'running'
+            ) {
+              parentIndex = idx
+              break
+            }
+          }
+        }
+
+        if (parentIndex === -1) {
+          for (let i = prev.length - 1; i >= 0; i--) {
+            const msg = prev[i]
+            if (msg.kind === 'tool' && msg.toolName === 'Agent' && msg.toolStatus === 'running') {
+              parentIndex = i
+              break
+            }
+          }
+        }
+
+        if (parentIndex === -1) {
+          return capMessages([...prev, childMsg])
+        }
+
+        const updated = [...prev]
+        const parent = updated[parentIndex]
+        if (parent.kind !== 'tool') {
+          return capMessages([...prev, childMsg])
+        }
+        updated[parentIndex] = {
+          ...parent,
+          children: [...(parent.children ?? []), childMsg],
+        }
+        return capMessages(updated)
+      })
+    },
+    [nextId],
+  )
+
+  const markAskAnswered = useCallback((toolId: string) => {
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.kind === 'ask' && m.toolId === toolId ? { ...m, askAnswered: true } : m,
+      ),
+    )
+  }, [])
+
+  const processEvent = useCallback(
+    (event: StreamEvent, isReplay = false) => {
+      if (event.type === 'agent') {
+        const text =
+          extractAgentMessageText(event.message) ??
+          extractAgentMessageText(event.text) ??
+          extractAgentMessageText(event)
+        if (text) {
+          setMessages((prev) => capMessages([...prev, { id: nextId(), kind: 'agent', text }]))
+        }
+        return
+      }
+
+      switch (event.type) {
+        case 'assistant': {
+          const blocks = event.message?.content
+          if (!Array.isArray(blocks)) break
+
+          for (const block of blocks) {
+            if (block.type === 'text') {
+              const text = block.text ?? ''
+              if (!text) continue
+              const id = nextId()
+              setMessages((prev) => capMessages([...prev, { id, kind: 'agent', text }]))
+            } else if (block.type === 'thinking') {
+              const text =
+                (typeof block.thinking === 'string' ? block.thinking : undefined) ??
+                (typeof block.text === 'string' ? block.text : '')
+              if (!text) continue
+              const id = nextId()
+              setMessages((prev) => capMessages([...prev, { id, kind: 'thinking', text }]))
+            } else if ((block as { type?: string }).type === 'agent_message') {
+              const text = extractAgentMessageText(block)
+              if (!text) continue
+              const id = nextId()
+              setMessages((prev) => capMessages([...prev, { id, kind: 'agent', text }]))
+            } else if (block.type === 'tool_use') {
+              const id = nextId()
+              if (block.name === 'AskUserQuestion') {
+                const input = block.input as { questions?: AskQuestion[] } | undefined
+                setMessages((prev) => {
+                  const existingIdx = prev.findIndex(
+                    (m) => m.kind === 'ask' && m.toolId === block.id,
+                  )
+                  if (existingIdx !== -1) {
+                    const nextQuestions = input?.questions
+                    if (!nextQuestions || nextQuestions.length === 0) return prev
+                    const existing = prev[existingIdx]
+                    if ((existing.askQuestions?.length ?? 0) > 0) return prev
+                    const updated = [...prev]
+                    updated[existingIdx] = { ...existing, askQuestions: nextQuestions }
+                    return updated
+                  }
+                  return capMessages([
+                    ...prev,
+                    {
+                      id,
+                      kind: 'ask',
+                      text: '',
+                      toolId: block.id,
+                      toolName: block.name,
+                      askQuestions: input?.questions ?? [],
+                      askAnswered: false,
+                    },
+                  ])
+                })
+              } else {
+                const { toolInput, toolFile, oldString, newString } = extractToolDetails(
+                  block.name,
+                  block.input,
+                )
+                const subagentDescription =
+                  block.name === 'Agent'
+                    ? extractSubagentDescription(block.input) ?? SUBAGENT_WORKING_LABEL
+                    : undefined
+                setMessages((prev) =>
+                  capMessages([
+                    ...prev,
+                    {
+                      id,
+                      kind: 'tool',
+                      text: '',
+                      toolId: block.id,
+                      toolName: block.name,
+                      toolStatus: 'running',
+                      toolInput,
+                      toolFile,
+                      oldString,
+                      newString,
+                      subagentDescription,
+                    },
+                  ]),
+                )
+                if (block.name === 'Agent') {
+                  pushActiveAgentMessageId(id)
+                }
+              }
+            }
+          }
+          break
+        }
+
+        case 'user': {
+          const content = event.message?.content
+          if (typeof content === 'string' && content.trim() && isReplay) {
+            setMessages((prev) =>
+              capMessages([...prev, { id: nextId(), kind: 'user', text: content.trim() }]),
+            )
+            break
+          }
+          if (!Array.isArray(content)) break
+
+          // During replay, reconstruct user messages that contain text+image blocks
+          if (isReplay) {
+            const hasToolResult = content.some((b) => b.type === 'tool_result')
+            const hasTextOrImage = content.some((b) => b.type === 'text' || b.type === 'image')
+            if (!hasToolResult && hasTextOrImage) {
+              let text = '[image]'
+              const images: { mediaType: string; data: string }[] = []
+              for (const b of content) {
+                if (b.type === 'text' && 'text' in b) {
+                  text = (b.text as string).trim() || text
+                } else if (b.type === 'image' && 'source' in b) {
+                  const src = b.source as { media_type?: string; data?: string } | undefined
+                  images.push({ mediaType: src?.media_type ?? '', data: src?.data ?? '' })
+                }
+              }
+              setMessages((prev) =>
+                capMessages([...prev, { id: nextId(), kind: 'user', text, images: images.length > 0 ? images : undefined }]),
+              )
+              break
+            }
+          }
+
+          const toolResults = content.filter((b) => b.type === 'tool_result')
+          if (toolResults.length === 0) break
+
+          setMessages((prev) => {
+            const updated = [...prev]
+            for (const result of toolResults) {
+              const status = result.is_error ? ('error' as const) : ('success' as const)
+              const toolOutput = extractToolResultOutput(result.content)
+              let matched = false
+              if (result.tool_use_id) {
+                for (let i = updated.length - 1; i >= 0; i--) {
+                  const msg = updated[i]
+                  if (
+                    msg.kind === 'tool' &&
+                    msg.toolStatus === 'running' &&
+                    msg.toolId === result.tool_use_id
+                  ) {
+                    updated[i] = toolOutput === undefined
+                      ? { ...msg, toolStatus: status }
+                      : { ...msg, toolStatus: status, toolOutput }
+                    if (msg.toolName === 'Agent') {
+                      removeActiveAgentMessageId(msg.id)
+                    }
+                    matched = true
+                    break
+                  }
+                }
+              }
+              if (!matched) {
+                for (let i = updated.length - 1; i >= 0; i--) {
+                  const msg = updated[i]
+                  if (msg.kind === 'tool' && msg.toolStatus === 'running') {
+                    updated[i] = toolOutput === undefined
+                      ? { ...msg, toolStatus: status }
+                      : { ...msg, toolStatus: status, toolOutput }
+                    if (msg.toolName === 'Agent') {
+                      removeActiveAgentMessageId(msg.id)
+                    }
+                    break
+                  }
+                }
+              }
+            }
+            return capMessages(updated)
+          })
+          break
+        }
+
+        case 'content_block_start': {
+          const block = event.content_block
+          if (block.type === 'text') {
+            const id = nextId()
+            currentBlockRef.current = { type: 'text', msgId: id }
+            setMessages((prev) => capMessages([...prev, { id, kind: 'agent', text: '' }]))
+            if (!isReplay) setIsStreaming(true)
+          } else if (block.type === 'thinking') {
+            const id = nextId()
+            currentBlockRef.current = { type: 'thinking', msgId: id }
+            setMessages((prev) => capMessages([...prev, { id, kind: 'thinking', text: '' }]))
+            if (!isReplay) setIsStreaming(true)
+          } else if (block.type === 'tool_use') {
+            const id = nextId()
+            currentBlockRef.current = {
+              type: 'tool_use',
+              msgId: id,
+              toolName: block.name,
+              toolId: block.id,
+              inputJsonParts: [],
+            }
+            if (block.name !== 'AskUserQuestion') {
+              setMessages((prev) =>
+                capMessages([
+                  ...prev,
+                  {
+                    id,
+                    kind: 'tool',
+                    text: '',
+                    toolId: block.id,
+                    toolName: block.name,
+                    toolStatus: 'running',
+                    toolInput: '',
+                    subagentDescription:
+                      block.name === 'Agent' ? SUBAGENT_WORKING_LABEL : undefined,
+                  },
+                ]),
+              )
+              if (block.name === 'Agent') {
+                pushActiveAgentMessageId(id)
+              }
+              if (!isReplay) setIsStreaming(true)
+            }
+          }
+          break
+        }
+
+        case 'content_block_delta': {
+          const cur = currentBlockRef.current
+          if (!cur) break
+          const delta = event.delta
+          if (delta.type === 'text_delta' && cur.type === 'text') {
+            const appendText = delta.text
+            setMessages((prev) => {
+              const last = prev.length - 1
+              if (last >= 0 && prev[last].id === cur.msgId) {
+                const updated = [...prev]
+                updated[last] = { ...prev[last], text: prev[last].text + appendText }
+                return updated
+              }
+              return prev.map((m) =>
+                m.id === cur.msgId ? { ...m, text: m.text + appendText } : m,
+              )
+            })
+          } else if (delta.type === 'thinking_delta' && cur.type === 'thinking') {
+            const appendText = delta.thinking
+            setMessages((prev) => {
+              const last = prev.length - 1
+              if (last >= 0 && prev[last].id === cur.msgId) {
+                const updated = [...prev]
+                updated[last] = { ...prev[last], text: prev[last].text + appendText }
+                return updated
+              }
+              return prev.map((m) =>
+                m.id === cur.msgId ? { ...m, text: m.text + appendText } : m,
+              )
+            })
+          } else if (delta.type === 'input_json_delta' && cur.type === 'tool_use') {
+            cur.inputJsonParts!.push(delta.partial_json)
+          }
+          break
+        }
+
+        case 'content_block_stop': {
+          const cur = currentBlockRef.current
+          if (cur?.type === 'text') {
+            // Remove empty agent messages that received no delta text
+            setMessages((prev) => {
+              const msg = prev.find((m) => m.id === cur.msgId)
+              if (msg && msg.kind === 'agent' && !msg.text.trim()) {
+                return prev.filter((m) => m.id !== cur.msgId)
+              }
+              return prev
+            })
+          }
+          if (cur?.type === 'tool_use') {
+            const rawJson = cur.inputJsonParts?.join('') ?? ''
+            if (cur.toolName === 'AskUserQuestion') {
+              let questions: AskQuestion[] = []
+              try {
+                const input = JSON.parse(rawJson) as { questions?: AskQuestion[] }
+                questions = input.questions ?? []
+              } catch {
+                // ignore — ask data may already have arrived via envelope event
+              }
+              setMessages((prev) => {
+                const existingIdx = prev.findIndex(
+                  (m) => m.kind === 'ask' && m.toolId === cur.toolId,
+                )
+                if (existingIdx !== -1) {
+                  const existing = prev[existingIdx]
+                  if (questions.length === 0 || (existing.askQuestions?.length ?? 0) > 0) {
+                    return prev
+                  }
+                  const updated = [...prev]
+                  updated[existingIdx] = { ...existing, askQuestions: questions }
+                  return updated
+                }
+                return capMessages([
+                  ...prev,
+                  {
+                    id: cur.msgId,
+                    kind: 'ask',
+                    text: '',
+                    toolId: cur.toolId,
+                    toolName: cur.toolName,
+                    askQuestions: questions,
+                    askAnswered: false,
+                  },
+                ])
+              })
+            } else {
+              const { toolInput, toolFile, oldString, newString } = extractToolDetails(
+                cur.toolName,
+                rawJson,
+              )
+              const subagentDescription =
+                cur.toolName === 'Agent'
+                  ? extractSubagentDescription(rawJson) ?? SUBAGENT_WORKING_LABEL
+                  : undefined
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === cur.msgId
+                    ? { ...m, toolInput, toolFile, oldString, newString, subagentDescription }
+                    : m,
+                ),
+              )
+            }
+          }
+          currentBlockRef.current = null
+          break
+        }
+
+        case 'message_start': {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.kind === 'tool' && m.toolStatus === 'running'
+                ? { ...m, toolStatus: 'success' }
+                : m,
+            ),
+          )
+          clearActiveAgentMessageIds()
+          setIsStreaming(false)
+          break
+        }
+
+        case 'message_stop': {
+          setIsStreaming(false)
+          break
+        }
+
+        case 'result': {
+          const resultStatus = event.is_error ? ('error' as const) : ('success' as const)
+          // Top-level results always carry duration_ms (session-level timing);
+          // sub-agent completions omit it. Use duration_ms as the reliable marker
+          // to avoid suppressing "Awaiting input" for costless top-level sessions
+          // (e.g. OpenClaw normalized results).
+          const isSubagentResult = !event.duration_ms
+          setMessages((prev) =>
+            capMessages([
+              ...prev.map((m) =>
+                m.kind === 'tool' && m.toolStatus === 'running'
+                  ? { ...m, toolStatus: resultStatus }
+                  : m,
+              ),
+              ...(isSubagentResult
+                ? []
+                : [{ id: nextId(), kind: 'system' as const, text: 'Awaiting input' }]),
+            ]),
+          )
+          clearActiveAgentMessageIds()
+          setIsStreaming(false)
+          break
+        }
+
+        case 'exit': {
+          setMessages((prev) => {
+            const hasRunning = prev.some((m) => m.kind === 'tool' && m.toolStatus === 'running')
+            if (!hasRunning) {
+              return capMessages([
+                ...prev,
+                { id: nextId(), kind: 'system', text: 'Session ended' },
+              ])
+            }
+            return capMessages([
+              ...prev.map((m) =>
+                m.kind === 'tool' && m.toolStatus === 'running'
+                  ? { ...m, toolStatus: 'error' as const }
+                  : m,
+              ),
+              { id: nextId(), kind: 'system', text: 'Session ended' },
+            ])
+          })
+          clearActiveAgentMessageIds()
+          setIsStreaming(false)
+          break
+        }
+
+        case 'system': {
+          // Sub-agent events like init, compact_boundary, status have no text — skip them
+          if (!event.text) {
+            const subtype = (event as { subtype?: string }).subtype
+            const toolUseId = (event as { tool_use_id?: string }).tool_use_id
+            if (subtype === 'task_progress') {
+              const desc = (event as { description?: string }).description
+              const tool = (event as { last_tool_name?: string }).last_tool_name
+              const parts = [desc, tool ? `[${tool}]` : ''].filter(Boolean)
+              if (parts.length > 0) {
+                appendSubagentSystemMessage(parts.join(' '), {
+                  toolUseId,
+                  descriptionHint: desc,
+                })
+              }
+            }
+            if (subtype === 'task_started') {
+              const desc = (event as { description?: string }).description
+              if (desc) {
+                appendSubagentSystemMessage(`Sub-agent: ${desc}`, {
+                  toolUseId,
+                  descriptionHint: desc,
+                })
+              }
+            }
+            if (subtype === 'task_notification') {
+              const desc = (event as { description?: string }).description
+              const summary = (event as { summary?: string }).summary
+              const status = (event as { status?: string }).status
+              const text =
+                summary ?? desc ?? (typeof status === 'string' ? `Sub-agent ${status}` : undefined)
+              if (text) {
+                appendSubagentSystemMessage(text, {
+                  toolUseId,
+                  descriptionHint: summary ?? desc,
+                })
+              }
+            }
+            // Silently skip init, compact_boundary, status
+            break
+          }
+          setMessages((prev) =>
+            capMessages([...prev, { id: nextId(), kind: 'system', text: event.text ?? '' }]),
+          )
+          break
+        }
+
+        default:
+          break
+      }
+    },
+    [
+      appendSubagentSystemMessage,
+      clearActiveAgentMessageIds,
+      nextId,
+      pushActiveAgentMessageId,
+      removeActiveAgentMessageId,
+    ],
+  )
+
+  const pushUserMessage = useCallback(
+    (text: string) => {
+      setMessages((prev) => capMessages([...prev, { id: nextId(), kind: 'user', text }]))
+    },
+    [nextId],
+  )
+
+  return { messages, setMessages, processEvent, resetMessages, isStreaming, markAskAnswered, pushUserMessage }
+}

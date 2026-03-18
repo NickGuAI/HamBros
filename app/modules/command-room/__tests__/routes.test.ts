@@ -297,4 +297,80 @@ describe('createCommandRoomRouter', () => {
     )
     expect(updateInvalidTimezone.status).toBe(400)
   })
+
+  it('filters tasks by commanderId query param when provided', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'command-room-routes-'))
+    cleanupDirs.push(dir)
+    const taskStore = new CommandRoomTaskStore(join(dir, 'tasks.json'))
+    const runStore = new CommandRoomRunStore(join(dir, 'runs.json'))
+
+    const server = await startServer({
+      taskStore,
+      runStore,
+      createSession: vi.fn(async () => ({ sessionId: 'session-1' })),
+      monitorSession: vi.fn(async () => ({
+        sessionId: 'session-1',
+        status: 'SUCCESS' as const,
+        finalComment: 'Run done.',
+        filesChanged: 0,
+        durationMin: 1,
+        raw: { total_cost_usd: 0.11 },
+      })),
+    })
+    servers.push(server)
+
+    const createFirst = await fetch(`${server.baseUrl}/api/command-room/tasks`, {
+      method: 'POST',
+      headers: {
+        ...AUTH_HEADERS,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: 'Commander A task',
+        schedule: '0 1 * * *',
+        machine: 'machine-1',
+        workDir: '/tmp/example-repo',
+        agentType: 'claude',
+        instruction: 'Task A',
+        enabled: true,
+        commanderId: 'cmdr-a',
+      }),
+    })
+    expect(createFirst.status).toBe(201)
+
+    const createSecond = await fetch(`${server.baseUrl}/api/command-room/tasks`, {
+      method: 'POST',
+      headers: {
+        ...AUTH_HEADERS,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: 'Commander B task',
+        schedule: '0 2 * * *',
+        machine: 'machine-1',
+        workDir: '/tmp/example-repo',
+        agentType: 'claude',
+        instruction: 'Task B',
+        enabled: true,
+        commanderId: 'cmdr-b',
+      }),
+    })
+    expect(createSecond.status).toBe(201)
+
+    const filteredResponse = await fetch(
+      `${server.baseUrl}/api/command-room/tasks?commanderId=cmdr-a`,
+      { headers: AUTH_HEADERS },
+    )
+    expect(filteredResponse.status).toBe(200)
+    const filtered = await readJson<Array<{ commanderId?: string }>>(filteredResponse)
+    expect(filtered).toHaveLength(1)
+    expect(filtered[0]?.commanderId).toBe('cmdr-a')
+
+    const allResponse = await fetch(`${server.baseUrl}/api/command-room/tasks`, {
+      headers: AUTH_HEADERS,
+    })
+    expect(allResponse.status).toBe(200)
+    const all = await readJson<Array<{ id: string }>>(allResponse)
+    expect(all).toHaveLength(2)
+  })
 })

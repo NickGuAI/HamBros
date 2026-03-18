@@ -16,6 +16,11 @@ import {
 } from './openai-realtime.js'
 
 const DEFAULT_WS_KEEPALIVE_INTERVAL_MS = 30000
+const PCM16_MONO_SAMPLE_RATE_HZ = 24000
+const PCM16_BYTES_PER_SAMPLE = 2
+const MIN_BUFFERED_AUDIO_MS = 100
+const MIN_COMMIT_AUDIO_BYTES =
+  (PCM16_MONO_SAMPLE_RATE_HZ * PCM16_BYTES_PER_SAMPLE * MIN_BUFFERED_AUDIO_MS) / 1000
 
 interface BrowserControlMessage {
   type?: unknown
@@ -94,6 +99,22 @@ function toBase64AudioChunk(data: RawData): string | null {
 
   const buffer = Buffer.from(data)
   return buffer.length > 0 ? buffer.toString('base64') : null
+}
+
+function getBinaryAudioByteLength(data: RawData): number {
+  if (typeof data === 'string') {
+    return 0
+  }
+
+  if (data instanceof ArrayBuffer) {
+    return data.byteLength
+  }
+
+  if (Array.isArray(data)) {
+    return data.reduce((total, chunk) => total + chunk.byteLength, 0)
+  }
+
+  return data.byteLength
 }
 
 function attachWebSocketKeepAlive(
@@ -254,6 +275,7 @@ export function createRealtimeProxy(options: RealtimeProxyOptions = {}): Realtim
         let finalized = false
         let disposed = false
         let pendingStop = false
+        let bufferedAudioBytes = 0
 
         const dispose = () => {
           if (disposed) {
@@ -313,6 +335,7 @@ export function createRealtimeProxy(options: RealtimeProxyOptions = {}): Realtim
             const base64Audio = toBase64AudioChunk(rawData)
             if (base64Audio) {
               client.sendAudio(base64Audio)
+              bufferedAudioBytes += getBinaryAudioByteLength(rawData)
             }
             return
           }
@@ -327,7 +350,11 @@ export function createRealtimeProxy(options: RealtimeProxyOptions = {}): Realtim
           const messageType = asNonEmptyString(message.type)
           if (messageType === 'stop') {
             pendingStop = true
-            client.commitAudioBuffer()
+            if (bufferedAudioBytes >= MIN_COMMIT_AUDIO_BYTES) {
+              client.commitAudioBuffer()
+            } else if (ws.readyState === WebSocket.OPEN) {
+              ws.close(1000, 'Recording too short')
+            }
           }
         })
 

@@ -44,13 +44,17 @@ describe('JournalWriter.scaffold()', () => {
   it('creates all required directories', async () => {
     await writer.scaffold()
     const { stat } = await import('node:fs/promises')
-    const check = (rel: string) => stat(join(tmpDir, 'test-commander', '.memory', rel))
-    await expect(check('.')).resolves.toBeTruthy()
-    await expect(check('journal')).resolves.toBeTruthy()
-    await expect(check('repos')).resolves.toBeTruthy()
-    await expect(check('skills')).resolves.toBeTruthy()
-    await expect(check('archive')).resolves.toBeTruthy()
-    await expect(check('archive/journal')).resolves.toBeTruthy()
+    const checkMemory = (rel: string) => stat(join(tmpDir, 'test-commander', '.memory', rel))
+    const checkCommanderRoot = (rel: string) => stat(join(tmpDir, 'test-commander', rel))
+    await expect(checkMemory('.')).resolves.toBeTruthy()
+    await expect(checkMemory('journal')).resolves.toBeTruthy()
+    await expect(checkCommanderRoot('skills')).resolves.toBeTruthy()
+    await expect(checkMemory('archive')).resolves.toBeTruthy()
+    await expect(checkMemory('archive/journal')).resolves.toBeTruthy()
+    await expect(checkMemory('LONG_TERM_MEM.md')).resolves.toBeTruthy()
+    await expect(checkMemory('working-memory.json')).resolves.toBeTruthy()
+    await expect(checkMemory('working-memory.md')).resolves.toBeTruthy()
+    await expect(checkMemory('associations.json')).resolves.toBeTruthy()
   })
 
   it('creates MEMORY.md with default content', async () => {
@@ -60,6 +64,15 @@ describe('JournalWriter.scaffold()', () => {
       'utf-8',
     )
     expect(content).toContain('# Commander Memory')
+  })
+
+  it('creates LONG_TERM_MEM.md with default content', async () => {
+    await writer.scaffold()
+    const content = await readFile(
+      join(tmpDir, 'test-commander', '.memory', 'LONG_TERM_MEM.md'),
+      'utf-8',
+    )
+    expect(content).toContain('# Commander Long-Term Memory')
   })
 
   it('creates consolidation-log.md with default content', async () => {

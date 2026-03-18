@@ -34,9 +34,12 @@ export interface TelemetryRouterOptions {
   verifyAuth0Token?: (token: string) => Promise<AuthUser>
   localScan?: LocalScanOptions
   localScanner?: LocalScannerLike
-  /** Days to retain JSONL entries (passed to TelemetryHub). Default: 14. */
+  /** Days to retain JSONL entries (passed to TelemetryHub). Default: 90. */
   retentionDays?: number
 }
+
+// Raised from 14d to support 30/90-day historical queries.
+const DEFAULT_RETENTION_DAYS = 90
 
 // ---------------------------------------------------------------------------
 // Parsing helpers — serve the legacy REST endpoints
@@ -199,14 +202,91 @@ function parseIntervalMs(value: unknown): number {
   return 0
 }
 
+interface SummaryPeriodRange {
+  period: string
+  startKey: string
+  endKey: string
+}
+
+function firstQueryString(value: unknown): string | null {
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    return trimmed.length > 0 ? trimmed : null
+  }
+  if (Array.isArray(value)) {
+    for (const candidate of value) {
+      const parsed = firstQueryString(candidate)
+      if (parsed) {
+        return parsed
+      }
+    }
+  }
+  return null
+}
+
+function toUtcDayKey(date: Date): string {
+  return date.toISOString().slice(0, 10)
+}
+
+function startOfUtcDay(date: Date): Date {
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()))
+}
+
+function parseSummaryPeriod(
+  rawPeriod: string | null,
+  now: Date,
+): { ok: true; value: SummaryPeriodRange } | { ok: false; error: string } {
+  const currentMonth = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`
+  const period = rawPeriod ?? `month:${currentMonth}`
+
+  if (period === '30d' || period === '90d') {
+    const days = period === '30d' ? 30 : 90
+    const end = startOfUtcDay(now)
+    const start = new Date(end.getTime() - (days - 1) * 24 * 60 * 60_000)
+    return {
+      ok: true,
+      value: {
+        period,
+        startKey: toUtcDayKey(start),
+        endKey: toUtcDayKey(end),
+      },
+    }
+  }
+
+  const monthMatch = /^month:(\d{4})-(\d{2})$/.exec(period)
+  if (monthMatch) {
+    const year = Number.parseInt(monthMatch[1], 10)
+    const month = Number.parseInt(monthMatch[2], 10)
+    if (month < 1 || month > 12) {
+      return { ok: false, error: 'Month must be in YYYY-MM format' }
+    }
+    const start = new Date(Date.UTC(year, month - 1, 1))
+    const end = new Date(Date.UTC(year, month, 0))
+    return {
+      ok: true,
+      value: {
+        period,
+        startKey: toUtcDayKey(start),
+        endKey: toUtcDayKey(end),
+      },
+    }
+  }
+
+  return {
+    ok: false,
+    error: 'Invalid period. Use 30d, 90d, or month:YYYY-MM',
+  }
+}
+
 export function createTelemetryRouterWithHub(
   options: TelemetryRouterOptions = {},
 ): TelemetryRouterResult {
   const now = options.now ?? (() => new Date())
+  const configuredRetentionDays = options.retentionDays ?? DEFAULT_RETENTION_DAYS
   const store =
     options.store ??
     new TelemetryJsonlStore(options.dataFilePath ?? defaultTelemetryStorePath())
-  const hub = new TelemetryHub({ store, now, retentionDays: options.retentionDays })
+  const hub = new TelemetryHub({ store, now, retentionDays: configuredRetentionDays })
   const localScanEnabled = options.localScan?.enabled ?? true
   const localScanner =
     options.localScanner ??
@@ -343,9 +423,22 @@ export function createTelemetryRouterWithHub(
     }
   })
 
-  router.get('/summary', requireReadAccess, async (_req, res) => {
+  router.get('/summary', requireReadAccess, async (req, res) => {
+    const parsedPeriod = parseSummaryPeriod(firstQueryString(req.query.period), now())
+    if (!parsedPeriod.ok) {
+      res.status(400).json({ error: parsedPeriod.error })
+      return
+    }
+
     try {
-      res.json(await hub.getSummary())
+      res.json(
+        await hub.getSummary({
+          period: parsedPeriod.value.period,
+          startKey: parsedPeriod.value.startKey,
+          endKey: parsedPeriod.value.endKey,
+          retentionDays: configuredRetentionDays,
+        }),
+      )
     } catch {
       res.status(500).json({ error: 'Failed to build telemetry summary' })
     }
@@ -356,7 +449,7 @@ export function createTelemetryRouterWithHub(
     const retentionDays =
       typeof body?.retentionDays === 'number' && Number.isFinite(body.retentionDays) && body.retentionDays > 0
         ? body.retentionDays
-        : (options.retentionDays ?? 14)
+        : configuredRetentionDays
     try {
       await hub.ensureReady()
       await store.compact(retentionDays)

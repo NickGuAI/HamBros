@@ -1,9 +1,20 @@
 import type { Router } from 'express'
+import cron from 'node-cron'
 import { randomBytes } from 'node:crypto'
 import type { IncomingMessage } from 'node:http'
 import type { Duplex } from 'node:stream'
 import { createAgentsRouter } from '../modules/agents/routes.js'
+import { CommandRoomExecutor } from '../modules/command-room/executor.js'
+import { CommandRoomRunStore } from '../modules/command-room/run-store.js'
 import { createCommandRoomRouter } from '../modules/command-room/routes.js'
+import { CommandRoomScheduler } from '../modules/command-room/scheduler.js'
+import { CommandRoomTaskStore } from '../modules/command-room/task-store.js'
+import { registerCommanderCron } from '../modules/commanders/cron.js'
+import { QuestStore } from '../modules/commanders/quest-store.js'
+import {
+  resolveCommanderDataDir,
+  resolveCommanderSessionStorePath,
+} from '../modules/commanders/paths.js'
 import { createCommandersRouter } from '../modules/commanders/routes.js'
 import { createFactoryRouter } from '../modules/factory/routes.js'
 import { createServicesRouter } from '../modules/services/routes.js'
@@ -37,13 +48,47 @@ export interface ModuleRegistryResult {
   otelRouter: Router
 }
 
+function parseEnabledFlag(value: string | undefined): boolean {
+  if (!value) {
+    return false
+  }
+  const normalized = value.trim().toLowerCase()
+  return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on'
+}
+
 export function createModules(options: ModuleRegistryOptions = {}): ModuleRegistryResult {
   const internalToken = randomBytes(32).toString('hex')
+
+  const commanderDataDir = resolveCommanderDataDir()
 
   const agents = createAgentsRouter({
     apiKeyStore: options.apiKeyStore,
     maxSessions: options.maxAgentSessions,
     internalToken,
+    questStore: new QuestStore(commanderDataDir),
+  })
+
+  const commanderSessionStorePath = resolveCommanderSessionStorePath(commanderDataDir)
+
+  const commandRoomTaskStore = new CommandRoomTaskStore({
+    commanderDataDir,
+  })
+  const commandRoomRunStore = new CommandRoomRunStore({
+    commanderDataDir,
+    taskStore: commandRoomTaskStore,
+  })
+  const commandRoomExecutor = new CommandRoomExecutor({
+    taskStore: commandRoomTaskStore,
+    runStore: commandRoomRunStore,
+    internalToken,
+  })
+  const commandRoomScheduler = new CommandRoomScheduler({
+    taskStore: commandRoomTaskStore,
+    executor: commandRoomExecutor,
+  })
+  const commandRoomSchedulerInitialized = commandRoomScheduler.initialize()
+  void commandRoomSchedulerInitialized.catch((error) => {
+    console.error('[command-room] Failed to initialize shared scheduler:', error)
   })
 
   const commanders = createCommandersRouter({
@@ -51,10 +96,30 @@ export function createModules(options: ModuleRegistryOptions = {}): ModuleRegist
     auth0Domain: options.auth0Domain,
     auth0Audience: options.auth0Audience,
     auth0ClientId: options.auth0ClientId,
+    sessionsInterface: agents.sessionsInterface,
+    sessionStorePath: commanderSessionStorePath,
+    questStoreDataDir: commanderDataDir,
+    heartbeatBasePath: commanderDataDir,
+    memoryBasePath: commanderDataDir,
+    commandRoomTaskStore,
+    commandRoomRunStore,
+    commandRoomScheduler,
+    commandRoomSchedulerInitialized,
+  })
+
+  registerCommanderCron(cron, {
+    basePath: commanderDataDir,
+    commanderSessionStorePath,
+    enableS3Sync: parseEnabledFlag(process.env.COMMANDER_S3_SYNC_ENABLED),
   })
 
   const commandRoom = createCommandRoomRouter({
     apiKeyStore: options.apiKeyStore,
+    taskStore: commandRoomTaskStore,
+    runStore: commandRoomRunStore,
+    executor: commandRoomExecutor,
+    scheduler: commandRoomScheduler,
+    schedulerInitialized: commandRoomSchedulerInitialized,
     internalToken,
   })
 
@@ -91,7 +156,6 @@ export function createModules(options: ModuleRegistryOptions = {}): ModuleRegist
       label: 'Commanders',
       routePrefix: '/api/commanders',
       router: commanders.router,
-      handleUpgrade: commanders.handleUpgrade,
     },
     {
       name: 'command-room',

@@ -10,7 +10,9 @@ export HOME="/home/ec2-user"
 export PATH="/home/ec2-user/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
 # Load bashrc for GOG_KEYRING_PASSWORD and other env vars
+set +u
 [ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc"
+set -u
 
 # --- Logging ---
 LOG_DIR="$HOME/.ginsights/logs"

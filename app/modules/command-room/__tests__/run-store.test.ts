@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { CommandRoomRunStore } from '../run-store.js'
+import { CommandRoomTaskStore } from '../task-store.js'
 
 describe('CommandRoomRunStore', () => {
   let tmpDir = ''
@@ -45,5 +46,52 @@ describe('CommandRoomRunStore', () => {
     const latestByTask = await store.listLatestRunsByTaskIds(['task-1', 'task-2'])
     expect(latestByTask.get('task-1')?.id).toBe(first.id)
     expect(latestByTask.get('task-2')?.status).toBe('failed')
+  })
+
+  it('routes commander-owned run records using task ownership lookup', async () => {
+    const commanderDataDir = join(tmpDir, 'commanders')
+    const taskStore = new CommandRoomTaskStore({
+      filePath: join(tmpDir, 'legacy-tasks.json'),
+      commanderDataDir,
+    })
+    const runStore = new CommandRoomRunStore({
+      filePath: join(tmpDir, 'legacy-runs.json'),
+      commanderDataDir,
+      taskStore,
+    })
+
+    const commanderTask = await taskStore.createTask({
+      name: 'Commander task',
+      schedule: '0 2 * * *',
+      machine: 'workstation-1',
+      workDir: '/tmp/example-repo',
+      agentType: 'claude',
+      instruction: 'Run commander task',
+      enabled: true,
+      commanderId: 'commander-run',
+    })
+
+    const run = await runStore.createRun({
+      cronTaskId: commanderTask.id,
+      startedAt: '2026-03-02T01:00:00.000Z',
+      completedAt: '2026-03-02T01:01:00.000Z',
+      status: 'complete',
+      report: 'done',
+      costUsd: 0,
+      sessionId: 'session-9',
+    })
+
+    const commanderRunsPath = join(
+      commanderDataDir,
+      'commander-run',
+      '.memory',
+      'cron',
+      'runs.json',
+    )
+    const commanderRuns = JSON.parse(await readFile(commanderRunsPath, 'utf8')) as {
+      runs?: Array<{ id: string }>
+    }
+
+    expect(commanderRuns.runs?.map((entry) => entry.id)).toEqual([run.id])
   })
 })

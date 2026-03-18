@@ -6,6 +6,7 @@ import {
   type SubagentResult,
 } from './memory/index.js'
 import type { GHIssue } from './memory/handoff.js'
+import { WorkingMemory } from './memory/working-memory.js'
 import type {
   AgentSessionCompletion,
   AgentSessionCreateInput,
@@ -19,6 +20,10 @@ import { AgentSessionClient } from './tools/agent-session.js'
 
 export interface Commander {
   id: string
+}
+
+export interface CommanderInitOptions {
+  skipScaffold?: boolean
 }
 
 export interface ContextPressureAgentSdk {
@@ -46,8 +51,18 @@ export interface DelegateSubagentTaskInput {
   monitorOptions?: AgentSessionMonitorOptions
 }
 
+export type CommanderSubagentState = 'running' | 'completed' | 'failed'
+
+export interface CommanderSubagentLifecycleEvent {
+  sessionId: string
+  dispatchedAt: string
+  state: CommanderSubagentState
+  result?: string
+}
+
 export interface CommanderManagerOptions {
   agentSessions?: CommanderAgentSessionTool
+  onSubagentLifecycleEvent?: (event: CommanderSubagentLifecycleEvent) => void
 }
 
 /**
@@ -58,7 +73,9 @@ export interface CommanderManagerOptions {
 export class CommanderManager {
   private readonly journal: JournalWriter
   private readonly handoff: SubagentHandoff
+  private readonly workingMemory: WorkingMemory
   private readonly agentSessions: CommanderAgentSessionTool
+  private readonly onSubagentLifecycleEvent?: (event: CommanderSubagentLifecycleEvent) => void
 
   constructor(
     private readonly commanderId: string,
@@ -67,12 +84,17 @@ export class CommanderManager {
   ) {
     this.journal = new JournalWriter(commanderId, basePath)
     this.handoff = new SubagentHandoff(commanderId, basePath)
+    this.workingMemory = new WorkingMemory(commanderId, basePath)
     this.agentSessions = options.agentSessions ?? new AgentSessionClient()
+    this.onSubagentLifecycleEvent = options.onSubagentLifecycleEvent
   }
 
   /** Initialize the commander — ensures `.memory/` scaffold exists. */
-  async init(): Promise<Commander> {
-    await this.journal.scaffold()
+  async init(options: CommanderInitOptions = {}): Promise<Commander> {
+    if (!options.skipScaffold) {
+      await this.journal.scaffold()
+    }
+    await this.safeAppendWorkingMemory(`Commander session initialized for ${this.commanderId}.`)
     return { id: this.commanderId }
   }
 
@@ -96,6 +118,11 @@ export class CommanderManager {
     subagentResult: SubagentResult,
   ): Promise<void> {
     await this.handoff.processCompletion(task, subagentResult, this.journal)
+    const notable = this.compact(subagentResult.finalComment).slice(0, 180)
+    await this.safeAppendWorkingMemory([
+      `Task completion: ${this.describeTask(task)} → ${subagentResult.status}.`,
+      notable ? `Notable observation: ${notable}.` : '',
+    ].filter((line) => line.length > 0).join(' '))
   }
 
   /**
@@ -106,6 +133,9 @@ export class CommanderManager {
     task: GHIssue,
     input: DelegateSubagentTaskInput,
   ): Promise<SubagentResult> {
+    await this.safeAppendWorkingMemory(
+      `Task start: ${this.describeTask(task)}. ${this.compact(input.instruction).slice(0, 180)}`,
+    )
     const handoffContext = await this.buildSubagentSystemContext(task)
     const createInput: AgentSessionCreateInput = {
       name: input.sessionName,
@@ -118,10 +148,35 @@ export class CommanderManager {
       host: input.host,
     }
     const created = await this.agentSessions.createSession(createInput)
-    const completion = await this.agentSessions.monitorSession(
-      created.sessionId,
-      input.monitorOptions,
-    )
+    const dispatchedAt = new Date().toISOString()
+    this.onSubagentLifecycleEvent?.({
+      sessionId: created.sessionId,
+      dispatchedAt,
+      state: 'running',
+    })
+
+    let completion: AgentSessionCompletion
+    try {
+      completion = await this.agentSessions.monitorSession(
+        created.sessionId,
+        input.monitorOptions,
+      )
+    } catch (error) {
+      this.onSubagentLifecycleEvent?.({
+        sessionId: created.sessionId,
+        dispatchedAt,
+        state: 'failed',
+        result: error instanceof Error ? error.message : String(error),
+      })
+      throw error
+    }
+
+    this.onSubagentLifecycleEvent?.({
+      sessionId: created.sessionId,
+      dispatchedAt,
+      state: this.toSubagentState(completion),
+      result: completion.finalComment.trim() || completion.status,
+    })
 
     const result: SubagentResult = {
       status: completion.status,
@@ -133,6 +188,10 @@ export class CommanderManager {
 
     await this.processSubagentCompletion(task, result)
     return result
+  }
+
+  private toSubagentState(completion: AgentSessionCompletion): CommanderSubagentState {
+    return completion.status === 'BLOCKED' ? 'failed' : 'completed'
   }
 
   /**
@@ -159,6 +218,9 @@ export class CommanderManager {
     buildFlushContext: FlushContextBuilder,
     pickUpNextTask: () => Promise<void>,
   ): Promise<void> {
+    await this.safeAppendWorkingMemory(
+      'Quest transition: flushing between tasks and requesting next task.',
+    )
     await flusher.betweenTaskFlush({
       ...buildFlushContext(),
       trigger: 'between-task',
@@ -174,5 +236,22 @@ export class CommanderManager {
         ? taskInstruction
         : '_No sub-task instruction provided._',
     ].join('\n\n')
+  }
+
+  private describeTask(task: GHIssue): string {
+    const repo = task.repo ?? (task.repoOwner && task.repoName ? `${task.repoOwner}/${task.repoName}` : null)
+    return `issue #${task.number}${repo ? ` (${repo})` : ''} "${this.compact(task.title)}"`
+  }
+
+  private compact(value: string): string {
+    return value.replace(/\s+/g, ' ').trim()
+  }
+
+  private async safeAppendWorkingMemory(note: string): Promise<void> {
+    try {
+      await this.workingMemory.append(note)
+    } catch {
+      // Working memory failures should not block commander execution paths.
+    }
   }
 }

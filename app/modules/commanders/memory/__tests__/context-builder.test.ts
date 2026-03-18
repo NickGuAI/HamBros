@@ -3,8 +3,10 @@ import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { JournalWriter } from '../journal.js'
+import { GoalsStore } from '../goals-store.js'
 import { MemoryContextBuilder, type Message } from '../context-builder.js'
 import type { GHIssue } from '../skill-matcher.js'
+import { WorkingMemoryStore } from '../working-memory.js'
 
 function dateString(date: Date): string {
   return date.toISOString().slice(0, 10)
@@ -42,10 +44,12 @@ describe('MemoryContextBuilder.build()', () => {
   let tmpDir: string
   let commanderId: string
   let memoryRoot: string
+  let commanderRoot: string
 
   beforeEach(async () => {
     tmpDir = await mkdtemp(join(tmpdir(), 'context-builder-test-'))
     commanderId = 'test-commander'
+    commanderRoot = join(tmpDir, commanderId)
     memoryRoot = join(tmpDir, commanderId, '.memory')
     const journal = new JournalWriter(commanderId, tmpDir)
     await journal.scaffold()
@@ -61,6 +65,18 @@ describe('MemoryContextBuilder.build()', () => {
       '# Long-term\n\n- Keep auth middleware deterministic\n- Certificate chain changes weekly\n',
       'utf-8',
     )
+    await writeFile(
+      join(memoryRoot, 'LONG_TERM_MEM.md'),
+      [
+        '# Commander Long-Term Memory',
+        '',
+        '## 2026-03-01',
+        '',
+        '### Journal Narrative',
+        'We observed token skew mismatches and validated cert fallback behavior.',
+      ].join('\n'),
+      'utf-8',
+    )
 
     await mkdir(join(memoryRoot, 'backlog'), { recursive: true })
     await writeFile(
@@ -69,27 +85,20 @@ describe('MemoryContextBuilder.build()', () => {
       'utf-8',
     )
 
-    await mkdir(join(memoryRoot, 'skills', 'auth-token-fix'), { recursive: true })
+    await mkdir(join(commanderRoot, 'skills', 'auth-fix'), { recursive: true })
     await writeFile(
-      join(memoryRoot, 'skills', 'auth-token-fix', 'SKILL.md'),
-      `---
-name: auth-token-fix
-auto-match:
-  labels: [bug, auth]
-  keywords: [token, cert, refresh]
----
-# Auth token fix playbook
-
-1. Verify refresh cadence
-2. Validate cert chain rollover`,
+      join(commanderRoot, 'skills', 'auth-fix', 'SKILL.md'),
+      '# Auth Fix\n\nUse this when fixing auth token refresh and cert rollover issues.\n',
       'utf-8',
     )
-
-    await writeFile(
-      join(memoryRoot, 'repos', 'example-user_example-repo.md'),
-      '# Repo Knowledge\n\n- Auth config is loaded from env at startup.',
-      'utf-8',
-    )
+    const workingMemory = new WorkingMemoryStore(commanderId, tmpDir)
+    await workingMemory.update({
+      source: 'message',
+      summary: 'Current hypothesis: token skew handling causes refresh failures.',
+      hypothesis: 'Token skew in refresh middleware',
+      files: ['apps/hammurabi/modules/commanders/memory/context-builder.ts'],
+      tags: ['hypothesis'],
+    })
 
     const today = new Date()
     const yesterday = new Date()
@@ -175,17 +184,22 @@ auto-match:
     })
 
     expect(built.layersIncluded).toEqual([1, 2, 3, 4, 5, 6])
-    expect(built.skillsMatched).toEqual(['auth-token-fix'])
+    expect(built.skillsMatched).toEqual([])
     expect(built.systemPromptSection).toContain('## Commander Memory')
     expect(built.systemPromptSection).toContain('### Long-term Memory')
+    expect(built.systemPromptSection).toContain('#### Facts (MEMORY.md)')
+    expect(built.systemPromptSection).toContain('#### Narrative (LONG_TERM_MEM.md)')
+    expect(built.systemPromptSection).toContain('token skew mismatches')
     expect(built.systemPromptSection).toContain('### Current Task')
     expect(built.systemPromptSection).toContain('### Backlog Overview')
-    expect(built.systemPromptSection).toContain('### Applicable Skills')
-    expect(built.systemPromptSection).toContain('### Repo Knowledge: example-user/example-repo')
+    expect(built.systemPromptSection).toContain('### Working Memory Scratchpad')
+    expect(built.systemPromptSection).toContain('### Cue-based Recollection')
     expect(built.systemPromptSection).toContain('### Recent Journal (last 2 days)')
     expect(built.systemPromptSection).toContain('### Recent Conversation')
+    expect(built.systemPromptSection).not.toContain('auth-fix')
     expect(built.systemPromptSection).toContain('Solved cert rollover outage')
-    expect(built.systemPromptSection).not.toContain('Other repo spike')
+    expect(built.systemPromptSection).toContain('Other repo spike')
+    expect(built.systemPromptSection).toContain('stale-signal: different repo context')
   })
 
   it('trims layers by priority and keeps layers 1 and 2', async () => {
@@ -196,38 +210,6 @@ auto-match:
     await writeFile(
       join(memoryRoot, 'backlog', 'thin-index.md'),
       '- #10 Small backlog item',
-      'utf-8',
-    )
-
-    await mkdir(join(memoryRoot, 'skills', 'skill-a'), { recursive: true })
-    await writeFile(
-      join(memoryRoot, 'skills', 'skill-a', 'SKILL.md'),
-      `---
-name: skill-a
-auto-match:
-  labels: [bug]
-  keywords: [token, refresh]
----
-${'A'.repeat(700)}`,
-      'utf-8',
-    )
-
-    await mkdir(join(memoryRoot, 'skills', 'skill-b'), { recursive: true })
-    await writeFile(
-      join(memoryRoot, 'skills', 'skill-b', 'SKILL.md'),
-      `---
-name: skill-b
-auto-match:
-  labels: [bug]
-  keywords: [token]
----
-${'B'.repeat(700)}`,
-      'utf-8',
-    )
-
-    await writeFile(
-      join(memoryRoot, 'repos', 'example-user_example-repo.md'),
-      `${'Repo knowledge '.repeat(80)}`,
       'utf-8',
     )
 
@@ -266,16 +248,18 @@ ${'B'.repeat(700)}`,
 
     expect(built.layersIncluded).toContain(1)
     expect(built.layersIncluded).toContain(2)
-    expect(built.layersIncluded).toContain(3)
+    expect(built.layersIncluded).not.toContain(3)
     expect(built.layersIncluded).not.toContain(4)
     expect(built.layersIncluded).not.toContain(5)
     expect(built.layersIncluded).not.toContain(6)
-    expect(built.skillsMatched).toEqual(['skill-a'])
+    expect(built.skillsMatched).toEqual([])
   })
 
-  it('caps long-term memory to 200 lines', async () => {
+  it('caps fact memory to 200 lines and narrative memory to last 100 lines', async () => {
     const longMemory = Array.from({ length: 230 }, (_, idx) => `memory line ${idx + 1}`).join('\n')
+    const longNarrative = Array.from({ length: 130 }, (_, idx) => `narrative line ${idx + 1}`).join('\n')
     await writeFile(join(memoryRoot, 'MEMORY.md'), longMemory, 'utf-8')
+    await writeFile(join(memoryRoot, 'LONG_TERM_MEM.md'), longNarrative, 'utf-8')
     await mkdir(join(memoryRoot, 'backlog'), { recursive: true })
     await writeFile(join(memoryRoot, 'backlog', 'thin-index.md'), '- #1 test', 'utf-8')
 
@@ -286,6 +270,85 @@ ${'B'.repeat(700)}`,
     })
 
     expect(built.systemPromptSection).toContain('_...truncated to first 200 lines._')
-    expect(built.layersIncluded).toEqual([1, 2])
+    expect(built.systemPromptSection).toContain('_...truncated to last 100 lines._')
+    expect(built.systemPromptSection).toContain('narrative line 130')
+    expect(built.systemPromptSection).not.toMatch(/\bnarrative line 1\b/)
+    expect(built.layersIncluded).toContain(1)
+    expect(built.layersIncluded).toContain(2)
+  })
+
+  it('includes Layer 1.5 (goals) when GOALS.md exists', async () => {
+    const goalsStore = new GoalsStore(commanderId, tmpDir)
+    await goalsStore.write([
+      {
+        id: 'ship-v2',
+        title: 'Ship v2 release',
+        targetDate: '2026-03-20',
+        currentState: 'Feature freeze',
+        intendedState: 'Deployed to prod',
+        reminders: ['Run smoke tests'],
+      },
+      {
+        id: 'old-goal',
+        title: 'Past deadline goal',
+        targetDate: '2026-01-01',
+        currentState: 'Not started',
+        intendedState: 'Complete',
+        reminders: [],
+      },
+    ])
+
+    const builder = new MemoryContextBuilder(commanderId, tmpDir)
+    const built = await builder.build({
+      currentTask: null,
+      recentConversation: [],
+    })
+
+    expect(built.layersIncluded).toContain(1.5)
+    expect(built.systemPromptSection).toContain('### Active Goals')
+    expect(built.systemPromptSection).toContain('Ship v2 release')
+    expect(built.systemPromptSection).toContain('⚠️ OVERDUE')
+    expect(built.systemPromptSection).toContain('Past deadline goal')
+  })
+
+  it('omits Layer 1.5 when GOALS.md does not exist', async () => {
+    const builder = new MemoryContextBuilder(commanderId, tmpDir)
+    const built = await builder.build({
+      currentTask: null,
+      recentConversation: [],
+    })
+
+    expect(built.layersIncluded).not.toContain(1.5)
+    expect(built.systemPromptSection).not.toContain('### Active Goals')
+  })
+
+  it('Layer 1.5 is never dropped by budget trimming', async () => {
+    const goalsStore = new GoalsStore(commanderId, tmpDir)
+    await goalsStore.write([
+      {
+        id: 'critical',
+        title: 'Critical goal',
+        targetDate: '2026-12-31',
+        currentState: 'Active',
+        intendedState: 'Done',
+        reminders: [],
+      },
+    ])
+
+    const builder = new MemoryContextBuilder(commanderId, tmpDir)
+    const built = await builder.build({
+      currentTask: null,
+      recentConversation: [
+        { role: 'user', content: 'x'.repeat(2000) },
+        { role: 'assistant', content: 'y'.repeat(2000) },
+      ],
+      tokenBudget: 200,
+    })
+
+    // Layer 1.5 should remain even when budget is tight
+    expect(built.layersIncluded).toContain(1)
+    expect(built.layersIncluded).toContain(1.5)
+    expect(built.layersIncluded).toContain(2)
+    expect(built.systemPromptSection).toContain('### Active Goals')
   })
 })

@@ -3,21 +3,20 @@ import { Application, extend, useTick } from '@pixi/react'
 import { Assets, Container, Rectangle, Sprite, Text, Texture, type Application as PixiApplication } from 'pixi.js'
 import type { WorldAgent } from './use-world-state'
 import { AgentSprite } from './AgentSprite'
-import { getTileFrame } from './avatar-hash'
+import { getAvatarTileIndex, getTileFrame } from './avatar-hash'
 import { drawParticleBurst, getParticleStyleForTool } from './particles'
 import { TileMapLayer } from './TileMapLayer'
 import { PlayerSprite } from './PlayerSprite'
-import { ROOM_WIDTH, ROOM_HEIGHT, TABLE_SPOTS, ANVIL_SPOTS, IDLE_SPOTS, TILE_SIZE } from './room-layout'
+import { ROOM_WIDTH, ROOM_HEIGHT, TABLE_SPOTS, ANVIL_SPOTS, IDLE_SPOTS, TILE_SIZE, findPath, isWalkable } from './room-layout'
 
 extend({ Container, Sprite, Text })
-
-// tiny-creatures tile indices: 127 = regular agent, 128 = factory agent
-const TILE_REGULAR = 127
-const TILE_FACTORY = 128
 
 // Player spawn matches PlayerSprite internals
 const PLAYER_SPAWN = { x: ROOM_WIDTH / 2, y: ROOM_HEIGHT - 28 }
 const INTERACT_RANGE = 20
+const AGENT_POS_KEY = 'rpg:agentPositions'
+const AGENT_RADIUS = 6
+const AGENT_POS_SAVE_DEBOUNCE_MS = 1000
 
 function isFactoryAgent(agent: WorldAgent): boolean {
   return agent.agentType === 'codex'
@@ -49,6 +48,38 @@ function buildPositionMap(agents: WorldAgent[]): Map<string, { x: number; y: num
   return map
 }
 
+type AgentPosition = { x: number; y: number }
+type AgentPositionMap = Record<string, AgentPosition>
+
+function isStoredAgentPosition(value: unknown): value is AgentPosition {
+  if (value === null || typeof value !== 'object') return false
+  if (!('x' in value) || !('y' in value)) return false
+  if (typeof value.x !== 'number' || typeof value.y !== 'number') return false
+  return isWalkable(value.x, value.y, AGENT_RADIUS)
+}
+
+function loadStoredAgentPositions(): AgentPositionMap {
+  if (typeof window === 'undefined') return {}
+
+  try {
+    const raw = window.localStorage.getItem(AGENT_POS_KEY)
+    if (!raw) return {}
+
+    const parsed = JSON.parse(raw) as unknown
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+
+    const map: AgentPositionMap = {}
+    for (const [agentId, value] of Object.entries(parsed)) {
+      if (!isStoredAgentPosition(value)) continue
+      map[agentId] = { x: value.x, y: value.y }
+    }
+
+    return map
+  } catch {
+    return {}
+  }
+}
+
 interface RuntimeAgent {
   id: string
   tileIndex: number
@@ -57,8 +88,10 @@ interface RuntimeAgent {
   y: number
   targetX: number
   targetY: number
+  waypoints: Array<{ x: number; y: number }>
   status: WorldAgent['status']
   phase: WorldAgent['phase']
+  role: WorldAgent['role']
   phaseChangedAt?: number
   completedAt?: number
   markedForRemoval: boolean
@@ -198,6 +231,10 @@ export const RpgScene = forwardRef<RpgSceneHandle, RpgSceneProps>(function RpgSc
   const textureCacheRef = useRef<Map<number, Texture>>(new Map())
   const runtimeAgentsRef = useRef<Record<string, RuntimeAgent>>({})
   const fxCleanupRef = useRef<Array<() => void>>([])
+  const savedAgentPositionsRef = useRef<AgentPositionMap>(loadStoredAgentPositions())
+  const pendingSavedAgentPositionsRef = useRef<AgentPositionMap | null>(null)
+  const saveTimeoutRef = useRef<number | null>(null)
+  const lastSavedAgentPositionsJsonRef = useRef(JSON.stringify(savedAgentPositionsRef.current))
 
   const [viewport, setViewport] = useState({ width: 1, height: 1 })
   const [textures, setTextures] = useState<LoadedTextures | null>(null)
@@ -228,6 +265,19 @@ export const RpgScene = forwardRef<RpgSceneHandle, RpgSceneProps>(function RpgSc
 
   useEffect(() => {
     return () => {
+      if (saveTimeoutRef.current !== null) {
+        window.clearTimeout(saveTimeoutRef.current)
+        saveTimeoutRef.current = null
+      }
+      if (pendingSavedAgentPositionsRef.current) {
+        try {
+          const serialized = JSON.stringify(pendingSavedAgentPositionsRef.current)
+          window.localStorage.setItem(AGENT_POS_KEY, serialized)
+          lastSavedAgentPositionsJsonRef.current = serialized
+        } catch {
+          // ignore storage errors
+        }
+      }
       if (nearestStreamAgentRef.current !== null) {
         onNearestStreamAgentChange?.(null)
       }
@@ -273,9 +323,45 @@ export const RpgScene = forwardRef<RpgSceneHandle, RpgSceneProps>(function RpgSc
     return () => { observer.disconnect() }
   }, [])
 
+  const queueSaveAgentPositions = useCallback((nextPositions: AgentPositionMap) => {
+    pendingSavedAgentPositionsRef.current = nextPositions
+    if (saveTimeoutRef.current !== null) return
+
+    saveTimeoutRef.current = window.setTimeout(() => {
+      saveTimeoutRef.current = null
+      const pending = pendingSavedAgentPositionsRef.current
+      if (!pending) return
+      pendingSavedAgentPositionsRef.current = null
+
+      const serialized = JSON.stringify(pending)
+      if (serialized === lastSavedAgentPositionsJsonRef.current) return
+
+      try {
+        window.localStorage.setItem(AGENT_POS_KEY, serialized)
+        lastSavedAgentPositionsJsonRef.current = serialized
+      } catch {
+        // ignore storage errors
+      }
+    }, AGENT_POS_SAVE_DEBOUNCE_MS)
+  }, [])
+
   useEffect(() => {
     const now = performance.now()
     const posMap = buildPositionMap(agents)
+    const savedPositions = savedAgentPositionsRef.current
+
+    for (const agent of agents) {
+      const savedPos = savedPositions[agent.id]
+      if (!savedPos || !isWalkable(savedPos.x, savedPos.y, AGENT_RADIUS)) continue
+      posMap.set(agent.id, savedPos)
+    }
+
+    const nextSavedPositions: AgentPositionMap = { ...savedPositions }
+    for (const [agentId, pos] of posMap.entries()) {
+      nextSavedPositions[agentId] = { x: pos.x, y: pos.y }
+    }
+    savedAgentPositionsRef.current = nextSavedPositions
+    queueSaveAgentPositions(nextSavedPositions)
 
     setRuntimeAgents((previous) => {
       const next: Record<string, RuntimeAgent> = { ...previous }
@@ -291,19 +377,25 @@ export const RpgScene = forwardRef<RpgSceneHandle, RpgSceneProps>(function RpgSc
         const pos = posMap.get(agent.id)!
         const zone: 'DESK' | 'IDLE' = agent.status === 'active' ? 'DESK' : 'IDLE'
         const existing = next[agent.id]
-        const tileIndex = isFactoryAgent(agent) ? TILE_FACTORY : TILE_REGULAR
+        const tileIndex = getAvatarTileIndex(agent.id)
 
         if (!existing) {
+          // New agents walk in from the entry door (bottom-center of map)
+          const savedPos = savedPositions[agent.id]
+          const spawnX = savedPos?.x ?? PLAYER_SPAWN.x
+          const spawnY = savedPos?.y ?? PLAYER_SPAWN.y
           next[agent.id] = {
             id: agent.id,
             tileIndex,
             zone,
-            x: pos.x,
-            y: pos.y,
+            x: spawnX,
+            y: spawnY,
             targetX: pos.x,
             targetY: pos.y,
+            waypoints: findPath(spawnX, spawnY, pos.x, pos.y),
             status: agent.status,
             phase: agent.phase,
+            role: agent.role,
             phaseChangedAt: now,
             completedAt: agent.status === 'completed' ? now : undefined,
             markedForRemoval: false,
@@ -311,6 +403,7 @@ export const RpgScene = forwardRef<RpgSceneHandle, RpgSceneProps>(function RpgSc
           continue
         }
 
+        const targetChanged = existing.targetX !== pos.x || existing.targetY !== pos.y
         const phaseChanged = existing.phase !== agent.phase || existing.status !== agent.status
         next[agent.id] = {
           ...existing,
@@ -318,8 +411,12 @@ export const RpgScene = forwardRef<RpgSceneHandle, RpgSceneProps>(function RpgSc
           zone,
           targetX: pos.x,
           targetY: pos.y,
+          waypoints: targetChanged
+            ? findPath(existing.targetX, existing.targetY, pos.x, pos.y)
+            : existing.waypoints,
           status: agent.status,
           phase: agent.phase,
+          role: agent.role,
           phaseChangedAt: phaseChanged ? now : existing.phaseChangedAt,
           completedAt: existing.completedAt ?? (agent.status === 'completed' ? now : undefined),
           markedForRemoval: false,
@@ -328,7 +425,7 @@ export const RpgScene = forwardRef<RpgSceneHandle, RpgSceneProps>(function RpgSc
 
       return next
     })
-  }, [agents])
+  }, [agents, queueSaveAgentPositions])
 
   const handleNearestChange = useCallback((nearestId: string | null) => {
     if (nearestStreamAgentRef.current === nearestId) {
@@ -431,9 +528,11 @@ export const RpgScene = forwardRef<RpgSceneHandle, RpgSceneProps>(function RpgSc
                   tileTexture={resolveTileTexture(agent.tileIndex)}
                   x={agent.x}
                   y={agent.y}
-                  targetX={agent.targetX}
-                  targetY={agent.targetY}
+                  agentRadius={AGENT_RADIUS}
+                  runtimeAgentsRef={runtimeAgentsRef}
+                  waypoints={agent.waypoints}
                   status={agent.status}
+                  role={agent.role}
                   phaseChangedAt={agent.phaseChangedAt}
                   completedAt={agent.completedAt}
                   markedForRemoval={agent.markedForRemoval}

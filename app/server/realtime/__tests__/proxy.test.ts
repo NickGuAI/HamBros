@@ -74,6 +74,8 @@ class MockRealtimeClient
   close = vi.fn(() => undefined)
 }
 
+const MIN_COMMIT_AUDIO_BYTES = 4800
+
 async function startServer(
   options: Partial<RealtimeProxyOptions> = {},
 ): Promise<RunningServer> {
@@ -163,6 +165,46 @@ describe('realtime proxy routes', () => {
 })
 
 describe('realtime proxy websocket', () => {
+  it('does not commit buffered audio when below the 100ms threshold', async () => {
+    const mockClient = new MockRealtimeClient()
+    mockClient.commitAudioBuffer = vi.fn()
+    const server = await startServer({
+      createClient: () => mockClient,
+    })
+
+    const wsUrl =
+      server.baseUrl.replace('http://', 'ws://') +
+      '/api/realtime/transcription?api_key=test-key'
+    const ws = new WebSocket(wsUrl)
+
+    await new Promise<void>((resolve, reject) => {
+      ws.once('open', () => resolve())
+      ws.once('error', reject)
+      ws.once('unexpected-response', (_request, response) => {
+        reject(new Error(`Unexpected websocket status ${response.statusCode}`))
+      })
+    })
+
+    const closed = new Promise<{ code: number; reason: string }>((resolve, reject) => {
+      ws.once('close', (code, reason) => {
+        resolve({ code, reason: reason.toString() })
+      })
+      ws.once('error', reject)
+    })
+
+    ws.send(Buffer.alloc(MIN_COMMIT_AUDIO_BYTES - 1))
+    ws.send(JSON.stringify({ type: 'stop' }))
+
+    const closeEvent = await closed
+    expect(closeEvent).toEqual({
+      code: 1000,
+      reason: 'Recording too short',
+    })
+    expect(mockClient.commitAudioBuffer).not.toHaveBeenCalled()
+
+    await server.close()
+  })
+
   it('streams audio chunks and final transcript through the websocket bridge', async () => {
     const mockClient = new MockRealtimeClient()
     const server = await startServer({
@@ -192,7 +234,7 @@ describe('realtime proxy websocket', () => {
       ws.on('error', reject)
     })
 
-    ws.send(Buffer.from([0x01, 0x02, 0x03]))
+    ws.send(Buffer.alloc(MIN_COMMIT_AUDIO_BYTES))
     ws.send(JSON.stringify({ type: 'stop' }))
 
     const payload = await finalMessage
@@ -201,7 +243,7 @@ describe('realtime proxy websocket', () => {
       text: 'hello from mock transcription',
     })
     expect(mockClient.connect).toHaveBeenCalledTimes(1)
-    expect(mockClient.sendAudio).toHaveBeenCalledWith('AQID')
+    expect(mockClient.sendAudio).toHaveBeenCalledTimes(1)
     expect(mockClient.commitAudioBuffer).toHaveBeenCalledTimes(1)
 
     if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {

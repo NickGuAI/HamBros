@@ -11,6 +11,7 @@
     "dev": "pnpm run build:deps && concurrently \"vite\" \"tsx watch server/index.ts\"",
     "dev:client": "vite",
     "dev:server": "tsx watch server/index.ts",
+    "start": "bash ./scripts/start-with-memory-restore.sh",
     "build": "pnpm run build:deps && vite build && tsc -p tsconfig.node.json",
     "preview": "vite preview",
     "test": "pnpm run build:deps && vitest run",
@@ -21,9 +22,11 @@
     "cap:build": "pnpm build && cap sync ios"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.1.77",
     "@auth0/auth0-react": "^2.4.0",
     "@capacitor/core": "^8.1.0",
     "@capacitor/ios": "^8.1.0",
+    "@gehirn/ai-services": "workspace:*",
     "@hambros/auth-providers": "workspace:*",
     "@hambros/cli": "workspace:*",
     "@hambros/sse-streaming": "workspace:*",
@@ -43,7 +46,6 @@
     "jose": "^5.10.0",
     "lucide-react": "^0.468.0",
     "multer": "1.4.5-lts.2",
-    "@anthropic-ai/claude-agent-sdk": "^0.1.77",
     "node-cron": "^4.2.1",
     "node-pty": "^1.1.0",
     "pixi.js": "^8.16.0",
@@ -58,6 +60,7 @@
   "devDependencies": {
     "@capacitor/cli": "^8.1.0",
     "@hambros/tsconfig": "workspace:*",
+    "@tailwindcss/typography": "^0.5.19",
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.0",
     "@types/multer": "^1.4.13",

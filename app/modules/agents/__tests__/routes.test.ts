@@ -1,11 +1,11 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import express from 'express'
 import { createServer, type Server } from 'node:http'
 import { EventEmitter } from 'node:events'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { WebSocket } from 'ws'
+import { WebSocket, WebSocketServer } from 'ws'
 import type { ApiKeyStoreLike } from '../../../server/api-keys/store'
 
 // Mock child_process.spawn so stream session tests can control the child process.
@@ -21,9 +21,11 @@ vi.mock('node:child_process', async (importOriginal) => {
 import {
   createAgentsRouter,
   type AgentsRouterOptions,
+  type CommanderSessionsInterface,
   type PtyHandle,
   type PtySpawner,
 } from '../routes'
+import { CommanderSessionStore, type CommanderSession } from '../../commanders/store'
 import { spawn as spawnFn } from 'node:child_process'
 
 // Typed reference to the mocked spawn function
@@ -86,6 +88,7 @@ interface RunningServer {
   baseUrl: string
   close: () => Promise<void>
   httpServer: Server
+  sessionsInterface: ReturnType<typeof createAgentsRouter>['sessionsInterface']
 }
 
 const AUTH_HEADERS = {
@@ -190,6 +193,7 @@ async function startServer(options: Partial<AgentsRouterOptions> = {}): Promise<
   const agents = createAgentsRouter({
     apiKeyStore: createTestApiKeyStore(),
     autoResumeSessions: false,
+    commanderSessionStorePath: '/tmp/nonexistent-commander-sessions-test.json',
     ...options,
   })
   app.use('/api/agents', agents.router)
@@ -215,6 +219,7 @@ async function startServer(options: Partial<AgentsRouterOptions> = {}): Promise<
   return {
     baseUrl: `http://127.0.0.1:${address.port}`,
     httpServer,
+    sessionsInterface: agents.sessionsInterface,
     close: async () => {
       await new Promise<void>((resolve, reject) => {
         httpServer.close((error) => {
@@ -246,8 +251,24 @@ function connectWs(
   })
 }
 
+function installMockProcess() {
+  const mock = createMockChildProcess()
+  mockedSpawn.mockReturnValue(mock.cp as never)
+  return mock
+}
+
+async function waitForPersistedSessionFlush(): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, 50)
+  })
+}
+
 afterEach(() => {
   vi.clearAllMocks()
+})
+
+beforeEach(() => {
+  vi.spyOn(CommanderSessionStore.prototype, 'list').mockResolvedValue([])
 })
 
 describe('agents routes', () => {
@@ -277,6 +298,63 @@ describe('agents routes', () => {
     await server.close()
   })
 
+  it('labels commander sessions by host from the commander session store', async () => {
+    installMockProcess()
+    vi.mocked(CommanderSessionStore.prototype.list).mockResolvedValue([
+      {
+        id: 'alpha',
+        host: 'athena',
+        pid: null,
+        state: 'running',
+        created: '2026-03-13T00:00:00.000Z',
+        heartbeat: {
+          intervalMs: 300000,
+          messageTemplate: 'ping',
+          lastSentAt: null,
+        },
+        lastHeartbeat: null,
+        taskSource: null,
+        currentTask: null,
+        completedTasks: 0,
+        totalCostUsd: 0,
+      },
+    ] satisfies CommanderSession[])
+
+    const { spawner } = createMockPtySpawner()
+    const server = await startServer({ ptySpawner: spawner })
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'commander-alpha',
+          mode: 'default',
+          sessionType: 'stream',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const response = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        headers: AUTH_HEADERS,
+      })
+      const payload = await response.json() as Array<{ name: string; label?: string }>
+
+      expect(response.status).toBe(200)
+      expect(payload).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          name: 'commander-alpha',
+          label: 'athena',
+        }),
+      ]))
+    } finally {
+      await server.close()
+    }
+  })
+
   it('returns empty world agent list initially', async () => {
     const { spawner } = createMockPtySpawner()
     const server = await startServer({ ptySpawner: spawner })
@@ -288,6 +366,122 @@ describe('agents routes', () => {
     expect(await response.json()).toEqual([])
 
     await server.close()
+  })
+
+  it('merges commander sessions with role and excludes stopped commanders', async () => {
+    const { spawner } = createMockPtySpawner()
+    const server = await startServer({ ptySpawner: spawner })
+
+    const commanderSessions: CommanderSession[] = [
+      {
+        id: 'alpha',
+        host: 'localhost',
+        pid: 101,
+        state: 'running',
+        created: '2026-03-06T00:00:00.000Z',
+        heartbeat: {
+          intervalMs: 300000,
+          messageTemplate: 'ping',
+          lastSentAt: null,
+        },
+        lastHeartbeat: '2026-03-06T00:01:00.000Z',
+        taskSource: { owner: 'example-user', repo: 'example-repo' },
+        currentTask: {
+          issueNumber: 331,
+          issueUrl: 'https://github.com/example-user/example-repo/issues/331',
+          startedAt: '2026-03-06T00:00:30.000Z',
+        },
+        completedTasks: 0,
+        totalCostUsd: 1.25,
+      },
+      {
+        id: 'commander-beta',
+        host: 'localhost',
+        pid: 202,
+        state: 'paused',
+        agentType: 'codex',
+        created: '2026-03-06T00:02:00.000Z',
+        heartbeat: {
+          intervalMs: 300000,
+          messageTemplate: 'ping',
+          lastSentAt: null,
+        },
+        lastHeartbeat: '2026-03-06T00:03:00.000Z',
+        taskSource: { owner: 'example-user', repo: 'example-repo' },
+        currentTask: null,
+        completedTasks: 0,
+        totalCostUsd: 0.5,
+      },
+      {
+        id: 'gamma',
+        host: 'localhost',
+        pid: null,
+        state: 'stopped',
+        created: '2026-03-06T00:04:00.000Z',
+        heartbeat: {
+          intervalMs: 300000,
+          messageTemplate: 'ping',
+          lastSentAt: null,
+        },
+        lastHeartbeat: null,
+        taskSource: { owner: 'example-user', repo: 'example-repo' },
+        currentTask: null,
+        completedTasks: 1,
+        totalCostUsd: 2.0,
+      },
+    ]
+
+    vi.mocked(CommanderSessionStore.prototype.list).mockResolvedValue(commanderSessions)
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'world-worker-01',
+          mode: 'default',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const response = await fetch(`${server.baseUrl}/api/agents/world`, {
+        headers: AUTH_HEADERS,
+      })
+      const payload = await response.json() as Array<{
+        id: string
+        agentType: string
+        role: string
+        status: string
+        phase: string
+      }>
+
+      expect(response.status).toBe(200)
+      expect(payload).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          id: 'world-worker-01',
+          role: 'worker',
+        }),
+        expect.objectContaining({
+          id: 'commander-alpha',
+          role: 'commander',
+          status: 'active',
+          phase: 'thinking',
+        }),
+        expect.objectContaining({
+          id: 'commander-beta',
+          agentType: 'codex',
+          role: 'commander',
+          status: 'idle',
+          phase: 'blocked',
+        }),
+      ]))
+      expect(payload.some((agent) => agent.id === 'commander-gamma')).toBe(false)
+    } finally {
+      await server.close()
+    }
   })
 
   it('returns PTY world agent with idle phase, zero usage, empty task, and null lastToolUse', async () => {
@@ -944,6 +1138,57 @@ describe('agents routes', () => {
     await server.close()
   })
 
+  it('does not count completed factory workers against the max tracked sessions limit', async () => {
+    const firstMock = createMockChildProcess()
+    mockedSpawn.mockReturnValueOnce(firstMock.cp as never)
+    mockedSpawn.mockImplementation(() => createMockChildProcess().cp as never)
+    const server = await startServer({ maxSessions: 1 })
+
+    const firstResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+      method: 'POST',
+      headers: {
+        ...AUTH_HEADERS,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: 'factory-feat-limit-1',
+        mode: 'default',
+        sessionType: 'stream',
+        task: '/legion-investigate test',
+      }),
+    })
+    expect(firstResponse.status).toBe(201)
+
+    firstMock.emitStdout('{"type":"result","subtype":"success","result":"done"}\n')
+
+    await vi.waitFor(async () => {
+      const statusResponse = await fetch(`${server.baseUrl}/api/agents/sessions/factory-feat-limit-1`, {
+        headers: AUTH_HEADERS,
+      })
+      expect(statusResponse.status).toBe(200)
+      const payload = await statusResponse.json() as { completed: boolean; status: string }
+      expect(payload.completed).toBe(true)
+      expect(payload.status).toBe('success')
+    })
+
+    const secondResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+      method: 'POST',
+      headers: {
+        ...AUTH_HEADERS,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: 'agent-limit-after-factory-complete',
+        mode: 'default',
+        sessionType: 'stream',
+      }),
+    })
+
+    expect(secondResponse.status).toBe(201)
+
+    await server.close()
+  })
+
   it('sends initial task after session creation', async () => {
     const { spawner, lastHandle } = createMockPtySpawner()
     const server = await startServer({
@@ -1580,6 +1825,36 @@ describe('agents routes', () => {
 
     await server.close()
   })
+
+  it('accepts WebSocket upgrade on /ws alias path (used by commander sessions)', async () => {
+    // The agents router accepts both /terminal (legacy) and /ws (new commander usage).
+    // Verify the /ws suffix correctly routes to the same session as /terminal.
+    const { spawner } = createMockPtySpawner()
+    const server = await startServer({ ptySpawner: spawner })
+
+    await fetch(`${server.baseUrl}/api/agents/sessions`, {
+      method: 'POST',
+      headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'ws-alias-test', mode: 'default' }),
+    })
+
+    const wsUrl = server.baseUrl.replace('http://', 'ws://') +
+      '/api/agents/sessions/ws-alias-test/ws?api_key=test-key'
+    const ws = new WebSocket(wsUrl)
+
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Timed out')), 3_000)
+      ws.on('open', () => { clearTimeout(timeout); resolve() })
+      ws.on('error', (err) => { clearTimeout(timeout); reject(err) })
+      ws.on('unexpected-response', (_req, res) => {
+        clearTimeout(timeout)
+        reject(new Error(`WebSocket upgrade rejected with status ${res.statusCode}`))
+      })
+    })
+
+    ws.close()
+    await server.close()
+  })
 })
 
 describe('agents directories endpoint', () => {
@@ -1701,6 +1976,9 @@ function createMockChildProcess() {
     emitStdout(data: string) {
       stdoutEmitter.emit('data', Buffer.from(data))
     },
+    emitStdoutEnd() {
+      stdoutEmitter.emit('end')
+    },
     emitExit(code: number, signal: string | null = null) {
       emitter.emit('exit', code, signal)
     },
@@ -1714,10 +1992,114 @@ function createMockChildProcess() {
 }
 
 describe('stream sessions', () => {
-  function installMockProcess() {
-    const mock = createMockChildProcess()
-    mockedSpawn.mockReturnValue(mock.cp as never)
-    return mock
+  function installMockCodexSidecar() {
+    const turnStartInputs: string[] = []
+    const requests: Array<{ method: string; params: unknown }> = []
+    const turnScripts: Array<{
+      error?: string
+      notifications?: Array<{ method: string; params: Record<string, unknown> }>
+    }> = []
+    const sidecarEmitter = new EventEmitter()
+    const sidecarProcess = Object.assign(sidecarEmitter, {
+      pid: 77777,
+      stdin: null,
+      stdout: null,
+      stderr: null,
+      kill: vi.fn(() => true),
+    })
+    let sidecarServer: WebSocketServer | null = null
+
+    mockedSpawn.mockImplementation((command, args) => {
+      if (command === 'codex' && args[0] === 'app-server' && args[1] === '--listen') {
+        const listenTarget = args[2]
+        const match = typeof listenTarget === 'string' ? listenTarget.match(/:(\d+)$/) : null
+        if (!match) {
+          throw new Error('Missing codex sidecar listen port')
+        }
+        const port = Number(match[1])
+        sidecarServer = new WebSocketServer({ host: '127.0.0.1', port })
+        sidecarServer.on('connection', (socket) => {
+          socket.on('message', (data) => {
+            const raw = JSON.parse(data.toString()) as {
+              id?: number
+              method?: string
+              params?: unknown
+            }
+            if (typeof raw.id !== 'number' || typeof raw.method !== 'string') {
+              return
+            }
+            requests.push({ method: raw.method, params: raw.params })
+
+            if (raw.method === 'thread/start') {
+              socket.send(JSON.stringify({ id: raw.id, result: { thread: { id: 'thread-test' } } }))
+              return
+            }
+
+            if (raw.method === 'turn/start') {
+              const params = (raw.params && typeof raw.params === 'object')
+                ? raw.params as { input?: Array<{ text?: unknown }>; threadId?: unknown }
+                : {}
+              const textValue = Array.isArray(params.input)
+                && params.input.length > 0
+                && typeof params.input[0]?.text === 'string'
+                ? params.input[0].text
+                : ''
+              const threadId = typeof params.threadId === 'string' ? params.threadId : 'thread-test'
+              turnStartInputs.push(textValue)
+              const script = turnScripts.shift()
+              if (script?.error) {
+                socket.send(JSON.stringify({ id: raw.id, error: { message: script.error } }))
+                return
+              }
+              socket.send(JSON.stringify({ id: raw.id, result: { turn: { id: `turn-${turnStartInputs.length}` } } }))
+              for (const notification of script?.notifications ?? []) {
+                socket.send(JSON.stringify({
+                  method: notification.method,
+                  params: {
+                    threadId,
+                    ...notification.params,
+                  },
+                }))
+              }
+              return
+            }
+
+            socket.send(JSON.stringify({ id: raw.id, result: {} }))
+          })
+        })
+        return sidecarProcess as never
+      }
+
+      return createMockChildProcess().cp as never
+    })
+
+    return {
+      turnStartInputs,
+      requests,
+      queueTurnScript: (script: {
+        error?: string
+        notifications?: Array<{ method: string; params: Record<string, unknown> }>
+      }) => {
+        turnScripts.push(script)
+      },
+      close: async () => {
+        if (!sidecarServer) {
+          return
+        }
+        for (const client of sidecarServer.clients) {
+          client.close()
+        }
+        await new Promise<void>((resolve, reject) => {
+          sidecarServer!.close((error) => {
+            if (error) {
+              reject(error)
+              return
+            }
+            resolve()
+          })
+        })
+      },
+    }
   }
 
   afterEach(() => {
@@ -1755,7 +2137,7 @@ describe('stream sessions', () => {
     // Verify spawn was called with correct args
     expect(mockedSpawn).toHaveBeenCalledWith(
       'claude',
-      ['-p', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json'],
+      ['-p', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json', '--model', 'claude-opus-4-6'],
       expect.objectContaining({
         stdio: ['pipe', 'pipe', 'pipe'],
       }),
@@ -1771,6 +2153,251 @@ describe('stream sessions', () => {
     })
 
     await server.close()
+  })
+
+  it('appends commander stream events to JSONL transcript', async () => {
+    const mock = installMockProcess()
+    const workDir = await mkdtemp(join(tmpdir(), 'hammurabi-commander-jsonl-'))
+    const commanderDataDir = join(workDir, 'commanders-data')
+    let server: RunningServer | null = null
+
+    try {
+      server = await startServer({
+        commanderSessionStorePath: join(commanderDataDir, 'sessions.json'),
+      })
+
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'commander-alpha',
+          mode: 'default',
+          sessionType: 'stream',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const initEvent = { type: 'system', subtype: 'init', session_id: 'claude-commander-123' }
+      const deltaEvent = {
+        type: 'message_delta',
+        delta: { stop_reason: 'tool_use' },
+        usage: { input_tokens: 3, output_tokens: 1 },
+      }
+
+      mock.emitStdout(`${JSON.stringify(initEvent)}\n`)
+      mock.emitStdout(`${JSON.stringify(deltaEvent)}\n`)
+
+      const transcriptPath = join(
+        commanderDataDir,
+        'alpha',
+        'sessions',
+        'claude-commander-123.jsonl',
+      )
+
+      await vi.waitFor(async () => {
+        const raw = await readFile(transcriptPath, 'utf8')
+        const events = raw
+          .split('\n')
+          .filter((line) => line.trim().length > 0)
+          .map((line) => JSON.parse(line) as Record<string, unknown>)
+
+        expect(events).toHaveLength(2)
+        expect(events[0]).toEqual(initEvent)
+        expect(events[1]).toEqual(deltaEvent)
+      })
+    } finally {
+      if (server) {
+        await server.close()
+      }
+      await rm(workDir, { recursive: true, force: true })
+    }
+  })
+
+  it('auto-rotates commander stream sessions after the configured entry threshold', async () => {
+    const processMocks: Array<ReturnType<typeof createMockChildProcess>> = []
+    mockedSpawn.mockImplementation(() => {
+      const mock = createMockChildProcess()
+      processMocks.push(mock)
+      return mock.cp as never
+    })
+
+    const workDir = await mkdtemp(join(tmpdir(), 'hammurabi-commander-rotate-'))
+    const commanderDataDir = join(workDir, 'commanders-data')
+    const sessionStorePath = join(workDir, 'stream-sessions.json')
+    let server: RunningServer | null = null
+
+    try {
+      server = await startServer({
+        autoRotateEntryThreshold: 1,
+        commanderSessionStorePath: join(commanderDataDir, 'sessions.json'),
+        sessionStorePath,
+      })
+
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'commander-alpha',
+          mode: 'default',
+          sessionType: 'stream',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+      expect(processMocks).toHaveLength(1)
+
+      const ws = await connectWs(server.baseUrl, 'commander-alpha')
+      const streamedEvents: Array<Record<string, unknown>> = []
+      ws.on('message', (data) => {
+        const parsed = JSON.parse(data.toString()) as Record<string, unknown>
+        if (parsed.type !== 'replay') {
+          streamedEvents.push(parsed)
+        }
+      })
+
+      processMocks[0].emitStdout('{"type":"message_start","message":{"id":"m1","role":"assistant"}}\n')
+      processMocks[0].emitStdout('{"type":"system","subtype":"init","session_id":"claude-rotate-old"}\n')
+      processMocks[0].emitStdout('{"type":"result","result":"turn-1 done"}\n')
+
+      await vi.waitFor(() => {
+        expect(processMocks).toHaveLength(2)
+      })
+
+      await vi.waitFor(() => {
+        expect(streamedEvents.some((event) => (
+          event.type === 'system' && event.subtype === 'session_rotated'
+        ))).toBe(true)
+      })
+
+      processMocks[1].emitStdout('{"type":"system","subtype":"init","session_id":"claude-rotate-new"}\n')
+
+      await vi.waitFor(async () => {
+        const raw = await readFile(sessionStorePath, 'utf8')
+        const parsed = JSON.parse(raw) as {
+          sessions: Array<{ name: string; claudeSessionId?: string; conversationEntryCount?: number }>
+        }
+        const saved = parsed.sessions.find((session) => session.name === 'commander-alpha')
+        expect(saved?.claudeSessionId).toBe('claude-rotate-new')
+        expect(saved?.conversationEntryCount).toBe(0)
+      })
+
+      const oldTranscriptPath = join(
+        commanderDataDir,
+        'alpha',
+        'sessions',
+        'claude-rotate-old.jsonl',
+      )
+      const newTranscriptPath = join(
+        commanderDataDir,
+        'alpha',
+        'sessions',
+        'claude-rotate-new.jsonl',
+      )
+
+      await vi.waitFor(async () => {
+        const raw = await readFile(oldTranscriptPath, 'utf8')
+        const events = raw
+          .split('\n')
+          .filter((line) => line.trim().length > 0)
+          .map((line) => JSON.parse(line) as Record<string, unknown>)
+        expect(events.some((event) => event.subtype === 'session_rotated')).toBe(true)
+      })
+
+      await vi.waitFor(async () => {
+        const raw = await readFile(newTranscriptPath, 'utf8')
+        const events = raw
+          .split('\n')
+          .filter((line) => line.trim().length > 0)
+          .map((line) => JSON.parse(line) as Record<string, unknown>)
+        expect(events).toEqual([
+          { type: 'system', subtype: 'init', session_id: 'claude-rotate-new' },
+        ])
+      })
+
+      const claudeSpawnCalls = mockedSpawn.mock.calls.filter(([command]) => command === 'claude')
+      expect(claudeSpawnCalls).toHaveLength(2)
+      expect(claudeSpawnCalls[1][1]).not.toContain('--resume')
+
+      ws.close()
+    } finally {
+      if (server) {
+        await server.close()
+      }
+      await rm(workDir, { recursive: true, force: true })
+    }
+  }, 15000)
+
+  it('respects COMMANDER_DATA_DIR and avoids repo-local commander transcript writes', async () => {
+    const mock = installMockProcess()
+    const workDir = await mkdtemp(join(tmpdir(), 'hammurabi-commander-jsonl-env-'))
+    const commanderDataDir = join(workDir, 'external-commander-root')
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(workDir)
+    const originalCommanderDataDir = process.env.COMMANDER_DATA_DIR
+    let server: RunningServer | null = null
+
+    try {
+      process.env.COMMANDER_DATA_DIR = commanderDataDir
+      server = await startServer({ commanderSessionStorePath: undefined })
+
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'commander-alpha',
+          mode: 'default',
+          sessionType: 'stream',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const event = { type: 'system', subtype: 'init', session_id: 'claude-commander-env-123' }
+      mock.emitStdout(`${JSON.stringify(event)}\n`)
+
+      const expectedTranscriptPath = join(
+        commanderDataDir,
+        'alpha',
+        'sessions',
+        'claude-commander-env-123.jsonl',
+      )
+      const leakedRepoLocalTranscriptPath = join(
+        workDir,
+        'data',
+        'commanders',
+        'alpha',
+        'sessions',
+        'claude-commander-env-123.jsonl',
+      )
+
+      await vi.waitFor(async () => {
+        const raw = await readFile(expectedTranscriptPath, 'utf8')
+        const parsed = raw
+          .split('\n')
+          .filter((line) => line.trim().length > 0)
+          .map((line) => JSON.parse(line) as Record<string, unknown>)
+        expect(parsed).toEqual([event])
+      })
+
+      await expect(readFile(leakedRepoLocalTranscriptPath, 'utf8')).rejects.toThrow()
+    } finally {
+      if (server) {
+        await server.close()
+      }
+      if (originalCommanderDataDir === undefined) {
+        delete process.env.COMMANDER_DATA_DIR
+      } else {
+        process.env.COMMANDER_DATA_DIR = originalCommanderDataDir
+      }
+      cwdSpy.mockRestore()
+      await rm(workDir, { recursive: true, force: true })
+    }
   })
 
   it('reports command-room stream sessions as completed after result without waiting for exit', async () => {
@@ -1865,6 +2492,168 @@ describe('stream sessions', () => {
     await server.close()
   })
 
+  it('reports factory stream sessions as completed after result without waiting for exit', async () => {
+    const mock = installMockProcess()
+    const server = await startServer()
+
+    const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+      method: 'POST',
+      headers: {
+        ...AUTH_HEADERS,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: 'factory-feat-result-only',
+        mode: 'default',
+        sessionType: 'stream',
+        task: '/legion-investigate test',
+      }),
+    })
+    expect(createResponse.status).toBe(201)
+
+    mock.emitStdout('{"type":"result","subtype":"success","result":"investigation complete","total_cost_usd":0.21}\n')
+
+    await vi.waitFor(async () => {
+      const response = await fetch(`${server.baseUrl}/api/agents/sessions/factory-feat-result-only`, {
+        headers: AUTH_HEADERS,
+      })
+      expect(response.status).toBe(200)
+      const payload = await response.json() as {
+        completed: boolean
+        status: string
+        result?: { status: string; finalComment: string; costUsd: number }
+      }
+      expect(payload.completed).toBe(true)
+      expect(payload.status).toBe('success')
+      expect(payload.result).toMatchObject({
+        status: 'success',
+        finalComment: 'investigation complete',
+        costUsd: 0.21,
+      })
+    })
+
+    const listResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+      headers: AUTH_HEADERS,
+    })
+    expect(listResponse.status).toBe(200)
+    const listed = await listResponse.json() as Array<{ name: string }>
+    expect(listed.some((session) => session.name === 'factory-feat-result-only')).toBe(false)
+    expect(mock.cp.kill).not.toHaveBeenCalled()
+
+    await server.close()
+  })
+
+  it('does not reset command-room completion when message_start arrives after result', async () => {
+    // Regression test: newer Claude CLI may emit message_start after the result
+    // event. Completion state must survive that so the executor can detect it.
+    const mock = installMockProcess()
+    const server = await startServer()
+
+    await fetch(`${server.baseUrl}/api/agents/sessions`, {
+      method: 'POST',
+      headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'command-room-msg-start-after-result',
+        mode: 'default',
+        sessionType: 'stream',
+        task: 'test',
+      }),
+    })
+
+    // Emit result then a spurious message_start (as newer CLI may do).
+    mock.emitStdout('{"type":"result","subtype":"success","result":"done","total_cost_usd":0.05}\n')
+    mock.emitStdout('{"type":"message_start","message":{"id":"m2","role":"assistant"}}\n')
+
+    await vi.waitFor(async () => {
+      const response = await fetch(
+        `${server.baseUrl}/api/agents/sessions/command-room-msg-start-after-result`,
+        { headers: AUTH_HEADERS },
+      )
+      expect(response.status).toBe(200)
+      const payload = await response.json() as { completed: boolean; status: string }
+      expect(payload.completed).toBe(true)
+      expect(payload.status).toBe('success')
+    })
+
+    await server.close()
+  })
+
+  it('flushes stdout buffer on end event so result is detected without trailing newline', async () => {
+    // Regression test: if the result JSON line arrives without a trailing '\n',
+    // it stays in stdoutBuffer. The end handler must flush it before exit fires.
+    const mock = installMockProcess()
+    const server = await startServer()
+
+    await fetch(`${server.baseUrl}/api/agents/sessions`, {
+      method: 'POST',
+      headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'command-room-no-newline',
+        mode: 'default',
+        sessionType: 'stream',
+        task: 'test',
+      }),
+    })
+
+    // Emit result without trailing newline so it stays in stdoutBuffer.
+    mock.emitStdout('{"type":"result","subtype":"success","result":"flushed","total_cost_usd":0.01}')
+    // Trigger end — routes should flush the buffer.
+    mock.emitStdoutEnd()
+
+    await vi.waitFor(async () => {
+      const response = await fetch(
+        `${server.baseUrl}/api/agents/sessions/command-room-no-newline`,
+        { headers: AUTH_HEADERS },
+      )
+      expect(response.status).toBe(200)
+      const payload = await response.json() as { completed: boolean; status: string; result?: { finalComment: string } }
+      expect(payload.completed).toBe(true)
+      expect(payload.status).toBe('success')
+      expect(payload.result?.finalComment).toBe('flushed')
+    })
+
+    await server.close()
+  })
+
+  it('adds synthetic completion for command-room sessions on DELETE so executor detects termination', async () => {
+    // Regression test: if a command-room session is deleted while the executor
+    // is monitoring it, the executor must get { completed: true } on the next
+    // poll rather than a 404 that would eventually time out.
+    const mock = installMockProcess()
+    const server = await startServer()
+
+    await fetch(`${server.baseUrl}/api/agents/sessions`, {
+      method: 'POST',
+      headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'command-room-delete-test',
+        mode: 'default',
+        sessionType: 'stream',
+        task: 'test',
+      }),
+    })
+
+    // Session is mid-run (no result yet). Delete it via the API.
+    const deleteResponse = await fetch(`${server.baseUrl}/api/agents/sessions/command-room-delete-test`, {
+      method: 'DELETE',
+      headers: AUTH_HEADERS,
+    })
+    expect(deleteResponse.status).toBe(200)
+
+    // Subsequent poll must return completed (not 404) so the executor does not
+    // time out.
+    const statusResponse = await fetch(
+      `${server.baseUrl}/api/agents/sessions/command-room-delete-test`,
+      { headers: AUTH_HEADERS },
+    )
+    expect(statusResponse.status).toBe(200)
+    const payload = await statusResponse.json() as { completed: boolean; status: string }
+    expect(payload.completed).toBe(true)
+
+    expect(mock.cp.kill).toHaveBeenCalled()
+    await server.close()
+  })
+
   it('never persists command-room sessions for auto-resume', async () => {
     const mock = installMockProcess()
     const sessionStoreDir = await mkdtemp(join(tmpdir(), 'hammurabi-stream-session-store-'))
@@ -1900,6 +2689,7 @@ describe('stream sessions', () => {
       })
     } finally {
       await server.close()
+      await waitForPersistedSessionFlush()
       await rm(sessionStoreDir, { recursive: true, force: true })
     }
   })
@@ -1956,7 +2746,12 @@ describe('stream sessions', () => {
       })
 
       await vi.waitFor(async () => {
-        const response = await fetch(`${secondServer.baseUrl}/api/agents/sessions`, {
+        const activeServer = secondServer
+        expect(activeServer).not.toBeNull()
+        if (!activeServer) {
+          throw new Error('Expected restart server to be available')
+        }
+        const response = await fetch(`${activeServer.baseUrl}/api/agents/sessions`, {
           headers: AUTH_HEADERS,
         })
         expect(response.status).toBe(200)
@@ -1980,6 +2775,66 @@ describe('stream sessions', () => {
       if (firstServer) {
         await firstServer.close()
       }
+      await waitForPersistedSessionFlush()
+      await rm(sessionStoreDir, { recursive: true, force: true })
+    }
+  })
+
+  it('persists and reuses codex thread ids for commander bridge restart flow', async () => {
+    const codexSidecar = installMockCodexSidecar()
+    const sessionStoreDir = await mkdtemp(join(tmpdir(), 'hammurabi-stream-session-store-'))
+    const sessionStorePath = join(sessionStoreDir, 'stream-sessions.json')
+    let server: RunningServer | null = null
+
+    try {
+      server = await startServer({ sessionStorePath })
+
+      await server.sessionsInterface.createCommanderSession({
+        name: 'commander-codex-bridge',
+        systemPrompt: 'Commander system prompt',
+        agentType: 'codex',
+      })
+      await vi.waitFor(() => {
+        expect(codexSidecar.turnStartInputs).toEqual(['Commander system prompt'])
+      })
+
+      let persistedThreadId = ''
+      await vi.waitFor(async () => {
+        const raw = await readFile(sessionStorePath, 'utf8')
+        const parsed = JSON.parse(raw) as {
+          sessions: Array<{ name: string; agentType?: string; codexThreadId?: string }>
+        }
+        const saved = parsed.sessions.find((session) => session.name === 'commander-codex-bridge')
+        expect(saved?.agentType).toBe('codex')
+        expect(saved?.codexThreadId).toBe('thread-test')
+        persistedThreadId = saved?.codexThreadId ?? ''
+      })
+
+      expect(persistedThreadId).toBe('thread-test')
+      server.sessionsInterface.deleteSession('commander-codex-bridge')
+      await server.sessionsInterface.createCommanderSession({
+        name: 'commander-codex-bridge',
+        systemPrompt: 'Commander system prompt',
+        agentType: 'codex',
+        resumeCodexThreadId: persistedThreadId,
+      })
+
+      const restored = server.sessionsInterface.getSession('commander-codex-bridge')
+      expect(restored?.agentType).toBe('codex')
+      expect(restored?.codexThreadId).toBe('thread-test')
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 25)
+      })
+      expect(codexSidecar.turnStartInputs).toEqual(['Commander system prompt'])
+
+      const threadStartRequests = codexSidecar.requests.filter((request) => request.method === 'thread/start')
+      expect(threadStartRequests).toHaveLength(1)
+    } finally {
+      if (server) {
+        await server.close()
+      }
+      await waitForPersistedSessionFlush()
+      await codexSidecar.close()
       await rm(sessionStoreDir, { recursive: true, force: true })
     }
   })
@@ -2070,6 +2925,7 @@ describe('stream sessions', () => {
       if (firstServer) {
         await firstServer.close()
       }
+      await waitForPersistedSessionFlush()
       await rm(sessionStoreDir, { recursive: true, force: true })
     }
   })
@@ -2125,7 +2981,7 @@ describe('stream sessions', () => {
       )
       const sshArgs = mockedSpawn.mock.calls[0][1]
       expect(sshArgs[sshArgs.length - 1]).toContain("cd '/home/ec2-user/workspace'")
-      expect(sshArgs[sshArgs.length - 1]).toContain('$SHELL -lc')
+      expect(sshArgs[sshArgs.length - 1]).toContain('$SHELL -lic')
       expect(sshArgs[sshArgs.length - 1]).toContain('claude')
     } finally {
       await server.close()
@@ -2217,7 +3073,7 @@ describe('stream sessions', () => {
 
     expect(mockedSpawn).toHaveBeenCalledWith(
       'claude',
-      ['-p', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json', '--permission-mode', 'acceptEdits'],
+      ['-p', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json', '--model', 'claude-opus-4-6', '--permission-mode', 'acceptEdits'],
       expect.any(Object),
     )
 
@@ -2243,7 +3099,7 @@ describe('stream sessions', () => {
 
     expect(mockedSpawn).toHaveBeenCalledWith(
       'claude',
-      ['-p', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json', '--dangerously-skip-permissions'],
+      ['-p', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json', '--model', 'claude-opus-4-6', '--dangerously-skip-permissions'],
       expect.any(Object),
     )
 
@@ -2499,6 +3355,1018 @@ describe('stream sessions', () => {
     await server.close()
   })
 
+  it('does not duplicate user messages in replay when Claude echoes them back', async () => {
+    const mock = installMockProcess()
+    const server = await startServer()
+
+    await fetch(`${server.baseUrl}/api/agents/sessions`, {
+      method: 'POST',
+      headers: {
+        ...AUTH_HEADERS,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: 'stream-no-dup',
+        mode: 'default',
+        sessionType: 'stream',
+      }),
+    })
+
+    const ws = await connectWs(server.baseUrl, 'stream-no-dup')
+
+    // Send user input — server synthesizes a 'user' event in session.events
+    ws.send(JSON.stringify({ type: 'input', text: 'Hello agent' }))
+    await new Promise((r) => setTimeout(r, 50))
+
+    // Claude's stdout echoes the user message back as a 'user' envelope event.
+    // The fix should skip this so session.events doesn't store a duplicate.
+    mock.emitStdout('{"type":"user","message":{"role":"user","content":"Hello agent"}}\n')
+    mock.emitStdout('{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hi!"}]}}\n')
+    await new Promise((r) => setTimeout(r, 50))
+
+    ws.close()
+    await new Promise<void>((resolve) => ws.on('close', () => resolve()))
+
+    // Reconnect and check replay — should have exactly one user event
+    const ws2Url = server.baseUrl.replace('http://', 'ws://') +
+      '/api/agents/sessions/stream-no-dup/terminal?api_key=test-key'
+    const ws2 = new WebSocket(ws2Url)
+    const messages: Array<{ type: string; events?: Array<{ type: string }> }> = []
+
+    ws2.on('message', (data) => {
+      messages.push(JSON.parse(data.toString()))
+    })
+
+    await new Promise<void>((resolve, reject) => {
+      ws2.on('open', () => resolve())
+      ws2.on('error', reject)
+    })
+
+    await vi.waitFor(() => {
+      expect(messages.length).toBeGreaterThan(0)
+    })
+
+    const replay = messages.find((m) => m.type === 'replay')
+    expect(replay).toBeDefined()
+    const userEvents = replay!.events!.filter((e) => e.type === 'user')
+    expect(userEvents).toHaveLength(1)
+
+    ws2.close()
+    await server.close()
+  })
+
+  it('persists initial task as user event in replay', async () => {
+    installMockProcess()
+    const server = await startServer()
+
+    await fetch(`${server.baseUrl}/api/agents/sessions`, {
+      method: 'POST',
+      headers: {
+        ...AUTH_HEADERS,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: 'stream-task-replay',
+        mode: 'default',
+        sessionType: 'stream',
+        task: 'Explain auth flow',
+      }),
+    })
+
+    // Wait for the initial task to be written to stdin and stored
+    await new Promise((r) => setTimeout(r, 50))
+
+    // Attach message handler BEFORE open to catch the replay sent on upgrade
+    const wsUrl = server.baseUrl.replace('http://', 'ws://') +
+      '/api/agents/sessions/stream-task-replay/terminal?api_key=test-key'
+    const ws = new WebSocket(wsUrl)
+    const messages: Array<{
+      type: string
+      events?: Array<{ type: string; message?: { content: string } }>
+    }> = []
+
+    ws.on('message', (data) => {
+      messages.push(JSON.parse(data.toString()))
+    })
+
+    await new Promise<void>((resolve, reject) => {
+      ws.on('open', () => resolve())
+      ws.on('error', reject)
+    })
+
+    await vi.waitFor(() => {
+      expect(messages.length).toBeGreaterThan(0)
+    })
+
+    const replay = messages.find((m) => m.type === 'replay')
+    expect(replay).toBeDefined()
+    const userEvents = replay!.events!.filter((e) => e.type === 'user')
+    expect(userEvents).toHaveLength(1)
+    expect(userEvents[0].message?.content).toBe('Explain auth flow')
+
+    ws.close()
+    await server.close()
+  })
+
+  it('accepts message body shape on POST /sessions/:name/send', async () => {
+    const mock = installMockProcess()
+    const server = await startServer()
+
+    try {
+      await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'stream-send-message-shape',
+          mode: 'default',
+          sessionType: 'stream',
+        }),
+      })
+
+      const response = await fetch(`${server.baseUrl}/api/agents/sessions/stream-send-message-shape/send`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ message: 'send route message field' }),
+      })
+
+      expect(response.status).toBe(200)
+      expect(await response.json()).toEqual({ sent: true })
+      expect(mock.getStdinWrites().some((write) => write.includes('send route message field'))).toBe(true)
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('queues HTTP /message requests and flushes FIFO by turn completion', async () => {
+    const mock = installMockProcess()
+    const server = await startServer()
+
+    try {
+      await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'stream-http-queue',
+          mode: 'default',
+          sessionType: 'stream',
+        }),
+      })
+
+      // Block queue dispatch until result is emitted.
+      mock.emitStdout('{"type":"message_start","message":{"id":"m1","role":"assistant"}}\n')
+
+      const first = await fetch(`${server.baseUrl}/api/agents/sessions/stream-http-queue/message`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ message: 'first queued message' }),
+      })
+      expect(first.status).toBe(202)
+      expect(await first.json()).toEqual({ queued: true, queueDepth: 1 })
+
+      const second = await fetch(`${server.baseUrl}/api/agents/sessions/stream-http-queue/message`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ message: 'second queued message' }),
+      })
+      expect(second.status).toBe(202)
+      expect(await second.json()).toEqual({ queued: true, queueDepth: 2 })
+
+      expect(mock.getStdinWrites().some((write) => write.includes('queued message'))).toBe(false)
+
+      mock.emitStdout('{"type":"result","result":"done"}\n')
+      await vi.waitFor(() => {
+        expect(mock.getStdinWrites().filter((write) => write.includes('queued message'))).toHaveLength(1)
+      })
+      expect(mock.getStdinWrites().some((write) => write.includes('second queued message'))).toBe(false)
+
+      mock.emitStdout('{"type":"result","result":"done"}\n')
+      await vi.waitFor(() => {
+        expect(mock.getStdinWrites().filter((write) => write.includes('queued message'))).toHaveLength(2)
+      })
+
+      const queuedWrites = mock
+        .getStdinWrites()
+        .filter((write) => write.includes('queued message'))
+        .map((write) => JSON.parse(write.replace('\n', '')) as { message: { content: string } })
+        .map((payload) => payload.message.content)
+      expect(queuedWrites).toEqual(['first queued message', 'second queued message'])
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('resets commander stream sessions in place via HTTP /message /reset', async () => {
+    const mock = installMockProcess()
+    const sessionStoreDir = await mkdtemp(join(tmpdir(), 'hammurabi-stream-session-store-'))
+    const sessionStorePath = join(sessionStoreDir, 'stream-sessions.json')
+    const server = await startServer({ sessionStorePath })
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'commander-reset-test',
+          mode: 'default',
+          sessionType: 'stream',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      mock.emitStdout('{"type":"system","subtype":"init","session_id":"claude-reset-old"}\n')
+
+      await vi.waitFor(async () => {
+        const raw = await readFile(sessionStorePath, 'utf8')
+        const parsed = JSON.parse(raw) as {
+          sessions: Array<{ name: string; claudeSessionId?: string }>
+        }
+        const saved = parsed.sessions.find((session) => session.name === 'commander-reset-test')
+        expect(saved?.claudeSessionId).toBe('claude-reset-old')
+      })
+
+      // Keep turn active so /reset must wait for completion before clearing.
+      mock.emitStdout('{"type":"message_start","message":{"id":"m1","role":"assistant"}}\n')
+
+      let resetSettled = false
+      const resetPromise = fetch(`${server.baseUrl}/api/agents/sessions/commander-reset-test/message`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ message: '/reset' }),
+      }).then(async (response) => {
+        resetSettled = true
+        expect(response.status).toBe(200)
+        expect(await response.json()).toEqual({ reset: true })
+      })
+
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      expect(resetSettled).toBe(false)
+
+      mock.emitStdout('{"type":"result","result":"done"}\n')
+      await resetPromise
+
+      const sessionsResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        headers: AUTH_HEADERS,
+      })
+      expect(sessionsResponse.status).toBe(200)
+      const listedSessions = await sessionsResponse.json() as Array<{ name: string }>
+      expect(listedSessions.some((session) => session.name === 'commander-reset-test')).toBe(true)
+
+      await vi.waitFor(async () => {
+        const raw = await readFile(sessionStorePath, 'utf8')
+        const parsed = JSON.parse(raw) as {
+          sessions: Array<{ name: string; claudeSessionId?: string }>
+        }
+        const saved = parsed.sessions.find((session) => session.name === 'commander-reset-test')
+        expect(saved).toBeUndefined()
+      })
+
+      const followUpResponse = await fetch(`${server.baseUrl}/api/agents/sessions/commander-reset-test/message`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ message: 'message after reset' }),
+      })
+      expect(followUpResponse.status).toBe(202)
+      expect(await followUpResponse.json()).toEqual({ queued: true, queueDepth: 1 })
+
+      await vi.waitFor(() => {
+        expect(mock.getStdinWrites().some((write) => write.includes('message after reset'))).toBe(true)
+      })
+
+      const resumeCall = mockedSpawn.mock.calls.find(([command, args]) => (
+        command === 'claude' &&
+        Array.isArray(args) &&
+        args.includes('--resume')
+      ))
+      expect(resumeCall).toBeUndefined()
+    } finally {
+      await server.close()
+      await waitForPersistedSessionFlush()
+      await rm(sessionStoreDir, { recursive: true, force: true })
+    }
+  })
+
+  it('passes /reset through to non-commander stream sessions', async () => {
+    const mock = installMockProcess()
+    const server = await startServer()
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'stream-reset-pass-through',
+          mode: 'default',
+          sessionType: 'stream',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const messageResponse = await fetch(`${server.baseUrl}/api/agents/sessions/stream-reset-pass-through/message`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ message: '/reset' }),
+      })
+
+      expect(messageResponse.status).toBe(202)
+      expect(await messageResponse.json()).toEqual({ queued: true, queueDepth: 1 })
+
+      await vi.waitFor(() => {
+        expect(mock.getStdinWrites().some((write) => write.includes('/reset'))).toBe(true)
+      })
+
+      const resetWrite = mock.getStdinWrites().find((write) => write.includes('/reset'))
+      expect(resetWrite).toBeDefined()
+      const parsed = JSON.parse(resetWrite!.replace('\n', '')) as { message: { content: string } }
+      expect(parsed.message.content).toBe('/reset')
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('returns 429 when HTTP /message queue reaches max depth', async () => {
+    const mock = installMockProcess()
+    const server = await startServer()
+
+    try {
+      await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'stream-queue-overflow',
+          mode: 'default',
+          sessionType: 'stream',
+        }),
+      })
+
+      // Hold queue processing so pending count grows.
+      mock.emitStdout('{"type":"message_start","message":{"id":"m1","role":"assistant"}}\n')
+
+      for (let i = 0; i < 50; i += 1) {
+        const response = await fetch(`${server.baseUrl}/api/agents/sessions/stream-queue-overflow/message`, {
+          method: 'POST',
+          headers: {
+            ...AUTH_HEADERS,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({ message: `queued ${i}` }),
+        })
+        expect(response.status).toBe(202)
+      }
+
+      const overflowResponse = await fetch(`${server.baseUrl}/api/agents/sessions/stream-queue-overflow/message`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ message: 'overflow' }),
+      })
+
+      expect(overflowResponse.status).toBe(429)
+      expect(await overflowResponse.json()).toEqual({ error: 'Queue full' })
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('routes HTTP /message through codex turn/start for codex sessions', async () => {
+    const codexSidecar = installMockCodexSidecar()
+    const server = await startServer()
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-http-message',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+        }),
+      })
+
+      expect(createResponse.status).toBe(201)
+
+      const messageResponse = await fetch(`${server.baseUrl}/api/agents/sessions/codex-http-message/message`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ message: 'codex queued input' }),
+      })
+
+      expect(messageResponse.status).toBe(202)
+      expect(await messageResponse.json()).toEqual({ queued: true, queueDepth: 1 })
+
+      await vi.waitFor(() => {
+        expect(codexSidecar.turnStartInputs).toEqual(['codex queued input'])
+      })
+    } finally {
+      await server.close()
+      await codexSidecar.close()
+    }
+  })
+
+  it('auto-rotates non-commander codex sessions at the entry threshold', async () => {
+    const codexSidecar = installMockCodexSidecar()
+    const sessionStoreDir = await mkdtemp(join(tmpdir(), 'hammurabi-codex-rotate-store-'))
+    const sessionStorePath = join(sessionStoreDir, 'stream-sessions.json')
+    const server = await startServer({
+      autoRotateEntryThreshold: 1,
+      sessionStorePath,
+    })
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-auto-rotate',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const ws = await connectWs(server.baseUrl, 'codex-auto-rotate')
+      const streamedEvents: Array<Record<string, unknown>> = []
+      ws.on('message', (data) => {
+        const parsed = JSON.parse(data.toString()) as Record<string, unknown>
+        if (parsed.type !== 'replay') {
+          streamedEvents.push(parsed)
+        }
+      })
+
+      codexSidecar.queueTurnScript({
+        notifications: [
+          {
+            method: 'turn/started',
+            params: { turn: { id: 'turn-1', status: 'inProgress', items: [] } },
+          },
+          {
+            method: 'turn/completed',
+            params: { turn: { id: 'turn-1', status: 'completed', items: [] } },
+          },
+        ],
+      })
+
+      const firstMessageResponse = await fetch(`${server.baseUrl}/api/agents/sessions/codex-auto-rotate/message`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ message: 'first codex turn' }),
+      })
+      expect(firstMessageResponse.status).toBe(202)
+
+      await vi.waitFor(() => {
+        expect(codexSidecar.turnStartInputs).toEqual(['first codex turn'])
+      })
+
+      await vi.waitFor(() => {
+        const threadStarts = codexSidecar.requests.filter((request) => request.method === 'thread/start')
+        expect(threadStarts.length).toBeGreaterThanOrEqual(2)
+      })
+
+      await vi.waitFor(() => {
+        expect(streamedEvents.some((event) => (
+          event.type === 'system' && event.subtype === 'session_rotated'
+        ))).toBe(true)
+      })
+
+      await vi.waitFor(async () => {
+        const raw = await readFile(sessionStorePath, 'utf8')
+        const parsed = JSON.parse(raw) as {
+          sessions: Array<{ name: string; conversationEntryCount?: number }>
+        }
+        const saved = parsed.sessions.find((session) => session.name === 'codex-auto-rotate')
+        expect(saved?.conversationEntryCount).toBe(0)
+      })
+
+      codexSidecar.queueTurnScript({})
+      const secondMessageResponse = await fetch(`${server.baseUrl}/api/agents/sessions/codex-auto-rotate/message`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ message: 'second codex turn' }),
+      })
+      expect(secondMessageResponse.status).toBe(202)
+
+      await vi.waitFor(() => {
+        expect(codexSidecar.turnStartInputs).toEqual(['first codex turn', 'second codex turn'])
+      })
+
+      const sessionsResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        headers: AUTH_HEADERS,
+      })
+      expect(sessionsResponse.status).toBe(200)
+      const listed = await sessionsResponse.json() as Array<{ name: string }>
+      expect(listed.filter((session) => session.name === 'codex-auto-rotate')).toHaveLength(1)
+
+      ws.close()
+    } finally {
+      await server.close()
+      await codexSidecar.close()
+      await rm(sessionStoreDir, { recursive: true, force: true })
+    }
+  }, 15000)
+
+  it('pre-kill-debrief returns immediately and debrief-status tracks completion for Codex stream session', async () => {
+    const codexSidecar = installMockCodexSidecar()
+    codexSidecar.queueTurnScript({
+      notifications: [
+        {
+          method: 'turn/started',
+          params: { turn: { id: 'turn-debrief', status: 'inProgress', items: [] } },
+        },
+        {
+          method: 'turn/completed',
+          params: { turn: { id: 'turn-debrief', status: 'completed', items: [] } },
+        },
+      ],
+    })
+    const server = await startServer()
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-kill-debrief',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const preResp = await fetch(`${server.baseUrl}/api/agents/sessions/codex-kill-debrief/pre-kill-debrief`, {
+        method: 'POST',
+        headers: AUTH_HEADERS,
+      })
+      expect(preResp.status).toBe(200)
+      const preJson = await preResp.json()
+      expect(preJson).toMatchObject({ debriefStarted: true, timeoutMs: 60000 })
+
+      await vi.waitFor(() => {
+        expect(codexSidecar.turnStartInputs).toEqual(['$debrief hotwash'])
+      })
+
+      await vi.waitFor(async () => {
+        const statusResp = await fetch(`${server.baseUrl}/api/agents/sessions/codex-kill-debrief/debrief-status`, {
+          headers: AUTH_HEADERS,
+        })
+        const { status } = await statusResp.json()
+        expect(status).toBe('completed')
+      })
+
+      const deleteResponse = await fetch(`${server.baseUrl}/api/agents/sessions/codex-kill-debrief`, {
+        method: 'DELETE',
+        headers: AUTH_HEADERS,
+      })
+      expect(deleteResponse.status).toBe(200)
+      expect(await deleteResponse.json()).toEqual({ killed: true })
+    } finally {
+      await server.close()
+      await codexSidecar.close()
+    }
+  })
+
+  it('streams Codex text deltas, avoids duplicate user echoes, and tracks usage', async () => {
+    const codexSidecar = installMockCodexSidecar()
+    codexSidecar.queueTurnScript({
+      notifications: [
+        {
+          method: 'turn/started',
+          params: { turn: { id: 'turn-1', status: 'inProgress', items: [] } },
+        },
+        {
+          method: 'item/started',
+          params: {
+            turnId: 'turn-1',
+            item: {
+              id: 'user-1',
+              type: 'userMessage',
+              content: [{ type: 'text', text: 'research please' }],
+            },
+          },
+        },
+        {
+          method: 'item/started',
+          params: {
+            turnId: 'turn-1',
+            item: { id: 'assistant-1', type: 'agentMessage', text: '' },
+          },
+        },
+        {
+          method: 'item/agentMessage/delta',
+          params: { turnId: 'turn-1', itemId: 'assistant-1', delta: 'Hello ' },
+        },
+        {
+          method: 'item/agentMessage/delta',
+          params: { turnId: 'turn-1', itemId: 'assistant-1', delta: 'world' },
+        },
+        {
+          method: 'item/completed',
+          params: {
+            turnId: 'turn-1',
+            item: { id: 'assistant-1', type: 'agentMessage', text: 'Hello world' },
+          },
+        },
+        {
+          method: 'thread/tokenUsage/updated',
+          params: {
+            turnId: 'turn-1',
+            tokenUsage: {
+              last: {
+                cachedInputTokens: 0,
+                inputTokens: 13,
+                outputTokens: 34,
+                reasoningOutputTokens: 0,
+                totalTokens: 47,
+              },
+              total: {
+                cachedInputTokens: 0,
+                inputTokens: 13,
+                outputTokens: 34,
+                reasoningOutputTokens: 0,
+                totalTokens: 47,
+              },
+            },
+          },
+        },
+        {
+          method: 'turn/completed',
+          params: { turn: { id: 'turn-1', status: 'completed', items: [] } },
+        },
+      ],
+    })
+    const server = await startServer()
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-stream-live',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const ws = await connectWs(server.baseUrl, 'codex-stream-live')
+      const messages: Array<Record<string, unknown>> = []
+      ws.on('message', (data) => {
+        messages.push(JSON.parse(data.toString()) as Record<string, unknown>)
+      })
+
+      ws.send(JSON.stringify({ type: 'input', text: 'research please' }))
+
+      await vi.waitFor(() => {
+        expect(messages.some((message) => message.type === 'result')).toBe(true)
+      })
+
+      expect(codexSidecar.turnStartInputs).toEqual(['research please'])
+
+      const userMessages = messages.filter((message) => {
+        if (message.type !== 'user') return false
+        const payload = message.message as { content?: unknown } | undefined
+        return payload?.content === 'research please'
+      })
+      expect(userMessages).toHaveLength(1)
+
+      expect(messages.some((message) => message.type === 'content_block_start')).toBe(true)
+      const streamedText = messages
+        .filter((message) => message.type === 'content_block_delta')
+        .map((message) => {
+          const delta = message.delta as { text?: string } | undefined
+          return delta?.text ?? ''
+        })
+        .join('')
+      expect(streamedText).toBe('Hello world')
+      expect(messages.some((message) => message.type === 'content_block_stop')).toBe(true)
+
+      const usageEvent = messages.find((message) => {
+        if (message.type !== 'message_delta') return false
+        const usage = message.usage as { input_tokens?: number; output_tokens?: number } | undefined
+        return usage?.input_tokens === 13 && usage?.output_tokens === 34
+      })
+      expect(usageEvent).toBeDefined()
+
+      const replayMessages: Array<{
+        type: string
+        usage?: { inputTokens: number; outputTokens: number; costUsd: number }
+      }> = []
+      const replayWsUrl = server.baseUrl.replace('http://', 'ws://') +
+        '/api/agents/sessions/codex-stream-live/terminal?api_key=test-key'
+      const replayWs = new WebSocket(replayWsUrl)
+      replayWs.on('message', (data) => {
+        replayMessages.push(JSON.parse(data.toString()) as {
+          type: string
+          usage?: { inputTokens: number; outputTokens: number; costUsd: number }
+        })
+      })
+      await new Promise<void>((resolve, reject) => {
+        replayWs.on('open', () => resolve())
+        replayWs.on('error', reject)
+      })
+
+      await vi.waitFor(() => {
+        expect(replayMessages.some((message) => message.type === 'replay')).toBe(true)
+      })
+
+      const replay = replayMessages.find((message) => message.type === 'replay')
+      expect(replay).toBeDefined()
+      expect(replay?.usage).toEqual({
+        inputTokens: 13,
+        outputTokens: 34,
+        costUsd: 0,
+      })
+
+      ws.close()
+      replayWs.close()
+    } finally {
+      await server.close()
+      await codexSidecar.close()
+    }
+  }, 15000)
+
+  it('does not leave queued Codex /message sends stuck after a turn/start failure', async () => {
+    const codexSidecar = installMockCodexSidecar()
+    codexSidecar.queueTurnScript({ error: 'sidecar disconnected' })
+    codexSidecar.queueTurnScript({
+      notifications: [
+        {
+          method: 'turn/started',
+          params: { turn: { id: 'turn-2', status: 'inProgress', items: [] } },
+        },
+        {
+          method: 'turn/completed',
+          params: { turn: { id: 'turn-2', status: 'completed', items: [] } },
+        },
+      ],
+    })
+    const server = await startServer()
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-message-retry',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const ws = await connectWs(server.baseUrl, 'codex-message-retry')
+      const messages: Array<Record<string, unknown>> = []
+      ws.on('message', (data) => {
+        messages.push(JSON.parse(data.toString()) as Record<string, unknown>)
+      })
+
+      const firstResponse = await fetch(`${server.baseUrl}/api/agents/sessions/codex-message-retry/message`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ message: 'first try' }),
+      })
+      expect(firstResponse.status).toBe(202)
+
+      await vi.waitFor(() => {
+        expect(codexSidecar.turnStartInputs).toEqual(['first try'])
+      })
+      await vi.waitFor(() => {
+        expect(messages.some((message) => {
+          if (message.type !== 'system') return false
+          return typeof message.text === 'string' && message.text.includes('Codex request failed')
+        })).toBe(true)
+      })
+
+      const secondResponse = await fetch(`${server.baseUrl}/api/agents/sessions/codex-message-retry/message`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ message: 'second try' }),
+      })
+      expect(secondResponse.status).toBe(202)
+
+      await vi.waitFor(() => {
+        expect(codexSidecar.turnStartInputs).toEqual(['first try', 'second try'])
+      })
+
+      ws.close()
+    } finally {
+      await server.close()
+      await codexSidecar.close()
+    }
+  })
+
+  it('routes HTTP /message directly to OpenClaw hook dispatch', async () => {
+    const originalFetch = globalThis.fetch.bind(globalThis)
+    const hookCalls: Array<{ url: string; body: { message?: string } }> = []
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(((input, init) => {
+      const url = typeof input === 'string'
+        ? input
+        : (input instanceof URL ? input.toString() : input.url)
+      if (url === 'http://localhost:18789/hooks/agent') {
+        const body = typeof init?.body === 'string' ? JSON.parse(init.body) as { message?: string } : {}
+        hookCalls.push({ url, body })
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }
+      return originalFetch(input, init)
+    }) as typeof fetch)
+
+    const server = await startServer()
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'openclaw-http-message',
+          mode: 'dangerouslySkipPermissions',
+          sessionType: 'stream',
+          agentType: 'openclaw',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const messageResponse = await fetch(`${server.baseUrl}/api/agents/sessions/openclaw-http-message/message`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ message: 'openclaw queued input' }),
+      })
+
+      expect(messageResponse.status).toBe(202)
+      expect(await messageResponse.json()).toEqual({ queued: true, queueDepth: 0 })
+
+      await vi.waitFor(() => {
+        expect(hookCalls).toHaveLength(1)
+      })
+      expect(hookCalls[0].body.message).toBe('openclaw queued input')
+    } finally {
+      fetchSpy.mockRestore()
+      await server.close()
+    }
+  })
+
+  it('pre-kill-debrief returns unsupported for OpenClaw; DELETE never blocks on debrief', async () => {
+    const originalFetch = globalThis.fetch.bind(globalThis)
+    const hookCalls: Array<{ url: string; body: { message?: string } }> = []
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(((input, init) => {
+      const url = typeof input === 'string'
+        ? input
+        : (input instanceof URL ? input.toString() : input.url)
+      if (url === 'http://localhost:18789/hooks/agent') {
+        const body = typeof init?.body === 'string' ? JSON.parse(init.body) as { message?: string } : {}
+        hookCalls.push({ url, body })
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }
+      return originalFetch(input, init)
+    }) as typeof fetch)
+
+    const server = await startServer()
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'openclaw-kill-no-debrief',
+          mode: 'dangerouslySkipPermissions',
+          sessionType: 'stream',
+          agentType: 'openclaw',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const preResp = await fetch(`${server.baseUrl}/api/agents/sessions/openclaw-kill-no-debrief/pre-kill-debrief`, {
+        method: 'POST',
+        headers: AUTH_HEADERS,
+      })
+      expect(preResp.status).toBe(200)
+      expect(await preResp.json()).toMatchObject({
+        debriefed: false,
+        reason: 'unsupported-agent-type',
+      })
+      expect(hookCalls).toHaveLength(0)
+
+      const deleteResponse = await fetch(`${server.baseUrl}/api/agents/sessions/openclaw-kill-no-debrief`, {
+        method: 'DELETE',
+        headers: AUTH_HEADERS,
+      })
+      expect(deleteResponse.status).toBe(200)
+      expect(await deleteResponse.json()).toEqual({ killed: true })
+    } finally {
+      fetchSpy.mockRestore()
+      await server.close()
+    }
+  })
+
+  it('pre-kill-debrief returns pty-session for PTY sessions without attempting debrief', async () => {
+    const { spawner } = createMockPtySpawner()
+    const server = await startServer({ ptySpawner: spawner })
+
+    const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+      method: 'POST',
+      headers: {
+        ...AUTH_HEADERS,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: 'pty-no-debrief',
+        mode: 'default',
+        sessionType: 'pty',
+      }),
+    })
+    expect(createResponse.status).toBe(201)
+
+    const preResp = await fetch(`${server.baseUrl}/api/agents/sessions/pty-no-debrief/pre-kill-debrief`, {
+      method: 'POST',
+      headers: AUTH_HEADERS,
+    })
+    expect(preResp.status).toBe(200)
+    expect(await preResp.json()).toEqual({ debriefed: false, reason: 'pty-session' })
+
+    const statusResp = await fetch(`${server.baseUrl}/api/agents/sessions/pty-no-debrief/debrief-status`, {
+      headers: AUTH_HEADERS,
+    })
+    expect((await statusResp.json()).status).toBe('none')
+
+    await server.close()
+  })
+
   it('clears lastTurnCompleted immediately when WS input is received for completed session', async () => {
     const mock = installMockProcess()
     const server = await startServer()
@@ -2570,13 +4438,19 @@ describe('stream sessions', () => {
     mock.emitStdout('{"type":"result","subtype":"success","result":"done"}\n')
 
     await vi.waitFor(async () => {
-      const resp = await fetch(`${server.baseUrl}/api/agents/world`, {
+      const resp = await fetch(`${server.baseUrl}/api/agents/sessions/command-room-no-clear-test`, {
         headers: AUTH_HEADERS,
       })
-      const payload = await resp.json() as Array<{ id: string; status: string }>
-      const entry = payload.find((e) => e.id === 'command-room-no-clear-test')
-      expect(entry?.status).toBe('completed')
+      const payload = await resp.json() as { completed: boolean; status?: string }
+      expect(payload.completed).toBe(true)
     })
+
+    // Completed command-room sessions should be excluded from /world.
+    const worldResp = await fetch(`${server.baseUrl}/api/agents/world`, {
+      headers: AUTH_HEADERS,
+    })
+    const worldPayload = await worldResp.json() as Array<{ id: string }>
+    expect(worldPayload.find((e) => e.id === 'command-room-no-clear-test')).toBeUndefined()
 
     // Send input — command-room sessions should stay completed.
     const ws = await connectWs(server.baseUrl, 'command-room-no-clear-test')
@@ -2585,12 +4459,11 @@ describe('stream sessions', () => {
     // Wait briefly to let the WS message be processed.
     await new Promise((r) => setTimeout(r, 100))
 
-    const resp = await fetch(`${server.baseUrl}/api/agents/world`, {
+    const resp = await fetch(`${server.baseUrl}/api/agents/sessions/command-room-no-clear-test`, {
       headers: AUTH_HEADERS,
     })
-    const payload = await resp.json() as Array<{ id: string; status: string }>
-    const entry = payload.find((e) => e.id === 'command-room-no-clear-test')
-    expect(entry?.status).toBe('completed')
+    const payload = await resp.json() as { completed: boolean; status?: string }
+    expect(payload.completed).toBe(true)
 
     ws.close()
     await server.close()
@@ -2638,6 +4511,52 @@ describe('stream sessions', () => {
       expect(sessions).toHaveLength(0)
     })
 
+    await server.close()
+  })
+
+  it('includes stderr summary in exit event payload', async () => {
+    const mock = installMockProcess()
+    const server = await startServer()
+
+    await fetch(`${server.baseUrl}/api/agents/sessions`, {
+      method: 'POST',
+      headers: {
+        ...AUTH_HEADERS,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: 'stream-exit-stderr',
+        mode: 'default',
+        sessionType: 'stream',
+      }),
+    })
+
+    const ws = await connectWs(server.baseUrl, 'stream-exit-stderr')
+    const exitPromise = new Promise<{ type: string; exitCode: number; stderr?: string; text?: string }>((resolve) => {
+      ws.on('message', (data) => {
+        const parsed = JSON.parse(data.toString()) as {
+          type: string
+          exitCode?: number
+          stderr?: string
+          text?: string
+        }
+        if (parsed.type === 'exit') {
+          resolve(parsed as { type: string; exitCode: number; stderr?: string; text?: string })
+        }
+      })
+    })
+
+    mock.cp.stderr.emit('data', Buffer.from('prep line\nclaude: command not found\n'))
+    mock.emitExit(127)
+
+    const exitEvent = await exitPromise
+    expect(exitEvent.type).toBe('exit')
+    expect(exitEvent.exitCode).toBe(127)
+    expect(exitEvent.stderr).toBe('claude: command not found')
+    expect(exitEvent.text).toContain('Process exited with code 127')
+    expect(exitEvent.text).toContain('stderr: claude: command not found')
+
+    ws.close()
     await server.close()
   })
 
@@ -2766,6 +4685,59 @@ describe('stream sessions', () => {
     expect(mock.cp.kill).toHaveBeenCalledWith('SIGTERM')
 
     await server.close()
+  })
+
+  it('pre-kill-debrief returns immediately and debrief-status tracks completion for Claude stream session', async () => {
+    const mock = installMockProcess()
+    const server = await startServer()
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'stream-kill-debrief',
+          mode: 'default',
+          sessionType: 'stream',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const preResp = await fetch(`${server.baseUrl}/api/agents/sessions/stream-kill-debrief/pre-kill-debrief`, {
+        method: 'POST',
+        headers: AUTH_HEADERS,
+      })
+      expect(preResp.status).toBe(200)
+      const preJson = await preResp.json()
+      expect(preJson).toMatchObject({ debriefStarted: true, timeoutMs: 60000 })
+
+      await vi.waitFor(() => {
+        expect(mock.getStdinWrites().some((write) => write.includes('/debrief hotwash'))).toBe(true)
+      })
+
+      mock.emitStdout('{"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":1,"is_error":false,"num_turns":1,"result":"done","session_id":"test-session"}\n')
+
+      await vi.waitFor(async () => {
+        const statusResp = await fetch(`${server.baseUrl}/api/agents/sessions/stream-kill-debrief/debrief-status`, {
+          headers: AUTH_HEADERS,
+        })
+        const { status } = await statusResp.json()
+        expect(status).toBe('completed')
+      })
+
+      const deleteResponse = await fetch(`${server.baseUrl}/api/agents/sessions/stream-kill-debrief`, {
+        method: 'DELETE',
+        headers: AUTH_HEADERS,
+      })
+      expect(deleteResponse.status).toBe(200)
+      expect(await deleteResponse.json()).toEqual({ killed: true })
+      expect(mock.cp.kill).toHaveBeenCalledWith('SIGTERM')
+    } finally {
+      await server.close()
+    }
   })
 
   it('tracks usage from message_delta events', async () => {
@@ -3310,6 +5282,374 @@ describe('stream sessions', () => {
       mock.cp.stdin.emit('error', new Error('write EPIPE'))
     }).not.toThrow()
 
+    await server.close()
+  })
+
+  it('marks factory session as completed on process exit without result', async () => {
+    const mock = installMockProcess()
+    const server = await startServer()
+
+    const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+      method: 'POST',
+      headers: {
+        ...AUTH_HEADERS,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: 'factory-feat-123-1234567890',
+        mode: 'default',
+        sessionType: 'stream',
+        task: 'implement feature',
+      }),
+    })
+    expect(createResponse.status).toBe(201)
+
+    // Factory worker exits without emitting result — exit handler should synthesize completion.
+    mock.emitExit(0)
+
+    await vi.waitFor(async () => {
+      const response = await fetch(`${server.baseUrl}/api/agents/sessions/factory-feat-123-1234567890`, {
+        headers: AUTH_HEADERS,
+      })
+      expect(response.status).toBe(200)
+      const payload = (await response.json()) as {
+        completed: boolean
+        status: string
+        result?: { status: string; finalComment: string }
+      }
+      expect(payload.completed).toBe(true)
+      expect(payload.status).toBe('success')
+      expect(payload.result?.finalComment).toContain('Process exited with code 0')
+    })
+
+    await server.close()
+  })
+
+  it('marks factory session as completed via POST /sessions/:name/complete', async () => {
+    const mock = installMockProcess()
+    const server = await startServer()
+
+    const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+      method: 'POST',
+      headers: {
+        ...AUTH_HEADERS,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: 'factory-fix-456-9876543210',
+        mode: 'default',
+        sessionType: 'stream',
+        task: 'fix bug',
+      }),
+    })
+    expect(createResponse.status).toBe(201)
+
+    // POST completion via the hook endpoint.
+    const completeResponse = await fetch(
+      `${server.baseUrl}/api/agents/sessions/factory-fix-456-9876543210/complete`,
+      {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ status: 'success', comment: 'Stop hook fired' }),
+      },
+    )
+    expect(completeResponse.status).toBe(200)
+    const completePayload = (await completeResponse.json()) as { name: string; completed: boolean; status: string }
+    expect(completePayload.completed).toBe(true)
+    expect(completePayload.status).toBe('success')
+
+    // The mock PID (99999) is not actually alive, so isPidAlive returns false
+    // and the kill is skipped — this is correct behavior.
+    void mock
+
+    // GET should return completed.
+    const getResponse = await fetch(
+      `${server.baseUrl}/api/agents/sessions/factory-fix-456-9876543210`,
+      { headers: AUTH_HEADERS },
+    )
+    expect(getResponse.status).toBe(200)
+    const getPayload = (await getResponse.json()) as { completed: boolean; status: string }
+    expect(getPayload.completed).toBe(true)
+
+    await server.close()
+  })
+
+  it('POST /sessions/:name/complete is idempotent', async () => {
+    installMockProcess()
+    const server = await startServer()
+
+    await fetch(`${server.baseUrl}/api/agents/sessions`, {
+      method: 'POST',
+      headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'factory-idempotent-789',
+        mode: 'default',
+        sessionType: 'stream',
+        task: 'test',
+      }),
+    })
+
+    // First complete call.
+    const first = await fetch(
+      `${server.baseUrl}/api/agents/sessions/factory-idempotent-789/complete`,
+      {
+        method: 'POST',
+        headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+        body: JSON.stringify({ status: 'success' }),
+      },
+    )
+    expect(first.status).toBe(200)
+
+    // Second complete call — should succeed without error.
+    const second = await fetch(
+      `${server.baseUrl}/api/agents/sessions/factory-idempotent-789/complete`,
+      {
+        method: 'POST',
+        headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+        body: JSON.stringify({ status: 'success' }),
+      },
+    )
+    expect(second.status).toBe(200)
+    const payload = (await second.json()) as { completed: boolean }
+    expect(payload.completed).toBe(true)
+
+    await server.close()
+  })
+
+  it('POST /sessions/:name/reset rotates commander session with new process', async () => {
+    const processMocks: Array<ReturnType<typeof createMockChildProcess>> = []
+    mockedSpawn.mockImplementation(() => {
+      const mock = createMockChildProcess()
+      processMocks.push(mock)
+      return mock.cp as never
+    })
+
+    const server = await startServer()
+
+    try {
+      // Create a commander stream session.
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'commander-reset-test',
+          mode: 'default',
+          sessionType: 'stream',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+      expect(processMocks).toHaveLength(1)
+
+      // Emit a result so the session is in a completed-turn state.
+      processMocks[0].emitStdout('{"type":"result","result":"done"}\n')
+      await waitForPersistedSessionFlush()
+
+      // Connect a WS client so we can verify event broadcast after reset.
+      const ws = await connectWs(server.baseUrl, 'commander-reset-test')
+      const wsEvents: Array<Record<string, unknown>> = []
+      ws.on('message', (data) => {
+        const parsed = JSON.parse(data.toString()) as Record<string, unknown>
+        if (parsed.type !== 'replay') {
+          wsEvents.push(parsed)
+        }
+      })
+      // Allow WS connection to fully establish.
+      await new Promise<void>((resolve) => setTimeout(resolve, 50))
+
+      // Reset the session.
+      const resetResponse = await fetch(
+        `${server.baseUrl}/api/agents/sessions/commander-reset-test/reset`,
+        {
+          method: 'POST',
+          headers: AUTH_HEADERS,
+        },
+      )
+      expect(resetResponse.status).toBe(200)
+      const resetPayload = (await resetResponse.json()) as { reset: boolean; sessionName: string }
+      expect(resetPayload.reset).toBe(true)
+      expect(resetPayload.sessionName).toBe('commander-reset-test')
+
+      // A new process should have been spawned.
+      expect(processMocks).toHaveLength(2)
+
+      // Old process should have been killed.
+      expect(processMocks[0].cp.kill).toHaveBeenCalledWith('SIGTERM')
+
+      // New process should NOT have --resume flag.
+      const lastSpawnArgs = mockedSpawn.mock.calls[mockedSpawn.mock.calls.length - 1]
+      expect(lastSpawnArgs[1]).not.toContain('--resume')
+
+      // WS client should have received the system reset event.
+      await vi.waitFor(() => {
+        expect(wsEvents.some((event) => (
+          event.type === 'system' &&
+          event.subtype === 'session_reset' &&
+          typeof event.text === 'string' &&
+          (event.text as string).includes('Session rotated')
+        ))).toBe(true)
+      })
+
+      // Session should still exist in the session list.
+      const listResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        headers: AUTH_HEADERS,
+      })
+      const sessions = (await listResponse.json()) as Array<{ name: string }>
+      expect(sessions.some((s) => s.name === 'commander-reset-test')).toBe(true)
+
+      ws.close()
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('POST /sessions/:name/reset rejects non-commander sessions', async () => {
+    const mock = installMockProcess()
+    const server = await startServer()
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'regular-session',
+          mode: 'default',
+          sessionType: 'stream',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      mock.emitStdout('{"type":"result","result":"done"}\n')
+      await waitForPersistedSessionFlush()
+
+      const resetResponse = await fetch(
+        `${server.baseUrl}/api/agents/sessions/regular-session/reset`,
+        {
+          method: 'POST',
+          headers: AUTH_HEADERS,
+        },
+      )
+      expect(resetResponse.status).toBe(400)
+      const payload = (await resetResponse.json()) as { error: string }
+      expect(payload.error).toContain('commander')
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('POST /sessions/:name/reset returns 404 for non-existent session', async () => {
+    const server = await startServer()
+
+    try {
+      const resetResponse = await fetch(
+        `${server.baseUrl}/api/agents/sessions/commander-nonexistent/reset`,
+        {
+          method: 'POST',
+          headers: AUTH_HEADERS,
+        },
+      )
+      expect(resetResponse.status).toBe(404)
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('passes --system-prompt to spawn when commander session is created with systemPrompt', async () => {
+    const mock = installMockProcess()
+    const server = await startServer()
+
+    server.sessionsInterface.createCommanderSession({
+      name: 'commander-identity-test',
+      systemPrompt: 'You are Commander Alpha',
+      cwd: '/tmp',
+    })
+
+    expect(mockedSpawn).toHaveBeenCalledWith(
+      'claude',
+      expect.arrayContaining(['--system-prompt', 'You are Commander Alpha']),
+      expect.objectContaining({ stdio: ['pipe', 'pipe', 'pipe'] }),
+    )
+
+    // Clean up
+    mock.cp.kill()
+    server.sessionsInterface.deleteSession('commander-identity-test')
+    await server.close()
+  })
+
+  it('preserves systemPrompt on respawn when process exits and new message arrives via WS', async () => {
+    const mock1 = createMockChildProcess()
+    mockedSpawn.mockReturnValueOnce(mock1.cp as never)
+
+    const server = await startServer()
+
+    // Create a commander session with a system prompt
+    server.sessionsInterface.createCommanderSession({
+      name: 'commander-respawn-test',
+      systemPrompt: 'You are Commander Beta',
+      cwd: '/tmp',
+      maxTurns: 5,
+    })
+
+    // Verify first spawn includes system prompt
+    expect(mockedSpawn).toHaveBeenCalledTimes(1)
+    expect(mockedSpawn).toHaveBeenCalledWith(
+      'claude',
+      expect.arrayContaining(['--system-prompt', 'You are Commander Beta']),
+      expect.anything(),
+    )
+
+    // Simulate the init event so claudeSessionId gets set
+    mock1.emitStdout('{"type":"system","subtype":"init","session_id":"claude-session-abc"}\n')
+    await new Promise((r) => setTimeout(r, 50))
+
+    // Connect WS *before* making stdin non-writable (session must still
+    // be in the map; after process exit the session is deleted).
+    const ws = await connectWs(server.baseUrl, 'commander-respawn-test')
+
+    // Make stdin non-writable without triggering a full process exit —
+    // this simulates a process that has finished its turn but whose exit
+    // event has not yet fired.
+    Object.defineProperty(mock1.cp.stdin, 'writable', { value: false })
+    mock1.cp.stdin.write = vi.fn(() => false)
+
+    // Prepare a second mock for the respawn
+    const mock2 = createMockChildProcess()
+    mockedSpawn.mockReturnValueOnce(mock2.cp as never)
+
+    // Send a user message via WS — this triggers the respawn path
+    ws.send(JSON.stringify({ type: 'input', text: 'check quest board' }))
+
+    // Wait for the respawn to be triggered (it happens asynchronously via readMachineRegistry)
+    await vi.waitFor(() => {
+      expect(mockedSpawn).toHaveBeenCalledTimes(2)
+    }, { timeout: 2000 })
+
+    // The second spawn call (respawn) should include --system-prompt
+    const secondCall = mockedSpawn.mock.calls[1]
+    expect(secondCall[0]).toBe('claude')
+    const args = secondCall[1] as string[]
+    expect(args).toContain('--system-prompt')
+    const spIdx = args.indexOf('--system-prompt')
+    expect(args[spIdx + 1]).toBe('You are Commander Beta')
+
+    // Also verify --max-turns is preserved
+    expect(args).toContain('--max-turns')
+    const mtIdx = args.indexOf('--max-turns')
+    expect(args[mtIdx + 1]).toBe('5')
+
+    // Also verify --resume is passed
+    expect(args).toContain('--resume')
+
+    ws.close()
+    server.sessionsInterface.deleteSession('commander-respawn-test')
     await server.close()
   })
 })

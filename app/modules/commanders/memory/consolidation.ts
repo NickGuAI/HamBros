@@ -5,7 +5,13 @@ import { DebriefParser, type ParsedDebrief } from './debrief-parser.js'
 import { JournalCompressor } from './compressor.js'
 import { JournalWriter } from './journal.js'
 import { MemoryMdWriter } from './memory-md-writer.js'
+import { WorkingMemory } from './working-memory.js'
 import type { JournalEntry } from './types.js'
+
+const HIGH_ACTIVITY_ENTRY_THRESHOLD = 20
+const HIGH_ACTIVITY_SPIKE_THRESHOLD = 4
+const MAX_LONG_TERM_JOURNAL_ENTRIES = 6
+const MAX_LONG_TERM_WORKING_NOTES = 8
 
 export interface CronEngine {
   schedule(expression: string, task: () => Promise<void> | void, options?: { name?: string }): void
@@ -17,6 +23,8 @@ export interface ConsolidationReport {
   entriesCompressed: { spike: number; notable: number; routine: number }
   entriesDeleted: number
   debrifsProcessed: number
+  idleDay?: boolean
+  incrementalRefreshTriggered?: boolean
 }
 
 export interface ConsolidationIssueClient {
@@ -25,21 +33,17 @@ export interface ConsolidationIssueClient {
 }
 
 export interface SkillDistillerLike {
-  run(journalEntries: JournalEntry[], debriefs: ParsedDebrief[]): Promise<void>
-}
-
-export interface RepoCacheUpdaterLike {
-  updateFromConsolidation(journalEntries: JournalEntry[]): Promise<void>
+  run(input: { journalEntries: JournalEntry[]; parsedDebriefs: ParsedDebrief[] }): Promise<void>
 }
 
 export interface NightlyConsolidationOptions {
   basePath?: string
   commanderIdsForCron?: string[]
+  commanderIdsForCronResolver?: () => string[] | Promise<string[]>
   debriefDir?: string
   now?: () => Date
   issueClient?: ConsolidationIssueClient
   skillDistiller?: SkillDistillerLike
-  repoCache?: RepoCacheUpdaterLike
 }
 
 function dateKey(date: Date): string {
@@ -65,6 +69,61 @@ function summarizeSpike(entry: JournalEntry): string {
   return `SPIKE: ${entry.outcome}${detail ? ` — ${detail.slice(0, 160)}` : ''}`
 }
 
+function compactText(value: string): string {
+  return value.replace(/\s+/g, ' ').trim()
+}
+
+function cleanSentence(value: string, maxLen: number): string {
+  const compacted = compactText(value).slice(0, maxLen)
+  if (!compacted) return ''
+  return /[.!?]$/.test(compacted) ? compacted : `${compacted}.`
+}
+
+function buildJournalNarrative(entries: JournalEntry[]): string {
+  const selected = entries.slice(-MAX_LONG_TERM_JOURNAL_ENTRIES)
+  if (selected.length === 0) return ''
+  const sentences = selected
+    .map((entry) => {
+      const time = entry.timestamp.slice(11, 16)
+      const repo = entry.repo ? ` in ${entry.repo}` : ''
+      const issue = entry.issueNumber != null ? ` (issue #${entry.issueNumber})` : ''
+      const detail = entry.body.trim()
+      const detailPart = detail
+        ? ` ${cleanSentence(detail, 200)}`
+        : ''
+      return cleanSentence(`${time}${repo}: ${entry.outcome}${issue}${detailPart}`, 280)
+    })
+    .filter((sentence) => sentence.length > 0)
+
+  if (sentences.length === 0) return ''
+  return sentences.join(' ')
+}
+
+function buildWorkingMemoryNarrative(workingMemory: string): string {
+  const lines = workingMemory.split(/\r?\n/)
+  const hypothesisLine = lines
+    .find((line) => line.startsWith('Active hypothesis:'))
+    ?.replace('Active hypothesis:', '')
+    .trim()
+  const hypothesis = hypothesisLine && hypothesisLine !== '_none_'
+    ? cleanSentence(`Active hypothesis was ${hypothesisLine}`, 220)
+    : ''
+
+  const checkpoints = lines
+    .map((line) => line.trim())
+    .map((line) => line.match(/^- [0-9T:.\-Z]+ \([^)]+\)(?: #[0-9]+)?(?: \[[^\]]+\])?(?: \{[^}]+\})? (.+)$/))
+    .filter((match): match is RegExpMatchArray => match != null)
+    .map((match) => compactText(match[1]))
+    .filter((note) => note.length > 0)
+    .slice(-MAX_LONG_TERM_WORKING_NOTES)
+
+  const observations = checkpoints.length > 0
+    ? cleanSentence(`Scratchpad observations: ${checkpoints.join('; ')}`, 420)
+    : ''
+
+  return [hypothesis, observations].filter((segment) => segment.length > 0).join(' ')
+}
+
 function buildCommentBody(
   commanderId: string,
   today: string,
@@ -83,6 +142,8 @@ function buildCommentBody(
   if (closedIssues.length > 0) {
     lines.push(`- closed issues reviewed: ${closedIssues.length}`)
   }
+  lines.push(`- idle day: ${(report.idleDay ?? false) ? 'yes' : 'no'}`)
+  lines.push(`- incremental refresh: ${(report.incrementalRefreshTriggered ?? false) ? 'triggered' : 'not triggered'}`)
   return lines.join('\n')
 }
 
@@ -106,12 +167,29 @@ export class NightlyConsolidation {
     cronEngine.schedule(
       '0 2 * * *',
       async () => {
-        for (const commanderId of this.commanderIdsForCron) {
+        const commanderIds = await this.resolveCommanderIdsForCron()
+        for (const commanderId of commanderIds) {
           await this.run(commanderId)
         }
       },
       { name: 'commander-nightly-consolidation' },
     )
+  }
+
+  private async resolveCommanderIdsForCron(): Promise<string[]> {
+    const source = this.options.commanderIdsForCronResolver
+      ? await this.options.commanderIdsForCronResolver()
+      : this.commanderIdsForCron
+
+    const deduped = new Set<string>()
+    for (const entry of source) {
+      const commanderId = entry.trim()
+      if (commanderId.length === 0) {
+        continue
+      }
+      deduped.add(commanderId)
+    }
+    return [...deduped]
   }
 
   // Run consolidation for a given commander (callable manually for testing)
@@ -130,6 +208,10 @@ export class NightlyConsolidation {
       this.parser.parseForDate(today, this.debriefDir),
       this.options.issueClient?.fetchClosedIssuesForDate?.(commanderId, today) ?? Promise.resolve([]),
     ])
+    const idleDay = todayEntries.length === 0 && debriefs.length === 0
+    const spikeCount = todayEntries.filter((entry) => entry.salience === 'SPIKE').length
+    const incrementalRefreshTriggered =
+      todayEntries.length >= HIGH_ACTIVITY_ENTRY_THRESHOLD || spikeCount >= HIGH_ACTIVITY_SPIKE_THRESHOLD
 
     // Phase 2: Extract durable facts -> MEMORY.md
     const factCandidates: string[] = []
@@ -148,6 +230,7 @@ export class NightlyConsolidation {
 
     const memoryWriter = new MemoryMdWriter(memoryRoot, { now: this.now })
     const memoryResult = await memoryWriter.updateFacts(factCandidates)
+    await this.distillLongTermMemory(commanderId, memoryRoot, today, todayEntries)
 
     // Phase 3: Compress episodic traces
     const files = await readdir(journalDir)
@@ -217,11 +300,14 @@ export class NightlyConsolidation {
     }
 
     // Phase 4: Downstream hooks (interfaces only).
-    if (this.options.skillDistiller) {
-      await this.options.skillDistiller.run(todayEntries, debriefs)
-    }
-    if (this.options.repoCache) {
-      await this.options.repoCache.updateFromConsolidation(todayEntries)
+    if (this.options.skillDistiller && !idleDay) {
+      const distillerJournalEntries = incrementalRefreshTriggered
+        ? await this.readJournalWindow(writer, today, 1, todayEntries)
+        : todayEntries
+      await this.options.skillDistiller.run({
+        journalEntries: distillerJournalEntries,
+        parsedDebriefs: debriefs,
+      })
     }
 
     // Phase 5: report + log.
@@ -231,6 +317,8 @@ export class NightlyConsolidation {
       entriesCompressed,
       entriesDeleted,
       debrifsProcessed: debriefs.length,
+      idleDay,
+      incrementalRefreshTriggered,
     }
     const commentBody = buildCommentBody(commanderId, today, report, closedIssues)
     const logPath = path.join(memoryRoot, 'consolidation-log.md')
@@ -245,5 +333,69 @@ export class NightlyConsolidation {
     await this.options.issueClient?.postConsolidationComment?.(commanderId, commentBody)
 
     return report
+  }
+
+  private async readJournalWindow(
+    writer: JournalWriter,
+    endDate: string,
+    lookbackDays: number,
+    todayEntries: JournalEntry[],
+  ): Promise<JournalEntry[]> {
+    const entries: JournalEntry[] = [...todayEntries]
+    for (let offset = 1; offset <= lookbackDays; offset++) {
+      const day = new Date(`${endDate}T00:00:00.000Z`)
+      day.setUTCDate(day.getUTCDate() - offset)
+      const date = day.toISOString().slice(0, 10)
+      const dayEntries = await writer.readDate(date)
+      entries.unshift(...dayEntries)
+    }
+    return entries
+  }
+
+  private async distillLongTermMemory(
+    commanderId: string,
+    memoryRoot: string,
+    today: string,
+    todayEntries: JournalEntry[],
+  ): Promise<void> {
+    const workingMemory = new WorkingMemory(commanderId, this.options.basePath, { now: this.now })
+    const workingMemoryContent = await workingMemory.read()
+    const journalNarrative = buildJournalNarrative(todayEntries)
+    const workingNarrative = buildWorkingMemoryNarrative(workingMemoryContent)
+
+    if (!journalNarrative && !workingNarrative) {
+      return
+    }
+
+    const sectionLines = [`## ${today}`, '']
+    if (journalNarrative) {
+      sectionLines.push('### Journal Narrative', journalNarrative, '')
+    }
+    if (workingNarrative) {
+      sectionLines.push('### Working Memory Narrative', workingNarrative, '')
+    }
+
+    const longTermPath = path.join(memoryRoot, 'LONG_TERM_MEM.md')
+    await this.appendLongTermSection(longTermPath, today, sectionLines.join('\n').trim())
+    await workingMemory.clear()
+  }
+
+  private async appendLongTermSection(
+    longTermPath: string,
+    date: string,
+    section: string,
+  ): Promise<void> {
+    let existing = '# Commander Long-Term Memory\n\n'
+    try {
+      existing = await readFile(longTermPath, 'utf-8')
+    } catch {
+      // Keep default header.
+    }
+
+    if (new RegExp(`^## ${date}$`, 'm').test(existing)) {
+      return
+    }
+
+    await writeFile(longTermPath, `${existing.trimEnd()}\n\n${section}\n`, 'utf-8')
   }
 }

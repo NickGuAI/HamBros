@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { QueryClient, useQuery } from '@tanstack/react-query'
 import {
   BarChart3,
   DollarSign,
@@ -28,10 +29,10 @@ import {
 } from '@/hooks/use-telemetry'
 import { fetchJson } from '@/lib/api'
 import { timeAgo, formatCost, formatTokens, cn } from '@/lib/utils'
-import type { SessionStatus, TelemetrySession } from '@/types'
+import type { SessionStatus, TelemetrySession, TelemetrySummary } from '@/types'
 
 const RETENTION_STORAGE_KEY = 'hammurabi:telemetry:retentionDays'
-const DEFAULT_RETENTION_DAYS = 14
+const DEFAULT_RETENTION_DAYS = 90
 
 function getStoredRetentionDays(): number {
   try {
@@ -47,8 +48,27 @@ function getStoredRetentionDays(): number {
 }
 
 type TrendPeriod = '7d' | '30d' | '90d'
+type SummaryPeriodMode = '30d' | '90d' | 'month:current' | 'month:pick'
 
 const PERIOD_DAYS: Record<TrendPeriod, number> = { '7d': 7, '30d': 30, '90d': 90 }
+
+function getCurrentMonthValue(now = new Date()): string {
+  return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`
+}
+
+function getSummaryPeriodLabel(period: string): string {
+  if (period === '30d' || period === '90d') {
+    return period
+  }
+  if (period.startsWith('month:')) {
+    const month = period.slice('month:'.length)
+    const parsed = new Date(`${month}-01T00:00:00.000Z`)
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed.toLocaleString(undefined, { month: 'short', year: 'numeric' })
+    }
+  }
+  return 'Selected period'
+}
 
 function CostTrendChart({
   dailyCosts,
@@ -212,6 +232,33 @@ function SummaryCard({
   )
 }
 
+function TokenSummaryCard({
+  label,
+  inputTokens,
+  outputTokens,
+  totalTokens,
+}: {
+  label: string
+  inputTokens: number
+  outputTokens: number
+  totalTokens: number
+}) {
+  return (
+    <div className="card-sumi p-5">
+      <div className="flex items-center gap-2 mb-3">
+        <BarChart3 size={14} className="text-sumi-diluted" />
+        <span className="section-title text-xs">{label}</span>
+      </div>
+      <p className="font-display text-heading text-sumi-black">
+        {formatTokens(totalTokens)}
+      </p>
+      <p className="text-whisper text-sumi-diluted mt-1">
+        In {formatTokens(inputTokens)} / Out {formatTokens(outputTokens)}
+      </p>
+    </div>
+  )
+}
+
 function SessionRow({
   session,
   onSelect,
@@ -247,6 +294,9 @@ function SessionRow({
           </p>
           <p className="text-whisper text-sumi-mist mt-1">
             {formatTokens(session.totalTokens)} tokens
+          </p>
+          <p className="text-whisper text-sumi-diluted mt-1">
+            In {formatTokens(session.inputTokens)} / Out {formatTokens(session.outputTokens)}
           </p>
         </div>
       </div>
@@ -300,7 +350,8 @@ function SessionDetail({
       minute: '2-digit',
     }),
     cost: c.cost,
-    tokens: c.inputTokens + c.outputTokens,
+    inputTokens: c.inputTokens,
+    outputTokens: c.outputTokens,
   }))
 
   return (
@@ -336,12 +387,15 @@ function SessionDetail({
           <p className="text-sm text-sumi-diluted">
             {formatTokens(session.totalTokens)} tokens
           </p>
+          <p className="text-whisper text-sumi-mist mt-1">
+            In {formatTokens(session.inputTokens)} / Out {formatTokens(session.outputTokens)}
+          </p>
         </div>
       </div>
 
       {/* Cost chart */}
       <div className="mb-8">
-        <h4 className="section-title mb-4">Cost and tokens per call</h4>
+        <h4 className="section-title mb-4">Cost and input/output tokens per call</h4>
         <div className="card-sumi p-4 h-48">
           <ResponsiveContainer width="100%" height="100%">
             <ComposedChart data={chartData}>
@@ -390,9 +444,19 @@ function SessionDetail({
               />
               <Line
                 type="monotone"
-                dataKey="tokens"
+                dataKey="inputTokens"
                 yAxisId="tokens"
-                stroke="#8B8B8B"
+                name="Input tokens"
+                stroke="#5C5C5C"
+                strokeWidth={1.2}
+                dot={false}
+              />
+              <Line
+                type="monotone"
+                dataKey="outputTokens"
+                yAxisId="tokens"
+                name="Output tokens"
+                stroke="#A6A6A6"
                 strokeWidth={1.2}
                 dot={false}
               />
@@ -420,7 +484,12 @@ function SessionDetail({
                 <span className="text-sumi-gray">{call.model}</span>
               </div>
               <div className="flex items-center gap-4 sm:gap-6 text-sumi-diluted">
-                <span>{formatTokens(call.inputTokens + call.outputTokens)}</span>
+                <span>
+                  {formatTokens(call.inputTokens)} in / {formatTokens(call.outputTokens)} out
+                </span>
+                <span className="text-whisper text-sumi-mist">
+                  {formatTokens(call.inputTokens + call.outputTokens)} total
+                </span>
                 <span className="font-mono text-sumi-black">
                   {formatCost(call.cost)}
                 </span>
@@ -437,7 +506,33 @@ function SessionDetail({
 }
 
 function GlobalSummary() {
-  const { data: summary, isLoading } = useTelemetrySummary()
+  const { data: baseSummary, isLoading: baseLoading } = useTelemetrySummary()
+  const [summaryPeriod, setSummaryPeriod] = useState<SummaryPeriodMode>('month:current')
+  const [pickedMonth, setPickedMonth] = useState<string>(getCurrentMonthValue)
+  const [summaryQueryClient] = useState(() => new QueryClient())
+
+  const currentMonth = getCurrentMonthValue()
+  const periodParam =
+    summaryPeriod === '30d' || summaryPeriod === '90d'
+      ? summaryPeriod
+      : `month:${summaryPeriod === 'month:pick' ? pickedMonth : currentMonth}`
+  const isDefaultPeriod = periodParam === `month:${currentMonth}`
+
+  const {
+    data: periodSummary,
+    isLoading: periodLoading,
+  } = useQuery({
+    queryKey: ['telemetry', 'summary', periodParam],
+    queryFn: () =>
+      fetchJson<TelemetrySummary>(
+        `/api/telemetry/summary?period=${encodeURIComponent(periodParam)}`,
+      ),
+    enabled: !isDefaultPeriod,
+    refetchInterval: 10000,
+  }, summaryQueryClient)
+
+  const summary = isDefaultPeriod ? baseSummary : (periodSummary ?? baseSummary)
+  const isLoading = !summary && (baseLoading || periodLoading)
 
   if (isLoading || !summary) {
     return (
@@ -447,6 +542,16 @@ function GlobalSummary() {
     )
   }
 
+  const resolvedPeriod = summary.period ?? periodParam
+  const periodLabel = getSummaryPeriodLabel(resolvedPeriod)
+  const periodCost = summary.costPeriod ?? summary.costMonth
+  const periodInputTokens = summary.inputTokensPeriod ?? summary.inputTokensMonth
+  const periodOutputTokens = summary.outputTokensPeriod ?? summary.outputTokensMonth
+  const periodTotalTokens = summary.totalTokensPeriod ?? summary.totalTokensMonth
+  const showRetentionWarning =
+    summary.periodOutsideRetention === true &&
+    typeof summary.retentionDays === 'number' &&
+    summary.retentionDays > 0
   const modelPieData = summary.topModels.map((m) => ({
     name: m.model,
     value: m.cost,
@@ -454,6 +559,67 @@ function GlobalSummary() {
 
   return (
     <div className="space-y-6 mb-8">
+      <div className="card-sumi p-5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h4 className="section-title">Usage period</h4>
+          <div className="flex items-center gap-1">
+            {([
+              { id: '30d' as SummaryPeriodMode, label: '30d' },
+              { id: '90d' as SummaryPeriodMode, label: '90d' },
+              { id: 'month:current' as SummaryPeriodMode, label: 'This month' },
+              { id: 'month:pick' as SummaryPeriodMode, label: 'Pick month' },
+            ]).map((option) => (
+              <button
+                key={option.id}
+                onClick={() => setSummaryPeriod(option.id)}
+                className={cn(
+                  'badge-sumi text-[10px] cursor-pointer transition-colors',
+                  summaryPeriod === option.id
+                    ? 'bg-sumi-black text-white'
+                    : 'hover:bg-washi-shadow',
+                )}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </div>
+        {summaryPeriod === 'month:pick' ? (
+          <div className="mt-3">
+            <input
+              type="month"
+              value={pickedMonth}
+              onChange={(event) => {
+                const value = event.target.value
+                if (/^\d{4}-\d{2}$/.test(value)) {
+                  setPickedMonth(value)
+                }
+              }}
+              className="text-xs px-2 py-1 rounded border border-ink-border bg-washi-aged/40 text-sumi-black"
+            />
+          </div>
+        ) : null}
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <SummaryCard
+          label={`Cost (${periodLabel})`}
+          value={formatCost(periodCost)}
+          icon={DollarSign}
+        />
+        <TokenSummaryCard
+          label={`Tokens (${periodLabel})`}
+          inputTokens={periodInputTokens}
+          outputTokens={periodOutputTokens}
+          totalTokens={periodTotalTokens}
+        />
+      </div>
+      {showRetentionWarning ? (
+        <div className="text-amber-600 text-xs">
+          Some data may be missing — retention window is {summary.retentionDays} days
+        </div>
+      ) : null}
+
       {/* Cost summary cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
         <SummaryCard label="Today" value={formatCost(summary.costToday)} icon={DollarSign} />
@@ -463,6 +629,27 @@ function GlobalSummary() {
           label="Active"
           value={`${summary.activeSessions} / ${summary.totalSessions}`}
           icon={Zap}
+        />
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <TokenSummaryCard
+          label="Tokens today"
+          inputTokens={summary.inputTokensToday}
+          outputTokens={summary.outputTokensToday}
+          totalTokens={summary.totalTokensToday}
+        />
+        <TokenSummaryCard
+          label="Tokens this week"
+          inputTokens={summary.inputTokensWeek}
+          outputTokens={summary.outputTokensWeek}
+          totalTokens={summary.totalTokensWeek}
+        />
+        <TokenSummaryCard
+          label="Tokens this month"
+          inputTokens={summary.inputTokensMonth}
+          outputTokens={summary.outputTokensMonth}
+          totalTokens={summary.totalTokensMonth}
         />
       </div>
 

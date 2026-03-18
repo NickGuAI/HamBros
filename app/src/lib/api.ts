@@ -59,3 +59,16 @@ export async function fetchJson<T>(path: string, init?: RequestInit): Promise<T>
   }
   return (await response.json()) as T
 }
+
+export async function fetchVoid(path: string, init?: RequestInit): Promise<void> {
+  const headers = await buildRequestHeaders(init?.headers)
+  const url = path.startsWith('http') ? path : `${getApiBase()}${path}`
+  const response = await fetch(url, {
+    ...init,
+    headers,
+  })
+  if (!response.ok) {
+    const body = await response.text()
+    throw new Error(`Request failed (${response.status}): ${body}`)
+  }
+}

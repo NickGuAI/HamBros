@@ -75,6 +75,50 @@ export async function killSession(sessionName: string): Promise<{ killed: boolea
   })
 }
 
+export interface PreKillDebriefResponse {
+  debriefStarted?: boolean
+  timeoutMs?: number
+  debriefed?: boolean
+  reason?: string
+}
+
+export async function triggerPreKillDebrief(
+  sessionName: string,
+): Promise<PreKillDebriefResponse> {
+  return fetchJson<PreKillDebriefResponse>(
+    `/api/agents/sessions/${encodeURIComponent(sessionName)}/pre-kill-debrief`,
+    { method: 'POST' },
+  )
+}
+
+export type DebriefStatus = 'pending' | 'completed' | 'timed-out' | 'none'
+
+export async function getDebriefStatus(
+  sessionName: string,
+): Promise<{ status: DebriefStatus }> {
+  return fetchJson<{ status: DebriefStatus }>(
+    `/api/agents/sessions/${encodeURIComponent(sessionName)}/debrief-status`,
+  )
+}
+
+interface ResetSessionResponse {
+  reset?: boolean
+  sessionName?: string
+}
+
+export async function resetSession(sessionName: string): Promise<{ reset: true }> {
+  const response = await fetchJson<ResetSessionResponse>(
+    `/api/agents/sessions/${encodeURIComponent(sessionName)}/reset`,
+    { method: 'POST' },
+  )
+
+  if (response.reset !== true) {
+    throw new Error('Session reset was not acknowledged by server')
+  }
+
+  return { reset: true }
+}
+
 export function useDirectories(dirPath?: string, enabled = true, host?: string) {
   return useQuery({
     queryKey: ['agents', 'directories', dirPath ?? '~', host ?? ''],

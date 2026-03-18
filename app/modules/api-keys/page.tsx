@@ -17,6 +17,8 @@ const AVAILABLE_SCOPES = [
   { value: 'telemetry:write', label: 'Telemetry write' },
   { value: 'agents:read', label: 'Agents read' },
   { value: 'agents:write', label: 'Agents write' },
+  { value: 'commanders:read', label: 'Commanders read' },
+  { value: 'commanders:write', label: 'Commanders write' },
   { value: 'services:read', label: 'Services read' },
   { value: 'services:write', label: 'Services write' },
   { value: 'factory:read', label: 'Factory read' },

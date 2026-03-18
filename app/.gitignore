@@ -3,3 +3,4 @@ node_modules/
 dist/
 dist-server/
 .hambros.json
+data/commanders/

@@ -1,3 +1,4 @@
+import { useMemo, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Zap, X } from 'lucide-react'
 import { useSkills } from '@/hooks/use-skills'
@@ -13,6 +14,13 @@ export function SkillsPicker({
   onClose: () => void
 }) {
   const { data: skills, isLoading } = useSkills()
+  const [query, setQuery] = useState('')
+  const filteredSkills = useMemo(() => {
+    if (!skills) return []
+    const normalized = query.trim().toLowerCase()
+    if (!normalized) return skills
+    return skills.filter((skill) => skill.name.toLowerCase().includes(normalized))
+  }, [skills, query])
 
   return createPortal(
     <>
@@ -35,6 +43,13 @@ export function SkillsPicker({
               <X size={16} className="text-sumi-diluted" />
             </button>
           </div>
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            className="w-full px-3 py-2 mb-3 rounded-lg border border-ink-border bg-washi-aged text-[16px] md:text-sm focus:outline-none focus:border-ink-border-hover"
+            placeholder="Search skills..."
+            aria-label="Search skills"
+          />
           <div className="space-y-2 max-h-[60dvh] overflow-y-auto">
             {isLoading ? (
               <div className="flex justify-center py-8">
@@ -44,8 +59,12 @@ export function SkillsPicker({
               <div className="text-center py-8 text-sumi-diluted text-sm">
                 No user-invocable skills installed
               </div>
+            ) : filteredSkills.length === 0 ? (
+              <div className="text-center py-8 text-sumi-diluted text-sm">
+                No skills match your search
+              </div>
             ) : (
-              skills?.map((skill) => (
+              filteredSkills.map((skill) => (
                 <button
                   key={skill.name}
                   onClick={() => {

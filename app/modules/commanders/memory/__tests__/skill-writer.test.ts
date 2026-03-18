@@ -46,7 +46,6 @@ describe('SkillWriter', () => {
     const skillPath = join(
       tmpDir,
       'test-commander',
-      '.memory',
       'skills',
       'auth-token-fix',
       'SKILL.md',
@@ -60,6 +59,12 @@ describe('SkillWriter', () => {
     expect(content).toContain('last-seen: 2026-02-28')
     expect(content).toContain('## Procedure')
     expect(content).toContain('## Source Episodes')
+    const memoryIndex = await readFile(
+      join(tmpDir, 'test-commander', '.memory', 'MEMORY.md'),
+      'utf-8',
+    )
+    expect(memoryIndex).toContain('## Skill Index')
+    expect(memoryIndex).toContain('`auth-token-fix` -> `../skills/auth-token-fix/SKILL.md`')
 
     const manifests = await writer.loadSkillManifests()
     expect(manifests).toHaveLength(1)
@@ -111,7 +116,6 @@ describe('SkillWriter', () => {
     const skillPath = join(
       tmpDir,
       'test-commander',
-      '.memory',
       'skills',
       'auth-token-fix',
       'SKILL.md',

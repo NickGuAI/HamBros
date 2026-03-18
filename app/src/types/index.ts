@@ -4,14 +4,16 @@ export interface FrontendModule {
   label: string
   icon: string
   path: string
+  hideFromNav?: boolean
   component: () => Promise<{ default: React.ComponentType }>
 }
 
 // Agents types
-export type AgentType = 'claude' | 'codex'
+export type AgentType = 'claude' | 'codex' | 'openclaw'
 
 export interface AgentSession {
   name: string
+  label?: string
   created: string
   pid: number
   sessionType?: SessionType
@@ -68,6 +70,7 @@ export interface CreateSessionInput {
   sessionType?: SessionType
   agentType?: AgentType
   host?: string
+  agentId?: string
 }
 
 // AskUserQuestion types
@@ -121,7 +124,13 @@ export type StreamEvent =
       type: 'user'
       message: {
         role: 'user'
-        content: Array<{ type: 'tool_result'; tool_use_id?: string; content?: string; is_error?: boolean }>
+        content:
+          | string
+          | Array<
+              | { type: 'tool_result'; tool_use_id?: string; content?: string; is_error?: boolean }
+              | { type: 'text'; text: string }
+              | { type: 'image'; source?: { type?: string; media_type?: string; data?: string } }
+            >
       }
       tool_use_result?: { stdout?: string; stderr?: string; interrupted?: boolean; isImage?: boolean; noOutputExpected?: boolean }
     }
@@ -142,7 +151,9 @@ export type StreamEvent =
       total_cost_usd?: number
     }
   | { type: 'exit'; exitCode: number; signal?: string | number }
-  | { type: 'system'; text: string }
+  | { type: 'system'; text?: string; subtype?: string; description?: string; last_tool_name?: string }
+  | { type: 'agent'; message?: unknown; text?: unknown }
+  | { type: 'rate_limit_event'; [key: string]: unknown }
 
 // Telemetry types
 export type SessionStatus = 'active' | 'idle' | 'stale' | 'completed'
@@ -177,11 +188,29 @@ export interface TelemetrySummary {
   costToday: number
   costWeek: number
   costMonth: number
+  costPeriod?: number
+  inputTokensToday: number
+  inputTokensWeek: number
+  inputTokensMonth: number
+  inputTokensPeriod?: number
+  outputTokensToday: number
+  outputTokensWeek: number
+  outputTokensMonth: number
+  outputTokensPeriod?: number
+  totalTokensToday: number
+  totalTokensWeek: number
+  totalTokensMonth: number
+  totalTokensPeriod?: number
   activeSessions: number
   totalSessions: number
   topModels: { model: string; cost: number; calls: number }[]
   topAgents: { agent: string; cost: number; sessions: number }[]
   dailyCosts: { date: string; costUsd: number }[]
+  period?: string
+  periodStartKey?: string
+  periodEndKey?: string
+  retentionDays?: number
+  periodOutsideRetention?: boolean
 }
 
 // Services types

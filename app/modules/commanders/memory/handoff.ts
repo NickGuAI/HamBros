@@ -1,38 +1,11 @@
-import type { Dirent } from 'node:fs'
-import { readdir, readFile } from 'node:fs/promises'
-import * as path from 'node:path'
+import { MemoryRecollection } from './recollection.js'
 import type { JournalWriter } from './journal.js'
 import type { SalienceLevel } from './types.js'
+import type { GHIssue as RecollectionIssue } from './skill-matcher.js'
+import { WorkingMemoryStore } from './working-memory.js'
 
-const MAX_MEMORY_EXCERPT_LINES = 50
-const TITLE_KEYWORD_MIN_LEN = 4
-const TITLE_KEYWORD_STOPWORDS = new Set([
-  'this',
-  'that',
-  'with',
-  'from',
-  'into',
-  'when',
-  'then',
-  'than',
-  'issue',
-  'split',
-  'build',
-  'create',
-  'update',
-  'after',
-  'before',
-  'under',
-  'over',
-  'about',
-  'where',
-  'while',
-  'there',
-  'their',
-  'would',
-  'could',
-  'should',
-])
+const MAX_SKILL_SUGGESTIONS = 6
+const MAX_MEMORY_EXCERPTS = 6
 
 const MANUAL_HELP_TRIGGERS = [
   'manual help',
@@ -73,16 +46,18 @@ export interface GHIssue {
   repoName?: string
 }
 
-export interface SkillContent {
+export interface SkillSuggestion {
   name: string
-  fullContent: string
+  path: string | null
+  reason: string
+  excerpt: string
 }
 
 export interface HandoffPackage {
   taskContext: string
-  repoKnowledge: string
-  matchedSkills: SkillContent[]
+  skillSuggestions: SkillSuggestion[]
   memoryExcerpts: string
+  workingMemory: string
   sourceCommanderId: string
 }
 
@@ -100,40 +75,76 @@ interface RepoRef {
   fullName: string | null
 }
 
+function compactText(value: string): string {
+  return value.replace(/\s+/g, ' ').trim()
+}
+
+function safeSnippet(value: string, maxLen: number = 220): string {
+  const compacted = compactText(value)
+  if (compacted.length <= maxLen) return compacted
+  return `${compacted.slice(0, maxLen - 3)}...`
+}
+
 export class SubagentHandoff {
-  private readonly memoryRoot: string
+  private readonly recollection: MemoryRecollection
+  private readonly workingMemory: WorkingMemoryStore
 
   constructor(
     private readonly commanderId: string,
     basePath?: string,
   ) {
-    this.memoryRoot = basePath
-      ? path.join(basePath, commanderId, '.memory')
-      : path.resolve(process.cwd(), 'data', 'commanders', commanderId, '.memory')
+    this.recollection = new MemoryRecollection(commanderId, basePath)
+    this.workingMemory = new WorkingMemoryStore(commanderId, basePath)
   }
 
   async buildHandoffPackage(task: GHIssue): Promise<HandoffPackage> {
-    const [repoKnowledge, matchedSkills, memoryExcerpts] = await Promise.all([
-      this.readRepoKnowledge(task),
-      this.readMatchedSkills(task),
-      this.extractMemoryExcerpts(task),
-    ])
+    const recollectionTask = this.toRecollectionIssue(task)
+    const recollection = await this.recollection.recall({
+      task: recollectionTask,
+      cue: this.buildCueText(task),
+      topK: 12,
+    })
+
+    const skillSuggestions = recollection.hits
+      .filter((hit) => hit.type === 'skill')
+      .slice(0, MAX_SKILL_SUGGESTIONS)
+      .map((hit) => ({
+        name: hit.title,
+        path: hit.path,
+        reason: hit.reason,
+        excerpt: hit.excerpt,
+      }))
+
+    const memoryExcerpts = recollection.hits
+      .filter((hit) => hit.type !== 'skill')
+      .slice(0, MAX_MEMORY_EXCERPTS)
+      .map((hit) => {
+        const header = `[${hit.type}] ${hit.title}${hit.repo ? ` [${hit.repo}]` : ''}`
+        const stale = hit.stale && hit.staleReason ? ` | stale: ${hit.staleReason}` : ''
+        return `- ${header}\n  - ${hit.excerpt}\n  - reason: ${hit.reason}${stale}`
+      })
+      .join('\n')
 
     return {
       taskContext: this.formatTaskContext(task),
-      repoKnowledge,
-      matchedSkills,
-      memoryExcerpts,
+      skillSuggestions,
+      memoryExcerpts: memoryExcerpts || '_No recollected memory excerpts._',
+      workingMemory: await this.workingMemory.render(5),
       sourceCommanderId: this.commanderId,
     }
   }
 
   formatAsSystemContext(pkg: HandoffPackage): string {
-    const skillsSection = pkg.matchedSkills.length
-      ? pkg.matchedSkills
-          .map((skill) => `#### ${skill.name}\n${skill.fullContent.trim()}`)
-          .join('\n\n')
-      : '_No applicable skills found._'
+    const skillsSection = pkg.skillSuggestions.length > 0
+      ? pkg.skillSuggestions
+          .map((skill) => [
+            `- **${skill.name}**`,
+            `  - path: ${skill.path ?? '_unknown_'}`,
+            `  - why: ${skill.reason}`,
+            `  - excerpt: ${skill.excerpt}`,
+          ].join('\n'))
+          .join('\n')
+      : '_No skill suggestions found for this task._'
 
     return [
       `## Handoff from Commander ${pkg.sourceCommanderId}`,
@@ -141,18 +152,18 @@ export class SubagentHandoff {
       '### Task',
       pkg.taskContext.trim() || '_No task context available._',
       '',
-      '### What I Know About This Repo',
-      pkg.repoKnowledge.trim() || '_No repo knowledge cache available._',
-      '',
-      '### Applicable Skills',
+      '### Suggested Skills (manual invoke only)',
       skillsSection,
       '',
-      '### Relevant Memory',
+      '### Working Memory Scratchpad',
+      pkg.workingMemory.trim() || '_No working-memory snapshot available._',
+      '',
+      '### Relevant Memory Recollection',
       pkg.memoryExcerpts.trim() || '_No relevant memory excerpts found._',
       '',
       '### Standing Instructions',
       '- Report key findings back as GH Issue comments as you go',
-      '- If you discover new conventions or pitfalls for this repo, note them explicitly',
+      '- If you discover new conventions or pitfalls, record them in journal + memory',
       '- Tag your final status: SUCCESS | PARTIAL | BLOCKED',
     ].join('\n')
   }
@@ -182,6 +193,25 @@ export class SubagentHandoff {
       salience,
       body,
     })
+  }
+
+  private toRecollectionIssue(task: GHIssue): RecollectionIssue {
+    const repo = this.resolveRepo(task)
+    return {
+      number: task.number,
+      title: task.title,
+      body: task.body,
+      comments: this.extractRecentComments(task.comments).map((body) => ({ body })),
+      owner: repo.owner ?? undefined,
+      repo: repo.name ?? undefined,
+      repository: repo.fullName ?? undefined,
+    }
+  }
+
+  private buildCueText(task: GHIssue): string {
+    const comments = this.extractRecentComments(task.comments).join('\n')
+    const repo = this.resolveRepo(task).fullName ?? ''
+    return [task.title, task.body, comments, repo].join('\n').trim()
   }
 
   private resolveRepo(task: GHIssue): RepoRef {
@@ -233,145 +263,8 @@ export class SubagentHandoff {
         if (!comment.author) return body
         return `${comment.author}: ${body}`
       })
+      .map((comment) => safeSnippet(comment))
       .filter((comment) => comment.length > 0)
-  }
-
-  private async readRepoKnowledge(task: GHIssue): Promise<string> {
-    const repo = this.resolveRepo(task)
-    if (!repo.owner || !repo.name) return ''
-
-    const repoFile = `${repo.owner}_${repo.name}`.replace(/[^\w.-]/gu, '_')
-    const repoPath = path.join(this.memoryRoot, 'repos', `${repoFile}.md`)
-    try {
-      return await readFile(repoPath, 'utf-8')
-    } catch {
-      return ''
-    }
-  }
-
-  private async readMatchedSkills(task: GHIssue): Promise<SkillContent[]> {
-    const skillsRoot = path.join(this.memoryRoot, 'skills')
-    const skillFiles = await this.collectSkillFiles(skillsRoot)
-    if (skillFiles.length === 0) return []
-
-    const repo = this.resolveRepo(task)
-    const taskText = `${task.title}\n${task.body}\n${repo.fullName ?? ''}`.toLowerCase()
-    const titleKeywords = this.extractTitleKeywords(task.title)
-    const skills: SkillContent[] = []
-
-    for (const skillPath of skillFiles) {
-      let fullContent = ''
-      try {
-        fullContent = await readFile(skillPath, 'utf-8')
-      } catch {
-        continue
-      }
-      if (!fullContent.trim()) continue
-
-      const skillName = path.basename(path.dirname(skillPath))
-      if (!this.isSkillMatch(skillName, fullContent, taskText, titleKeywords)) continue
-
-      skills.push({ name: skillName, fullContent })
-    }
-
-    return skills
-  }
-
-  private async collectSkillFiles(root: string): Promise<string[]> {
-    const files: string[] = []
-    let entries: Dirent<string>[]
-    try {
-      entries = await readdir(root, { withFileTypes: true })
-    } catch {
-      return files
-    }
-
-    for (const entry of entries) {
-      const fullPath = path.join(root, entry.name)
-      if (entry.isDirectory()) {
-        files.push(...(await this.collectSkillFiles(fullPath)))
-        continue
-      }
-      if (!entry.isFile()) continue
-      if (entry.name.toLowerCase() === 'skill.md') files.push(fullPath)
-    }
-    return files
-  }
-
-  private isSkillMatch(
-    skillName: string,
-    fullContent: string,
-    taskText: string,
-    titleKeywords: string[],
-  ): boolean {
-    const skillNameLower = skillName.toLowerCase()
-    if (taskText.includes(skillNameLower)) return true
-
-    const contentLower = fullContent.toLowerCase()
-    for (const keyword of titleKeywords) {
-      if (skillNameLower.includes(keyword) || contentLower.includes(keyword)) {
-        return true
-      }
-    }
-    return false
-  }
-
-  private async extractMemoryExcerpts(task: GHIssue): Promise<string> {
-    const memoryPath = path.join(this.memoryRoot, 'MEMORY.md')
-    let content = ''
-    try {
-      content = await readFile(memoryPath, 'utf-8')
-    } catch {
-      return ''
-    }
-    if (!content.trim()) return ''
-
-    const lines = content.split(/\r?\n/u)
-    const selected = new Set<number>()
-    const repo = this.resolveRepo(task)
-    const repoName = (repo.name ?? '').toLowerCase()
-    const repoFullName = (repo.fullName ?? '').toLowerCase()
-    const titleKeywords = this.extractTitleKeywords(task.title)
-
-    const firstHeaderIndex = lines.findIndex((line) => /^#{1,6}\s+\S/u.test(line))
-    if (firstHeaderIndex >= 0) {
-      let endIndex = lines.length
-      for (let i = firstHeaderIndex + 1; i < lines.length; i++) {
-        if (/^#{1,6}\s+\S/u.test(lines[i])) {
-          endIndex = i
-          break
-        }
-      }
-      for (let i = firstHeaderIndex; i < endIndex; i++) {
-        selected.add(i)
-      }
-    }
-
-    for (let i = 0; i < lines.length; i++) {
-      const normalizedLine = lines[i].toLowerCase()
-      if (repoFullName && normalizedLine.includes(repoFullName)) selected.add(i)
-      if (repoName && normalizedLine.includes(repoName)) selected.add(i)
-      if (titleKeywords.some((keyword) => normalizedLine.includes(keyword))) selected.add(i)
-    }
-
-    const excerptLines = [...selected]
-      .sort((a, b) => a - b)
-      .slice(0, MAX_MEMORY_EXCERPT_LINES)
-      .map((i) => lines[i])
-
-    return excerptLines.join('\n').trim()
-  }
-
-  private extractTitleKeywords(title: string): string[] {
-    const seen = new Set<string>()
-    const rawWords = title.toLowerCase().match(/[a-z0-9-]+/gu) ?? []
-    for (const word of rawWords) {
-      if (word.length < TITLE_KEYWORD_MIN_LEN) continue
-      if (TITLE_KEYWORD_STOPWORDS.has(word)) continue
-      if (seen.has(word)) continue
-      seen.add(word)
-    }
-    return [...seen]
   }
 
   private deriveCompletionSalience(result: SubagentResult): SalienceLevel {

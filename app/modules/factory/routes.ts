@@ -1,20 +1,21 @@
 import { Router, type Router as RouterType } from 'express'
-import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import type { ApiKeyStoreLike } from '../../server/api-keys/store.js'
 import { combinedAuth } from '../../server/middleware/combined-auth.js'
+import type { CommandRunner } from './worktree.js'
+import {
+  bootstrapFactoryWorktree,
+  defaultCommandRunner,
+  parseFeatureName,
+  parseOwnerRepo,
+} from './worktree.js'
 
-const execFileAsync = promisify(execFile)
+// Re-export for consumers that import from this module (e.g. tests, agents/routes)
+export type { CommandRunner, BootstrapFactoryWorktreeInput, BootstrapFactoryWorktreeResult } from './worktree.js'
+export { bootstrapFactoryWorktree } from './worktree.js'
 
 const GITHUB_URL_PATTERN = /^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+?)(?:\.git)?$/
-const FEATURE_NAME_PATTERN = /^[\w-]+$/
-const OWNER_REPO_PATTERN = /^[\w.-]+$/
-
-export interface CommandRunner {
-  exec(command: string, args: string[], options?: { cwd?: string }): Promise<{ stdout: string; stderr: string }>
-}
 
 export interface FactoryRouterOptions {
   baseDir?: string
@@ -23,12 +24,6 @@ export interface FactoryRouterOptions {
   auth0Domain?: string
   auth0Audience?: string
   auth0ClientId?: string
-}
-
-function defaultCommandRunner(): CommandRunner {
-  return {
-    exec: (command, args, options) => execFileAsync(command, args, { cwd: options?.cwd }),
-  }
 }
 
 function parseGitHubUrl(url: unknown): { owner: string; repo: string } | null {
@@ -42,53 +37,6 @@ function parseGitHubUrl(url: unknown): { owner: string; repo: string } | null {
   }
 
   return { owner: match[1], repo: match[2] }
-}
-
-function parseFeatureName(feature: unknown): string | null {
-  if (typeof feature !== 'string') {
-    return null
-  }
-
-  const trimmed = feature.trim()
-  if (!FEATURE_NAME_PATTERN.test(trimmed)) {
-    return null
-  }
-
-  return trimmed
-}
-
-function parseOwnerRepo(owner: unknown, repo: unknown): { owner: string; repo: string } | null {
-  if (typeof owner !== 'string' || typeof repo !== 'string') {
-    return null
-  }
-
-  if (!OWNER_REPO_PATTERN.test(owner) || !OWNER_REPO_PATTERN.test(repo)) {
-    return null
-  }
-
-  if (owner === '.' || owner === '..' || repo === '.' || repo === '..') {
-    return null
-  }
-
-  return { owner, repo }
-}
-
-async function detectDefaultBranch(runner: CommandRunner, bareGitDir: string): Promise<string> {
-  // Bare clones have HEAD pointing to the default branch (refs/heads/main),
-  // not refs/remotes/origin/HEAD which only exists in non-bare clones.
-  try {
-    const { stdout } = await runner.exec('git', ['symbolic-ref', 'HEAD'], { cwd: bareGitDir })
-    // Output looks like: refs/heads/main
-    const ref = stdout.trim()
-    const branch = ref.replace('refs/heads/', '')
-    if (branch && branch !== ref) {
-      return branch
-    }
-  } catch {
-    // fallback
-  }
-
-  return 'main'
 }
 
 export function createFactoryRouter(options: FactoryRouterOptions = {}): RouterType {
@@ -306,15 +254,20 @@ export function createFactoryRouter(options: FactoryRouterOptions = {}): RouterT
     }
 
     try {
-      await runner.exec('git', ['fetch', 'origin'], { cwd: bareGitDir })
-      const defaultBranch = await detectDefaultBranch(runner, bareGitDir)
-      // Create a new branch named after the feature, based off the default branch.
-      // Using -b ensures each worktree gets an isolated feature branch instead of
-      // checking out the shared default branch (which would fail on the second worktree).
-      await runner.exec('git', ['worktree', 'add', '-b', feature, worktreePath, defaultBranch], { cwd: bareGitDir })
-
-      res.status(201).json({ feature, path: worktreePath, branch: feature })
-    } catch {
+      const created = await bootstrapFactoryWorktree({
+        owner,
+        repo,
+        feature,
+        baseDir,
+        commandRunner: runner,
+      })
+      res.status(201).json({ feature: created.feature, path: created.path, branch: created.branch })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to create worktree'
+      if (message.includes('already exists')) {
+        res.status(409).json({ error: message })
+        return
+      }
       res.status(500).json({ error: 'Failed to create worktree' })
     }
   })

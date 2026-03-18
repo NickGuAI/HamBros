@@ -27,6 +27,7 @@ export const modules: FrontendModule[] = [
     label: 'Factory',
     icon: 'Warehouse',
     path: '/factory',
+    hideFromNav: true,
     component: () => import('@modules/factory/page'),
   },
   {

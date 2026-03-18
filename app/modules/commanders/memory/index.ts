@@ -1,4 +1,15 @@
 export * from './types.js'
+export {
+  GoalsStore,
+  parseGoalsMd,
+  serializeGoalsMd,
+} from './goals-store.js'
+export {
+  checkPreCompactionFlush,
+  PRE_COMPACTION_FLUSH_MESSAGE,
+  type PreCompactionFlushOptions,
+  type PreCompactionFlushState,
+} from './pre-compaction-flush.js'
 export { JournalWriter } from './journal.js'
 export {
   MemoryContextBuilder,
@@ -39,7 +50,6 @@ export {
   type PatternEpisode,
   type SkillDistillerOptions,
 } from './skill-distiller.js'
-export { RepoCacheManager } from './repo-cache.js'
 export {
   EmergencyFlusher,
   type FlushContext,
@@ -48,7 +58,31 @@ export {
 export {
   SubagentHandoff,
   SPIKE_TRIGGERS,
-  type SkillContent,
+  type SkillSuggestion,
   type HandoffPackage,
   type SubagentResult,
 } from './handoff.js'
+export {
+  WorkingMemoryStore,
+  type WorkingMemoryState,
+  type WorkingMemoryEntry,
+  type WorkingMemoryUpdate,
+  type WorkingMemorySource,
+} from './working-memory.js'
+export {
+  MemoryRecollection,
+  type RecollectionQuery,
+  type RecollectionResult,
+  type RecollectionHit,
+  type RecollectionHitType,
+} from './recollection.js'
+export {
+  AssociationStore,
+  type AssociationGraph,
+  type AssociationCue,
+  type AssociationNode,
+  type AssociationEdge,
+  type AssociationNodeKind,
+  type AssociationEdgeKind,
+  type SkillAssociationInput,
+} from './associations.js'

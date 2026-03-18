@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { CommanderManager } from '../manager.js'
@@ -40,11 +40,6 @@ describe('CommanderManager.init()', () => {
   it('builds formatted subagent system context', async () => {
     await manager.init()
     await writeFile(
-      join(tmpDir, 'test-cmdr', '.memory', 'repos', 'example-user_example-repo.md'),
-      'Repo conventions: use pnpm --filter for targeted checks.\n',
-      'utf-8',
-    )
-    await writeFile(
       join(tmpDir, 'test-cmdr', '.memory', 'MEMORY.md'),
       [
         '# Commander Standing Orders',
@@ -55,7 +50,7 @@ describe('CommanderManager.init()', () => {
       ].join('\n'),
       'utf-8',
     )
-    const skillDir = join(tmpDir, 'test-cmdr', '.memory', 'skills', 'lint-fix')
+    const skillDir = join(tmpDir, 'test-cmdr', 'skills', 'lint-fix')
     await mkdir(skillDir, { recursive: true })
     await writeFile(
       join(skillDir, 'SKILL.md'),
@@ -74,8 +69,9 @@ describe('CommanderManager.init()', () => {
 
     expect(context).toContain('## Handoff from Commander test-cmdr')
     expect(context).toContain('**Issue #167**: Fix lint regression in example-repo')
-    expect(context).toContain('Repo conventions: use pnpm --filter for targeted checks.')
-    expect(context).toContain('#### lint-fix')
+    expect(context).toContain('### Suggested Skills (manual invoke only)')
+    expect(context).toContain('**lint-fix**')
+    expect(context).toContain('### Relevant Memory Recollection')
   })
 
   it('writes completion read-back through manager API', async () => {
@@ -159,6 +155,13 @@ describe('CommanderManager.init()', () => {
     expect(entry).toBeDefined()
     expect(entry?.outcome).toBe('Sub-agent completion: SUCCESS')
     expect(entry?.body).toContain('sess-subagent-167')
+
+    const workingMemory = await readFile(
+      join(tmpDir, 'test-cmdr', '.memory', 'working-memory.md'),
+      'utf-8',
+    )
+    expect(workingMemory).toContain('Task start: issue #167')
+    expect(workingMemory).toContain('Task completion: issue #167')
   })
 
   it('wires pre-compaction flush to Agent SDK context pressure hook', async () => {
@@ -241,5 +244,11 @@ describe('CommanderManager.init()', () => {
     )
     expect(pickUpNextTask).toHaveBeenCalledTimes(1)
     expect(callOrder).toEqual(['flush', 'next-task'])
+
+    const workingMemory = await readFile(
+      join(tmpDir, 'test-cmdr', '.memory', 'working-memory.md'),
+      'utf-8',
+    )
+    expect(workingMemory).toContain('Quest transition: flushing between tasks and requesting next task.')
   })
 })

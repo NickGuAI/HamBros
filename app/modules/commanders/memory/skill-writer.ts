@@ -1,6 +1,7 @@
 import type { Dirent } from 'node:fs'
 import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises'
 import * as path from 'node:path'
+import { resolveCommanderPaths } from '../paths.js'
 
 export interface SkillManifest {
   name: string
@@ -50,11 +51,12 @@ const SKILL_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*$/
 
 export class SkillWriter {
   private readonly memoryRoot: string
+  private readonly skillsRoot: string
 
   constructor(commanderId: string, basePath?: string) {
-    this.memoryRoot = basePath
-      ? path.join(basePath, commanderId, '.memory')
-      : path.resolve(process.cwd(), 'data', 'commanders', commanderId, '.memory')
+    const resolved = resolveCommanderPaths(commanderId, basePath)
+    this.memoryRoot = resolved.memoryRoot
+    this.skillsRoot = resolved.skillsRoot
   }
 
   async loadSkillManifests(): Promise<SkillManifest[]> {
@@ -111,6 +113,7 @@ export class SkillWriter {
     })
 
     await this._writeAtomic(skillPath, content)
+    await this._syncMemorySkillIndex()
   }
 
   /**
@@ -160,10 +163,11 @@ export class SkillWriter {
     })
 
     await this._writeAtomic(skillPath, content)
+    await this._syncMemorySkillIndex()
   }
 
   private _skillsDir(): string {
-    return path.join(this.memoryRoot, 'skills')
+    return this.skillsRoot
   }
 
   private _skillPath(skillName: string): string {
@@ -479,6 +483,46 @@ export class SkillWriter {
     }
 
     return { values, added }
+  }
+
+  private async _syncMemorySkillIndex(): Promise<void> {
+    const manifests = await this.loadSkillManifests()
+    const memoryPath = path.join(this.memoryRoot, 'MEMORY.md')
+    const section = this._renderMemorySkillIndexSection(manifests.map((manifest) => manifest.name))
+
+    let existing = '# Commander Memory\n\n'
+    try {
+      existing = await readFile(memoryPath, 'utf-8')
+    } catch {
+      // Keep default header.
+    }
+
+    const sectionPattern = /## Skill Index\s*\n[\s\S]*?<!--\s*commander-skill-index:end\s*-->\s*/m
+    const next = sectionPattern.test(existing)
+      ? existing.replace(sectionPattern, `${section}\n\n`)
+      : `${existing.trimEnd()}\n\n${section}\n`
+
+    if (next === existing) {
+      return
+    }
+
+    await mkdir(this.memoryRoot, { recursive: true })
+    await writeFile(memoryPath, next, 'utf-8')
+  }
+
+  private _renderMemorySkillIndexSection(skillNames: string[]): string {
+    const lines = skillNames.length > 0
+      ? skillNames
+          .sort((left, right) => left.localeCompare(right))
+          .map((name) => `- \`${name}\` -> \`../skills/${name}/SKILL.md\``)
+      : ['- _No skills cataloged yet._']
+
+    return [
+      '## Skill Index',
+      '<!-- commander-skill-index:start -->',
+      ...lines,
+      '<!-- commander-skill-index:end -->',
+    ].join('\n')
   }
 
   private async _writeAtomic(filePath: string, content: string): Promise<void> {

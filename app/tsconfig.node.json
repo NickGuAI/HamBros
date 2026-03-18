@@ -1,6 +1,12 @@
 {
   "extends": "@hambros/tsconfig/base.json",
   "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"],
+      "@server/*": ["./server/*"],
+      "@modules/*": ["./modules/*"]
+    },
     "lib": ["ES2021"],
     "module": "ESNext",
     "moduleResolution": "bundler",

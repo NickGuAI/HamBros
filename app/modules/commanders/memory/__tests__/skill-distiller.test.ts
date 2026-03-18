@@ -102,7 +102,6 @@ describe('SkillDistiller', () => {
     const skillPath = join(
       tmpDir,
       'test-commander',
-      '.memory',
       'skills',
       'auth-token-fix',
       'SKILL.md',
@@ -172,7 +171,6 @@ describe('SkillDistiller', () => {
     const skillPath = join(
       tmpDir,
       'test-commander',
-      '.memory',
       'skills',
       'auth-token-fix',
       'SKILL.md',

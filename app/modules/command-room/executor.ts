@@ -15,6 +15,7 @@ interface AgentSessionClientLike {
     sessionId: string,
     options?: AgentSessionMonitorOptions,
   ): Promise<AgentSessionCompletion>
+  killSession?(sessionId: string): Promise<void>
 }
 
 export interface CommandRoomExecutorOptions {
@@ -140,8 +141,9 @@ export class CommandRoomExecutor {
   private readonly inFlightByTaskId = new Map<string, Promise<WorkflowRun | null>>()
 
   constructor(options: CommandRoomExecutorOptions = {}) {
-    this.taskStore = options.taskStore ?? new CommandRoomTaskStore()
-    this.runStore = options.runStore ?? new CommandRoomRunStore()
+    const taskStore = options.taskStore ?? new CommandRoomTaskStore()
+    this.taskStore = taskStore
+    this.runStore = options.runStore ?? new CommandRoomRunStore({ taskStore })
     this.now = options.now ?? (() => new Date())
     this.monitorOptions = options.monitorOptions
     this.internalToken = options.internalToken
@@ -191,8 +193,21 @@ export class CommandRoomExecutor {
     })
 
     let sessionId = ''
+    let client: AgentSessionClientLike | null = null
+    let sessionKilled = false
+    const killSessionSafely = async () => {
+      if (!sessionId || sessionKilled || !client?.killSession) {
+        return
+      }
+      try {
+        await client.killSession(sessionId)
+        sessionKilled = true
+      } catch {
+        // Best-effort cleanup; fallback retry happens in finally.
+      }
+    }
     try {
-      const client = authToken
+      client = authToken
         ? new AgentSessionClient({ baseUrl: resolveBaseUrl(), bearerToken: authToken })
         : this.agentSessionFactory()
       const created = await client.createSession({
@@ -208,6 +223,9 @@ export class CommandRoomExecutor {
       await this.runStore.updateRun(run.id, { sessionId })
 
       const completion = await client.monitorSession(sessionId, this.monitorOptions)
+      // Command-room stream runs are one-shot; terminate the backing process as
+      // soon as completion is observed instead of waiting for process exit.
+      await killSessionSafely()
       const completedAt = this.now().toISOString()
       const updated = await this.runStore.updateRun(run.id, {
         status: completionToRunStatus(completion.status),
@@ -250,6 +268,8 @@ export class CommandRoomExecutor {
         costUsd: 0,
         sessionId,
       }
+    } finally {
+      await killSessionSafely()
     }
   }
 }

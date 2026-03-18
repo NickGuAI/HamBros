@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { resolveCommanderDataDir } from '../commanders/paths.js'
 
 const DEFAULT_TASK_STORE_PATH = 'data/command-room/tasks.json'
 
@@ -9,6 +10,7 @@ export type CommandRoomAgentType = 'claude' | 'codex'
 export interface CronTask {
   id: string
   name: string
+  description?: string
   schedule: string
   timezone?: string
   machine: string
@@ -17,6 +19,7 @@ export interface CronTask {
   instruction: string
   enabled: boolean
   createdAt: string
+  commanderId?: string
   permissionMode?: string
   sessionType?: 'stream' | 'pty'
 }
@@ -27,6 +30,7 @@ interface PersistedTaskCollection {
 
 export interface CreateCronTaskInput {
   name: string
+  description?: string
   schedule: string
   timezone?: string
   machine: string
@@ -34,12 +38,14 @@ export interface CreateCronTaskInput {
   agentType: CommandRoomAgentType
   instruction: string
   enabled: boolean
+  commanderId?: string
   permissionMode?: string
   sessionType?: 'stream' | 'pty'
 }
 
 export interface UpdateCronTaskInput {
   name?: string
+  description?: string
   schedule?: string
   timezone?: string
   machine?: string
@@ -49,6 +55,16 @@ export interface UpdateCronTaskInput {
   enabled?: boolean
   permissionMode?: string
   sessionType?: 'stream' | 'pty'
+}
+
+export interface CommandRoomTaskStoreOptions {
+  filePath?: string
+  commanderDataDir?: string | null
+}
+
+interface TaskLocation {
+  task: CronTask
+  filePath: string
 }
 
 const AGENT_TYPES = new Set<CommandRoomAgentType>(['claude', 'codex'])
@@ -80,6 +96,7 @@ function isCronTask(value: unknown): value is CronTask {
   return (
     typeof value.id === 'string' &&
     typeof value.name === 'string' &&
+    (value.description === undefined || typeof value.description === 'string') &&
     typeof value.schedule === 'string' &&
     (value.timezone === undefined || typeof value.timezone === 'string') &&
     typeof value.machine === 'string' &&
@@ -87,7 +104,8 @@ function isCronTask(value: unknown): value is CronTask {
     AGENT_TYPES.has(value.agentType as CommandRoomAgentType) &&
     typeof value.instruction === 'string' &&
     typeof value.enabled === 'boolean' &&
-    typeof value.createdAt === 'string'
+    typeof value.createdAt === 'string' &&
+    (value.commanderId === undefined || typeof value.commanderId === 'string')
   )
 }
 
@@ -111,21 +129,42 @@ export function defaultCommandRoomTaskStorePath(): string {
   return path.resolve(process.cwd(), DEFAULT_TASK_STORE_PATH)
 }
 
+function resolveCommanderCronTasksPath(commanderDataDir: string, commanderId: string): string {
+  return path.join(path.resolve(commanderDataDir), commanderId, '.memory', 'cron', 'tasks.json')
+}
+
 export class CommandRoomTaskStore {
   private mutationQueue: Promise<void> = Promise.resolve()
   private readonly filePath: string
+  private readonly commanderDataDir: string | null
 
-  constructor(filePath: string = defaultCommandRoomTaskStorePath()) {
-    this.filePath = path.resolve(filePath)
+  constructor(config: string | CommandRoomTaskStoreOptions = {}) {
+    if (typeof config === 'string') {
+      this.filePath = path.resolve(config)
+      this.commanderDataDir = null
+      return
+    }
+
+    this.filePath = path.resolve(config.filePath ?? defaultCommandRoomTaskStorePath())
+    const commanderDataDir = config.commanderDataDir === null
+      ? null
+      : path.resolve(config.commanderDataDir ?? resolveCommanderDataDir())
+    this.commanderDataDir = commanderDataDir
   }
 
-  async listTasks(): Promise<CronTask[]> {
+  async listTasks(filter: { commanderId?: string } = {}): Promise<CronTask[]> {
     await this.mutationQueue
-    const tasks = await this.readTasks()
-    return tasks.sort(
+    const locations = await this.readTaskLocations()
+    const tasks = [...locations.values()].map((entry) => entry.task)
+    const sorted = tasks.sort(
       (left, right) =>
         right.createdAt.localeCompare(left.createdAt) || left.id.localeCompare(right.id),
     )
+    const commanderId = asTrimmedString(filter.commanderId)
+    if (!commanderId) {
+      return sorted
+    }
+    return sorted.filter((task) => task.commanderId === commanderId)
   }
 
   async listEnabledTasks(): Promise<CronTask[]> {
@@ -139,9 +178,12 @@ export class CommandRoomTaskStore {
   }
 
   async createTask(input: CreateCronTaskInput): Promise<CronTask> {
+    const commanderId = asTrimmedString(input.commanderId)
+    const description = asTrimmedString(input.description)
     const nextTask: CronTask = {
       id: randomUUID(),
       name: input.name,
+      ...(description ? { description } : {}),
       schedule: input.schedule,
       ...(input.timezone ? { timezone: input.timezone } : {}),
       machine: input.machine,
@@ -150,21 +192,27 @@ export class CommandRoomTaskStore {
       instruction: input.instruction,
       enabled: input.enabled,
       createdAt: new Date().toISOString(),
+      ...(commanderId ? { commanderId } : {}),
       ...(input.permissionMode ? { permissionMode: input.permissionMode } : {}),
       ...(input.sessionType ? { sessionType: input.sessionType } : {}),
     }
 
     return this.withMutationLock(async () => {
-      const tasks = await this.readTasks()
+      const targetPath = this.resolveCreatePath(commanderId)
+      const tasks = await this.readTasksFromFile(targetPath)
       tasks.push(nextTask)
-      await this.writeTasks(tasks)
+      await this.writeTasksToFile(targetPath, tasks)
       return nextTask
     })
   }
 
   async updateTask(taskId: string, update: UpdateCronTaskInput): Promise<CronTask | null> {
     return this.withMutationLock(async () => {
-      const tasks = await this.readTasks()
+      const location = (await this.readTaskLocations()).get(taskId)
+      if (!location) {
+        return null
+      }
+      const tasks = await this.readTasksFromFile(location.filePath)
       const index = tasks.findIndex((task) => task.id === taskId)
       if (index < 0) {
         return null
@@ -179,6 +227,14 @@ export class CommandRoomTaskStore {
       const name = asTrimmedString(update.name)
       if (name) {
         nextTask.name = name
+      }
+      if (Object.prototype.hasOwnProperty.call(update, 'description')) {
+        const description = asTrimmedString(update.description)
+        if (description) {
+          nextTask.description = description
+        } else {
+          delete nextTask.description
+        }
       }
       const schedule = asTrimmedString(update.schedule)
       if (schedule) {
@@ -207,23 +263,66 @@ export class CommandRoomTaskStore {
       if (typeof update.enabled === 'boolean') {
         nextTask.enabled = update.enabled
       }
+      if (Object.prototype.hasOwnProperty.call(update, 'permissionMode')) {
+        const permissionMode = asTrimmedString(update.permissionMode)
+        if (permissionMode) {
+          nextTask.permissionMode = permissionMode
+        } else {
+          delete nextTask.permissionMode
+        }
+      }
+      if (Object.prototype.hasOwnProperty.call(update, 'sessionType')) {
+        if (update.sessionType === 'pty' || update.sessionType === 'stream') {
+          nextTask.sessionType = update.sessionType
+        } else {
+          delete nextTask.sessionType
+        }
+      }
 
       tasks[index] = nextTask
-      await this.writeTasks(tasks)
+      await this.writeTasksToFile(location.filePath, tasks)
       return nextTask
     })
   }
 
   async deleteTask(taskId: string): Promise<boolean> {
     return this.withMutationLock(async () => {
-      const tasks = await this.readTasks()
+      const location = (await this.readTaskLocations()).get(taskId)
+      if (!location) {
+        return false
+      }
+      const tasks = await this.readTasksFromFile(location.filePath)
       const nextTasks = tasks.filter((task) => task.id !== taskId)
       if (nextTasks.length === tasks.length) {
         return false
       }
 
-      await this.writeTasks(nextTasks)
+      await this.writeTasksToFile(location.filePath, nextTasks)
       return true
+    })
+  }
+
+  async deleteTaskEverywhere(taskId: string, commanderId?: string): Promise<number> {
+    return this.withMutationLock(async () => {
+      let deletedCount = 0
+
+      for (const sourcePath of await this.listTaskSourcePaths()) {
+        const tasks = await this.readTasksFromFile(sourcePath)
+        const nextTasks = tasks.filter((task) => {
+          const matchesCommander = commanderId === undefined || task.commanderId === commanderId
+          const shouldDelete = task.id === taskId && matchesCommander
+          if (shouldDelete) {
+            deletedCount += 1
+          }
+          return !shouldDelete
+        })
+
+        if (nextTasks.length !== tasks.length) {
+          await this.writeTasksToFile(sourcePath, nextTasks)
+        }
+      }
+
+      return deletedCount
     })
   }
 
@@ -236,10 +335,69 @@ export class CommandRoomTaskStore {
     return next
   }
 
-  private async readTasks(): Promise<CronTask[]> {
+  private resolveCreatePath(commanderId: string | null): string {
+    if (commanderId && this.commanderDataDir) {
+      return resolveCommanderCronTasksPath(this.commanderDataDir, commanderId)
+    }
+    return this.filePath
+  }
+
+  private async readTaskLocations(): Promise<Map<string, TaskLocation>> {
+    const locations = new Map<string, TaskLocation>()
+    for (const sourcePath of await this.listTaskSourcePaths()) {
+      const tasks = await this.readTasksFromFile(sourcePath)
+      for (const task of tasks) {
+        // Commander-owned entries override legacy global copies when IDs collide.
+        locations.set(task.id, {
+          task,
+          filePath: sourcePath,
+        })
+      }
+    }
+    return locations
+  }
+
+  private async listTaskSourcePaths(): Promise<string[]> {
+    const sourcePaths = [this.filePath]
+    if (!this.commanderDataDir) {
+      return sourcePaths
+    }
+
+    const commanderIds = await this.listCommanderIds()
+    for (const commanderId of commanderIds) {
+      sourcePaths.push(resolveCommanderCronTasksPath(this.commanderDataDir, commanderId))
+    }
+    return sourcePaths
+  }
+
+  private async listCommanderIds(): Promise<string[]> {
+    if (!this.commanderDataDir) {
+      return []
+    }
+
+    try {
+      const entries = await readdir(this.commanderDataDir, { withFileTypes: true })
+      return entries
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name)
+        .sort((left, right) => left.localeCompare(right))
+    } catch (error) {
+      if (
+        isObject(error) &&
+        'code' in error &&
+        typeof error.code === 'string' &&
+        error.code === 'ENOENT'
+      ) {
+        return []
+      }
+      throw error
+    }
+  }
+
+  private async readTasksFromFile(filePath: string): Promise<CronTask[]> {
     let contents: string
     try {
-      contents = await readFile(this.filePath, 'utf8')
+      contents = await readFile(filePath, 'utf8')
     } catch (error) {
       if (
         isObject(error) &&
@@ -262,9 +420,9 @@ export class CommandRoomTaskStore {
     return parseTaskCollection(parsed).tasks
   }
 
-  private async writeTasks(tasks: CronTask[]): Promise<void> {
-    await mkdir(path.dirname(this.filePath), { recursive: true })
+  private async writeTasksToFile(filePath: string, tasks: CronTask[]): Promise<void> {
+    await mkdir(path.dirname(filePath), { recursive: true })
     const payload: PersistedTaskCollection = { tasks }
-    await writeFile(this.filePath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
+    await writeFile(filePath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
   }
 }

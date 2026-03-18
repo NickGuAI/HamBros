@@ -1,8 +1,14 @@
-import { type FormEvent } from 'react'
+import { type FormEvent, type ReactNode, useEffect, useState } from 'react'
 import { AlertTriangle, Plus } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { AgentType, ClaudePermissionMode, Machine, SessionType } from '@/types'
 import { DirectoryPicker } from './DirectoryPicker'
+
+interface OpenClawGatewayInfo {
+  url: string
+  authEnabled: boolean
+  reachable: boolean
+}
 
 export const CLAUDE_MODE_OPTIONS: Array<{
   value: ClaudePermissionMode
@@ -48,6 +54,8 @@ export function NewSessionForm({
   machines,
   selectedHost,
   setSelectedHost,
+  openclawAgentId,
+  setOpenclawAgentId,
   isCreating,
   createError,
   onSubmit,
@@ -61,6 +69,7 @@ export function NewSessionForm({
   taskLabel = 'Initial Task (Optional)',
   taskPlaceholder = 'Fix the auth bug in login.ts',
   taskRequired = false,
+  beforeTaskField,
 }: {
   name: string
   setName: (v: string) => void
@@ -77,6 +86,8 @@ export function NewSessionForm({
   machines: Machine[]
   selectedHost: string
   setSelectedHost: (v: string) => void
+  openclawAgentId: string
+  setOpenclawAgentId: (v: string) => void
   isCreating: boolean
   createError: string | null
   onSubmit: (e: FormEvent<HTMLFormElement>) => void
@@ -89,16 +100,64 @@ export function NewSessionForm({
   taskLabel?: string
   taskPlaceholder?: string
   taskRequired?: boolean
+  beforeTaskField?: ReactNode
 }) {
   const remoteMachines = machines.filter((machine) => machine.host)
   const showMachineSelector = remoteMachines.length > 0
+  const [openclawAgents, setOpenclawAgents] = useState<string[]>([])
+  const [openclawGatewayInfo, setOpenclawGatewayInfo] = useState<OpenClawGatewayInfo | null>(null)
+
+  useEffect(() => {
+    if (agentType !== 'openclaw') return
+    let cancelled = false
+    fetch('/api/agents/openclaw/agents')
+      .then((r) => r.ok ? r.json() as Promise<{ agents: Array<{ id: string }> }> : Promise.resolve({ agents: [] }))
+      .then((data) => {
+        if (!cancelled) {
+          const ids = data.agents.map((a) => a.id).filter(Boolean)
+          setOpenclawAgents(ids)
+          if (ids.length > 0 && !ids.includes(openclawAgentId)) {
+            setOpenclawAgentId(ids[0])
+          }
+        }
+      })
+      .catch(() => { if (!cancelled) setOpenclawAgents([]) })
+    return () => { cancelled = true }
+  }, [agentType])
+
+  useEffect(() => {
+    if (agentType !== 'openclaw') return
+    let cancelled = false
+    setOpenclawGatewayInfo(null)
+
+    fetch('/api/agents/openclaw/gateway-info')
+      .then((r) => r.ok ? r.json() as Promise<OpenClawGatewayInfo> : Promise.reject(new Error('Failed to load gateway info')))
+      .then((data) => {
+        if (!cancelled) {
+          setOpenclawGatewayInfo(data)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setOpenclawGatewayInfo({
+            url: 'Unavailable',
+            authEnabled: false,
+            reachable: false,
+          })
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [agentType])
 
   return (
     <form onSubmit={onSubmit} className="space-y-3">
       <div>
         <label className="section-title block mb-2">Agent</label>
         <div className="flex gap-2">
-          {(['claude', 'codex'] as const).map((type) => (
+          {(['claude', 'codex', 'openclaw'] as const).map((type) => (
             <button
               key={type}
               type="button"
@@ -116,45 +175,86 @@ export function NewSessionForm({
         </div>
       </div>
 
-      <div>
-        <label className="section-title block mb-2">Session Type</label>
-        <div className="flex gap-2">
-          {([
-            { value: 'stream', label: 'Stream', description: 'Chat UI, supports resume' },
-            { value: 'pty', label: 'PTY', description: 'Terminal UI, no resume' },
-          ] as const).map((option) => (
-            <button
-              key={option.value}
-              type="button"
-              onClick={() => setSessionType(option.value)}
-              className={cn(
-                'flex-1 text-left rounded-lg border px-3 py-2 transition-colors min-h-[44px]',
-                sessionType === option.value
-                  ? 'border-sumi-black bg-sumi-black text-washi-aged'
-                  : 'border-ink-border bg-washi-aged text-sumi-black hover:border-ink-border-hover',
-              )}
-            >
-              <div className="font-mono text-xs">{option.label}</div>
-              <div
+      {agentType !== 'openclaw' && (
+        <div>
+          <label className="section-title block mb-2">Session Type</label>
+          <div className="flex gap-2">
+            {([
+              { value: 'stream', label: 'Stream', description: 'Chat UI, supports resume' },
+              { value: 'pty', label: 'PTY', description: 'Terminal UI, no resume' },
+            ] as const).map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                onClick={() => setSessionType(option.value)}
                 className={cn(
-                  'text-whisper mt-1',
-                  sessionType === option.value ? 'text-washi-aged/80' : 'text-sumi-diluted',
+                  'flex-1 text-left rounded-lg border px-3 py-2 transition-colors min-h-[44px]',
+                  sessionType === option.value
+                    ? 'border-sumi-black bg-sumi-black text-washi-aged'
+                    : 'border-ink-border bg-washi-aged text-sumi-black hover:border-ink-border-hover',
                 )}
               >
-                {option.description}
-              </div>
-            </button>
-          ))}
-        </div>
-        {sessionType === 'pty' && (
-          <div className="mt-2 flex items-start gap-2 rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-700">
-            <AlertTriangle size={13} className="mt-0.5 shrink-0" />
-            <span>PTY sessions cannot be resumed after server restart</span>
+                <div className="font-mono text-xs">{option.label}</div>
+                <div
+                  className={cn(
+                    'text-whisper mt-1',
+                    sessionType === option.value ? 'text-washi-aged/80' : 'text-sumi-diluted',
+                  )}
+                >
+                  {option.description}
+                </div>
+              </button>
+            ))}
           </div>
-        )}
-      </div>
+          {sessionType === 'pty' && (
+            <div className="mt-2 flex items-start gap-2 rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-700">
+              <AlertTriangle size={13} className="mt-0.5 shrink-0" />
+              <span>PTY sessions cannot be resumed after server restart</span>
+            </div>
+          )}
+        </div>
+      )}
 
-      {showMachineSelector && (
+      {agentType === 'openclaw' && (
+        <div>
+          <label className="section-title block mb-2">Gateway</label>
+          <div className="w-full px-3 py-2 rounded-lg border border-ink-border bg-washi-aged text-sm flex items-center gap-2">
+            <span
+              aria-hidden
+              className={cn(
+                'inline-block h-2.5 w-2.5 rounded-full shrink-0',
+                openclawGatewayInfo?.reachable ? 'bg-emerald-500' : 'bg-accent-vermillion',
+              )}
+            />
+            <span className="font-mono break-all">{openclawGatewayInfo?.url ?? 'Loading...'}</span>
+          </div>
+
+          <label className="section-title block mt-3 mb-2">Agent ID</label>
+          {openclawAgents.length > 0 ? (
+            <select
+              value={openclawAgentId}
+              onChange={(event) => setOpenclawAgentId(event.target.value)}
+              className="w-full px-3 py-2 rounded-lg border border-ink-border bg-washi-aged text-[16px] md:text-sm focus:outline-none focus:border-ink-border-hover"
+            >
+              {openclawAgents.map((id) => (
+                <option key={id} value={id}>{id}</option>
+              ))}
+            </select>
+          ) : (
+            <input
+              value={openclawAgentId}
+              onChange={(event) => setOpenclawAgentId(event.target.value)}
+              className="w-full px-3 py-2 rounded-lg border border-ink-border bg-washi-aged text-[16px] md:text-sm focus:outline-none focus:border-ink-border-hover"
+              placeholder="main"
+            />
+          )}
+          <p className="mt-1 text-whisper text-sumi-mist">
+            Agent must be configured in your OpenClaw gateway. Default agent is `main`.
+          </p>
+        </div>
+      )}
+
+      {agentType !== 'openclaw' && showMachineSelector && (
         <div>
           <label className="section-title block mb-2">Machine</label>
           <select
@@ -204,6 +304,7 @@ export function NewSessionForm({
         <DirectoryPicker value={cwd} onChange={setCwd} host={selectedHost || undefined} />
       </div>
 
+      {agentType !== 'openclaw' && (
       <div>
         <label className="section-title block mb-2">Permission Mode</label>
         <div className="grid gap-2">
@@ -232,6 +333,9 @@ export function NewSessionForm({
           ))}
         </div>
       </div>
+      )}
+
+      {beforeTaskField}
 
       <div>
         <label className="section-title block mb-2">{taskLabel}</label>

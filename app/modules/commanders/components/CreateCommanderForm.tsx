@@ -2,6 +2,18 @@ import { useState, type FormEvent } from 'react'
 import type { CommanderCreateInput } from '../hooks/useCommander'
 
 const HOST_PATTERN = /^[a-zA-Z0-9_-]+$/
+const MIN_HEARTBEAT_MINUTES = 1
+const DEFAULT_HEARTBEAT_MINUTES = 15
+const MS_PER_MINUTE = 60_000
+
+declare module '../hooks/useCommander' {
+  interface CommanderCreateInput {
+    persona?: string
+    heartbeat?: {
+      intervalMs: number
+    }
+  }
+}
 
 export function CreateCommanderForm({
   onAdd,
@@ -11,20 +23,18 @@ export function CreateCommanderForm({
   isPending: boolean
 }) {
   const [host, setHost] = useState('')
-  const [owner, setOwner] = useState('')
-  const [repo, setRepo] = useState('')
-  const [label, setLabel] = useState('')
+  const [cwd, setCwd] = useState('')
+  const [persona, setPersona] = useState('')
+  const [heartbeatMinutes, setHeartbeatMinutes] = useState(String(DEFAULT_HEARTBEAT_MINUTES))
   const [actionError, setActionError] = useState<string | null>(null)
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault()
 
     const trimmedHost = host.trim()
-    const trimmedOwner = owner.trim()
-    const trimmedRepo = repo.trim()
 
-    if (!trimmedHost || !trimmedOwner || !trimmedRepo) {
-      setActionError('Host, owner, and repo are required.')
+    if (!trimmedHost) {
+      setActionError('Host is required.')
       return
     }
 
@@ -33,32 +43,38 @@ export function CreateCommanderForm({
       return
     }
 
+    const trimmedCwd = cwd.trim() || undefined
+    const trimmedPersona = persona.trim() || undefined
+    const parsedHeartbeatMinutes = Number.parseInt(heartbeatMinutes.trim(), 10)
+    if (!Number.isFinite(parsedHeartbeatMinutes) || parsedHeartbeatMinutes < MIN_HEARTBEAT_MINUTES) {
+      setActionError('Heartbeat interval must be at least 1 minute.')
+      return
+    }
+
     setActionError(null)
     try {
-      const input: CommanderCreateInput = {
+      const createInput: CommanderCreateInput = {
         host: trimmedHost,
-        taskSource: {
-          owner: trimmedOwner,
-          repo: trimmedRepo,
-          ...(label.trim() ? { label: label.trim() } : {}),
+        cwd: trimmedCwd,
+        persona: trimmedPersona,
+        heartbeat: {
+          intervalMs: parsedHeartbeatMinutes * MS_PER_MINUTE,
         },
       }
-      await onAdd(input)
+
+      await onAdd(createInput)
       setHost('')
-      setOwner('')
-      setRepo('')
-      setLabel('')
+      setCwd('')
+      setPersona('')
+      setHeartbeatMinutes(String(DEFAULT_HEARTBEAT_MINUTES))
     } catch (caughtError) {
       if (caughtError instanceof Error && caughtError.message.includes('(409)')) {
-        setActionError(`Host "${host.trim()}" already exists.`)
+        setActionError(`Host "${trimmedHost}" already exists.`)
       } else {
         setActionError(caughtError instanceof Error ? caughtError.message : 'Failed to create commander.')
       }
     }
   }
-
-  const inputClass =
-    'w-full rounded-lg border border-ink-border px-3 py-2 text-sm bg-washi-white focus:outline-none focus:ring-1 focus:ring-sumi-black/20'
 
   return (
     <form
@@ -71,30 +87,39 @@ export function CreateCommanderForm({
         value={host}
         onChange={(event) => setHost(event.target.value)}
         placeholder="host (e.g. my-agent-1)"
-        className={inputClass}
+        className="w-full rounded-lg border border-ink-border px-3 py-2 text-sm bg-washi-white focus:outline-none focus:ring-1 focus:ring-sumi-black/20"
       />
-
-      <div className="grid grid-cols-2 gap-2">
-        <input
-          value={owner}
-          onChange={(event) => setOwner(event.target.value)}
-          placeholder="github owner"
-          className={inputClass}
-        />
-        <input
-          value={repo}
-          onChange={(event) => setRepo(event.target.value)}
-          placeholder="repo"
-          className={inputClass}
-        />
-      </div>
 
       <input
-        value={label}
-        onChange={(event) => setLabel(event.target.value)}
-        placeholder="label (optional)"
-        className={inputClass}
+        value={cwd}
+        onChange={(event) => setCwd(event.target.value)}
+        placeholder="working directory (optional, e.g. /home/user/project)"
+        className="w-full rounded-lg border border-ink-border px-3 py-2 text-sm bg-washi-white focus:outline-none focus:ring-1 focus:ring-sumi-black/20"
       />
+
+      <label className="block">
+        <span className="text-whisper uppercase tracking-wide text-sumi-diluted">Persona</span>
+        <input
+          value={persona}
+          onChange={(event) => setPersona(event.target.value)}
+          placeholder="Senior engineer who owns infra"
+          className="mt-1 w-full rounded-lg border border-ink-border px-3 py-2 text-sm bg-washi-white focus:outline-none focus:ring-1 focus:ring-sumi-black/20"
+        />
+      </label>
+
+      <label className="block">
+        <span className="text-whisper uppercase tracking-wide text-sumi-diluted">
+          Heartbeat interval (minutes)
+        </span>
+        <input
+          type="number"
+          min={MIN_HEARTBEAT_MINUTES}
+          step={1}
+          value={heartbeatMinutes}
+          onChange={(event) => setHeartbeatMinutes(event.target.value)}
+          className="mt-1 w-full rounded-lg border border-ink-border px-3 py-2 text-sm bg-washi-white focus:outline-none focus:ring-1 focus:ring-sumi-black/20"
+        />
+      </label>
 
       {actionError && <p className="text-sm text-accent-vermillion">{actionError}</p>}
 
