@@ -1,0 +1,77 @@
+# Agents Monitor
+
+The Agents Monitor is the primary interface for watching AI agents work in real-time. It provides live WebSocket streaming, interactive terminals, and session management.
+
+## Overview
+
+```
+┌─────────────────────────────────────────────────┐
+│  Agents Monitor                                  │
+├─────────────┬───────────────────────────────────┤
+│  Session    │  Live Stream                       │
+│  List       │  ┌─────────────────────────────┐  │
+│             │  │  Agent messages              │  │
+│  • session1 │  │  Tool calls (Read/Edit/Bash) │  │
+│  • session2 │  │  Thinking blocks             │  │
+│  ◉ active   │  │  System events               │  │
+│             │  └─────────────────────────────┘  │
+│             │  ┌─────────────────────────────┐  │
+│             │  │  Input bar                   │  │
+│             │  └─────────────────────────────┘  │
+└─────────────┴───────────────────────────────────┘
+```
+
+## Features
+
+### Live Session Streaming
+
+Sessions stream output over WebSocket connections. Each message type is visually distinct:
+
+- **Agent text** — formatted markdown with syntax highlighting
+- **Tool calls** — collapsible cards showing tool name, arguments, and results
+- **Thinking blocks** — italic, muted text showing internal reasoning
+- **User messages** — right-aligned bubbles
+- **System events** — centered dividers for session lifecycle events
+
+### Session Creation
+
+Create sessions with configurable options:
+
+| Option | Values | Description |
+|--------|--------|-------------|
+| Agent Type | `claude`, `codex`, `openclaw` | Which AI agent to spawn |
+| Permission Mode | `default`, `acceptEdits`, `bypassPermissions` | Tool approval behavior |
+| Working Directory | Any path | Where the agent operates |
+| Initial Prompt | Text | First instruction to the agent |
+
+### Worker Dispatch
+
+Sessions can dispatch **worker sub-agents** via the Factory module. Workers run in isolated git worktrees and report back to the parent session. The worker panel shows:
+
+- Active worker count and status
+- Per-worker task description
+- Link to worker session stream
+
+### Session Lifecycle
+
+1. **Created** — session spawned, process starting
+2. **Active** — agent running, streaming output
+3. **Idle** — agent waiting for input
+4. **Completed** — agent finished task
+5. **Killed** — manually terminated
+
+### Debrief
+
+Before killing a session, you can trigger a **pre-kill debrief** that generates either a hotwash (short sessions) or After-Action Review (long sessions). This captures what the agent accomplished and any issues encountered.
+
+## World View
+
+The `GET /api/agents/world` endpoint provides a global view of all agents across all sessions, including their phase, role (commander vs worker), and resource usage.
+
+## Mobile Experience
+
+On mobile devices, the Agents Monitor uses a full-screen overlay with:
+- Swipeable session list
+- Dark terminal theme with custom colors
+- Safe-area-aware input bar
+- Voice input via microphone button

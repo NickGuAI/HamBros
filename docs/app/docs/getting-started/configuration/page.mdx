@@ -1,0 +1,82 @@
+# Configuration
+
+HamBros is configured through environment variables in `app/.env`. All variables are optional for local development — sensible defaults are provided.
+
+## Core Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `20001` | Express API server port |
+| `HAMMURABI_ALLOWED_ORIGINS` | `http://localhost:5173` | CORS allowed origins (comma-separated) |
+| `HAMMURABI_MAX_AGENT_SESSIONS` | `10` | Maximum concurrent agent sessions |
+| `HAMMURABI_INTERNAL_API_KEY` | — | Internal API key for server-side session creation |
+| `HAMMURABI_SETTINGS_ENCRYPTION_KEY` | auto-generated | Key for encrypting stored API keys |
+
+## Authentication
+
+HamBros supports two authentication methods. You can use either or both.
+
+### API Key Authentication
+
+API keys are managed through the Services module or the master key file. Each key has scoped permissions:
+
+- `agents:read` / `agents:write`
+- `telemetry:read` / `telemetry:write`
+- `factory:read` / `factory:write`
+- `services:read` / `services:write`
+- `commanders:read` / `commanders:write`
+
+Pass your API key in the `X-Hammurabi-Api-Key` header.
+
+### Auth0 (Optional)
+
+For team environments, configure Auth0 JWT authentication:
+
+| Variable | Description |
+|----------|-------------|
+| `AUTH0_DOMAIN` | Your Auth0 tenant domain (e.g., `your-tenant.us.auth0.com`) |
+| `AUTH0_AUDIENCE` | API audience identifier (e.g., `https://hammurabi-api`) |
+| `AUTH0_CLIENT_ID` | Auth0 application client ID |
+| `VITE_AUTH0_DOMAIN` | Same as AUTH0_DOMAIN (exposed to frontend) |
+| `VITE_AUTH0_AUDIENCE` | Same as AUTH0_AUDIENCE (exposed to frontend) |
+| `VITE_AUTH0_CLIENT_ID` | Same as AUTH0_CLIENT_ID (exposed to frontend) |
+
+## GitHub Integration
+
+| Variable | Description |
+|----------|-------------|
+| `GITHUB_TOKEN` | GitHub personal access token for private repo cloning in Factory |
+
+## Commander Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `COMMANDER_DATA_DIR` | `~/.hammurabi/commander` | Local commander data directory |
+| `COMMANDER_MACHINE_ID` | — | Machine identifier for multi-host setups |
+| `COMMANDER_S3_BUCKET` | — | S3 bucket for commander data sync |
+| `COMMANDER_S3_PREFIX` | `commander` | S3 key prefix |
+| `COMMANDER_S3_SYNC_ENABLED` | `0` | Enable S3 sync (`1` to enable) |
+
+## Master Key
+
+On first boot, HamBros generates a master API key at `app/data/api-keys/master-key.json` with the default password `HAMBROS!`. This key has all scopes.
+
+**Before deploying to production:**
+1. Create a new API key through the Services UI
+2. Delete the master key file
+3. Set `HAMMURABI_SETTINGS_ENCRYPTION_KEY` to a strong random value
+
+## iOS / Capacitor
+
+When building for iOS, set the app URL so the mobile client knows where to connect:
+
+```bash
+VITE_APP_URL=http://your-server-ip:20001
+```
+
+Then run:
+
+```bash
+pnpm --filter app run cap:sync
+pnpm --filter app run cap:ios
+```

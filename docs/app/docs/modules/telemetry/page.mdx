@@ -1,0 +1,117 @@
+# Telemetry Hub
+
+The Telemetry Hub collects, stores, and visualizes operational data from AI agent sessions. It supports OTLP/HTTP ingestion for traces and logs, tracks token usage and costs, and provides dashboards for monitoring spend.
+
+## Overview
+
+```
+┌──────────────────────────────────────────────┐
+│  Telemetry Hub                                │
+├──────────────────────────────────────────────┤
+│  ┌─────────────────────┐  ┌──────────────┐  │
+│  │  Cost Summary       │  │  Sessions    │  │
+│  │  $142.30 / 30d      │  │  47 total    │  │
+│  │  ████████░░ 71%     │  │  3 active    │  │
+│  └─────────────────────┘  └──────────────┘  │
+│                                               │
+│  Session Details                              │
+│  ┌──────────────────────────────────────────┐│
+│  │ Session   │ Tokens   │ Cost   │ Duration ││
+│  │ fix-bug   │ 45,230   │ $2.14  │ 12m      ││
+│  │ refactor  │ 128,400  │ $6.80  │ 45m      ││
+│  └──────────────────────────────────────────┘│
+└──────────────────────────────────────────────┘
+```
+
+## OTLP Ingestion
+
+HamBros accepts OpenTelemetry-compatible traces and logs over HTTP:
+
+### Traces
+
+```bash
+POST /v1/traces
+Content-Type: application/json
+```
+
+Send OTLP-formatted trace data. HamBros extracts token counts, model identifiers, and timing information from span attributes.
+
+### Logs
+
+```bash
+POST /v1/logs
+Content-Type: application/json
+```
+
+Ingest structured log entries from agent sessions.
+
+## Telemetry Events
+
+The telemetry module also accepts custom events via its own API:
+
+```bash
+POST /api/telemetry/ingest
+Content-Type: application/json
+X-Hammurabi-Api-Key: YOUR_KEY
+
+{
+  "sessionId": "my-session",
+  "event": "token_usage",
+  "inputTokens": 1500,
+  "outputTokens": 800,
+  "model": "claude-sonnet-4-20250514",
+  "cost": 0.012,
+  "duration": 3400
+}
+```
+
+## Heartbeat
+
+Sessions can send periodic heartbeats to report their status:
+
+```bash
+POST /api/telemetry/heartbeat
+Content-Type: application/json
+X-Hammurabi-Api-Key: YOUR_KEY
+
+{
+  "sessionId": "my-session",
+  "status": "active",
+  "taskStatus": "implementing feature X"
+}
+```
+
+## Cost Tracking
+
+The summary endpoint provides aggregated cost data:
+
+```bash
+GET /api/telemetry/summary?period=30d
+```
+
+Returns total cost, token counts, and per-session breakdowns for the specified period. Supported periods:
+- `30d` — last 30 days
+- `90d` — last 90 days
+- `YYYY-MM` — specific month
+
+## Local Scan
+
+Trigger a scan of local Claude/Codex session directories to discover and import telemetry data:
+
+```bash
+POST /api/telemetry/scan
+```
+
+## Data Compaction
+
+Periodically compact the JSONL telemetry store to prune old data:
+
+```bash
+POST /api/telemetry/compact
+```
+
+This removes entries older than the configured retention period.
+
+## Onboarding Agents
+
+Use the `hammurabi onboard` CLI command to automatically configure agents to send telemetry to your HamBros instance. See the [CLI Reference](/docs/docs/cli) for details.

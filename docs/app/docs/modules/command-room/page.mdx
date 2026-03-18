@@ -1,0 +1,115 @@
+# Command Room
+
+The Command Room is a cron-based task scheduler for recurring agent operations. It manages scheduled tasks, tracks run history, and supports manual triggers.
+
+## Overview
+
+```
+┌──────────────────────────────────────────────┐
+│  Command Room                                 │
+├──────────┬───────────────────────────────────┤
+│  Tasks   │  Task Detail                       │
+│          │  ┌──────────────────────────────┐  │
+│  ▶ daily │  │  Schedule: 0 9 * * *         │  │
+│  ▶ scan  │  │  Status: active              │  │
+│  ■ sync  │  │  Last run: 2h ago            │  │
+│          │  │  Next run: in 22h            │  │
+│          │  └──────────────────────────────┘  │
+│          │                                    │
+│          │  Run History                        │
+│          │  ┌──────────────────────────────┐  │
+│          │  │  #5  ✓ success  2h ago       │  │
+│          │  │  #4  ✓ success  26h ago      │  │
+│          │  │  #3  ✗ failed   50h ago      │  │
+│          │  └──────────────────────────────┘  │
+└──────────┴───────────────────────────────────┘
+```
+
+## Features
+
+### Task Scheduling
+
+Tasks are defined with standard **cron expressions**:
+
+```
+┌───────────── minute (0-59)
+│ ┌───────────── hour (0-23)
+│ │ ┌───────────── day of month (1-31)
+│ │ │ ┌───────────── month (1-12)
+│ │ │ │ ┌───────────── day of week (0-7, Sun=0 or 7)
+│ │ │ │ │
+* * * * *
+```
+
+Common patterns:
+
+| Expression | Schedule |
+|-----------|----------|
+| `0 9 * * *` | Every day at 9:00 AM |
+| `*/15 * * * *` | Every 15 minutes |
+| `0 0 * * 1` | Every Monday at midnight |
+| `0 */6 * * *` | Every 6 hours |
+
+### Task Configuration
+
+Each task specifies:
+
+- **Name** — human-readable identifier
+- **Schedule** — cron expression
+- **Instruction** — the prompt or command to execute
+- **Agent type** — `claude` or `codex`
+- **Session type** — `stream` or `pty`
+- **Permission mode** — tool approval behavior
+- **Working directory** — execution context
+- **Machine** — target machine for multi-host setups
+- **Enabled/Disabled** — toggle without deleting
+
+### Run History
+
+Each task maintains a history of recent executions with:
+- Execution timestamp
+- Duration
+- Exit status (success/failed)
+- Output excerpt
+
+### Manual Trigger
+
+Any task can be triggered immediately regardless of its schedule. Use the dashboard button or the CLI:
+
+```bash
+hammurabi cron trigger --instruction "Run the daily report now"
+```
+
+## Creating Tasks
+
+### Via Dashboard
+
+1. Open **Command Room** in the navigation
+2. Click **New Task**
+3. Fill in the schedule, instruction, and configuration
+4. Save
+
+### Via CLI
+
+```bash
+hammurabi cron add \
+  --commander <commander-id> \
+  --schedule "0 9 * * *" \
+  --instruction "Review open PRs and summarize status" \
+  --agent claude \
+  --name "daily-pr-review"
+```
+
+### Via API
+
+```bash
+curl -X POST http://localhost:20001/api/command-room/tasks \
+  -H "Content-Type: application/json" \
+  -H "X-Hammurabi-Api-Key: YOUR_KEY" \
+  -d '{
+    "name": "daily-pr-review",
+    "schedule": "0 9 * * *",
+    "instruction": "Review open PRs and summarize status",
+    "agentType": "claude"
+  }'
+```

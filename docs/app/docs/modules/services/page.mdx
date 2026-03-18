@@ -1,0 +1,111 @@
+# Services Manager
+
+The Services module provides API key management with encrypted storage, service health monitoring, and system metrics.
+
+## Overview
+
+```
+┌──────────────────────────────────────────────┐
+│  Services Manager                             │
+├──────────────────────────────────────────────┤
+│                                               │
+│  API Keys                                     │
+│  ┌──────────────────────────────────────────┐│
+│  │ Name      │ Prefix  │ Scopes   │ Status  ││
+│  │ prod-key  │ hb_3f.. │ all      │ active  ││
+│  │ read-only │ hb_a1.. │ *:read   │ active  ││
+│  └──────────────────────────────────────────┘│
+│                                               │
+│  System Health                                │
+│  ┌──────────────────────────────────────────┐│
+│  │ CPU: 23%  │ Memory: 4.2GB  │ Disk: 67%  ││
+│  └──────────────────────────────────────────┘│
+└──────────────────────────────────────────────┘
+```
+
+## API Key Management
+
+### Creating Keys
+
+Create scoped API keys through the dashboard or API:
+
+```bash
+POST /api/auth/keys
+{
+  "name": "ci-pipeline",
+  "scopes": ["agents:read", "agents:write", "telemetry:write"]
+}
+```
+
+Returns the full key (shown only once) and a key prefix for identification.
+
+### Available Scopes
+
+| Scope | Description |
+|-------|-------------|
+| `agents:read` | View sessions and agent data |
+| `agents:write` | Create, message, and kill sessions |
+| `telemetry:read` | View telemetry data and summaries |
+| `telemetry:write` | Ingest telemetry events |
+| `factory:read` | View repos and worktrees |
+| `factory:write` | Clone repos, create worktrees |
+| `services:read` | View API keys and service status |
+| `services:write` | Create and revoke API keys |
+| `commanders:read` | View commander data and quests |
+| `commanders:write` | Manage commanders, quests, memory |
+
+### Encrypted Storage
+
+API keys are encrypted at rest using the `HAMMURABI_SETTINGS_ENCRYPTION_KEY` environment variable. If not set, a key is auto-generated on first boot and stored locally.
+
+### Listing and Revoking
+
+```bash
+# List keys (returns name, prefix, scopes — not the full key)
+GET /api/auth/keys
+
+# Revoke a key
+DELETE /api/auth/keys/:id
+```
+
+## Service Discovery
+
+The Services module discovers and monitors running services:
+
+```bash
+# List services with health status
+GET /api/services/list
+
+# Check specific service health
+GET /api/services/:name/health
+
+# Get system metrics
+GET /api/services/metrics
+
+# Restart a service
+POST /api/services/:name/restart
+```
+
+### Log Streaming
+
+Stream service logs in real-time via WebSocket:
+
+```
+ws://localhost:20001/api/services/:name/logs
+```
+
+## OpenAI Transcription Key
+
+For voice input features, configure an OpenAI API key:
+
+```bash
+# Check status
+GET /api/auth/transcription/openai
+
+# Set key
+PUT /api/auth/transcription/openai
+{ "apiKey": "sk-..." }
+
+# Remove key
+DELETE /api/auth/transcription/openai
+```

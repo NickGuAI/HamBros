@@ -1,0 +1,86 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  ::selection {
+    background: rgba(28, 28, 28, 0.15);
+  }
+
+  body {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: rgba(28, 28, 28, 0.1);
+    border-radius: 3px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(28, 28, 28, 0.2);
+  }
+}
+
+@layer components {
+  .card-sumi {
+    @apply bg-washi-white border border-ink-border shadow-ink-sm;
+    border-radius: 4px 20px 4px 20px;
+    transition: all 0.4s cubic-bezier(0.23, 1, 0.32, 1);
+  }
+
+  .card-sumi:hover {
+    @apply shadow-ink-hover;
+    border-color: rgba(28, 28, 28, 0.1);
+  }
+
+  .btn-primary {
+    @apply bg-sumi-black text-washi-white px-7 py-3.5 font-normal tracking-wide inline-flex items-center gap-2;
+    border-radius: 2px 12px 2px 12px;
+    transition: all 0.4s cubic-bezier(0.23, 1, 0.32, 1);
+  }
+
+  .btn-primary:hover {
+    @apply bg-sumi-gray shadow-ink-hover;
+    transform: translateY(-1px);
+  }
+
+  .btn-ghost {
+    @apply bg-transparent border border-ink-border-hover text-sumi-gray px-7 py-3.5 inline-flex items-center gap-2;
+    border-radius: 2px 12px 2px 12px;
+    transition: all 0.4s cubic-bezier(0.23, 1, 0.32, 1);
+  }
+
+  .btn-ghost:hover {
+    @apply bg-ink-wash;
+  }
+
+  .badge-sumi {
+    @apply inline-flex items-center px-3 py-1 text-whisper uppercase;
+    background: rgba(28, 28, 28, 0.04);
+    color: #4A4A4A;
+    border-radius: 2px 8px 2px 8px;
+  }
+
+  .badge-active {
+    background: rgba(107, 123, 94, 0.12);
+    color: #6B7B5E;
+  }
+
+  .section-title {
+    @apply text-section uppercase text-sumi-diluted tracking-widest;
+  }
+
+  .divider-ink {
+    border-top: 1px solid rgba(28, 28, 28, 0.06);
+  }
+}

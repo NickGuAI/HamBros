@@ -1,0 +1,122 @@
+# Authentication
+
+HamBros supports two authentication methods: API keys and Auth0 JWT tokens. Both can be used simultaneously — the middleware accepts either.
+
+## API Key Authentication
+
+Pass your API key in the `X-Hammurabi-Api-Key` request header:
+
+```bash
+curl -H "X-Hammurabi-Api-Key: hb_3f..." \
+  http://localhost:20001/api/agents/sessions
+```
+
+### Managing Keys
+
+#### Create a Key
+
+```
+POST /api/auth/keys
+```
+
+```json
+{
+  "name": "ci-pipeline",
+  "scopes": ["agents:read", "agents:write", "telemetry:write"]
+}
+```
+
+**Response:**
+
+```json
+{
+  "id": "key-abc123",
+  "name": "ci-pipeline",
+  "key": "hb_3f8a9b2c...",
+  "prefix": "hb_3f8a",
+  "scopes": ["agents:read", "agents:write", "telemetry:write"],
+  "created": "2026-03-18T10:00:00Z"
+}
+```
+
+> The full `key` value is returned **only once** at creation time. Store it securely.
+
+#### List Keys
+
+```
+GET /api/auth/keys
+```
+
+Returns key metadata (name, prefix, scopes, timestamps) without the full key value.
+
+#### Revoke a Key
+
+```
+DELETE /api/auth/keys/:id
+```
+
+Immediately invalidates the key.
+
+### Scope Reference
+
+| Scope | Description |
+|-------|-------------|
+| `agents:read` | View sessions, directories, skills, files, world state |
+| `agents:write` | Create/kill sessions, send messages, dispatch workers, upload files |
+| `telemetry:read` | View sessions, summaries, metrics |
+| `telemetry:write` | Ingest events, heartbeats, trigger scans, compact data |
+| `factory:read` | List repos, worktrees, status |
+| `factory:write` | Clone/delete repos, create/delete worktrees, sync |
+| `services:read` | List API keys, services, health, metrics |
+| `services:write` | Create/revoke API keys, restart services, manage transcription keys |
+| `commanders:read` | View commanders, quests, memory, heartbeat, cron |
+| `commanders:write` | Create/update commanders, manage quests, save memory, configure heartbeat/cron |
+
+### Master Key
+
+On first boot, HamBros creates a master API key with all scopes:
+
+- **Location**: `app/data/api-keys/master-key.json`
+- **Default password**: `HAMBROS!`
+
+Delete this file and create new scoped keys before production deployment.
+
+## Auth0 JWT Authentication
+
+For team environments with identity management, configure Auth0:
+
+### Setup
+
+1. Create an API in your Auth0 dashboard
+2. Set the audience identifier (e.g., `https://hammurabi-api`)
+3. Configure the environment variables:
+
+```env
+AUTH0_DOMAIN=your-tenant.us.auth0.com
+AUTH0_AUDIENCE=https://hammurabi-api
+AUTH0_CLIENT_ID=your-client-id
+VITE_AUTH0_DOMAIN=your-tenant.us.auth0.com
+VITE_AUTH0_AUDIENCE=https://hammurabi-api
+VITE_AUTH0_CLIENT_ID=your-client-id
+```
+
+### Usage
+
+Pass the JWT in the `Authorization` header:
+
+```bash
+curl -H "Authorization: Bearer eyJhbGciOiJSUzI1NiIs..." \
+  http://localhost:20001/api/agents/sessions
+```
+
+The frontend automatically handles token acquisition and refresh when Auth0 is configured.
+
+## Combined Authentication
+
+When both methods are configured, the middleware checks:
+
+1. `X-Hammurabi-Api-Key` header (API key)
+2. `Authorization: Bearer` header (Auth0 JWT)
+3. Internal token (for service-to-service calls)
+
+The first valid credential wins. If none are valid, the request is rejected with `401 Unauthorized`.

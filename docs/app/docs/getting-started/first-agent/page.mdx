@@ -1,0 +1,78 @@
+# First Agent Session
+
+This guide walks you through creating and monitoring your first AI agent session in HamBros.
+
+## Prerequisites
+
+- HamBros running locally (`pnpm --filter app run dev`)
+- An API key (use the default master key `HAMBROS!` for development)
+- Claude Code or Codex installed on your machine
+
+## Step 1 — Open the Dashboard
+
+Navigate to **http://localhost:5200** in your browser. You'll see the HamBros landing page with the module grid.
+
+## Step 2 — Navigate to Agents Monitor
+
+Click on **Agents Monitor** to open the live session view. This is where all active agent sessions appear.
+
+## Step 3 — Create a Session
+
+Click the **New Session** button. You'll see a session creation form with these options:
+
+| Field | Description |
+|-------|-------------|
+| **Name** | A unique identifier for this session |
+| **Agent Type** | `claude` or `codex` |
+| **Working Directory** | The directory the agent will operate in |
+| **Permission Mode** | `default`, `acceptEdits`, or `bypassPermissions` |
+| **Initial Prompt** | The first message to send to the agent |
+
+Fill in the form and click **Create**.
+
+## Step 4 — Watch the Stream
+
+Once the session starts, you'll see real-time output streaming via WebSocket:
+
+- **Agent messages** — the AI's responses and reasoning
+- **Tool calls** — file reads, edits, bash commands
+- **Thinking blocks** — internal reasoning (when visible)
+
+The session view uses a dark terminal theme with color-coded tool indicators.
+
+## Step 5 — Interact
+
+Use the input bar at the bottom to send messages to the running agent. You can also:
+
+- **Reset** the session to clear the terminal buffer
+- **Kill** the session to terminate the agent process
+- View **worker sessions** if the agent dispatches sub-agents
+
+## Using the API
+
+You can also create sessions programmatically:
+
+```bash
+curl -X POST http://localhost:20001/api/agents/sessions \
+  -H "Content-Type: application/json" \
+  -H "X-Hammurabi-Api-Key: HAMBROS!" \
+  -d '{
+    "name": "my-first-session",
+    "agentType": "claude",
+    "workingDirectory": "/path/to/project",
+    "permissionMode": "default",
+    "prompt": "List all files in this directory"
+  }'
+```
+
+Then connect to the WebSocket stream:
+
+```
+ws://localhost:20001/api/agents/sessions/my-first-session
+```
+
+## Next Steps
+
+- Learn about [Commanders](/docs/docs/modules/commanders) to set up persistent agent personas
+- Explore the [Telemetry Hub](/docs/docs/modules/telemetry) to track costs across sessions
+- Set up recurring tasks in the [Command Room](/docs/docs/modules/command-room)
