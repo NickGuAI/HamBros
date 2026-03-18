@@ -1,0 +1,106 @@
+# Commanders
+
+Commanders are persistent AI agent personas backed by GitHub repositories. Each commander has its own identity, memory system, heartbeat configuration, and quest board.
+
+## Overview
+
+```
+┌──────────────────────────────────────────┐
+│  Commander: luminous-drifting-rocket      │
+├──────────────────────────────────────────┤
+│  Identity    │ GitHub-backed persona      │
+│  Memory      │ Searchable fact store      │
+│  Heartbeat   │ Periodic health checks     │
+│  Quest Board │ Task queue with lifecycle   │
+│  Cron Jobs   │ Scheduled recurring tasks   │
+└──────────────────────────────────────────┘
+```
+
+## Key Concepts
+
+### Identity
+
+Each commander has a unique ID and optional human-readable name. Commander configuration lives in a `COMMANDER.md` file that defines personality, skills, and operating parameters.
+
+### Memory System
+
+Commanders maintain a searchable memory store with these operations:
+
+- **Save** — store facts extracted from conversations
+- **Find** — semantic search across stored memories
+- **Compact** — consolidate and compress memory entries, prune stale data
+
+Memory entries are typed (fact, observation, instruction) and scored by relevance during recall.
+
+### Quest Board
+
+The quest board is a task queue where work items flow through a lifecycle:
+
+```
+pending → active → done
+                 → failed
+```
+
+Each quest includes:
+- **Instruction** — what needs to be done
+- **Working directory** — where to operate
+- **Agent mode** — permission level
+- **Skills** — available tool skills
+- **Artifacts** — linked GitHub issues, PRs, files, or URLs
+- **Notes** — progress updates added during execution
+
+### Heartbeat
+
+Commanders can be configured with a **heartbeat** — a periodic check-in that monitors system state, reviews pending quests, and optionally triggers actions. The heartbeat template is customizable via `HEARTBEAT.md`.
+
+### Cron Jobs
+
+Recurring tasks can be scheduled with cron expressions. Each cron job specifies:
+- Schedule (standard cron syntax)
+- Instruction to execute
+- Agent type and permission mode
+- Working directory
+
+## Creating a Commander
+
+1. Navigate to the **Commanders** module in the dashboard
+2. Click **Create Commander**
+3. Configure identity, GitHub repo, and initial persona
+4. Set up heartbeat schedule (optional)
+5. Add initial quests to the board
+
+Or via the CLI:
+
+```bash
+hammurabi commander init
+```
+
+## Quest Workflow Example
+
+```bash
+# Create a quest
+hammurabi quests create \
+  --instruction "Fix the login page redirect bug" \
+  --cwd /home/user/project \
+  --mode default \
+  --agent claude \
+  --issue https://github.com/org/repo/issues/42
+
+# Claim it
+hammurabi quests claim <quest-id>
+
+# Add progress notes
+hammurabi quests note <quest-id> "Root cause identified: missing redirect URL encoding"
+
+# Complete it
+hammurabi quests done <quest-id> --note "Fixed in commit abc123, PR #43 created"
+```
+
+## S3 Sync
+
+Commander data can be synced to S3 for multi-host setups. Enable with:
+
+```
+COMMANDER_S3_BUCKET=your-bucket
+COMMANDER_S3_SYNC_ENABLED=1
+```

@@ -1,0 +1,217 @@
+# Agents API
+
+Manage agent sessions, send messages, and stream real-time output.
+
+## Sessions
+
+### Create Session
+
+```
+POST /api/agents/sessions
+```
+
+Create and start a new agent session.
+
+**Request Body:**
+
+```json
+{
+  "name": "my-session",
+  "agentType": "claude",
+  "workingDirectory": "/path/to/project",
+  "permissionMode": "default",
+  "prompt": "Fix the failing tests"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | Yes | Unique session identifier |
+| `agentType` | string | Yes | `claude`, `codex`, or `openclaw` |
+| `workingDirectory` | string | Yes | Absolute path for the agent |
+| `permissionMode` | string | No | `default`, `acceptEdits`, or `bypassPermissions` |
+| `prompt` | string | No | Initial instruction to the agent |
+
+**Response:** `201 Created`
+
+```json
+{
+  "name": "my-session",
+  "pid": 12345,
+  "agentType": "claude",
+  "created": "2026-03-18T10:00:00Z"
+}
+```
+
+### List Sessions
+
+```
+GET /api/agents/sessions
+```
+
+Returns all active sessions with metadata.
+
+**Response:**
+
+```json
+[
+  {
+    "name": "my-session",
+    "pid": 12345,
+    "agentType": "claude",
+    "created": "2026-03-18T10:00:00Z",
+    "workingDirectory": "/path/to/project"
+  }
+]
+```
+
+### Get Session Detail
+
+```
+GET /api/agents/sessions/:name
+```
+
+Returns detailed session info including event history and worker summary.
+
+### Send Message
+
+```
+POST /api/agents/sessions/:name/message
+```
+
+Send a user message to the agent's stdin.
+
+**Request Body:**
+
+```json
+{
+  "message": "Now fix the TypeScript errors too"
+}
+```
+
+### Reset Session
+
+```
+POST /api/agents/sessions/:name/reset
+```
+
+Clear the terminal buffer and reset the session state.
+
+### Terminate Session
+
+```
+DELETE /api/agents/sessions/:name
+```
+
+Kill the agent process and clean up resources.
+
+### Pre-Kill Debrief
+
+```
+POST /api/agents/sessions/:name/pre-kill-debrief
+```
+
+Generate a debrief report before terminating. Returns a hotwash (short sessions) or After-Action Review (long sessions).
+
+### Mark Complete
+
+```
+POST /api/agents/sessions/:name/complete
+```
+
+Mark a session as completed with a final status.
+
+**Request Body:**
+
+```json
+{
+  "status": "success",
+  "comment": "All tests passing, PR created"
+}
+```
+
+## Workers
+
+### Get Workers
+
+```
+GET /api/agents/sessions/:name/workers
+```
+
+Returns worker session summary for a parent session.
+
+### Dispatch Worker
+
+```
+POST /api/agents/sessions/dispatch-worker
+```
+
+Spawn a worker agent in an isolated git worktree.
+
+**Request Body:**
+
+```json
+{
+  "parentSession": "main-session",
+  "issue": "https://github.com/org/repo/issues/42",
+  "branch": "fix-issue-42",
+  "task": "Fix the login redirect bug",
+  "agent": "claude",
+  "machine": "machine-id"
+}
+```
+
+## WebSocket Streaming
+
+```
+ws://host/api/agents/sessions/:name
+```
+
+Connect to receive real-time session events:
+
+- **tty_data** — raw terminal output
+- **json_event** — structured event (tool call, message, etc.)
+- **ping** — keep-alive heartbeat
+
+## Utility Endpoints
+
+### List Directories
+
+```
+GET /api/agents/directories
+```
+
+Returns available project directories for session creation.
+
+### List Skills
+
+```
+GET /api/agents/skills
+```
+
+Returns installed agent skills.
+
+### List Files
+
+```
+GET /api/agents/files?path=/some/dir
+```
+
+List files in a directory (restricted to home directory).
+
+### World State
+
+```
+GET /api/agents/world
+```
+
+Global view of all active agents, their status, usage, phase, and role.
+
+### Upload Files
+
+```
+POST /api/agents/upload
+Content-Type: multipart/form-data
+```
+
+Upload up to 5 files (10MB each) to a specified working directory.

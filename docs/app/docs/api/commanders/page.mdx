@@ -1,0 +1,233 @@
+# Commanders API
+
+Manage commander personas, quest boards, memory systems, and cron schedules.
+
+## Quest Board
+
+### List Quests
+
+```
+GET /api/commanders/:id/quests
+```
+
+Returns pending and active quests for a commander.
+
+**Response:**
+
+```json
+[
+  {
+    "id": "quest-abc123",
+    "instruction": "Fix the login redirect bug",
+    "status": "active",
+    "cwd": "/path/to/project",
+    "agent": "claude",
+    "mode": "default",
+    "artifacts": [],
+    "notes": [],
+    "created": "2026-03-18T10:00:00Z"
+  }
+]
+```
+
+### Create Quest
+
+```
+POST /api/commanders/:id/quests
+```
+
+**Request Body:**
+
+```json
+{
+  "instruction": "Fix the login redirect bug",
+  "cwd": "/path/to/project",
+  "mode": "default",
+  "agent": "claude",
+  "skills": ["git", "testing"],
+  "source": "github-issue",
+  "issue": "https://github.com/org/repo/issues/42"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `instruction` | string | Yes | What needs to be done |
+| `cwd` | string | Yes | Working directory |
+| `mode` | string | Yes | Permission mode |
+| `agent` | string | Yes | Agent type (`claude`, `codex`) |
+| `skills` | string[] | No | Available skills |
+| `source` | string | No | Origin of the quest |
+| `issue` | string | No | Linked GitHub issue URL |
+
+### Claim Quest
+
+```
+POST /api/commanders/:id/quests/:questId/claim
+```
+
+Mark a quest as active (being worked on).
+
+### Add Note
+
+```
+POST /api/commanders/:id/quests/:questId/note
+```
+
+```json
+{
+  "text": "Root cause identified: missing URL encoding in redirect handler"
+}
+```
+
+### Complete Quest
+
+```
+POST /api/commanders/:id/quests/:questId/done
+```
+
+```json
+{
+  "note": "Fixed in commit abc123. PR #43 created and passing CI."
+}
+```
+
+### Fail Quest
+
+```
+POST /api/commanders/:id/quests/:questId/fail
+```
+
+```json
+{
+  "note": "Blocked by upstream dependency issue. Created issue #44 to track."
+}
+```
+
+### Add Artifact
+
+```
+POST /api/commanders/:id/quests/:questId/artifacts
+```
+
+```json
+{
+  "type": "github_pr",
+  "label": "Fix PR",
+  "href": "https://github.com/org/repo/pull/43"
+}
+```
+
+Artifact types: `github_issue`, `github_pr`, `url`, `file`
+
+### Remove Artifact
+
+```
+DELETE /api/commanders/:id/quests/:questId/artifacts/:href
+```
+
+## Memory
+
+### Find Memories
+
+```
+POST /api/commanders/:id/memory/find
+```
+
+```json
+{
+  "query": "authentication redirect",
+  "top": 5
+}
+```
+
+Returns ranked results with relevance scores:
+
+```json
+[
+  {
+    "type": "fact",
+    "score": 0.87,
+    "title": "Auth redirect uses URL encoding",
+    "excerpt": "The auth middleware encodes redirect URLs...",
+    "reason": "Matches query on authentication redirect handling"
+  }
+]
+```
+
+### Save Memory
+
+```
+POST /api/commanders/:id/memory/save
+```
+
+```json
+{
+  "facts": [
+    "The auth middleware requires URL-encoded redirect paths",
+    "Login page redirect bug was caused by missing encodeURIComponent"
+  ]
+}
+```
+
+### Compact Memory
+
+```
+POST /api/commanders/:id/memory/compact
+```
+
+Consolidate memory entries, extract key facts, and prune stale data. Returns statistics on the compaction.
+
+## Heartbeat
+
+### Configure Heartbeat
+
+```
+PUT /api/commanders/:id/heartbeat
+```
+
+```json
+{
+  "enabled": true,
+  "intervalMinutes": 30,
+  "template": "Check system health and review pending quests"
+}
+```
+
+## Cron Management
+
+### List Cron Tasks
+
+```
+GET /api/commanders/:id/cron
+```
+
+### Create Cron Task
+
+```
+POST /api/commanders/:id/cron
+```
+
+```json
+{
+  "name": "daily-review",
+  "schedule": "0 9 * * *",
+  "instruction": "Review open PRs and summarize status",
+  "agent": "claude",
+  "sessionType": "stream",
+  "permissionMode": "default",
+  "workDir": "/path/to/project"
+}
+```
+
+### Update Cron Task
+
+```
+PATCH /api/commanders/:id/cron/:cronId
+```
+
+### Delete Cron Task
+
+```
+DELETE /api/commanders/:id/cron/:cronId
+```

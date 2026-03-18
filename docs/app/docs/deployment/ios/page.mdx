@@ -1,0 +1,85 @@
+# iOS / Capacitor
+
+HamBros includes Capacitor support for building a native iOS companion app. This allows monitoring agent sessions from your iPhone or iPad.
+
+## Prerequisites
+
+- macOS with Xcode installed
+- CocoaPods (`sudo gem install cocoapods`)
+- HamBros server running and accessible from your device's network
+
+## Setup
+
+### 1. Configure the App URL
+
+Set the server URL so the iOS app knows where to connect:
+
+```bash
+# In app/.env
+VITE_APP_URL=http://your-server-ip:20001
+```
+
+Use your server's LAN IP address — `localhost` won't work from a physical device.
+
+### 2. Build the Frontend
+
+```bash
+pnpm --filter app run build
+```
+
+### 3. Sync Capacitor
+
+```bash
+pnpm --filter app run cap:sync
+```
+
+This copies the built web assets into the Capacitor iOS project.
+
+### 4. Open in Xcode
+
+```bash
+pnpm --filter app run cap:ios
+```
+
+This opens the Xcode project. From there:
+- Select your development team for code signing
+- Choose your device or simulator
+- Build and run
+
+## Capacitor Configuration
+
+The Capacitor config lives at `app/capacitor.config.ts`:
+
+```typescript
+import type { CapacitorConfig } from '@capacitor/cli'
+
+const config: CapacitorConfig = {
+  appId: 'ai.gehirn.hambros',
+  appName: 'HamBros',
+  webDir: 'dist',
+}
+
+export default config
+```
+
+## Mobile UI Features
+
+The HamBros mobile interface includes:
+
+- **Bottom sheet navigation** — swipe-up module selector
+- **Safe area support** — respects notch and home indicator
+- **Dark terminal overlay** — full-screen session view with custom colors
+- **Voice input** — microphone button for speech-to-text (requires OpenAI API key)
+- **Responsive cards** — all module views adapt to narrow screens
+
+## Network Configuration
+
+For local development:
+1. Ensure your Mac and iOS device are on the same network
+2. Set `HAMMURABI_ALLOWED_ORIGINS` to include the Capacitor origin
+3. The server's port (20001) must be accessible from the device
+
+For production:
+1. Deploy HamBros behind HTTPS
+2. Update `VITE_APP_URL` to the production URL
+3. Rebuild and redeploy the iOS app

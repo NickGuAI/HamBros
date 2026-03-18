@@ -1,0 +1,72 @@
+# API Reference
+
+HamBros exposes a RESTful API for managing agent sessions, telemetry, factory operations, and more. All endpoints are served from the Express backend (default port 20001).
+
+## Base URL
+
+```
+http://localhost:20001/api
+```
+
+## Authentication
+
+All endpoints require authentication. Include one of:
+
+| Method | Header | Example |
+|--------|--------|---------|
+| API Key | `X-Hammurabi-Api-Key` | `X-Hammurabi-Api-Key: hb_3f...` |
+| Auth0 JWT | `Authorization` | `Authorization: Bearer eyJ...` |
+
+See [Authentication](/docs/docs/api/authentication) for setup details.
+
+## Response Format
+
+All endpoints return JSON. Successful responses use HTTP 200/201. Errors return appropriate status codes with a message:
+
+```json
+{
+  "error": "Session not found",
+  "status": 404
+}
+```
+
+## API Sections
+
+### [Agents API](/docs/docs/api/agents)
+Session management, message sending, streaming, and worker dispatch.
+
+### [Commanders API](/docs/docs/api/commanders)
+Commander CRUD, quest board, memory system, and heartbeat.
+
+### [Command Room API](/docs/docs/api/command-room)
+Scheduled task management, run history, and manual triggers.
+
+### [Telemetry API](/docs/docs/api/telemetry)
+OTLP ingestion, cost summaries, session metrics, and data compaction.
+
+### [Authentication](/docs/docs/api/authentication)
+API key management, Auth0 configuration, and scope reference.
+
+## Health Check
+
+```
+GET /api/health
+```
+
+Returns server status and loaded modules:
+
+```json
+{
+  "status": "ok",
+  "modules": ["agents", "telemetry", "services", "factory", "commanders", "command-room"]
+}
+```
+
+## WebSocket Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `ws://host/api/agents/sessions/:name` | Stream agent session output |
+| `ws://host/api/services/:name/logs` | Stream service logs |
+
+WebSocket connections require matching CORS origin configuration.

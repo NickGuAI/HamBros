@@ -1,0 +1,47 @@
+# Getting Started
+
+Get HamBros running locally in under five minutes.
+
+## Prerequisites
+
+- **Node.js** 20 or later
+- **pnpm** 9 or later
+- A terminal emulator (iTerm2, Terminal.app, Windows Terminal)
+
+## Quick Start
+
+```bash
+# Clone the repository
+git clone https://github.com/NickGuAI/HamBros.git
+cd HamBros
+
+# Install dependencies
+pnpm install
+
+# Copy environment config
+cp app/.env.example app/.env
+
+# Build shared packages
+pnpm --filter app run build:deps
+
+# Start development server
+pnpm --filter app run dev
+```
+
+The app will be available at **http://localhost:5200**. The API server runs on port **20001**.
+
+## Default Authentication
+
+On first boot, HamBros creates a **master API key** stored at `app/data/api-keys/master-key.json`. The default password is:
+
+```
+HAMBROS!
+```
+
+> **Security note**: Delete the master key file and create a new API key before deploying to production.
+
+## What's Next
+
+1. [Installation](/docs/docs/getting-started/installation) — detailed setup instructions
+2. [Configuration](/docs/docs/getting-started/configuration) — environment variables and auth providers
+3. [First Agent Session](/docs/docs/getting-started/first-agent) — create and monitor your first agent

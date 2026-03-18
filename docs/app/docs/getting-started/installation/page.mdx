@@ -1,0 +1,94 @@
+# Installation
+
+## Prerequisites
+
+| Requirement | Version | Check |
+|------------|---------|-------|
+| Node.js | 20+ | `node --version` |
+| pnpm | 9+ | `pnpm --version` |
+| Git | 2.x | `git --version` |
+
+If you don't have pnpm installed:
+
+```bash
+npm install -g pnpm
+```
+
+## Clone and Install
+
+```bash
+git clone https://github.com/NickGuAI/HamBros.git
+cd HamBros
+pnpm install
+```
+
+> **Important**: Always use `pnpm` — not `npm install` — inside the HamBros workspace. The project uses pnpm workspaces for its monorepo structure.
+
+## Build Shared Packages
+
+HamBros has several shared packages that must be compiled before the main app:
+
+```bash
+pnpm --filter app run build:deps
+```
+
+This builds:
+- `@hambros/auth-providers` — authentication abstractions
+- `@hambros/telemetry` — OTLP cost tracking
+- `@hambros/sse-streaming` — Server-Sent Events utilities
+- `@hambros/tsconfig` — shared TypeScript configuration
+
+## Environment Setup
+
+Copy the example environment file:
+
+```bash
+cp app/.env.example app/.env
+```
+
+At minimum, the defaults work for local development. See [Configuration](/docs/docs/getting-started/configuration) for all available options.
+
+## Start Development
+
+```bash
+pnpm --filter app run dev
+```
+
+This runs both the Vite dev server (port 5200) and the Express API server (port 20001) concurrently. The Vite dev server proxies `/api` requests to Express.
+
+You can also run them separately:
+
+```bash
+# Frontend only
+pnpm --filter app run dev:client
+
+# Backend only
+pnpm --filter app run dev:server
+```
+
+## Production Build
+
+```bash
+pnpm --filter app run build
+```
+
+The production build outputs to `app/dist/` (client) and `app/dist-server/` (server).
+
+## Project Structure
+
+```
+HamBros/
+├── app/                  # Main application
+│   ├── src/              # React frontend (Vite)
+│   ├── server/           # Express backend
+│   ├── modules/          # Feature modules (agents, telemetry, etc.)
+│   ├── data/             # Runtime data (gitignored)
+│   └── public/           # Static assets
+├── packages/             # Shared packages
+│   ├── auth-providers/   # @hambros/auth-providers
+│   ├── cli/              # @hambros/cli (hammurabi CLI)
+│   ├── telemetry/        # @hambros/telemetry
+│   ├── sse-streaming/    # @hambros/sse-streaming
+│   └── tsconfig/         # Shared TypeScript config
+└── docs/                 # Documentation site (you are here)
+```

@@ -1,0 +1,7 @@
+{
+  "name": "@gehirn/ai-services",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Stub — real implementation lives in the parent monorepo",
+  "main": "index.js"
+}

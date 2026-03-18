@@ -1,0 +1,103 @@
+# Factory
+
+The Factory module manages repository cloning, git worktree creation, and worker session dispatch. It enables parallel agent workflows by giving each worker an isolated copy of the codebase.
+
+## Overview
+
+```
+┌──────────────────────────────────────────────┐
+│  Factory                                      │
+├──────────────────────────────────────────────┤
+│                                               │
+│  Repositories                                 │
+│  ┌──────────────────────────────────────────┐│
+│  │ NickGuAI/HamBros     main  ✓ synced     ││
+│  │ NickGuAI/monorepo-g  main  ✓ synced     ││
+│  └──────────────────────────────────────────┘│
+│                                               │
+│  Active Worktrees                             │
+│  ┌──────────────────────────────────────────┐│
+│  │ feat-auth-fix   → worker-1  ● running   ││
+│  │ feat-new-api    → worker-2  ● running   ││
+│  │ fix-bug-123     → (idle)    ○ ready     ││
+│  └──────────────────────────────────────────┘│
+└──────────────────────────────────────────────┘
+```
+
+## Key Concepts
+
+### Repository Management
+
+Clone and manage Git repositories:
+
+```bash
+# Clone a repo
+POST /api/factory/repos
+{ "owner": "NickGuAI", "repo": "HamBros" }
+
+# Sync (pull latest)
+POST /api/factory/repos/NickGuAI/HamBros/sync
+
+# List repos
+GET /api/factory/repos
+```
+
+### Worktree Isolation
+
+Git worktrees allow multiple branches to be checked out simultaneously in separate directories. The Factory creates a worktree per feature branch, giving each worker agent its own isolated working copy.
+
+```bash
+# Create worktree for a feature branch
+POST /api/factory/repos/NickGuAI/HamBros/worktrees/feat-auth-fix
+
+# Check worktree status
+GET /api/factory/repos/NickGuAI/HamBros/worktrees/feat-auth-fix
+
+# Delete worktree
+DELETE /api/factory/repos/NickGuAI/HamBros/worktrees/feat-auth-fix
+```
+
+### Worker Dispatch
+
+Dispatch worker agents that operate in isolated worktrees:
+
+```bash
+POST /api/agents/sessions/dispatch-worker
+{
+  "parentSession": "main-session",
+  "issue": "https://github.com/org/repo/issues/42",
+  "branch": "fix-issue-42",
+  "task": "Fix the login redirect bug",
+  "agent": "claude"
+}
+```
+
+Workers:
+- Get their own git worktree (isolated filesystem)
+- Run as child sessions of the parent
+- Report status back to the parent session
+- Can be monitored in the Agents Monitor
+
+## Workflow
+
+```
+1. Parent session receives task
+   │
+2. Factory clones repo (if needed)
+   │
+3. Factory creates worktree for feature branch
+   │
+4. Worker agent spawned in worktree directory
+   │
+5. Worker implements changes, commits, pushes
+   │
+6. Worker reports completion to parent
+   │
+7. Worktree cleaned up (optional)
+```
+
+## Use Cases
+
+- **Parallel issue processing** — a commander dispatches multiple workers to tackle different issues simultaneously
+- **Safe experimentation** — workers operate on isolated branches, protecting the main codebase
+- **CI-like workflows** — automated session creation for testing, linting, or deployment tasks

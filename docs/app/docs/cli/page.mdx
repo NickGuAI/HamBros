@@ -1,0 +1,278 @@
+# CLI Reference
+
+The `hammurabi` CLI provides command-line access to HamBros features including agent onboarding, quest management, worker dispatch, memory operations, and cron scheduling.
+
+## Installation
+
+The CLI is included in the HamBros monorepo as `@hambros/cli`:
+
+```bash
+# From the HamBros root
+pnpm --filter app run build:deps
+```
+
+The CLI binary is available at `packages/cli/bin/hammurabi.mjs`.
+
+## Commands
+
+---
+
+### `hammurabi onboard`
+
+Interactive setup wizard that configures AI agents to send telemetry to your HamBros instance.
+
+```bash
+hammurabi onboard
+```
+
+The wizard prompts for:
+- **Hammurabi endpoint** — URL of your HamBros instance (default: `https://hammurabi.gehirn.ai`)
+- **API key** — authentication key
+- **Agent selection** — which agents to configure (multi-select)
+
+Supported agents:
+- Claude Code (auto-configured)
+- Codex (auto-configured)
+- Cursor (auto-configured)
+- Terminal CRI (manual setup)
+- Anti-Gravity (manual setup)
+
+Configuration is saved to `~/.hammurabi.json`.
+
+---
+
+### `hammurabi quests`
+
+Manage the commander quest board.
+
+> Requires `HAMMURABI_COMMANDER_ID` environment variable for `list` operations.
+
+#### `quests list`
+
+```bash
+HAMMURABI_COMMANDER_ID=<uuid> hammurabi quests list
+```
+
+List pending and active quests.
+
+#### `quests create`
+
+```bash
+hammurabi quests create \
+  --instruction "Fix the login page redirect bug" \
+  --cwd /path/to/project \
+  --mode default \
+  --agent claude
+```
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--instruction` | Yes | Task description |
+| `--cwd` | Yes | Working directory |
+| `--mode` | Yes | Permission mode |
+| `--agent` | Yes | Agent type (`claude`, `codex`) |
+| `--skills` | No | Comma-separated skill list |
+| `--source` | No | Origin identifier |
+| `--issue` | No | GitHub issue URL |
+| `--note` | No | Initial note |
+
+#### `quests delete <id>`
+
+Delete a quest by ID.
+
+#### `quests claim <id>`
+
+Mark a quest as active.
+
+#### `quests note <id> "<text>"`
+
+Add a progress note to a quest.
+
+#### `quests done <id> --note "<text>"`
+
+Mark a quest as completed with a completion note.
+
+#### `quests fail <id> --note "<text>"`
+
+Mark a quest as failed with a failure note.
+
+#### `quests artifact add <id>`
+
+```bash
+hammurabi quests artifact add <quest-id> \
+  --type github_pr \
+  --label "Fix PR" \
+  --href https://github.com/org/repo/pull/43
+```
+
+Artifact types: `github_issue`, `github_pr`, `url`, `file`
+
+#### `quests artifact remove <id> <href>`
+
+Remove an artifact from a quest.
+
+---
+
+### `hammurabi workers`
+
+Manage factory worker sessions.
+
+#### `workers list`
+
+List active factory workers.
+
+#### `workers dispatch`
+
+```bash
+hammurabi workers dispatch \
+  --session main-session \
+  --issue https://github.com/org/repo/issues/42 \
+  --branch fix-issue-42 \
+  --task "Fix the login redirect bug" \
+  --agent claude
+```
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--session` | Yes | Parent session name |
+| `--issue` | Yes* | GitHub issue URL |
+| `--branch` | Yes* | Feature branch name |
+| `--task` | No | Task description |
+| `--machine` | No | Target machine ID |
+| `--agent` | No | Agent type (default: `claude`) |
+
+*At least one of `--issue` or `--branch` is required.
+
+#### `workers kill <name>`
+
+Kill a worker session by name.
+
+#### `workers status <name>`
+
+Get worker session status.
+
+#### `workers send <name> "<text>"`
+
+Send a message to a running worker.
+
+---
+
+### `hammurabi memory`
+
+Manage commander memory.
+
+#### `memory find`
+
+```bash
+hammurabi memory find --commander <id> "authentication redirect"
+```
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--commander` | Yes | Commander ID |
+| `--top` | No | Number of results to return |
+
+#### `memory save`
+
+```bash
+hammurabi memory save --commander <id> "Auth redirects require URL encoding"
+```
+
+Multiple facts can be saved:
+
+```bash
+hammurabi memory save --commander <id> \
+  "Auth redirects require URL encoding" \
+  --fact "Login page uses /callback as redirect path"
+```
+
+#### `memory compact`
+
+```bash
+hammurabi memory compact --commander <id>
+```
+
+Consolidates memory, extracts facts, and prunes stale entries.
+
+---
+
+### `hammurabi cron`
+
+Manage scheduled tasks.
+
+#### `cron list`
+
+```bash
+hammurabi cron list --commander <id>
+```
+
+#### `cron add`
+
+```bash
+hammurabi cron add \
+  --commander <id> \
+  --schedule "0 9 * * *" \
+  --instruction "Review open PRs" \
+  --agent claude \
+  --name daily-review
+```
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--commander` | Yes | Commander ID |
+| `--schedule` | Yes | Cron expression |
+| `--instruction` | Yes | Agent prompt |
+| `--name` | No | Task name |
+| `--agent` | No | Agent type |
+| `--session-type` | No | `stream` or `pty` |
+| `--permission-mode` | No | Tool approval behavior |
+| `--work-dir` | No | Working directory |
+| `--machine` | No | Target machine |
+| `--disabled` | No | Create in disabled state |
+
+#### `cron update <id>`
+
+```bash
+hammurabi cron update <cron-id> \
+  --schedule "0 */6 * * *" \
+  --enabled false
+```
+
+#### `cron delete`
+
+```bash
+hammurabi cron delete --commander <id> <cron-id>
+```
+
+#### `cron trigger`
+
+```bash
+HAMMURABI_COMMANDER_ID=<uuid> hammurabi cron trigger \
+  --instruction "Run the daily report now"
+```
+
+---
+
+### `hammurabi commander`
+
+Initialize and configure commander instances.
+
+#### `commander init`
+
+```bash
+hammurabi commander init
+```
+
+Interactive setup that creates a local `COMMANDER.md` configuration.
+
+#### `commander init --remote`
+
+```bash
+hammurabi commander init \
+  --remote https://your-server.com \
+  --token sync-token-123 \
+  --commander <id> \
+  --poll-interval 30
+```
+
+Initialize with remote sync to a HamBros server.

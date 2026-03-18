@@ -1,0 +1,144 @@
+# Deployment
+
+HamBros can be self-hosted on any machine with Node.js 20+ or deployed to cloud platforms.
+
+## Self-Hosting
+
+### Prerequisites
+
+- Node.js 20+
+- pnpm 9+
+- A Linux or macOS server (Windows via WSL)
+
+### Production Build
+
+```bash
+# Clone and install
+git clone https://github.com/NickGuAI/HamBros.git
+cd HamBros
+pnpm install
+
+# Build everything
+pnpm --filter app run build:deps
+pnpm --filter app run build
+```
+
+This produces:
+- `app/dist/` — compiled frontend (static assets)
+- `app/dist-server/` — compiled backend (Node.js)
+
+### Running with PM2
+
+```bash
+npm install -g pm2
+
+# Start the server
+pm2 start app/dist-server/index.js --name hambros
+
+# Auto-restart on reboot
+pm2 startup
+pm2 save
+```
+
+### Running with systemd
+
+Create `/etc/systemd/system/hambros.service`:
+
+```ini
+[Unit]
+Description=HamBros Agent Observability
+After=network.target
+
+[Service]
+Type=simple
+User=hambros
+WorkingDirectory=/opt/hambros/app
+ExecStart=/usr/bin/node dist-server/index.js
+Restart=on-failure
+RestartSec=10
+Environment=PORT=20001
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable hambros
+sudo systemctl start hambros
+```
+
+### Environment Variables
+
+For production, set at minimum:
+
+```env
+PORT=20001
+HAMMURABI_ALLOWED_ORIGINS=https://your-domain.com
+HAMMURABI_SETTINGS_ENCRYPTION_KEY=<random-32-char-string>
+NODE_ENV=production
+```
+
+See [Configuration](/docs/docs/getting-started/configuration) for all options.
+
+### Reverse Proxy (nginx)
+
+```nginx
+server {
+    listen 80;
+    server_name hambros.example.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:20001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_read_timeout 86400;
+    }
+}
+```
+
+The `proxy_read_timeout` and WebSocket upgrade headers are required for the real-time streaming features.
+
+## Data Directory
+
+HamBros stores runtime data in `app/data/`:
+
+```
+app/data/
+├── agents/         # Session metadata
+├── api-keys/       # Encrypted API keys
+├── commanders/     # Commander configurations
+├── command-room/   # Task definitions and run history
+└── telemetry/      # Telemetry JSONL store
+```
+
+Back up this directory regularly. It is gitignored by default.
+
+## Vercel (Docs Site Only)
+
+The documentation site (this site) is deployed on Vercel:
+
+- **Root Directory**: `docs`
+- **Framework**: Next.js
+- **Build Command**: `next build`
+- **Output Directory**: `.next`
+- **Domain**: `hambros.gehirn.ai`
+
+The `vercel.json` in the `docs/` directory configures the deployment.
+
+> The main HamBros app requires a persistent server process (for WebSocket, node-pty, cron) and cannot run on serverless platforms like Vercel.
+
+## Security Checklist
+
+Before deploying to production:
+
+- [ ] Delete the master key file (`app/data/api-keys/master-key.json`)
+- [ ] Create scoped API keys for each consumer
+- [ ] Set `HAMMURABI_SETTINGS_ENCRYPTION_KEY` to a strong random value
+- [ ] Configure `HAMMURABI_ALLOWED_ORIGINS` to your domain only
+- [ ] Set up HTTPS via reverse proxy or load balancer
+- [ ] Configure Auth0 for team access (optional)
+- [ ] Set up regular backups of `app/data/`

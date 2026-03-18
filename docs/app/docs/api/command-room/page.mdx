@@ -1,0 +1,121 @@
+# Command Room API
+
+Manage scheduled tasks, view run history, and trigger manual executions.
+
+## Tasks
+
+### List Tasks
+
+```
+GET /api/command-room/tasks
+```
+
+Returns all scheduled tasks with their configuration and last run status.
+
+**Response:**
+
+```json
+[
+  {
+    "id": "task-abc123",
+    "name": "daily-pr-review",
+    "schedule": "0 9 * * *",
+    "instruction": "Review open PRs and summarize status",
+    "agentType": "claude",
+    "enabled": true,
+    "lastRun": "2026-03-18T09:00:00Z",
+    "lastStatus": "success",
+    "nextRun": "2026-03-19T09:00:00Z"
+  }
+]
+```
+
+### Create Task
+
+```
+POST /api/command-room/tasks
+```
+
+**Request Body:**
+
+```json
+{
+  "name": "daily-pr-review",
+  "schedule": "0 9 * * *",
+  "instruction": "Review open PRs and post summaries",
+  "agentType": "claude",
+  "sessionType": "stream",
+  "permissionMode": "default",
+  "workDir": "/path/to/project"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | Yes | Human-readable task name |
+| `schedule` | string | Yes | Cron expression |
+| `instruction` | string | Yes | Prompt for the agent |
+| `agentType` | string | No | `claude` or `codex` (default: `claude`) |
+| `sessionType` | string | No | `stream` or `pty` |
+| `permissionMode` | string | No | Tool approval behavior |
+| `workDir` | string | No | Working directory |
+
+### Update Task
+
+```
+PATCH /api/command-room/tasks/:id
+```
+
+Partial update — only include fields you want to change.
+
+```json
+{
+  "schedule": "0 */6 * * *",
+  "enabled": false
+}
+```
+
+### Delete Task
+
+```
+DELETE /api/command-room/tasks/:id
+```
+
+### Manual Trigger
+
+```
+POST /api/command-room/tasks/:id/trigger
+```
+
+Execute a task immediately, regardless of schedule. Returns the run ID.
+
+## Run History
+
+### Get Runs
+
+```
+GET /api/command-room/tasks/:id/runs
+```
+
+Returns recent executions for a task:
+
+```json
+[
+  {
+    "runId": "run-001",
+    "startedAt": "2026-03-18T09:00:00Z",
+    "completedAt": "2026-03-18T09:05:23Z",
+    "status": "success",
+    "duration": 323000,
+    "output": "Reviewed 5 PRs. 2 ready to merge, 1 needs changes..."
+  },
+  {
+    "runId": "run-002",
+    "startedAt": "2026-03-17T09:00:00Z",
+    "completedAt": "2026-03-17T09:03:15Z",
+    "status": "failed",
+    "duration": 195000,
+    "error": "Agent process exited with code 1"
+  }
+]
+```

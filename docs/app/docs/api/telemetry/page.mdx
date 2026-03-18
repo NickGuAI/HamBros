@@ -1,0 +1,141 @@
+# Telemetry API
+
+Ingest telemetry data, query cost summaries, and manage the telemetry store.
+
+## OTLP Ingestion
+
+HamBros accepts OpenTelemetry-compatible data over HTTP.
+
+### Ingest Traces
+
+```
+POST /v1/traces
+Content-Type: application/json
+```
+
+Standard OTLP trace format. HamBros extracts token counts, model identifiers, and timing from span attributes.
+
+### Ingest Logs
+
+```
+POST /v1/logs
+Content-Type: application/json
+```
+
+Standard OTLP log format.
+
+## Custom Telemetry
+
+### Ingest Event
+
+```
+POST /api/telemetry/ingest
+```
+
+Send a custom telemetry event for token usage, cost, or duration tracking.
+
+**Request Body:**
+
+```json
+{
+  "sessionId": "my-session",
+  "event": "token_usage",
+  "inputTokens": 1500,
+  "outputTokens": 800,
+  "model": "claude-sonnet-4-20250514",
+  "cost": 0.012,
+  "duration": 3400
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `sessionId` | string | Yes | Session identifier |
+| `event` | string | Yes | Event type |
+| `inputTokens` | number | No | Input token count |
+| `outputTokens` | number | No | Output token count |
+| `model` | string | No | Model identifier |
+| `cost` | number | No | Cost in USD |
+| `duration` | number | No | Duration in milliseconds |
+
+### Send Heartbeat
+
+```
+POST /api/telemetry/heartbeat
+```
+
+Report session status with optional task information.
+
+```json
+{
+  "sessionId": "my-session",
+  "status": "active",
+  "taskStatus": "implementing authentication module"
+}
+```
+
+## Queries
+
+### List Sessions
+
+```
+GET /api/telemetry/sessions
+```
+
+Returns all telemetry sessions with aggregated metrics (total tokens, cost, duration).
+
+### Get Session Detail
+
+```
+GET /api/telemetry/sessions/:id
+```
+
+Returns detailed metrics, all events, and cost breakdown for a specific session.
+
+### Cost Summary
+
+```
+GET /api/telemetry/summary?period=30d
+```
+
+Returns aggregated cost and usage data for the specified period.
+
+**Query Parameters:**
+
+| Parameter | Values | Description |
+|-----------|--------|-------------|
+| `period` | `30d`, `90d`, `YYYY-MM` | Time period for aggregation |
+
+**Response:**
+
+```json
+{
+  "period": "30d",
+  "totalCost": 142.30,
+  "totalInputTokens": 2450000,
+  "totalOutputTokens": 890000,
+  "sessionCount": 47,
+  "byModel": {
+    "claude-sonnet-4-20250514": { "cost": 98.50, "sessions": 32 },
+    "claude-opus-4-20250514": { "cost": 43.80, "sessions": 15 }
+  }
+}
+```
+
+## Maintenance
+
+### Scan Local Sessions
+
+```
+POST /api/telemetry/scan
+```
+
+Trigger a scan of local Claude/Codex session directories to discover and import telemetry data from agent sessions running on this machine.
+
+### Compact Store
+
+```
+POST /api/telemetry/compact
+```
+
+Prune telemetry data older than the configured retention period. Compacts the JSONL store on disk.
