@@ -1,0 +1,17 @@
+{
+  "machines": [
+    {
+      "id": "local",
+      "label": "Hammurabi Server",
+      "host": null
+    },
+    {
+      "id": "example-remote",
+      "label": "Example Remote",
+      "host": "example-host",
+      "user": "example-user",
+      "port": 22,
+      "cwd": "/home/example"
+    }
+  ]
+}

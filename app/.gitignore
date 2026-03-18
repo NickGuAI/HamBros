@@ -4,3 +4,4 @@ dist/
 dist-server/
 .hambros.json
 data/commanders/
+data/machines.json
