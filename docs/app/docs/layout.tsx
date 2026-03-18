@@ -13,7 +13,7 @@ export default function DocsLayout({
       <header className="border-b border-ink-border bg-washi-white/80 backdrop-blur-sm sticky top-0 z-50 h-16">
         <div className="max-w-screen-2xl mx-auto px-6 h-full flex items-center justify-between">
           <Link href="/docs" className="flex items-center gap-3">
-            <Image src="/docs/logo.png" alt="HamBros" width={28} height={28} />
+            <Image src="/logo.png" alt="HamBros" width={28} height={28} />
             <span className="font-display text-lg text-sumi-black">HamBros</span>
             <span className="badge-sumi ml-1">Docs</span>
           </Link>

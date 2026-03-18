@@ -28,7 +28,7 @@ export const metadata: Metadata = {
     template: '%s — HamBros Docs',
     default: 'HamBros — Agent Observability Platform',
   },
-  description: 'Open-source agent observability platform. Monitor, manage, and orchestrate AI agent sessions with real-time telemetry.',
+  description: 'Source-available agent observability platform. Monitor, manage, and orchestrate AI agent sessions with real-time telemetry.',
 }
 
 export default function RootLayout({

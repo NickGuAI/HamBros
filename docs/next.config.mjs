@@ -9,7 +9,20 @@ const withMDX = createMDX({
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  basePath: '/docs',
+  async redirects() {
+    return [
+      {
+        source: '/docs/docs',
+        destination: '/docs',
+        permanent: true,
+      },
+      {
+        source: '/docs/docs/:path*',
+        destination: '/docs/:path*',
+        permanent: true,
+      },
+    ]
+  },
   pageExtensions: ['ts', 'tsx', 'md', 'mdx'],
   output: 'standalone',
 }

@@ -5,7 +5,7 @@
 <h1 align="center">HamBros</h1>
 
 <p align="center">
-  Open-source agent observability platform — monitor, trace, and manage your AI agents in one place.
+  Source-available agent observability platform — monitor, trace, and manage your AI agents in one place.
 </p>
 
 ---
@@ -193,4 +193,12 @@ pnpm --filter hambros run cap:ios    # Open in Xcode
 
 ## License
 
-MIT
+HamBros is source-available under the [PolyForm Noncommercial 1.0.0](./LICENSE)
+license.
+
+- Personal and other noncommercial uses are permitted under that license.
+- Commercial use requires a separate written commercial license.
+- See [COMMERCIAL-LICENSING.md](./COMMERCIAL-LICENSING.md) for the commercial
+  licensing note.
+
+HamBros is not distributed under an OSI-approved open source license.

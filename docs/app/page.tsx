@@ -6,43 +6,43 @@ const modules = [
   {
     title: 'Agents Monitor',
     description: 'Live session view with real-time WebSocket streaming, interactive terminal, and message history.',
-    href: '/docs/docs/modules/agents',
+    href: '/docs/modules/agents',
     icon: '🔍',
   },
   {
     title: 'Commanders',
     description: 'GitHub-backed personas with memory systems, heartbeat monitoring, and quest boards.',
-    href: '/docs/docs/modules/commanders',
+    href: '/docs/modules/commanders',
     icon: '🎖️',
   },
   {
     title: 'Command Room',
     description: 'Cron-based task scheduler with run history, manual triggers, and status tracking.',
-    href: '/docs/docs/modules/command-room',
+    href: '/docs/modules/command-room',
     icon: '🎯',
   },
   {
     title: 'Telemetry Hub',
     description: 'OTLP/HTTP trace and log ingestion with cost tracking and visualization.',
-    href: '/docs/docs/modules/telemetry',
+    href: '/docs/modules/telemetry',
     icon: '📡',
   },
   {
     title: 'Factory',
     description: 'Session creation wizard with worktree-based workers and automated git workflow.',
-    href: '/docs/docs/modules/factory',
+    href: '/docs/modules/factory',
     icon: '🏭',
   },
   {
     title: 'Services Manager',
     description: 'API key management, encrypted storage, and service configuration.',
-    href: '/docs/docs/modules/services',
+    href: '/docs/modules/services',
     icon: '⚙️',
   },
   {
     title: 'Settings',
     description: 'Auth configuration, encryption management, and module toggle controls.',
-    href: '/docs/docs/modules/services',
+    href: '/docs/modules/services',
     icon: '🔧',
   },
 ]
@@ -53,15 +53,15 @@ export default function HomePage() {
       {/* Header */}
       <header className="border-b border-ink-border bg-washi-white/80 backdrop-blur-sm sticky top-0 z-50">
         <div className="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
-          <Link href="/docs" className="flex items-center gap-3">
-            <Image src="/docs/logo.png" alt="HamBros" width={32} height={32} />
+          <Link href="/" className="flex items-center gap-3">
+            <Image src="/logo.png" alt="HamBros" width={32} height={32} />
             <span className="font-display text-xl text-sumi-black">HamBros</span>
           </Link>
           <nav className="flex items-center gap-6">
-            <Link href="/docs/docs" className="text-sm text-sumi-diluted hover:text-sumi-black transition-colors">
+            <Link href="/docs" className="text-sm text-sumi-diluted hover:text-sumi-black transition-colors">
               Docs
             </Link>
-            <Link href="/docs/docs/api" className="text-sm text-sumi-diluted hover:text-sumi-black transition-colors">
+            <Link href="/docs/api" className="text-sm text-sumi-diluted hover:text-sumi-black transition-colors">
               API
             </Link>
             <a
@@ -79,7 +79,7 @@ export default function HomePage() {
       {/* Hero */}
       <section className="py-24 md:py-32">
         <div className="max-w-6xl mx-auto px-6 text-center">
-          <p className="section-title mb-4">Open-Source</p>
+          <p className="section-title mb-4">Source-Available</p>
           <h1 className="font-display text-5xl md:text-6xl text-sumi-black mb-6 leading-tight">
             Agent Observability<br />Platform
           </h1>
@@ -88,10 +88,10 @@ export default function HomePage() {
             commander personas, and a unified command room.
           </p>
           <div className="flex items-center justify-center gap-4 flex-wrap">
-            <Link href="/docs/docs/getting-started" className="btn-primary">
+            <Link href="/docs/getting-started" className="btn-primary">
               Get Started
             </Link>
-            <Link href="/docs/docs/api" className="btn-ghost">
+            <Link href="/docs/api" className="btn-ghost">
               API Reference
             </Link>
           </div>
@@ -132,7 +132,7 @@ export default function HomePage() {
             <p>pnpm --filter app run dev</p>
           </div>
           <div className="text-center mt-8">
-            <Link href="/docs/docs/getting-started/installation" className="btn-ghost text-sm">
+            <Link href="/docs/getting-started/installation" className="btn-ghost text-sm">
               Full installation guide
             </Link>
           </div>
@@ -143,7 +143,7 @@ export default function HomePage() {
       <footer className="border-t border-ink-border py-12">
         <div className="max-w-6xl mx-auto px-6 flex flex-col md:flex-row items-center justify-between gap-4">
           <p className="text-sm text-sumi-diluted">
-            HamBros — open-source agent observability
+            HamBros — source-available agent observability
           </p>
           <div className="flex items-center gap-6">
             <a
@@ -154,7 +154,7 @@ export default function HomePage() {
             >
               GitHub
             </a>
-            <span className="text-sumi-mist">MIT License</span>
+            <span className="text-sumi-mist">PolyForm Noncommercial 1.0.0</span>
           </div>
         </div>
       </footer>
