@@ -8,6 +8,8 @@ import {
   Warehouse,
   Crown,
   Swords,
+  CalendarClock,
+  FolderOpen,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -18,6 +20,8 @@ const iconMap: Record<string, React.ComponentType<LucideProps>> = {
   Warehouse,
   Crown,
   Swords,
+  CalendarClock,
+  FolderOpen,
   Settings,
 }
 
@@ -28,7 +32,8 @@ const SHORT_LABELS: Record<string, string> = {
   services: 'Services',
   factory: 'Factory',
   commanders: 'Commanders',
-  'command-room': 'Command',
+  'command-room': 'Cron',
+  workspace: 'Files',
   'api-keys': 'Settings',
 }
 

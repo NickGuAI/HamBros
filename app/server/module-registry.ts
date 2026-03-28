@@ -19,6 +19,7 @@ import {
 import { createCommandersRouter } from '../modules/commanders/routes.js'
 import { createFactoryRouter } from '../modules/factory/routes.js'
 import { createServicesRouter } from '../modules/services/routes.js'
+import { createSkillsRouter } from '../modules/skills/routes.js'
 import { createTelemetryRouterWithHub } from '../modules/telemetry/routes.js'
 import { createOtelRouter } from '../modules/telemetry/otel-receiver.js'
 import type { ApiKeyStoreLike } from './api-keys/store.js'
@@ -192,6 +193,17 @@ export function createModules(options: ModuleRegistryOptions = {}): ModuleRegist
       routePrefix: '/api/realtime',
       router: realtime.router,
       handleUpgrade: realtime.handleUpgrade,
+    },
+    {
+      name: 'skills',
+      label: 'Skills & Cron',
+      routePrefix: '/api/skills',
+      router: createSkillsRouter({
+        apiKeyStore: options.apiKeyStore,
+        auth0Domain: options.auth0Domain,
+        auth0Audience: options.auth0Audience,
+        auth0ClientId: options.auth0ClientId,
+      }),
     },
   ]
 

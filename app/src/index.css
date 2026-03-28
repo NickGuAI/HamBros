@@ -808,6 +808,26 @@
     border-top: 1px solid var(--msg-border);
     flex-shrink: 0;
   }
+  .session-view-overlay .file-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    background: var(--msg-surface-elevated);
+    border: 1px solid var(--msg-border);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--msg-text);
+  }
+  .session-view-overlay .file-chip-remove {
+    color: var(--msg-text-muted);
+    cursor: pointer;
+    line-height: 1;
+  }
+  .session-view-overlay .file-chip-remove:hover {
+    color: var(--msg-text);
+  }
   .session-view-overlay .input-field {
     flex: 1;
     min-height: 40px;

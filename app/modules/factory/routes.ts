@@ -1,4 +1,4 @@
-import { Router, type Router as RouterType } from 'express'
+import { Router, type Response, type Router as RouterType } from 'express'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import type { ApiKeyStoreLike } from '../../server/api-keys/store.js'
@@ -10,6 +10,15 @@ import {
   parseFeatureName,
   parseOwnerRepo,
 } from './worktree.js'
+import {
+  listWorkspaceTree,
+  readWorkspaceFilePreview,
+  readWorkspaceGitLog,
+  readWorkspaceGitStatus,
+  resolveWorkspaceRoot,
+  toWorkspaceError,
+  WorkspaceError,
+} from '../workspace/index.js'
 
 // Re-export for consumers that import from this module (e.g. tests, agents/routes)
 export type { CommandRunner, BootstrapFactoryWorktreeInput, BootstrapFactoryWorktreeResult } from './worktree.js'
@@ -58,6 +67,45 @@ export function createFactoryRouter(options: FactoryRouterOptions = {}): RouterT
     audience: options.auth0Audience,
     clientId: options.auth0ClientId,
   })
+
+  function sendWorkspaceError(res: Response, error: unknown): void {
+    const workspaceError = toWorkspaceError(error)
+    res.status(workspaceError.statusCode).json({ error: workspaceError.message })
+  }
+
+  async function resolveFactoryWorkspace(
+    rawOwner: unknown,
+    rawRepo: unknown,
+    rawFeature: unknown,
+  ) {
+    const parsedRepo = parseOwnerRepo(rawOwner, rawRepo)
+    if (!parsedRepo) {
+      throw new WorkspaceError(400, 'Invalid owner or repo name')
+    }
+
+    const feature = parseFeatureName(rawFeature)
+    if (!feature) {
+      throw new WorkspaceError(400, 'Invalid feature name')
+    }
+
+    return resolveWorkspaceRoot(
+      {
+        rootPath: path.join(baseDir, parsedRepo.owner, parsedRepo.repo, 'worktrees', feature),
+        source: {
+          kind: 'factory-worktree',
+          id: `${parsedRepo.owner}/${parsedRepo.repo}/${feature}`,
+          label: `${parsedRepo.owner}/${parsedRepo.repo}:${feature}`,
+          readOnly: true,
+          repo: {
+            owner: parsedRepo.owner,
+            repo: parsedRepo.repo,
+          },
+          branch: feature,
+        },
+      },
+      runner,
+    )
+  }
 
   // GET /repos - List cloned repos
   router.get('/repos', requireReadAccess, async (_req, res) => {
@@ -220,6 +268,90 @@ export function createFactoryRouter(options: FactoryRouterOptions = {}): RouterT
       res.json(worktrees)
     } catch {
       res.status(500).json({ error: 'Failed to list worktrees' })
+    }
+  })
+
+  router.get('/repos/:owner/:repo/worktrees/:feature/workspace/tree', requireReadAccess, async (req, res) => {
+    try {
+      const workspace = await resolveFactoryWorkspace(
+        req.params.owner,
+        req.params.repo,
+        req.params.feature,
+      )
+      const tree = await listWorkspaceTree(
+        workspace,
+        typeof req.query.path === 'string' ? req.query.path : '',
+      )
+      res.json(tree)
+    } catch (error) {
+      sendWorkspaceError(res, error)
+    }
+  })
+
+  router.get('/repos/:owner/:repo/worktrees/:feature/workspace/expand', requireReadAccess, async (req, res) => {
+    try {
+      const workspace = await resolveFactoryWorkspace(
+        req.params.owner,
+        req.params.repo,
+        req.params.feature,
+      )
+      const tree = await listWorkspaceTree(
+        workspace,
+        typeof req.query.path === 'string' ? req.query.path : '',
+      )
+      res.json(tree)
+    } catch (error) {
+      sendWorkspaceError(res, error)
+    }
+  })
+
+  router.get('/repos/:owner/:repo/worktrees/:feature/workspace/file', requireReadAccess, async (req, res) => {
+    try {
+      if (typeof req.query.path !== 'string' || !req.query.path.trim()) {
+        throw new WorkspaceError(400, 'path query parameter is required')
+      }
+      const workspace = await resolveFactoryWorkspace(
+        req.params.owner,
+        req.params.repo,
+        req.params.feature,
+      )
+      const preview = await readWorkspaceFilePreview(workspace, req.query.path)
+      res.json(preview)
+    } catch (error) {
+      sendWorkspaceError(res, error)
+    }
+  })
+
+  router.get('/repos/:owner/:repo/worktrees/:feature/workspace/git/status', requireReadAccess, async (req, res) => {
+    try {
+      const workspace = await resolveFactoryWorkspace(
+        req.params.owner,
+        req.params.repo,
+        req.params.feature,
+      )
+      const status = await readWorkspaceGitStatus(workspace, runner)
+      res.json(status)
+    } catch (error) {
+      sendWorkspaceError(res, error)
+    }
+  })
+
+  router.get('/repos/:owner/:repo/worktrees/:feature/workspace/git/log', requireReadAccess, async (req, res) => {
+    try {
+      const workspace = await resolveFactoryWorkspace(
+        req.params.owner,
+        req.params.repo,
+        req.params.feature,
+      )
+      const limit = typeof req.query.limit === 'string' ? Number.parseInt(req.query.limit, 10) : 15
+      const log = await readWorkspaceGitLog(
+        workspace,
+        Number.isFinite(limit) ? limit : 15,
+        runner,
+      )
+      res.json(log)
+    } catch (error) {
+      sendWorkspaceError(res, error)
     }
   })
 

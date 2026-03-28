@@ -54,6 +54,10 @@ describe('CommanderAgent identity prompt injection', () => {
     expect(built.systemPrompt.indexOf('# Identity Section')).toBeLessThan(
       built.systemPrompt.indexOf('Base system prompt'),
     )
+    expect(built.memorySection).toBe(built.systemPromptSection)
+    expect(built.memorySection).not.toContain('# Identity Section')
+    expect(built.memorySection).not.toContain('You are Athena, engineering commander.')
+    expect(built.memorySection).not.toContain('Base system prompt')
   })
 
   it('keeps current behavior when commander.md does not exist', async () => {

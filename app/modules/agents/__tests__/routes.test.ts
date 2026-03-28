@@ -5950,6 +5950,48 @@ describe('stream sessions', () => {
     await server.close()
   })
 
+  it('keeps websocket clients connected when commander session is replaced', async () => {
+    const firstMock = createMockChildProcess()
+    const secondMock = createMockChildProcess()
+    mockedSpawn.mockReturnValueOnce(firstMock.cp as never)
+    mockedSpawn.mockReturnValueOnce(secondMock.cp as never)
+
+    const server = await startServer()
+
+    await server.sessionsInterface.createCommanderSession({
+      name: 'commander-replace-test',
+      systemPrompt: 'You are Commander Gamma',
+      agentType: 'claude',
+      cwd: '/tmp',
+    })
+
+    const ws = await connectWs(server.baseUrl, 'commander-replace-test')
+    const closeSpy = vi.fn()
+    ws.on('close', closeSpy)
+
+    await server.sessionsInterface.createCommanderSession({
+      name: 'commander-replace-test',
+      systemPrompt: 'You are Commander Delta',
+      agentType: 'claude',
+      cwd: '/tmp',
+    })
+
+    await vi.waitFor(() => {
+      expect(firstMock.cp.kill).toHaveBeenCalledWith('SIGTERM')
+    })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    expect(ws.readyState).toBe(WebSocket.OPEN)
+    expect(closeSpy).not.toHaveBeenCalled()
+
+    ws.close()
+    await new Promise<void>((resolve) => {
+      ws.once('close', () => resolve())
+    })
+    server.sessionsInterface.deleteSession('commander-replace-test')
+    await server.close()
+  })
+
   it('preserves systemPrompt on respawn when process exits and new message arrives via WS', async () => {
     const mock1 = createMockChildProcess()
     mockedSpawn.mockReturnValueOnce(mock1.cp as never)
@@ -6630,5 +6672,98 @@ describe('session messages endpoint', () => {
     expect(res.status).toBe(404)
 
     await server.close()
+  })
+
+  it('serves workspace tree, preview, and save routes for local sessions', async () => {
+    const tempWorkspaceRoot = await mkdtemp(join(tmpdir(), 'agent-workspace-'))
+    const workspaceDir = join(tempWorkspaceRoot, 'workspace')
+    await mkdir(workspaceDir, { recursive: true })
+    await mkdir(join(workspaceDir, 'src'), { recursive: true })
+    await writeFile(join(workspaceDir, 'README.md'), '# workspace\n', 'utf8')
+
+    const { spawner } = createMockPtySpawner()
+    const server = await startServer({ ptySpawner: spawner })
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          name: 'workspace-local',
+          mode: 'default',
+          cwd: workspaceDir,
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const treeResponse = await fetch(
+        `${server.baseUrl}/api/agents/sessions/workspace-local/workspace/tree`,
+        { headers: AUTH_HEADERS },
+      )
+      expect(treeResponse.status).toBe(200)
+      const treeBody = await treeResponse.json()
+      expect(treeBody.nodes.map((node: { name: string }) => node.name)).toEqual(['src', 'README.md'])
+
+      const fileResponse = await fetch(
+        `${server.baseUrl}/api/agents/sessions/workspace-local/workspace/file?path=README.md`,
+        { headers: AUTH_HEADERS },
+      )
+      expect(fileResponse.status).toBe(200)
+      const fileBody = await fileResponse.json()
+      expect(fileBody.kind).toBe('text')
+      expect(fileBody.content).toContain('# workspace')
+
+      const saveResponse = await fetch(
+        `${server.baseUrl}/api/agents/sessions/workspace-local/workspace/file`,
+        {
+          method: 'PUT',
+          headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+          body: JSON.stringify({
+            path: 'README.md',
+            content: '# updated\n',
+          }),
+        },
+      )
+      expect(saveResponse.status).toBe(200)
+      expect(await readFile(join(workspaceDir, 'README.md'), 'utf8')).toBe('# updated\n')
+    } finally {
+      await rm(tempWorkspaceRoot, { recursive: true, force: true })
+      await server.close()
+    }
+  })
+
+  it('rejects workspace traversal outside the resolved root', async () => {
+    const tempWorkspaceRoot = await mkdtemp(join(tmpdir(), 'agent-workspace-escape-'))
+    const workspaceDir = join(tempWorkspaceRoot, 'workspace-escape')
+    await mkdir(workspaceDir, { recursive: true })
+    await writeFile(join(workspaceDir, 'inside.txt'), 'ok\n', 'utf8')
+
+    const { spawner } = createMockPtySpawner()
+    const server = await startServer({ ptySpawner: spawner })
+
+    try {
+      await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          name: 'workspace-escape',
+          mode: 'default',
+          cwd: workspaceDir,
+        }),
+      })
+
+      const response = await fetch(
+        `${server.baseUrl}/api/agents/sessions/workspace-escape/workspace/file?path=../outside.txt`,
+        { headers: AUTH_HEADERS },
+      )
+
+      expect(response.status).toBe(400)
+      expect(await response.json()).toEqual({
+        error: 'Workspace path cannot escape the workspace root',
+      })
+    } finally {
+      await rm(tempWorkspaceRoot, { recursive: true, force: true })
+      await server.close()
+    }
   })
 })

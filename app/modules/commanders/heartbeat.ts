@@ -10,6 +10,7 @@ export interface HeartbeatConfig {
 
 export interface CommanderHeartbeatState extends HeartbeatConfig {
   lastSentAt: string | null
+  intervalOverridden?: boolean
 }
 
 export interface HeartbeatConfigPatch {
@@ -73,6 +74,12 @@ function parseLastSentAt(raw: unknown): string | null {
   return trimmed || null
 }
 
+function parseIntervalOverridden(raw: unknown): boolean | undefined {
+  return raw === true || raw === false
+    ? raw
+    : undefined
+}
+
 export function createDefaultHeartbeatState(): CommanderHeartbeatState {
   return {
     intervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
@@ -94,10 +101,19 @@ export function normalizeHeartbeatState(
     }
   }
 
+  const intervalMs = parseIntervalMs(raw.intervalMs) ?? defaults.intervalMs
+  const intervalOverridden = parseIntervalOverridden(raw.intervalOverridden)
+  // Legacy migration: if an existing session stores a non-default interval and has no explicit
+  // override marker, treat it as user-authored so COMMANDER.md defaults do not clobber it.
+  const inferredIntervalOverridden = intervalOverridden !== undefined
+    ? intervalOverridden
+    : intervalMs !== defaults.intervalMs
+
   return {
-    intervalMs: parseIntervalMs(raw.intervalMs) ?? defaults.intervalMs,
+    intervalMs,
     messageTemplate: parseMessageTemplate(raw.messageTemplate) ?? defaults.messageTemplate,
     lastSentAt: parseLastSentAt(raw.lastSentAt) ?? fallbackLastSentAt,
+    ...(inferredIntervalOverridden ? { intervalOverridden: true } : {}),
   }
 }
 
@@ -105,10 +121,12 @@ export function mergeHeartbeatState(
   current: CommanderHeartbeatState,
   patch: HeartbeatConfigPatch,
 ): CommanderHeartbeatState {
+  const intervalOverridden = current.intervalOverridden === true || patch.intervalMs !== undefined
   return {
     intervalMs: patch.intervalMs ?? current.intervalMs,
     messageTemplate: patch.messageTemplate ?? current.messageTemplate,
     lastSentAt: current.lastSentAt,
+    ...(intervalOverridden ? { intervalOverridden: true } : {}),
   }
 }
 

@@ -17,6 +17,6 @@
     "declarationMap": false,
     "sourceMap": false
   },
-  "include": ["server", "modules/**/*.ts"],
+  "include": ["server"],
   "exclude": ["node_modules", "dist", "modules/**/__tests__/**", "modules/**/*.test.ts", "modules/**/*.tsx", "modules/**/hooks/**"]
 }

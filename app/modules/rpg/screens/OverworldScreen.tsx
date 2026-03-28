@@ -834,6 +834,15 @@ export function OverworldScreen({ agents, worldStatus, worldError }: OverworldSc
         wsStatus={wsStatus}
       />
 
+      <button
+        type="button"
+        className="pointer-events-auto absolute left-3 top-3 z-20 rounded-md border border-white/20 bg-black/45 px-2 py-1 font-mono text-[10px] uppercase tracking-[0.08em] text-white/70 backdrop-blur-[2px] hover:bg-black/60 hover:text-white/90 active:bg-black/75"
+        onClick={() => sceneRef.current?.resetPositions()}
+        title="Reset all agent positions to their default spots"
+      >
+        reset pos
+      </button>
+
       {worldError ? (
         <div className="pointer-events-none absolute inset-x-0 top-12 z-20 px-3 text-center text-[10px] font-mono text-red-200/95">
           {worldError}

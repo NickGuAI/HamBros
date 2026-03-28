@@ -110,6 +110,7 @@ function buildOtelLogsPayload(
   attributes: Record<string, string | number> = {},
   resource: Record<string, string> = {},
 ): object {
+  const timestampNano = String(TEST_NOW.getTime() * 1_000_000)
   return {
     resourceLogs: [
       {
@@ -123,7 +124,7 @@ function buildOtelLogsPayload(
           {
             logRecords: [
               {
-                timeUnixNano: String(Date.now() * 1_000_000),
+                timeUnixNano: timestampNano,
                 body: { stringValue: eventName },
                 attributes: [
                   { key: 'event.name', value: { stringValue: eventName } },
@@ -149,6 +150,7 @@ function buildOtelMetricsPayload(
   metricAttributes: Record<string, string> = {},
   resource: Record<string, string> = {},
 ): object {
+  const timestampNano = String(TEST_NOW.getTime() * 1_000_000)
   return {
     resourceMetrics: [
       {
@@ -167,7 +169,7 @@ function buildOtelMetricsPayload(
                   dataPoints: [
                     {
                       asDouble: value,
-                      timeUnixNano: String(Date.now() * 1_000_000),
+                      timeUnixNano: timestampNano,
                       attributes: Object.entries(metricAttributes).map(([key, val]) => ({
                         key,
                         value: { stringValue: val },

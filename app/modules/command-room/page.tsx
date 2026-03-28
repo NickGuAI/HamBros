@@ -1,10 +1,17 @@
+import { useState } from 'react'
 import { CalendarClock } from 'lucide-react'
+import { useMachines } from '@/hooks/use-agents'
+import { ModalFormContainer } from '../components/ModalFormContainer'
+import { CreateTaskForm } from './components/CreateTaskForm'
 import { RunHistory } from './components/RunHistory'
 import { TaskList } from './components/TaskList'
 import { useCommandRoom } from './hooks/useCommandRoom'
 
 export default function CommandRoomPage() {
   const commandRoom = useCommandRoom()
+  const { data: machines } = useMachines()
+  const machineList = machines ?? []
+  const [showCreateForm, setShowCreateForm] = useState(false)
 
   return (
     <div className="h-full flex flex-col">
@@ -20,6 +27,19 @@ export default function CommandRoomPage() {
         </div>
       </header>
 
+      <ModalFormContainer
+        open={showCreateForm}
+        title="New Cron Task"
+        onClose={() => setShowCreateForm(false)}
+      >
+        <CreateTaskForm
+          onCreate={commandRoom.createTask}
+          onClose={() => setShowCreateForm(false)}
+          machines={machineList}
+          createPending={commandRoom.createTaskPending}
+        />
+      </ModalFormContainer>
+
       <div className="flex-1 min-h-0 p-4 md:p-6 flex flex-col gap-3">
         {(commandRoom.tasksError || commandRoom.runsError || commandRoom.actionError) && (
           <p className="text-sm text-accent-vermillion">
@@ -32,7 +52,7 @@ export default function CommandRoomPage() {
             tasks={commandRoom.tasks}
             selectedTaskId={commandRoom.selectedTaskId}
             onSelect={commandRoom.setSelectedTaskId}
-            onCreate={commandRoom.createTask}
+            onNewTask={() => setShowCreateForm(true)}
             onToggle={async (taskId, enabled) => {
               await commandRoom.updateTask({
                 taskId,
@@ -41,7 +61,6 @@ export default function CommandRoomPage() {
             }}
             onDelete={commandRoom.deleteTask}
             onRunNow={commandRoom.triggerTask}
-            createPending={commandRoom.createTaskPending}
             updateTaskId={commandRoom.updateTaskId}
             deleteTaskId={commandRoom.deleteTaskId}
             triggerTaskId={commandRoom.triggerTaskId}

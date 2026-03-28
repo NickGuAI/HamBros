@@ -89,6 +89,40 @@ describe('QuestStore', () => {
     expect(refreshed?.status).toBe('pending')
   })
 
+  it('sets completedAt on completion and clears it when reopened', async () => {
+    const created = await store.create({
+      commanderId: 'cmdr-4',
+      status: 'pending',
+      source: 'manual',
+      instruction: 'Implement commander board grouping',
+      contract: {
+        cwd: '/tmp/example-repo',
+        permissionMode: 'bypassPermissions',
+        agentType: 'claude',
+        skillsToUse: [],
+      },
+    })
+
+    expect(created.completedAt).toBeUndefined()
+
+    const completed = await store.update('cmdr-4', created.id, { status: 'done' })
+    expect(completed).not.toBeNull()
+    expect(completed?.completedAt).toBeTruthy()
+    const completedAt = completed?.completedAt
+    expect(completedAt).toBeTruthy()
+
+    const reloadedStore = new QuestStore(tmpDir)
+    const persistedCompleted = await reloadedStore.get('cmdr-4', created.id)
+    expect(persistedCompleted?.completedAt).toBe(completedAt)
+
+    const reopened = await store.update('cmdr-4', created.id, { status: 'pending' })
+    expect(reopened).not.toBeNull()
+    expect(reopened?.completedAt).toBeUndefined()
+
+    const persistedReopened = await reloadedStore.get('cmdr-4', created.id)
+    expect(persistedReopened?.completedAt).toBeUndefined()
+  })
+
   it('persists and updates quest artifacts', async () => {
     const created = await store.create({
       commanderId: 'cmdr-3',

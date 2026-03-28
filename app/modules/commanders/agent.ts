@@ -63,13 +63,12 @@ Compact memory after major progress or context pressure:
 
 export interface CommanderAgentPromptResult extends BuiltContext {
   systemPrompt: string
+  memorySection: string
 }
 
 /**
  * Prompt helper for Commander runtime events.
- * Injects assembled memory context into the system prompt at:
- * - task pickup
- * - heartbeat
+ * Injects assembled memory context into the system prompt at task pickup.
  */
 export class CommanderAgent {
   private readonly contextBuilder: MemoryContextBuilder
@@ -84,13 +83,6 @@ export class CommanderAgent {
   }
 
   async buildTaskPickupSystemPrompt(
-    baseSystemPrompt: string,
-    options: ContextBuildOptions,
-  ): Promise<CommanderAgentPromptResult> {
-    return this.buildSystemPrompt(baseSystemPrompt, options)
-  }
-
-  async buildHeartbeatSystemPrompt(
     baseSystemPrompt: string,
     options: ContextBuildOptions,
   ): Promise<CommanderAgentPromptResult> {
@@ -122,6 +114,7 @@ export class CommanderAgent {
     return {
       ...builtContext,
       systemPrompt,
+      memorySection: builtContext.systemPromptSection,
     }
   }
 

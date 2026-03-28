@@ -257,6 +257,7 @@ function ObjectProximityProbe({
 
 export interface RpgSceneHandle {
   emitToolFx: (agentId: string, toolName: string) => void
+  resetPositions: () => void
 }
 
 interface RpgSceneProps {
@@ -300,6 +301,7 @@ export const RpgScene = forwardRef<RpgSceneHandle, RpgSceneProps>(function RpgSc
   const [nearObject, setNearObject] = useState<ObjectInteraction | null>(null)
   const [fps, setFps] = useState(0)
   const [error, setError] = useState<string | null>(null)
+  const [resetCounter, setResetCounter] = useState(0)
 
   const handleAppInit = useCallback((app: PixiApplication) => {
     app.ticker.maxFPS = 60
@@ -488,7 +490,7 @@ export const RpgScene = forwardRef<RpgSceneHandle, RpgSceneProps>(function RpgSc
 
       return next
     })
-  }, [agents, queueSaveAgentPositions])
+  }, [agents, queueSaveAgentPositions, resetCounter])
 
   const handleNearestChange = useCallback((nearestId: string | null) => {
     if (nearestStreamAgentRef.current === nearestId) {
@@ -575,6 +577,23 @@ export const RpgScene = forwardRef<RpgSceneHandle, RpgSceneProps>(function RpgSc
         shape: style.shape,
       })
       fxCleanupRef.current.push(cleanup)
+    },
+    resetPositions() {
+      // Clear persisted positions
+      try {
+        window.localStorage.removeItem(AGENT_POS_KEY)
+      } catch {
+        // ignore storage errors
+      }
+      savedAgentPositionsRef.current = {}
+      pendingSavedAgentPositionsRef.current = null
+      lastSavedAgentPositionsJsonRef.current = '{}'
+      if (saveTimeoutRef.current !== null) {
+        window.clearTimeout(saveTimeoutRef.current)
+        saveTimeoutRef.current = null
+      }
+      // Force agent sync effect to re-run with empty saved positions
+      setResetCounter((c) => c + 1)
     },
   }), [])
 

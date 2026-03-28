@@ -3,7 +3,11 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { JournalWriter } from '../journal.js'
-import { NightlyConsolidation } from '../consolidation.js'
+import {
+  buildJournalNarrative,
+  buildWorkingMemoryNarrative,
+  NightlyConsolidation,
+} from '../consolidation.js'
 import type { JournalEntry } from '../types.js'
 import { WorkingMemory } from '../working-memory.js'
 
@@ -25,6 +29,74 @@ function block(args: {
     `${args.body ?? ''}\n\n---\n\n`
   )
 }
+
+describe('buildJournalNarrative()', () => {
+  it('skips synthetic cron outcomes before limiting the long-term window', () => {
+    const entries: JournalEntry[] = [
+      {
+        timestamp: '2026-03-10T08:00:00.000Z',
+        issueNumber: 667,
+        repo: 'example-user/example-repo',
+        outcome: 'Investigate memory junk',
+        durationMin: 30,
+        salience: 'SPIKE',
+        body: 'Found the polluted checkpoint feedback loop in consolidation.',
+      },
+      ...Array.from({ length: 8 }, (_, idx) => ({
+        timestamp: `2026-03-10T0${9 + idx}:00:00.000Z`,
+        issueNumber: null,
+        repo: null,
+        outcome: idx % 2 === 0 ? 'Daily observations' : 'Work pulse reflection',
+        durationMin: 5,
+        salience: 'ROUTINE' as const,
+        body: 'Synthetic summary that should not enter long-term memory.',
+      })),
+    ]
+
+    const narrative = buildJournalNarrative(entries)
+
+    expect(narrative).toContain('Investigate memory junk')
+    expect(narrative).toContain('Found the polluted checkpoint feedback loop in consolidation.')
+    expect(narrative).not.toContain('Daily observations')
+    expect(narrative).not.toContain('Work pulse reflection')
+  })
+})
+
+describe('buildWorkingMemoryNarrative()', () => {
+  it('filters heartbeat and system-prompt checkpoints before limiting retained notes', () => {
+    const workingMemory = [
+      '# Working Memory',
+      '',
+      'Updated: 2026-03-10T18:00:00.000Z',
+      'Active hypothesis: keep only substantive checkpoints in long-term memory',
+      '',
+      '## Files In Focus',
+      '- _none_',
+      '',
+      '## Checkpoints',
+      '- 2026-03-10T08:00:00.000Z (system) {observation} Investigating why checkpoint summaries are polluting LONG_TERM_MEM.md.',
+      '- 2026-03-10T09:00:00.000Z (heartbeat) {heartbeat, fat} {heartbeat}',
+      '- 2026-03-10T10:00:00.000Z (start) {startup} Commander runtime started. Acknowledge readiness and await instructions.',
+      '- 2026-03-10T11:00:00.000Z (system) {observation} Commander session initialized for cmdr-test.',
+      '- 2026-03-10T12:00:00.000Z (message) {observation} Check your quest board and continue your current task.',
+      '- 2026-03-10T13:00:00.000Z (message) {observation} You are Athena, goddes of wisdom and engineering commander for Gehirn.',
+      '- 2026-03-10T14:00:00.000Z (heartbeat) {heartbeat, thin} {heartbeat}',
+      '- 2026-03-10T15:00:00.000Z (heartbeat) {heartbeat, thin} {heartbeat}',
+      '- 2026-03-10T16:00:00.000Z (heartbeat) {heartbeat, thin} {heartbeat}',
+      '- 2026-03-10T17:00:00.000Z (heartbeat) {heartbeat, thin} {heartbeat}',
+    ].join('\n')
+
+    const narrative = buildWorkingMemoryNarrative(workingMemory)
+
+    expect(narrative).toContain('Active hypothesis was keep only substantive checkpoints in long-term memory.')
+    expect(narrative).toContain('Investigating why checkpoint summaries are polluting LONG_TERM_MEM.md.')
+    expect(narrative).not.toContain('{heartbeat}')
+    expect(narrative).not.toContain('Commander runtime started')
+    expect(narrative).not.toContain('Commander session initialized')
+    expect(narrative).not.toContain('Check your quest board')
+    expect(narrative).not.toContain('You are Athena')
+  })
+})
 
 describe('NightlyConsolidation.run()', () => {
   let tmpDir: string
@@ -182,6 +254,66 @@ describe('NightlyConsolidation.run()', () => {
       parsedDebriefs: expect.any(Array),
     }))
     expect(issueClient.postConsolidationComment).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not write a long-term section when journal and working-memory input are fully filtered', async () => {
+    const now = () => new Date('2026-03-11T02:00:00.000Z')
+    const writer = new JournalWriter('cmdr-filtered', tmpDir)
+    await writer.scaffold()
+    const memoryRoot = join(tmpDir, 'cmdr-filtered', '.memory')
+    const journalDir = join(memoryRoot, 'journal')
+
+    await writeFile(
+      join(journalDir, '2026-03-11.md'),
+      [
+        block({
+          time: '08:00',
+          outcome: 'Daily observations',
+          salience: 'ROUTINE',
+          body: '### Activity Window\n- Completed quests: 2\n- Worker updates: 1',
+        }),
+        block({
+          time: '09:00',
+          outcome: 'Work pulse reflection',
+          salience: 'ROUTINE',
+          body: '### Activity Window\n- Completed quests: 2\n- Worker updates: 1',
+        }),
+      ].join(''),
+      'utf-8',
+    )
+    await writeFile(
+      join(memoryRoot, 'working-memory.md'),
+      [
+        '# Working Memory',
+        '',
+        'Updated: 2026-03-11T01:59:00.000Z',
+        'Active hypothesis: _none_',
+        '',
+        '## Files In Focus',
+        '- _none_',
+        '',
+        '## Checkpoints',
+        '- 2026-03-11T01:00:00.000Z (heartbeat) {heartbeat, fat} {heartbeat}',
+        '- 2026-03-11T01:05:00.000Z (start) {startup} Commander runtime started. Acknowledge readiness and await instructions.',
+        '- 2026-03-11T01:10:00.000Z (system) {observation} Commander session initialized for cmdr-filtered.',
+        '- 2026-03-11T01:15:00.000Z (message) {observation} Check your quest board and continue your current task.',
+        '- 2026-03-11T01:20:00.000Z (message) {observation} You are Athena, goddes of wisdom and engineering commander for Gehirn.',
+        '',
+      ].join('\n'),
+      'utf-8',
+    )
+
+    const consolidation = new NightlyConsolidation({
+      basePath: tmpDir,
+      debriefDir,
+      now,
+    })
+
+    await consolidation.run('cmdr-filtered')
+
+    const longTerm = await readFile(join(memoryRoot, 'LONG_TERM_MEM.md'), 'utf-8')
+    expect(longTerm).toBe('# Commander Long-Term Memory\n\n')
+    expect(await readFile(join(memoryRoot, 'working-memory.md'), 'utf-8')).toBe('')
   })
 
   it('registers with cron at 02:00 and runs configured commanders', async () => {

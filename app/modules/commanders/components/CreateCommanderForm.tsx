@@ -18,9 +18,11 @@ declare module '../hooks/useCommander' {
 export function CreateCommanderForm({
   onAdd,
   isPending,
+  onClose,
 }: {
   onAdd: (input: CommanderCreateInput) => Promise<void>
   isPending: boolean
+  onClose?: () => void
 }) {
   const [host, setHost] = useState('')
   const [cwd, setCwd] = useState('')
@@ -67,6 +69,7 @@ export function CreateCommanderForm({
       setCwd('')
       setPersona('')
       setHeartbeatMinutes(String(DEFAULT_HEARTBEAT_MINUTES))
+      onClose?.()
     } catch (caughtError) {
       if (caughtError instanceof Error && caughtError.message.includes('(409)')) {
         setActionError(`Host "${trimmedHost}" already exists.`)
@@ -87,14 +90,14 @@ export function CreateCommanderForm({
         value={host}
         onChange={(event) => setHost(event.target.value)}
         placeholder="host (e.g. my-agent-1)"
-        className="w-full rounded-lg border border-ink-border px-3 py-2 text-sm bg-washi-white focus:outline-none focus:ring-1 focus:ring-sumi-black/20"
+        className="w-full rounded-lg border border-ink-border px-3 py-2 text-[16px] md:text-sm bg-washi-white focus:outline-none focus:ring-1 focus:ring-sumi-black/20"
       />
 
       <input
         value={cwd}
         onChange={(event) => setCwd(event.target.value)}
         placeholder="working directory (optional, e.g. /home/user/project)"
-        className="w-full rounded-lg border border-ink-border px-3 py-2 text-sm bg-washi-white focus:outline-none focus:ring-1 focus:ring-sumi-black/20"
+        className="w-full rounded-lg border border-ink-border px-3 py-2 text-[16px] md:text-sm bg-washi-white focus:outline-none focus:ring-1 focus:ring-sumi-black/20"
       />
 
       <label className="block">
@@ -103,7 +106,7 @@ export function CreateCommanderForm({
           value={persona}
           onChange={(event) => setPersona(event.target.value)}
           placeholder="Senior engineer who owns infra"
-          className="mt-1 w-full rounded-lg border border-ink-border px-3 py-2 text-sm bg-washi-white focus:outline-none focus:ring-1 focus:ring-sumi-black/20"
+          className="mt-1 w-full rounded-lg border border-ink-border px-3 py-2 text-[16px] md:text-sm bg-washi-white focus:outline-none focus:ring-1 focus:ring-sumi-black/20"
         />
       </label>
 
@@ -117,17 +120,26 @@ export function CreateCommanderForm({
           step={1}
           value={heartbeatMinutes}
           onChange={(event) => setHeartbeatMinutes(event.target.value)}
-          className="mt-1 w-full rounded-lg border border-ink-border px-3 py-2 text-sm bg-washi-white focus:outline-none focus:ring-1 focus:ring-sumi-black/20"
+          className="mt-1 w-full rounded-lg border border-ink-border px-3 py-2 text-[16px] md:text-sm bg-washi-white focus:outline-none focus:ring-1 focus:ring-sumi-black/20"
         />
       </label>
 
       {actionError && <p className="text-sm text-accent-vermillion">{actionError}</p>}
 
-      <div className="flex justify-end">
+      <div className="flex justify-end gap-2">
+        {onClose && (
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-lg border border-ink-border px-3 py-1.5 text-sm min-h-[44px] min-w-[44px] hover:bg-ink-wash transition-colors"
+          >
+            Cancel
+          </button>
+        )}
         <button
           type="submit"
           disabled={isPending}
-          className="rounded-lg border border-ink-border px-3 py-1.5 text-sm hover:bg-ink-wash disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+          className="rounded-lg border border-ink-border px-3 py-1.5 text-sm min-h-[44px] min-w-[44px] hover:bg-ink-wash disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
         >
           {isPending ? 'Creating...' : '+ Create'}
         </button>

@@ -3,7 +3,7 @@ import express from 'express'
 import { createServer, type Server } from 'node:http'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import type { ApiKeyStoreLike } from '../../../server/api-keys/store'
 import { createCommandersRouter, type CommandersRouterOptions } from '../routes'
 import type { CommanderSessionsInterface } from '../../agents/routes'
@@ -13,7 +13,6 @@ import {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   DEFAULT_HEARTBEAT_MESSAGE,
 } from '../heartbeat'
-import { THIN_HEARTBEAT_PROMPT } from '../choose-heartbeat-mode'
 
 const AUTH_HEADERS = {
   'x-hammurabi-api-key': 'test-key',
@@ -177,12 +176,19 @@ function createMockSessionsInterface(opts: {
 async function startServer(
   options: Partial<CommandersRouterOptions> = {},
 ): Promise<RunningServer> {
+  const sessionStorePath = options.sessionStorePath
+    ?? join(await createTempDir('hammurabi-commanders-session-store-'), 'sessions.json')
+  const memoryBasePath = options.memoryBasePath
+    ?? join(dirname(sessionStorePath), 'memory')
+
   const app = express()
   app.use(express.json())
 
   const commanders = createCommandersRouter({
     apiKeyStore: createTestApiKeyStore(),
     ...options,
+    sessionStorePath,
+    memoryBasePath,
   })
   app.use('/api/commanders', commanders.router)
 
@@ -292,7 +298,11 @@ describe('commanders routes', () => {
   it('creates idle commander and rejects duplicate host', async () => {
     const dir = await createTempDir('hammurabi-commanders-create-')
     const storePath = join(dir, 'sessions.json')
-    const server = await startServer({ sessionStorePath: storePath })
+    const memoryBasePath = join(dir, 'memory')
+    const server = await startServer({
+      sessionStorePath: storePath,
+      memoryBasePath,
+    })
 
     try {
       const first = await fetch(`${server.baseUrl}/api/commanders`, {
@@ -356,6 +366,14 @@ describe('commanders routes', () => {
 
       const names = JSON.parse(await readFile(join(dir, 'names.json'), 'utf8')) as Record<string, string>
       expect(names[created.id]).toBe('worker-1')
+
+      const template = await readFile(join(memoryBasePath, 'COMMANDER.template.md'), 'utf8')
+      expect(template).toContain('[COMMANDER_ID]')
+      expect(template).toContain('## Memory')
+
+      const workflow = await readFile(join(memoryBasePath, created.id, 'COMMANDER.md'), 'utf8')
+      expect(workflow).toContain(`hammurabi memory find --commander ${created.id}`)
+      expect(workflow).toContain('.memory/MEMORY.md')
     } finally {
       await server.close()
     }
@@ -891,7 +909,7 @@ describe('commanders routes', () => {
     }
   })
 
-  it('reloads authoritative COMMANDER.md before fat heartbeats', async () => {
+  it('reloads authoritative COMMANDER.md body for fat heartbeats instead of sending injected memory context', async () => {
     const dir = await createTempDir('hammurabi-commanders-workflow-heartbeat-reload-')
     const storePath = join(dir, 'sessions.json')
     const memoryBasePath = join(dir, 'memory')
@@ -917,10 +935,22 @@ describe('commanders routes', () => {
       })
       const commander = (await createResponse.json()) as { id: string }
       const commanderRoot = join(memoryBasePath, commander.id)
+      const memoryRoot = join(commanderRoot, '.memory')
       await mkdir(commanderRoot, { recursive: true })
+      await mkdir(memoryRoot, { recursive: true })
       await writeFile(
         join(commanderRoot, 'COMMANDER.md'),
         'COMMANDER PROMPT V1',
+        'utf8',
+      )
+      await writeFile(
+        join(memoryRoot, 'MEMORY.md'),
+        '# Commander Memory\n\n- Initial memory fact',
+        'utf8',
+      )
+      await writeFile(
+        join(memoryRoot, 'identity.md'),
+        '# Identity Section\n\nYou are Athena, engineering commander.',
         'utf8',
       )
 
@@ -936,6 +966,11 @@ describe('commanders routes', () => {
       await writeFile(
         join(commanderRoot, 'COMMANDER.md'),
         'COMMANDER PROMPT V2',
+        'utf8',
+      )
+      await writeFile(
+        join(memoryRoot, 'MEMORY.md'),
+        '# Commander Memory\n\n- Updated memory fact',
         'utf8',
       )
 
@@ -956,6 +991,12 @@ describe('commanders routes', () => {
       })
       const lastSend = mock.sendCalls[mock.sendCalls.length - 1]
       expect(lastSend?.text).toContain('COMMANDER PROMPT V2')
+      expect(lastSend?.text).toContain('Check your task list.')
+      expect(lastSend?.text).not.toContain('COMMANDER PROMPT V1')
+      expect(lastSend?.text).not.toContain('Updated memory fact')
+      expect(lastSend?.text).not.toContain('You are Athena, engineering commander.')
+      expect(lastSend?.text).not.toContain('# Hammurabi Quest Board')
+      expect(lastSend?.text).not.toContain('# Commander Memory Workflow')
     } finally {
       await server.close()
     }
@@ -1004,10 +1045,17 @@ describe('commanders routes', () => {
       'utf8',
     )
     const commanderRoot = join(memoryBasePath, commanderId)
+    const memoryRoot = join(commanderRoot, '.memory')
     await mkdir(commanderRoot, { recursive: true })
+    await mkdir(memoryRoot, { recursive: true })
     await writeFile(
       join(commanderRoot, 'COMMANDER.md'),
       'RESTART REHYDRATED PROMPT',
+      'utf8',
+    )
+    await writeFile(
+      join(memoryRoot, 'MEMORY.md'),
+      '# Commander Memory\n\n- Recovered memory fact',
       'utf8',
     )
 
@@ -1041,7 +1089,8 @@ describe('commanders routes', () => {
         expect(
           mock.sendCalls.some((call) =>
             call.text.includes('RESTART REHYDRATED PROMPT') &&
-            call.text.includes('## Commander Memory')),
+            call.text.includes('Check your task list.') &&
+            !call.text.includes('Recovered memory fact')),
         ).toBe(true)
       })
       expect(mock.createCalls).toHaveLength(0)
@@ -1124,8 +1173,13 @@ describe('commanders routes', () => {
       }, { timeout: 3000 })
 
       await vi.waitFor(() => {
-        expect(mock.sendCalls.some((call) => call.text === THIN_HEARTBEAT_PROMPT)).toBe(true)
-      })
+        expect(
+          mock.sendCalls.some((call) =>
+            call.text.includes('Check your task list.') &&
+            call.text.includes('If current task is complete, mark it done and pick up the next one.'),
+          ),
+        ).toBe(true)
+      }, { timeout: 3000 })
 
       await vi.waitFor(async () => {
         const persisted = JSON.parse(await readFile(storePath, 'utf8')) as {
@@ -1133,7 +1187,7 @@ describe('commanders routes', () => {
         }
         const updated = persisted.sessions?.find((session) => session.id === commanderId)
         expect(updated?.heartbeatTickCount).toBe(2)
-      })
+      }, { timeout: 3000 })
     } finally {
       await server.close()
     }
@@ -2138,7 +2192,9 @@ describe('commanders routes', () => {
   })
 
   describe('memory CLI endpoints', () => {
-    async function createServerWithCommander(): Promise<{
+    async function createServerWithCommander(
+      options: Partial<CommandersRouterOptions> = {},
+    ): Promise<{
       server: RunningServer
       commanderId: string
       memoryBasePath: string
@@ -2170,6 +2226,7 @@ describe('commanders routes', () => {
         sessionStorePath: storePath,
         memoryBasePath,
         agentsSessionStorePath: join(dir, 'agents-sessions.json'),
+        ...options,
       })
       return { server, commanderId, memoryBasePath }
     }
@@ -2254,6 +2311,59 @@ describe('commanders routes', () => {
       }
     })
 
+    it('POST /:id/memory/semantic-search returns semantic results', async () => {
+      const semanticSearchRunner = vi.fn(async () => ([
+        {
+          score: 0.872,
+          text: 'Agent memory architecture uses semantic search over the knowledge cache.',
+          source_file: '/home/ec2-user/.ginsights/domains/agentic-ai/knowledge/agent-fleet-operations.md',
+          section_header: 'Agent Memory Architecture',
+          chunk_index: 0,
+        },
+      ]))
+      const { server, commanderId } = await createServerWithCommander({ semanticSearchRunner })
+      try {
+        const response = await fetch(
+          `${server.baseUrl}/api/commanders/${commanderId}/memory/semantic-search`,
+          {
+            method: 'POST',
+            headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+            body: JSON.stringify({ query: 'agent memory', topK: 3 }),
+          },
+        )
+        expect(response.status).toBe(200)
+        const body = await response.json()
+        expect(body).toEqual([
+          expect.objectContaining({
+            section_header: 'Agent Memory Architecture',
+            source_file: '/home/ec2-user/.ginsights/domains/agentic-ai/knowledge/agent-fleet-operations.md',
+          }),
+        ])
+        expect(semanticSearchRunner).toHaveBeenCalledWith('agent memory', 3)
+      } finally {
+        await server.close()
+      }
+    })
+
+    it('POST /:id/memory/semantic-search returns 400 when query is missing', async () => {
+      const { server, commanderId } = await createServerWithCommander()
+      try {
+        const response = await fetch(
+          `${server.baseUrl}/api/commanders/${commanderId}/memory/semantic-search`,
+          {
+            method: 'POST',
+            headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+            body: JSON.stringify({}),
+          },
+        )
+        expect(response.status).toBe(400)
+        const body = await response.json()
+        expect(body.error).toContain('query is required')
+      } finally {
+        await server.close()
+      }
+    })
+
     it('POST /:id/memory/facts saves facts and returns result', async () => {
       const { server, commanderId } = await createServerWithCommander()
       try {
@@ -2307,6 +2417,45 @@ describe('commanders routes', () => {
           },
         )
         expect(response.status).toBe(404)
+      } finally {
+        await server.close()
+      }
+    })
+
+    it('exposes read-only workspace tree and file preview routes', async () => {
+      const workspaceDir = await createTempDir('hammurabi-commander-workspace-')
+      await mkdir(join(workspaceDir, 'quests'), { recursive: true })
+      await writeFile(join(workspaceDir, 'brief.md'), 'Commander workspace\n', 'utf8')
+
+      const server = await startServer()
+      try {
+        const createResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+          method: 'POST',
+          headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+          body: JSON.stringify({
+            host: 'local-hq',
+            cwd: workspaceDir,
+          }),
+        })
+        expect(createResponse.status).toBe(201)
+        const created = await createResponse.json()
+
+        const treeResponse = await fetch(
+          `${server.baseUrl}/api/commanders/${created.id}/workspace/tree`,
+          { headers: AUTH_HEADERS },
+        )
+        expect(treeResponse.status).toBe(200)
+        const treeBody = await treeResponse.json()
+        expect(treeBody.nodes.map((node: { name: string }) => node.name)).toEqual(['quests', 'brief.md'])
+
+        const fileResponse = await fetch(
+          `${server.baseUrl}/api/commanders/${created.id}/workspace/file?path=brief.md`,
+          { headers: AUTH_HEADERS },
+        )
+        expect(fileResponse.status).toBe(200)
+        const fileBody = await fileResponse.json()
+        expect(fileBody.kind).toBe('text')
+        expect(fileBody.content).toContain('Commander workspace')
       } finally {
         await server.close()
       }

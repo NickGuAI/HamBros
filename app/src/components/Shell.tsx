@@ -10,6 +10,8 @@ import {
   Warehouse,
   Crown,
   Swords,
+  CalendarClock,
+  FolderOpen,
   PanelLeftClose,
   PanelLeft,
 } from 'lucide-react'
@@ -24,6 +26,8 @@ const iconMap: Record<string, React.ComponentType<LucideProps>> = {
   Warehouse,
   Crown,
   Swords,
+  CalendarClock,
+  FolderOpen,
   Settings,
 }
 

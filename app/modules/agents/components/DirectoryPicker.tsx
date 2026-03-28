@@ -17,12 +17,10 @@ export function DirectoryPicker({
   const { data } = useDirectories(browsePath, isOpen, host)
 
   // Reset browse state when host changes
-  const [prevHost, setPrevHost] = useState(host)
-  if (host !== prevHost) {
-    setPrevHost(host)
+  useEffect(() => {
     setBrowsePath(undefined)
     setHomeDir(undefined)
-  }
+  }, [host])
 
   // Capture the home directory from the initial (default) response
   useEffect(() => {

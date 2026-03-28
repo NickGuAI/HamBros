@@ -38,6 +38,7 @@ export interface CommanderSession {
   state: CommanderState
   created: string
   agentType?: CommanderAgentType
+  cwd?: string
   heartbeat: CommanderHeartbeatState
   lastHeartbeat: string | null
   taskSource: CommanderTaskSource | null
@@ -567,25 +568,27 @@ export function useCommander() {
     }
 
     const connect = async () => {
+      clearReconnectTimer()
       setTerminalConnectionStatus('connecting')
       const token = await getAccessToken()
       if (disposed) {
         return
       }
 
-      socket = new WebSocket(commanderWsUrl(selectedCommanderId, token))
-      socket.binaryType = 'arraybuffer'
+      const nextSocket = new WebSocket(commanderWsUrl(selectedCommanderId, token))
+      nextSocket.binaryType = 'arraybuffer'
+      socket = nextSocket
 
-      socket.onopen = () => {
-        if (disposed) {
+      nextSocket.onopen = () => {
+        if (disposed || socket !== nextSocket) {
           return
         }
         reconnectBackoff.reset()
         setTerminalConnectionStatus('connected')
       }
 
-      socket.onmessage = (event) => {
-        if (disposed) {
+      nextSocket.onmessage = (event) => {
+        if (disposed || socket !== nextSocket) {
           return
         }
         const lines = parseIncomingMessage(event.data)
@@ -594,21 +597,31 @@ export function useCommander() {
         }
       }
 
-      socket.onerror = () => {
-        if (!disposed) {
-          setTerminalConnectionStatus('disconnected')
+      nextSocket.onerror = () => {
+        if (disposed || socket !== nextSocket) {
+          return
+        }
+
+        if (
+          nextSocket.readyState === WebSocket.CONNECTING ||
+          nextSocket.readyState === WebSocket.OPEN
+        ) {
+          nextSocket.close()
         }
       }
 
-      socket.onclose = (event) => {
-        if (disposed) {
+      nextSocket.onclose = (event) => {
+        if (disposed || socket !== nextSocket) {
+          return
+        }
+
+        socket = null
+        if (shouldReconnectWebSocketClose(event)) {
+          scheduleReconnect()
           return
         }
 
         setTerminalConnectionStatus('disconnected')
-        if (shouldReconnectWebSocketClose(event)) {
-          scheduleReconnect()
-        }
       }
     }
 
@@ -618,7 +631,15 @@ export function useCommander() {
       disposed = true
       clearReconnectTimer()
       setTerminalConnectionStatus('disconnected')
-      socket?.close()
+      const activeSocket = socket
+      socket = null
+      if (
+        activeSocket &&
+        (activeSocket.readyState === WebSocket.CONNECTING ||
+          activeSocket.readyState === WebSocket.OPEN)
+      ) {
+        activeSocket.close()
+      }
     }
   }, [selectedCommanderId, selectedCommander?.state])
 

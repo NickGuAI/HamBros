@@ -1,0 +1,17 @@
+[project]
+name = "hammurabi-tbench"
+version = "0.1.0"
+description = "Hammurabi agent adapter for Terminal-Bench"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.40.0",
+    "requests>=2.31.0",
+    "terminal-bench>=0.2.18",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]

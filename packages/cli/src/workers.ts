@@ -11,6 +11,7 @@ interface DispatchOptions {
   branch?: string
   machine?: string
   agentType?: 'claude' | 'codex'
+  workerType?: 'factory' | 'agent'
 }
 
 interface SendOptions {
@@ -46,7 +47,7 @@ function printUsage(stdout: Writable): void {
   stdout.write('Usage:\n')
   stdout.write('  hammurabi workers list\n')
   stdout.write(
-    '  hammurabi workers dispatch --session <name> [--issue <url>] [--task <text>] [--branch <name>] [--machine <id>] [--agent claude|codex]\n',
+    '  hammurabi workers dispatch --session <name> [--type factory|agent] [--issue <url>] [--task <text>] [--branch <name>] [--machine <id>] [--agent claude|codex]\n',
   )
   stdout.write('  hammurabi workers kill <name>\n')
   stdout.write('  hammurabi workers status <session-name>\n')
@@ -166,6 +167,7 @@ function parseDispatchOptions(args: readonly string[]): DispatchOptions | null {
   let branch: string | undefined
   let machine: string | undefined
   let agentType: 'claude' | 'codex' | undefined
+  let workerType: 'factory' | 'agent' | undefined
 
   for (let index = 0; index < args.length; index += 1) {
     const flag = args[index]
@@ -177,7 +179,8 @@ function parseDispatchOptions(args: readonly string[]): DispatchOptions | null {
       flag !== '--task' &&
       flag !== '--branch' &&
       flag !== '--machine' &&
-      flag !== '--agent'
+      flag !== '--agent' &&
+      flag !== '--type'
     ) {
       return null
     }
@@ -200,12 +203,21 @@ function parseDispatchOptions(args: readonly string[]): DispatchOptions | null {
         return null
       }
       agentType = value
+    } else if (flag === '--type') {
+      if (value !== 'factory' && value !== 'agent') {
+        return null
+      }
+      workerType = value
     }
 
     index += 1
   }
 
-  if (!parentSession || (!issueUrl && !branch)) {
+  if (!parentSession) {
+    return null
+  }
+
+  if ((workerType ?? 'factory') !== 'agent' && !issueUrl && !branch) {
     return null
   }
 
@@ -216,6 +228,7 @@ function parseDispatchOptions(args: readonly string[]): DispatchOptions | null {
     branch,
     machine,
     agentType,
+    workerType,
   }
 }
 
@@ -285,6 +298,16 @@ function parseWorkerStatus(payload: unknown): WorkerSessionStatus | null {
   }
 }
 
+function resolveWorkerSessionType(sessionName: string): 'factory' | 'agent' | null {
+  if (sessionName.startsWith('factory-')) {
+    return 'factory'
+  }
+  if (sessionName.startsWith('agent-')) {
+    return 'agent'
+  }
+  return null
+}
+
 async function runList(
   config: HammurabiConfig,
   fetchImpl: typeof fetch,
@@ -307,20 +330,23 @@ async function runList(
     return 1
   }
 
-  const workers = parseSessions(result.data).filter(
-    (session) => session.sessionType === 'stream' && session.name.startsWith('factory-'),
-  )
+  const workers = parseSessions(result.data).filter((session) => (
+    session.sessionType === 'stream' && resolveWorkerSessionType(session.name) !== null
+  ))
 
   if (workers.length === 0) {
-    stdout.write('No active factory workers.\n')
+    stdout.write('No active workers.\n')
     return 0
   }
 
-  stdout.write('Active factory workers:\n')
+  const hasAgentWorkers = workers.some((worker) => resolveWorkerSessionType(worker.name) === 'agent')
+  stdout.write(hasAgentWorkers ? 'Active workers:\n' : 'Active factory workers:\n')
   for (const worker of workers) {
+    const type = resolveWorkerSessionType(worker.name) ?? 'factory'
     const host = worker.host ? ` host=${worker.host}` : ''
     const cwd = worker.cwd ? ` cwd=${worker.cwd}` : ''
-    stdout.write(`- ${worker.name}${host}${cwd}\n`)
+    const typeLabel = hasAgentWorkers ? ` type=${type}` : ''
+    stdout.write(`- ${worker.name}${host}${cwd}${typeLabel}\n`)
   }
 
   return 0
@@ -352,6 +378,9 @@ async function runDispatch(
   if (options.agentType) {
     body.agentType = options.agentType
   }
+  if (options.workerType) {
+    body.workerType = options.workerType
+  }
 
   const result = await fetchJson(fetchImpl, url, {
     method: 'POST',
@@ -371,12 +400,24 @@ async function runDispatch(
 
   const payload = isObject(result.data) ? result.data : {}
   const name = typeof payload.name === 'string' ? payload.name : '(unknown)'
-  const branch = typeof payload.branch === 'string' ? payload.branch : '(unknown)'
-  const worktree = typeof payload.worktree === 'string' ? payload.worktree : '(unknown)'
+  const workerType = typeof payload.workerType === 'string' ? payload.workerType : undefined
+  const branch = typeof payload.branch === 'string' ? payload.branch : undefined
+  const worktree = typeof payload.worktree === 'string' ? payload.worktree : undefined
+  const cwd = typeof payload.cwd === 'string' ? payload.cwd : undefined
 
   stdout.write(`Worker dispatched: ${name}\n`)
-  stdout.write(`Branch: ${branch}\n`)
-  stdout.write(`Worktree: ${worktree}\n`)
+  if (workerType) {
+    stdout.write(`Type: ${workerType}\n`)
+  }
+  if (branch) {
+    stdout.write(`Branch: ${branch}\n`)
+  }
+  if (worktree) {
+    stdout.write(`Worktree: ${worktree}\n`)
+  }
+  if (cwd) {
+    stdout.write(`Cwd: ${cwd}\n`)
+  }
   return 0
 }
 

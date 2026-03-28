@@ -70,9 +70,11 @@ describe('runCommanderCli', () => {
     expect(writtenContent).toContain('maxTurns')
     expect(writtenContent).toContain('contextMode')
     expect(writtenContent).toContain('System prompt')
+    expect(writtenContent).toContain('## Memory')
+    expect(writtenContent).toContain('/tmp/test-project')
   })
 
-  it('generated file has all 4 front matter keys commented out', async () => {
+  it('generated file enables the default heartbeat source-of-truth fields', async () => {
     let writtenContent = ''
 
     await runCommanderCli(['init'], {
@@ -85,22 +87,14 @@ describe('runCommanderCli', () => {
       stderr: { write: () => true },
     })
 
-    // All 4 keys must be commented out (lines start with #)
     const lines = writtenContent.split('\n')
-    const keyLines = lines.filter(
-      (l) =>
-        l.includes('heartbeat.interval') ||
-        l.includes('heartbeat.message') ||
-        l.includes('maxTurns') ||
-        l.includes('contextMode'),
-    )
-    expect(keyLines.length).toBe(4)
-    for (const line of keyLines) {
-      expect(line.trim()).toMatch(/^#/)
-    }
+    expect(lines).toContain('heartbeat.interval: 900000')
+    expect(lines).toContain('heartbeat.message: "Check your quest board. What is your current task? Post a progress note, then continue or pick up the next quest."')
+    expect(lines).toContain('contextMode: fat')
+    expect(lines).toContain('# maxTurns: 3')
   })
 
-  it('generated file body is empty so systemPromptTemplate is not activated', async () => {
+  it('generated file body teaches the commander to read memory on demand', async () => {
     let writtenContent = ''
 
     await runCommanderCli(['init'], {
@@ -113,10 +107,12 @@ describe('runCommanderCli', () => {
       stderr: { write: () => true },
     })
 
-    // Body is everything after the closing ---
     const closingDelimiter = writtenContent.indexOf('\n---\n')
     const body = closingDelimiter >= 0 ? writtenContent.slice(closingDelimiter + 5).trim() : writtenContent
-    expect(body).toBe('')
+    expect(body).toContain('## Quest Board')
+    expect(body).toContain('## Memory')
+    expect(body).toContain('.memory/MEMORY.md')
+    expect(body).toContain('hammurabi memory find --commander [COMMANDER_ID] "<query>"')
   })
 
   it('errors and returns 1 when COMMANDER.md already exists', async () => {

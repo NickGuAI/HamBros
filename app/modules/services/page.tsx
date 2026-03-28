@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { Fragment, useEffect, useRef, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
@@ -7,18 +7,107 @@ import { SearchAddon } from '@xterm/addon-search'
 import { Unicode11Addon } from '@xterm/addon-unicode11'
 import { SerializeAddon } from '@xterm/addon-serialize'
 import '@xterm/xterm/css/xterm.css'
-import { Server, Activity, Circle, X, ScrollText, RotateCw, Cpu, MemoryStick, AlertTriangle } from 'lucide-react'
-import { useServices, useRestartService, useSystemMetrics } from '@/hooks/use-services'
+import {
+  Server,
+  Activity,
+  Circle,
+  X,
+  ScrollText,
+  RotateCw,
+  Cpu,
+  MemoryStick,
+  AlertTriangle,
+  ChevronDown,
+  ChevronRight,
+  CloudUpload,
+  ExternalLink,
+  GitBranch,
+} from 'lucide-react'
+import {
+  useServices,
+  useRestartService,
+  useSystemMetrics,
+  useVercelProjects,
+  useVercelDeployments,
+  useTriggerVercelDeploy,
+} from '@/hooks/use-services'
 import { cn, timeAgo } from '@/lib/utils'
 import { getAccessToken } from '@/lib/api'
 import { getWsBase } from '@/lib/api-base'
 import { useIsMobile } from '@/hooks/use-is-mobile'
-import type { ServiceInfo, ServiceStatus } from '@/types'
+import type {
+  ServiceInfo,
+  ServiceStatus,
+  VercelDeploymentInfo,
+  VercelDeploymentStatus,
+  VercelProjectInfo,
+} from '@/types'
 
 const STATUS_CLASSES: Record<ServiceStatus, string> = {
   running: 'badge-active',
   degraded: 'badge-idle',
   stopped: 'badge-stale',
+}
+
+type ServicesTab = 'local' | 'vercel'
+
+const VERCEL_STATUS_CLASSES: Record<VercelDeploymentStatus, string> = {
+  READY: 'badge-active',
+  BUILDING: 'badge-idle',
+  INITIALIZING: 'badge-idle',
+  ERROR: 'border border-accent-vermillion/20 bg-accent-vermillion/10 text-accent-vermillion',
+  QUEUED: 'badge-stale',
+  CANCELED: 'badge-stale',
+  UNKNOWN: 'badge-stale',
+}
+
+function formatVercelStatus(status: VercelDeploymentStatus): string {
+  switch (status) {
+    case 'READY':
+      return 'Ready'
+    case 'BUILDING':
+    case 'INITIALIZING':
+      return 'Building'
+    case 'ERROR':
+      return 'Error'
+    case 'QUEUED':
+      return 'Queued'
+    case 'CANCELED':
+      return 'Canceled'
+    default:
+      return 'Unknown'
+  }
+}
+
+function parseApiErrorMessage(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return 'Unexpected error'
+  }
+
+  const match = error.message.match(/^Request failed \(\d+\): (.+)$/s)
+  const raw = match?.[1] ?? error.message
+
+  try {
+    const parsed = JSON.parse(raw) as { error?: string; message?: string }
+    return parsed.error ?? parsed.message ?? error.message
+  } catch {
+    return raw
+  }
+}
+
+function formatCommitSha(commitSha: string | null): string {
+  if (!commitSha) {
+    return '—'
+  }
+  return commitSha.slice(0, 7)
+}
+
+function VercelStatusBadge({ status }: { status: VercelDeploymentStatus }) {
+  return (
+    <span className={cn('badge-sumi', VERCEL_STATUS_CLASSES[status])}>
+      {formatVercelStatus(status)}
+    </span>
+  )
 }
 
 function ServiceCard({
@@ -270,7 +359,306 @@ function formatBytes(bytes: number): string {
   return `${mb.toFixed(0)} MB`
 }
 
-export default function ServicesPage() {
+function VercelDeploymentHistory({
+  project,
+  autoRefresh,
+}: {
+  project: VercelProjectInfo
+  autoRefresh: boolean
+}) {
+  const { data, isLoading, error, isFetching } = useVercelDeployments(project.id, {
+    enabled: true,
+    autoRefresh,
+  })
+
+  return (
+    <div className="rounded-xl bg-washi-aged/60 p-4">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div>
+          <p className="text-xs uppercase tracking-[0.18em] text-sumi-mist">
+            Deployment History
+          </p>
+          <p className="mt-1 text-sm text-sumi-diluted">
+            Last 10 deployments for {project.name}
+          </p>
+        </div>
+        <span className={cn('badge-sumi', isFetching ? 'badge-idle' : 'badge-stale')}>
+          {isFetching ? 'Refreshing' : autoRefresh ? 'Every 30s' : 'Manual'}
+        </span>
+      </div>
+
+      {isLoading ? (
+        <div className="flex justify-center py-8">
+          <div className="h-3 w-3 animate-breathe rounded-full bg-sumi-mist" />
+        </div>
+      ) : error ? (
+        <div className="rounded-lg bg-accent-vermillion/10 px-3 py-2 text-sm text-accent-vermillion">
+          {parseApiErrorMessage(error)}
+        </div>
+      ) : !data || data.length === 0 ? (
+        <div className="rounded-lg border border-ink-border/60 px-4 py-6 text-center text-sm text-sumi-diluted">
+          No deployments found for this project.
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {data.map((deployment: VercelDeploymentInfo) => (
+            <div
+              key={deployment.id}
+              className="grid gap-3 rounded-lg border border-ink-border/60 bg-white/50 p-3 md:grid-cols-[minmax(0,1.6fr)_minmax(0,0.9fr)_auto_auto]"
+            >
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <VercelStatusBadge status={deployment.status} />
+                  <span className="font-mono text-sm text-sumi-black">{deployment.name}</span>
+                </div>
+                <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-sumi-diluted">
+                  <span className="inline-flex items-center gap-1.5">
+                    <GitBranch size={12} />
+                    {deployment.branch ?? project.productionBranch ?? '—'}
+                  </span>
+                  <span className="font-mono text-sumi-gray">{formatCommitSha(deployment.commitSha)}</span>
+                  <span>{deployment.createdAt ? timeAgo(deployment.createdAt) : '—'}</span>
+                </div>
+              </div>
+
+              <div className="text-xs text-sumi-diluted md:text-right">
+                {deployment.url ? (
+                  <a
+                    href={deployment.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1 text-sumi-black hover:text-accent-ink"
+                  >
+                    Open
+                    <ExternalLink size={12} />
+                  </a>
+                ) : (
+                  '—'
+                )}
+              </div>
+
+              <div className="font-mono text-xs text-sumi-diluted md:text-right">
+                {deployment.id}
+              </div>
+
+              <div className="font-mono text-xs text-sumi-diluted md:text-right">
+                {deployment.commitSha ?? '—'}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function VercelPanel() {
+  const [autoRefresh, setAutoRefresh] = useState(true)
+  const [expandedProjectId, setExpandedProjectId] = useState<string | null>(null)
+  const projectsQuery = useVercelProjects({ enabled: true, autoRefresh })
+  const deployMutation = useTriggerVercelDeploy()
+  const projects = projectsQuery.data ?? []
+  const activeBuilds = projects.filter((project) => {
+    const status = project.latestDeployment?.status
+    return status === 'BUILDING' || status === 'INITIALIZING' || status === 'QUEUED'
+  }).length
+  const projectsError = projectsQuery.error ? parseApiErrorMessage(projectsQuery.error) : null
+  const expandedProject = projects.find((project) => project.id === expandedProjectId) ?? null
+
+  function handleDeploy(project: VercelProjectInfo) {
+    if (deployMutation.isPending) {
+      return
+    }
+
+    const confirmed = window.confirm(
+      `Trigger a new production deployment for "${project.name}"?`,
+    )
+    if (!confirmed) {
+      return
+    }
+
+    deployMutation.mutate(project.id)
+  }
+
+  return (
+    <div className="flex h-full flex-col overflow-y-auto pb-20 md:pb-0">
+      <div className="px-4 py-6 md:px-6 md:py-8">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h2 className="font-display text-display text-sumi-black">Services</h2>
+            <p className="mt-2 text-sm leading-relaxed text-sumi-diluted">
+              Team Vercel projects with live deployment status and one-click production deploys.
+            </p>
+          </div>
+          <div className="flex flex-col gap-2">
+            <div className="card-sumi min-w-44 px-4 py-3">
+              <div className="flex items-center gap-2 text-whisper text-sumi-diluted">
+                <Activity size={12} />
+                <span>Auto-refresh</span>
+              </div>
+              <div className="mt-2 flex items-center justify-between gap-3">
+                <span className="text-sm text-sumi-black">
+                  {autoRefresh ? 'Every 30s' : 'Manual only'}
+                </span>
+                <button
+                  onClick={() => setAutoRefresh((value) => !value)}
+                  className={cn(
+                    'rounded-full px-2.5 py-1 text-xs transition-colors',
+                    autoRefresh
+                      ? 'bg-accent-moss/15 text-accent-moss'
+                      : 'bg-ink-wash text-sumi-gray',
+                  )}
+                >
+                  {autoRefresh ? 'On' : 'Off'}
+                </button>
+              </div>
+              <p className="mt-1 text-whisper text-sumi-mist">
+                {activeBuilds}/{projects.length} building or queued
+              </p>
+            </div>
+
+            <button
+              onClick={() => {
+                void projectsQuery.refetch()
+              }}
+              className="card-sumi inline-flex items-center justify-center gap-2 px-4 py-3 text-sm text-sumi-black transition-colors hover:bg-ink-wash"
+            >
+              <RotateCw size={14} className={projectsQuery.isFetching ? 'animate-spin' : ''} />
+              Refresh
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {deployMutation.error && (
+        <div className="mx-4 mb-3 flex items-start gap-2 rounded-lg bg-accent-vermillion/10 px-3 py-2 text-sm text-accent-vermillion md:mx-6">
+          <AlertTriangle size={15} className="mt-0.5 shrink-0" />
+          <span>{parseApiErrorMessage(deployMutation.error)}</span>
+        </div>
+      )}
+
+      <div className="px-4 pb-4 md:px-6">
+        {projectsQuery.isLoading ? (
+          <div className="flex justify-center py-16">
+            <div className="h-3 w-3 animate-breathe rounded-full bg-sumi-mist" />
+          </div>
+        ) : projectsError ? (
+          <div className="card-sumi p-5 text-sm text-sumi-diluted">
+            <div className="flex items-start gap-2 text-accent-vermillion">
+              <AlertTriangle size={16} className="mt-0.5 shrink-0" />
+              <span>{projectsError}</span>
+            </div>
+          </div>
+        ) : projects.length === 0 ? (
+          <div className="card-sumi p-8 text-center text-sm text-sumi-diluted">
+            No Vercel projects were returned for this team.
+          </div>
+        ) : (
+          <div className="card-sumi overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="min-w-full text-left text-sm">
+                <thead className="bg-washi-aged text-xs uppercase tracking-[0.18em] text-sumi-mist">
+                  <tr>
+                    <th className="w-12 px-4 py-3"> </th>
+                    <th className="px-4 py-3">Project Name</th>
+                    <th className="px-4 py-3">Framework</th>
+                    <th className="px-4 py-3">Status</th>
+                    <th className="px-4 py-3">Branch</th>
+                    <th className="px-4 py-3">Time</th>
+                    <th className="px-4 py-3 text-right">Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {projects.map((project) => {
+                    const latest = project.latestDeployment
+                    const expanded = expandedProjectId === project.id
+                    const deployDisabled = deployMutation.isPending || !latest
+
+                    return (
+                      <Fragment key={project.id}>
+                        <tr key={project.id} className="border-t border-ink-border/60">
+                          <td className="px-4 py-3 align-top">
+                            <button
+                              onClick={() =>
+                                setExpandedProjectId((current) =>
+                                  current === project.id ? null : project.id,
+                                )
+                              }
+                              className="rounded-lg p-1 text-sumi-diluted transition-colors hover:bg-ink-wash hover:text-sumi-black"
+                              aria-label={expanded ? 'Collapse deployment history' : 'Expand deployment history'}
+                            >
+                              {expanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                            </button>
+                          </td>
+                          <td className="px-4 py-3 align-top">
+                            <div className="min-w-0">
+                              <div className="font-mono text-sm text-sumi-black">{project.name}</div>
+                              {latest?.url ? (
+                                <a
+                                  href={latest.url}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="mt-1 inline-flex items-center gap-1 text-xs text-sumi-diluted hover:text-accent-ink"
+                                >
+                                  {latest.url.replace(/^https?:\/\//, '')}
+                                  <ExternalLink size={12} />
+                                </a>
+                              ) : (
+                                <p className="mt-1 text-xs text-sumi-mist">No deployment URL yet</p>
+                              )}
+                            </div>
+                          </td>
+                          <td className="px-4 py-3 align-top text-sumi-gray">
+                            {project.framework ?? '—'}
+                          </td>
+                          <td className="px-4 py-3 align-top">
+                            <VercelStatusBadge status={latest?.status ?? 'UNKNOWN'} />
+                          </td>
+                          <td className="px-4 py-3 align-top text-sumi-gray">
+                            {latest?.branch ?? project.productionBranch ?? '—'}
+                          </td>
+                          <td className="px-4 py-3 align-top text-sumi-gray">
+                            {latest?.createdAt ? timeAgo(latest.createdAt) : '—'}
+                          </td>
+                          <td className="px-4 py-3 align-top text-right">
+                            <button
+                              onClick={() => handleDeploy(project)}
+                              disabled={deployDisabled}
+                              className="inline-flex items-center gap-1.5 rounded-lg bg-sumi-black px-3 py-2 text-xs text-white transition-colors hover:bg-accent-ink disabled:cursor-not-allowed disabled:bg-sumi-mist"
+                              title={latest ? 'Trigger a new production deployment' : 'No previous deployment available to redeploy'}
+                            >
+                              <CloudUpload size={12} />
+                              {deployMutation.isPending && deployMutation.variables === project.id
+                                ? 'Deploying...'
+                                : 'Deploy'}
+                            </button>
+                          </td>
+                        </tr>
+
+                        {expanded && (
+                          <tr className="border-t border-ink-border/40 bg-white/40">
+                            <td colSpan={7} className="px-4 pb-4 pt-1">
+                              <VercelDeploymentHistory
+                                project={expandedProject ?? project}
+                                autoRefresh={autoRefresh}
+                              />
+                            </td>
+                          </tr>
+                        )}
+                      </Fragment>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function LocalServicesPanel() {
   const isMobile = useIsMobile()
   const { data: services, isLoading, error } = useServices()
   const { data: metrics } = useSystemMetrics()
@@ -403,6 +791,45 @@ export default function ServicesPage() {
           </div>
         )
       )}
+    </div>
+  )
+}
+
+export default function ServicesPage() {
+  const [activeTab, setActiveTab] = useState<ServicesTab>('local')
+
+  return (
+    <div className="flex h-full flex-col">
+      <div className="px-4 pt-4 md:px-6 md:pt-6">
+        <div className="inline-flex rounded-full border border-ink-border bg-washi-aged p-1">
+          <button
+            onClick={() => setActiveTab('local')}
+            className={cn(
+              'rounded-full px-4 py-2 text-sm transition-colors',
+              activeTab === 'local'
+                ? 'bg-sumi-black text-white'
+                : 'text-sumi-diluted hover:text-sumi-black',
+            )}
+          >
+            Local
+          </button>
+          <button
+            onClick={() => setActiveTab('vercel')}
+            className={cn(
+              'rounded-full px-4 py-2 text-sm transition-colors',
+              activeTab === 'vercel'
+                ? 'bg-sumi-black text-white'
+                : 'text-sumi-diluted hover:text-sumi-black',
+            )}
+          >
+            Vercel
+          </button>
+        </div>
+      </div>
+
+      <div className="min-h-0 flex-1 pt-4">
+        {activeTab === 'local' ? <LocalServicesPanel /> : <VercelPanel />}
+      </div>
     </div>
   )
 }

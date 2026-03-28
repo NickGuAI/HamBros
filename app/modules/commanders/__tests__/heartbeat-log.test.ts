@@ -3,7 +3,7 @@ import express from 'express'
 import { createServer, type Server } from 'node:http'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import type { ApiKeyStoreLike } from '../../../server/api-keys/store'
 import { HeartbeatLog } from '../heartbeat-log.js'
 import {
@@ -64,12 +64,19 @@ async function createTempDir(prefix: string): Promise<string> {
 async function startServer(
   options: Partial<CommandersRouterOptions> = {},
 ): Promise<RunningServer> {
+  const sessionStorePath = options.sessionStorePath
+    ?? join(await createTempDir('hammurabi-heartbeat-log-session-store-'), 'sessions.json')
+  const memoryBasePath = options.memoryBasePath
+    ?? join(dirname(sessionStorePath), 'memory')
+
   const app = express()
   app.use(express.json())
 
   const commanders = createCommandersRouter({
     apiKeyStore: createTestApiKeyStore(),
     ...options,
+    sessionStorePath,
+    memoryBasePath,
   })
   app.use('/api/commanders', commanders.router)
 

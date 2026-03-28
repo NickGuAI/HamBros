@@ -22,7 +22,12 @@ type CurrentBlock = {
   inputJsonParts?: string[]
 }
 
-export function useStreamEventProcessor() {
+const FILE_MUTATING_TOOLS = new Set(['Bash', 'Edit', 'MultiEdit', 'Write', 'NotebookEdit'])
+
+export function useStreamEventProcessor(options?: {
+  onWorkspaceMutation?: () => void
+}) {
+  const onWorkspaceMutation = options?.onWorkspaceMutation
   const idCounterRef = useRef(0)
   const currentBlockRef = useRef<CurrentBlock | null>(null)
   const activeAgentMessageIdsRef = useRef<string[]>([])
@@ -318,6 +323,7 @@ export function useStreamEventProcessor() {
           const toolResults = content.filter((b) => b.type === 'tool_result')
           if (toolResults.length === 0) break
 
+          let shouldTriggerWorkspaceRefresh = false
           setMessages((prev) => {
             const updated = [...prev]
             for (const result of toolResults) {
@@ -335,6 +341,9 @@ export function useStreamEventProcessor() {
                     updated[i] = toolOutput === undefined
                       ? { ...msg, toolStatus: status }
                       : { ...msg, toolStatus: status, toolOutput }
+                    if (FILE_MUTATING_TOOLS.has(msg.toolName ?? '')) {
+                      shouldTriggerWorkspaceRefresh = true
+                    }
                     if (msg.toolName === 'Agent') {
                       removeActiveAgentMessageId(msg.id)
                     }
@@ -350,6 +359,9 @@ export function useStreamEventProcessor() {
                     updated[i] = toolOutput === undefined
                       ? { ...msg, toolStatus: status }
                       : { ...msg, toolStatus: status, toolOutput }
+                    if (FILE_MUTATING_TOOLS.has(msg.toolName ?? '')) {
+                      shouldTriggerWorkspaceRefresh = true
+                    }
                     if (msg.toolName === 'Agent') {
                       removeActiveAgentMessageId(msg.id)
                     }
@@ -360,6 +372,9 @@ export function useStreamEventProcessor() {
             }
             return capMessages(updated)
           })
+          if (shouldTriggerWorkspaceRefresh) {
+            onWorkspaceMutation?.()
+          }
           break
         }
 
@@ -555,6 +570,7 @@ export function useStreamEventProcessor() {
           )
           clearActiveAgentMessageIds()
           setIsStreaming(false)
+          onWorkspaceMutation?.()
           break
         }
 
@@ -636,6 +652,7 @@ export function useStreamEventProcessor() {
       appendSubagentSystemMessage,
       clearActiveAgentMessageIds,
       nextId,
+      onWorkspaceMutation,
       pushActiveAgentMessageId,
       removeActiveAgentMessageId,
     ],

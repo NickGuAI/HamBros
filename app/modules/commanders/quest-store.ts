@@ -24,6 +24,7 @@ export interface CommanderQuest {
   id: string
   commanderId: string
   createdAt: string
+  completedAt?: string
   status: CommanderQuestStatus
   source: CommanderQuestSource
   instruction: string
@@ -172,6 +173,7 @@ function parseQuest(raw: unknown): CommanderQuest | null {
   const id = asTrimmedString(raw.id)
   const commanderId = asTrimmedString(raw.commanderId)
   const createdAt = asTrimmedString(raw.createdAt)
+  const completedAt = asTrimmedString(raw.completedAt) ?? undefined
   const instruction = asTrimmedString(raw.instruction)
   const contract = normalizeContract(raw.contract)
   const artifacts = normalizeQuestArtifacts(raw.artifacts) ?? []
@@ -195,6 +197,7 @@ function parseQuest(raw: unknown): CommanderQuest | null {
     id,
     commanderId,
     createdAt,
+    ...(completedAt ? { completedAt } : {}),
     status: raw.status,
     source: raw.source,
     instruction,
@@ -228,6 +231,7 @@ function parsePersistedQuests(raw: unknown): PersistedCommanderQuests {
 function cloneQuest(quest: CommanderQuest): CommanderQuest {
   return {
     ...quest,
+    ...(quest.completedAt ? { completedAt: quest.completedAt } : {}),
     artifacts: (quest.artifacts ?? []).map((artifact) => ({ ...artifact })),
     contract: {
       ...quest.contract,
@@ -390,6 +394,14 @@ export class QuestStore {
           throw new Error(`Invalid quest status: ${String(update.status)}`)
         }
         nextQuest.status = update.status
+
+        if (update.status === 'done' || update.status === 'failed') {
+          if (!nextQuest.completedAt) {
+            nextQuest.completedAt = new Date().toISOString()
+          }
+        } else {
+          delete nextQuest.completedAt
+        }
       }
       if (update.source !== undefined) {
         if (!isQuestSource(update.source)) {

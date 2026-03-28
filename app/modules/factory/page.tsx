@@ -1,4 +1,4 @@
-import { FormEvent, useState } from 'react'
+import { FormEvent, useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   Warehouse,
@@ -24,6 +24,7 @@ import {
 import { cn } from '@/lib/utils'
 import { useIsMobile } from '@/hooks/use-is-mobile'
 import type { FactoryRepo } from '@/types'
+import { WorkspacePanel } from '../workspace/components/WorkspacePanel'
 
 function RepoCard({
   repo,
@@ -112,6 +113,21 @@ function WorktreeSection({
   const deleteWorktree = useDeleteWorktree(owner, repo)
   const [feature, setFeature] = useState('')
   const [showNewForm, setShowNewForm] = useState(false)
+  const [selectedFeature, setSelectedFeature] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!worktrees || worktrees.length === 0) {
+      setSelectedFeature(null)
+      return
+    }
+
+    const selectedExists = worktrees.some((worktree) => worktree.feature === selectedFeature)
+    if (!selectedExists) {
+      setSelectedFeature(worktrees[0].feature)
+    }
+  }, [selectedFeature, worktrees])
+
+  const selectedWorktree = worktrees?.find((worktree) => worktree.feature === selectedFeature) ?? null
 
   async function handleCreate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -207,14 +223,24 @@ function WorktreeSection({
       ) : (
         <div className="space-y-3">
           {worktrees?.map((wt) => (
-            <div key={wt.feature} className="card-sumi p-4">
+            <div
+              key={wt.feature}
+              className={cn(
+                'card-sumi p-4 transition-all duration-300 ease-gentle',
+                selectedFeature === wt.feature && 'ring-1 ring-sumi-black/10 shadow-ink-md',
+              )}
+            >
               <div className="flex items-center justify-between">
-                <div>
+                <button
+                  type="button"
+                  className="min-w-0 flex-1 text-left"
+                  onClick={() => setSelectedFeature(wt.feature)}
+                >
                   <div className="font-mono text-sm text-sumi-black">{wt.feature}</div>
                   <div className="mt-1 text-whisper text-sumi-diluted">
                     branch: {wt.branch}
                   </div>
-                </div>
+                </button>
                 <div className="flex items-center gap-2">
                   <button
                     onClick={() => handleStartAgent(wt.path, wt.feature)}
@@ -234,6 +260,26 @@ function WorktreeSection({
               </div>
             </div>
           ))}
+        </div>
+      )}
+
+      {selectedWorktree && (
+        <div className="mt-4 card-sumi p-4">
+          <div className="mb-3">
+            <h4 className="section-title">Workspace</h4>
+            <p className="mt-1 text-whisper text-sumi-diluted font-mono truncate">
+              {selectedWorktree.path}
+            </p>
+          </div>
+          <WorkspacePanel
+            source={{
+              kind: 'factory-worktree',
+              owner,
+              repo,
+              feature: selectedWorktree.feature,
+              readOnly: true,
+            }}
+          />
         </div>
       )}
     </div>

@@ -235,6 +235,33 @@ export interface SystemMetrics {
   memUsedPercent: number
 }
 
+export type VercelDeploymentStatus =
+  | 'READY'
+  | 'BUILDING'
+  | 'ERROR'
+  | 'QUEUED'
+  | 'CANCELED'
+  | 'INITIALIZING'
+  | 'UNKNOWN'
+
+export interface VercelDeploymentInfo {
+  id: string
+  name: string
+  url: string | null
+  status: VercelDeploymentStatus
+  branch: string | null
+  commitSha: string | null
+  createdAt: string | null
+}
+
+export interface VercelProjectInfo {
+  id: string
+  name: string
+  framework: string | null
+  productionBranch: string | null
+  latestDeployment: VercelDeploymentInfo | null
+}
+
 // Factory types
 export interface FactoryRepo {
   owner: string

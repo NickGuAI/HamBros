@@ -250,6 +250,97 @@ describe('runMemoryCli', () => {
       expect(sentBody).toEqual({ cue: 'prisma', topK: 3 })
     })
 
+    it('runs semantic search when --semantic is passed and merges both result sections', async () => {
+      const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            hits: [
+              {
+                type: 'memory',
+                score: 0.81,
+                title: 'Prisma UserUpdateInput for String[] Fields',
+                excerpt: 'For String[] fields, use { set: string[] }...',
+                reason: 'lexical 1.5',
+              },
+            ],
+            queryTerms: ['agent', 'memory'],
+          }),
+          {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          },
+        ),
+      )
+      const runSemanticSearch = vi.fn(async () => ([
+        {
+          score: 0.872,
+          text: 'Agent memory architecture uses a knowledge cache plus cue-based recall.',
+          source_file: '/home/ec2-user/.ginsights/domains/agentic-ai/knowledge/agent-fleet-operations.md',
+          section_header: 'Agent Memory Architecture',
+          chunk_index: 0,
+        },
+      ]))
+      const stdout = createBufferWriter()
+      const stderr = createBufferWriter()
+
+      const exitCode = await runMemoryCli(
+        ['find', '--commander', 'cmdr-1', '--top', '3', '--semantic', 'agent memory'],
+        {
+          fetchImpl,
+          readConfig: async () => config,
+          runSemanticSearch,
+          stdout: stdout.writer,
+          stderr: stderr.writer,
+        },
+      )
+
+      expect(exitCode).toBe(0)
+      expect(stderr.read()).toBe('')
+      expect(stdout.read()).toContain('=== Commander Memory (cue-based recall) ===')
+      expect(stdout.read()).toContain('Hits (1 found, query terms: agent, memory)')
+      expect(stdout.read()).toContain('=== Knowledge Index (semantic search) ===')
+      expect(stdout.read()).toContain('1. [87.2%] Agent Memory Architecture')
+      expect(stdout.read()).toContain('Source: ~/.ginsights/domains/agentic-ai/knowledge/agent-fleet-operations.md')
+
+      expect(runSemanticSearch).toHaveBeenCalledWith('agent memory', 3)
+    })
+
+    it('warns and keeps lexical results when semantic search cannot run', async () => {
+      const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            hits: [],
+            queryTerms: ['agent', 'memory'],
+          }),
+          {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          },
+        ),
+      )
+      const runSemanticSearch = vi.fn(async () => {
+        throw new Error('GEMINI_API_KEY not found')
+      })
+      const stdout = createBufferWriter()
+      const stderr = createBufferWriter()
+
+      const exitCode = await runMemoryCli(
+        ['find', '--commander', 'cmdr-1', '--semantic', 'agent memory'],
+        {
+          fetchImpl,
+          readConfig: async () => config,
+          runSemanticSearch,
+          stdout: stdout.writer,
+          stderr: stderr.writer,
+        },
+      )
+
+      expect(exitCode).toBe(0)
+      expect(stdout.read()).toContain('=== Commander Memory (cue-based recall) ===')
+      expect(stdout.read()).not.toContain('=== Knowledge Index (semantic search) ===')
+      expect(stderr.read()).toContain('Warning: semantic search skipped: GEMINI_API_KEY not found')
+    })
+
     it('prints usage when query is missing', async () => {
       const stdout = createBufferWriter()
       const stderr = createBufferWriter()

@@ -25,7 +25,7 @@ describe('CommanderAgent system prompt injection', () => {
     await rm(tmpDir, { recursive: true, force: true })
   })
 
-  it('injects memory context for task pickup and heartbeat', async () => {
+  it('injects memory context for task pickup', async () => {
     const issue: GHIssue = {
       number: 77,
       title: 'Fix auth bug',
@@ -45,14 +45,6 @@ describe('CommanderAgent system prompt injection', () => {
       },
     )
 
-    const heartbeat = await agent.buildHeartbeatSystemPrompt(
-      'You are the commander system.',
-      {
-        currentTask: issue,
-        recentConversation: [{ role: 'assistant', content: 'I am still processing.' }],
-      },
-    )
-
     expect(taskPickup.systemPrompt).toContain('You are the commander system.')
     expect(taskPickup.systemPrompt).toContain('# Hammurabi Quest Board')
     expect(taskPickup.systemPrompt).toContain('hammurabi quests list')
@@ -61,15 +53,12 @@ describe('CommanderAgent system prompt injection', () => {
     expect(taskPickup.systemPrompt).toContain(`hammurabi memory save --commander ${commanderId}`)
     expect(taskPickup.systemPrompt).toContain(`hammurabi memory compact --commander ${commanderId}`)
     expect(taskPickup.systemPrompt).toContain('## Commander Memory')
+    expect(taskPickup.memorySection).toBe(taskPickup.systemPromptSection)
+    expect(taskPickup.memorySection).toContain('## Commander Memory')
+    expect(taskPickup.memorySection).not.toContain('You are the commander system.')
+    expect(taskPickup.memorySection).not.toContain('# Hammurabi Quest Board')
+    expect(taskPickup.memorySection).not.toContain('# Commander Memory Workflow')
     expect(taskPickup.layersIncluded).toContain(1)
     expect(taskPickup.layersIncluded).toContain(2)
-
-    expect(heartbeat.systemPrompt).toContain('You are the commander system.')
-    expect(heartbeat.systemPrompt).toContain('# Hammurabi Quest Board')
-    expect(heartbeat.systemPrompt).toContain('# Commander Memory Workflow')
-    expect(heartbeat.systemPrompt).toContain(`hammurabi memory find --commander ${commanderId}`)
-    expect(heartbeat.systemPrompt).toContain('## Commander Memory')
-    expect(heartbeat.layersIncluded).toContain(1)
-    expect(heartbeat.layersIncluded).toContain(2)
   })
 })

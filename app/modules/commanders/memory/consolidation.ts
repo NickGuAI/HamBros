@@ -12,6 +12,16 @@ const HIGH_ACTIVITY_ENTRY_THRESHOLD = 20
 const HIGH_ACTIVITY_SPIKE_THRESHOLD = 4
 const MAX_LONG_TERM_JOURNAL_ENTRIES = 6
 const MAX_LONG_TERM_WORKING_NOTES = 8
+const SYNTHETIC_JOURNAL_OUTCOMES = new Set([
+  'Daily observations',
+  'Work pulse reflection',
+])
+const WORKING_MEMORY_JUNK_PREFIXES = [
+  'you are',
+  'check your quest',
+  'commander runtime',
+  'commander session initialized',
+]
 
 export interface CronEngine {
   schedule(expression: string, task: () => Promise<void> | void, options?: { name?: string }): void
@@ -79,8 +89,23 @@ function cleanSentence(value: string, maxLen: number): string {
   return /[.!?]$/.test(compacted) ? compacted : `${compacted}.`
 }
 
-function buildJournalNarrative(entries: JournalEntry[]): string {
-  const selected = entries.slice(-MAX_LONG_TERM_JOURNAL_ENTRIES)
+function isSyntheticJournalOutcome(outcome: string): boolean {
+  return SYNTHETIC_JOURNAL_OUTCOMES.has(outcome.trim())
+}
+
+function isHeartbeatMarker(note: string): boolean {
+  return note === '{heartbeat}'
+}
+
+function isWorkingMemoryJunk(note: string): boolean {
+  const normalized = compactText(note).toLowerCase()
+  return WORKING_MEMORY_JUNK_PREFIXES.some((prefix) => normalized.startsWith(prefix))
+}
+
+export function buildJournalNarrative(entries: JournalEntry[]): string {
+  const selected = entries
+    .filter((entry) => !isSyntheticJournalOutcome(entry.outcome))
+    .slice(-MAX_LONG_TERM_JOURNAL_ENTRIES)
   if (selected.length === 0) return ''
   const sentences = selected
     .map((entry) => {
@@ -99,7 +124,7 @@ function buildJournalNarrative(entries: JournalEntry[]): string {
   return sentences.join(' ')
 }
 
-function buildWorkingMemoryNarrative(workingMemory: string): string {
+export function buildWorkingMemoryNarrative(workingMemory: string): string {
   const lines = workingMemory.split(/\r?\n/)
   const hypothesisLine = lines
     .find((line) => line.startsWith('Active hypothesis:'))
@@ -115,6 +140,8 @@ function buildWorkingMemoryNarrative(workingMemory: string): string {
     .filter((match): match is RegExpMatchArray => match != null)
     .map((match) => compactText(match[1]))
     .filter((note) => note.length > 0)
+    .filter((note) => !isHeartbeatMarker(note))
+    .filter((note) => !isWorkingMemoryJunk(note))
     .slice(-MAX_LONG_TERM_WORKING_NOTES)
 
   const observations = checkpoints.length > 0
@@ -364,6 +391,7 @@ export class NightlyConsolidation {
     const workingNarrative = buildWorkingMemoryNarrative(workingMemoryContent)
 
     if (!journalNarrative && !workingNarrative) {
+      await workingMemory.clear()
       return
     }
 

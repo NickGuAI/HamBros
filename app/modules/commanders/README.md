@@ -20,11 +20,13 @@ Legacy compatibility: existing commander tasks in `data/command-room/tasks.json`
 
 ## Prompt Contract
 
-`CommanderAgent` includes an explicit memory workflow section that teaches one supported interaction model:
+Session creation still uses `CommanderAgent` to inject an explicit memory workflow section that teaches one supported interaction model:
 
 - `hammurabi memory find --commander <id> "<query>"`
 - `hammurabi memory save --commander <id> "<fact>"`
 - `hammurabi memory compact --commander <id>`
+
+Fat heartbeats no longer inject assembled memory layers. They reload the commander-owned `COMMANDER.md` body and append dynamic runtime state (pending quests, rendered heartbeat message, sub-agent results, and optional `HEARTBEAT.md` checklist). That means the commander-owned `COMMANDER.md` template must teach the agent where its `.memory/*` files live and how to read them on demand.
 
 ## Architecture Diagram
 

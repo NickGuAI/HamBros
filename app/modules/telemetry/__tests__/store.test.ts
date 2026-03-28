@@ -94,10 +94,16 @@ describe('TelemetryJsonlStore.compact()', () => {
   it('removes entries older than retentionDays', async () => {
     const filePath = await createTempStoreFilePath()
     const store = new TelemetryJsonlStore(filePath)
+    const oldDate = new Date()
+    oldDate.setUTCDate(oldDate.getUTCDate() - 60)
+    const oldIso = oldDate.toISOString()
+    const recentDate = new Date()
+    recentDate.setUTCDate(recentDate.getUTCDate() - 7)
+    const recentIso = recentDate.toISOString()
 
     const old: TelemetryStoreEntry = {
       type: 'ingest',
-      recordedAt: '2026-01-01T00:00:00.000Z',
+      recordedAt: oldIso,
       payload: {
         id: 'old-1',
         sessionId: 's1',
@@ -109,12 +115,12 @@ describe('TelemetryJsonlStore.compact()', () => {
         cost: 0.01,
         durationMs: 100,
         currentTask: 'old task',
-        timestamp: '2026-01-01T00:00:00.000Z',
+        timestamp: oldIso,
       },
     }
     const recent: TelemetryStoreEntry = {
       type: 'ingest',
-      recordedAt: '2026-02-28T00:00:00.000Z',
+      recordedAt: recentIso,
       payload: {
         id: 'new-1',
         sessionId: 's2',
@@ -126,16 +132,13 @@ describe('TelemetryJsonlStore.compact()', () => {
         cost: 0.05,
         durationMs: 200,
         currentTask: 'new task',
-        timestamp: '2026-02-28T00:00:00.000Z',
+        timestamp: recentIso,
       },
     }
 
     await store.append(old)
     await store.append(recent)
 
-    // Use a fixed "now" by patching: compact keeps entries where recordedAt >= cutoff.
-    // cutoff = now - 14d. We manually compact with retentionDays=14 and rely on
-    // the real Date.now() being 2026-03-04 (current date), so 2026-01-01 is ~62 days old.
     await store.compact(14)
 
     const kept = await store.load()

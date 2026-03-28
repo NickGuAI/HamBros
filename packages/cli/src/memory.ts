@@ -1,3 +1,7 @@
+import { execFile } from 'node:child_process'
+import { access, readFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { promisify } from 'node:util'
 import { type HammurabiConfig, normalizeEndpoint, readHammurabiConfig } from './config.js'
 import {
   fetchRemoteMemoryExport,
@@ -9,9 +13,25 @@ interface Writable {
   write(chunk: string): boolean
 }
 
+const execFileAsync = promisify(execFile)
+const KNOWLEDGE_SEARCH_SCRIPT_PATH = '/home/ec2-user/App/agent-skills/pkos/knowledge-search/knowledge_search.py'
+const KAIZEN_OS_ENV_PATH = '/home/ec2-user/App/apps/kaizen_os/app/.env'
+const DEFAULT_SEMANTIC_TOP_K = 10
+
+interface SemanticSearchResult {
+  score: number
+  text: string
+  source_file: string
+  section_header: string
+  chunk_index: number
+}
+
+type SemanticSearchRunner = (query: string, topK: number) => Promise<SemanticSearchResult[]>
+
 export interface MemoryCliDependencies {
   fetchImpl?: typeof fetch
   readConfig?: () => Promise<HammurabiConfig | null>
+  runSemanticSearch?: SemanticSearchRunner
   stdout?: Writable
   stderr?: Writable
 }
@@ -23,7 +43,7 @@ function isObject(value: unknown): value is Record<string, unknown> {
 function printUsage(stdout: Writable): void {
   stdout.write('Usage:\n')
   stdout.write('  hammurabi memory compact --commander <id>\n')
-  stdout.write('  hammurabi memory find --commander <id> "<query>" [--top <k>]\n')
+  stdout.write('  hammurabi memory find --commander <id> "<query>" [--top <k>] [--semantic]\n')
   stdout.write('  hammurabi memory save --commander <id> "<fact>" [--fact "<another>"]\n')
   stdout.write('  hammurabi memory export --commander <id>\n')
   stdout.write(
@@ -34,6 +54,130 @@ function printUsage(stdout: Writable): void {
 function parseNonEmpty(value: string | undefined): string | null {
   const trimmed = value?.trim() ?? ''
   return trimmed.length > 0 ? trimmed : null
+}
+
+function stripOptionalQuotes(value: string): string {
+  if (
+    (value.startsWith('"') && value.endsWith('"'))
+    || (value.startsWith("'") && value.endsWith("'"))
+  ) {
+    return value.slice(1, -1)
+  }
+  return value
+}
+
+function parseEnvAssignment(fileContents: string, key: string): string | null {
+  for (const rawLine of fileContents.split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (!line || line.startsWith('#')) {
+      continue
+    }
+
+    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/)
+    if (!match || match[1] !== key) {
+      continue
+    }
+
+    let value = match[2]?.trim() ?? ''
+    if (!value) {
+      return null
+    }
+
+    const isQuoted = (
+      (value.startsWith('"') && value.endsWith('"'))
+      || (value.startsWith("'") && value.endsWith("'"))
+    )
+    if (!isQuoted) {
+      value = value.split(/\s+#/, 1)[0]?.trim() ?? ''
+    }
+
+    return parseNonEmpty(stripOptionalQuotes(value))
+  }
+
+  return null
+}
+
+async function resolveGeminiApiKey(): Promise<string | null> {
+  const explicit = parseNonEmpty(process.env.GEMINI_API_KEY)
+  if (explicit) {
+    return explicit
+  }
+
+  try {
+    const envFile = await readFile(KAIZEN_OS_ENV_PATH, 'utf8')
+    return parseEnvAssignment(envFile, 'GEMINI_API_KEY')
+  } catch {
+    return null
+  }
+}
+
+function parseSemanticSearchResults(stdout: string): SemanticSearchResult[] {
+  let parsed: unknown
+
+  try {
+    parsed = JSON.parse(stdout)
+  } catch (error) {
+    throw new Error(
+      `knowledge_search.py returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
+
+  if (!Array.isArray(parsed)) {
+    throw new Error('knowledge_search.py returned an unexpected payload')
+  }
+
+  return parsed.flatMap((entry) => {
+    if (!isObject(entry)) {
+      return []
+    }
+
+    const score = typeof entry.score === 'number' ? entry.score : null
+    const text = typeof entry.text === 'string' ? entry.text : null
+    const sourceFile = typeof entry.source_file === 'string' ? entry.source_file : null
+    const sectionHeader = typeof entry.section_header === 'string' ? entry.section_header : null
+    const chunkIndex = typeof entry.chunk_index === 'number' ? entry.chunk_index : 0
+
+    if (score === null || text === null || sourceFile === null || sectionHeader === null) {
+      return []
+    }
+
+    return [{
+      score,
+      text,
+      source_file: sourceFile,
+      section_header: sectionHeader,
+      chunk_index: chunkIndex,
+    }]
+  })
+}
+
+async function runKnowledgeSearchScript(query: string, topK: number): Promise<SemanticSearchResult[]> {
+  await access(KNOWLEDGE_SEARCH_SCRIPT_PATH)
+
+  const apiKey = await resolveGeminiApiKey()
+  if (!apiKey) {
+    throw new Error(`GEMINI_API_KEY not found in environment or ${KAIZEN_OS_ENV_PATH}`)
+  }
+
+  const result = await execFileAsync(
+    'python3',
+    [
+      KNOWLEDGE_SEARCH_SCRIPT_PATH,
+      query,
+      '--top-k',
+      String(topK),
+      '--json',
+    ],
+    {
+      env: {
+        ...process.env,
+        GEMINI_API_KEY: apiKey,
+      },
+      maxBuffer: 10 * 1024 * 1024,
+    },
+  )
+
+  return parseSemanticSearchResults(result.stdout)
 }
 
 function buildApiUrl(endpoint: string, apiPath: string): string {
@@ -115,6 +259,7 @@ interface FindOptions {
   commanderId: string
   query: string
   topK?: number
+  semantic?: boolean
 }
 
 interface SaveOptions {
@@ -148,6 +293,7 @@ function parseFindOptions(args: readonly string[]): FindOptions | null {
   let commanderId: string | undefined
   let query: string | undefined
   let topK: number | undefined
+  let semantic = false
 
   let index = 0
   while (index < args.length) {
@@ -169,6 +315,12 @@ function parseFindOptions(args: readonly string[]): FindOptions | null {
       continue
     }
 
+    if (flag === '--semantic') {
+      semantic = true
+      index += 1
+      continue
+    }
+
     // positional argument = query
     if (!query && !flag?.startsWith('--')) {
       query = parseNonEmpty(flag) ?? undefined
@@ -183,7 +335,7 @@ function parseFindOptions(args: readonly string[]): FindOptions | null {
     return null
   }
 
-  return { commanderId, query, topK }
+  return { commanderId, query, topK, semantic }
 }
 
 function parseSaveOptions(args: readonly string[]): SaveOptions | null {
@@ -455,10 +607,76 @@ interface RecollectionHit {
   reason: string
 }
 
+function writeLexicalHits(
+  stdout: Writable,
+  hits: unknown[],
+  queryTerms: string[],
+): void {
+  const termsStr = queryTerms.length > 0 ? queryTerms.join(', ') : '(none)'
+  stdout.write(`Hits (${hits.length} found, query terms: ${termsStr}):\n`)
+
+  for (let i = 0; i < hits.length; i++) {
+    const hit = hits[i] as unknown
+    if (!isObject(hit)) continue
+
+    const h: RecollectionHit = {
+      type: typeof hit.type === 'string' ? hit.type : 'unknown',
+      score: typeof hit.score === 'number' ? hit.score : 0,
+      title: typeof hit.title === 'string' ? hit.title : '(untitled)',
+      excerpt: typeof hit.excerpt === 'string' ? hit.excerpt : '',
+      reason: typeof hit.reason === 'string' ? hit.reason : '',
+    }
+
+    const paddedType = `[${h.type}]`.padEnd(10)
+    stdout.write(`${i + 1}. ${paddedType} ${h.score.toFixed(3)} — ${h.title}\n`)
+    if (h.excerpt) {
+      stdout.write(`   excerpt: "${h.excerpt}"\n`)
+    }
+    if (h.reason) {
+      stdout.write(`   reason: ${h.reason}\n`)
+    }
+  }
+}
+
+function shortenHomePath(filePath: string): string {
+  const homePath = homedir()
+  return filePath.startsWith(homePath)
+    ? `~${filePath.slice(homePath.length)}`
+    : filePath
+}
+
+function formatSemanticExcerpt(text: string, maxLength = 180): string {
+  const compact = text.replace(/\s+/g, ' ').trim()
+  if (compact.length <= maxLength) {
+    return compact
+  }
+  return `${compact.slice(0, Math.max(0, maxLength - 3))}...`
+}
+
+function writeSemanticHits(
+  stdout: Writable,
+  results: SemanticSearchResult[],
+): void {
+  stdout.write('=== Knowledge Index (semantic search) ===\n')
+
+  if (results.length === 0) {
+    stdout.write('No semantic results found.\n')
+    return
+  }
+
+  for (let index = 0; index < results.length; index += 1) {
+    const result = results[index]
+    stdout.write(`${index + 1}. [${(result.score * 100).toFixed(1)}%] ${result.section_header}\n`)
+    stdout.write(`   Source: ${shortenHomePath(result.source_file)}\n`)
+    stdout.write(`   ${formatSemanticExcerpt(result.text)}\n`)
+  }
+}
+
 async function runFind(
   config: HammurabiConfig,
   fetchImpl: typeof fetch,
   options: FindOptions,
+  runSemanticSearch: SemanticSearchRunner,
   stdout: Writable,
   stderr: Writable,
 ): Promise<number> {
@@ -493,29 +711,24 @@ async function runFind(
     ? data.queryTerms.filter((t: unknown): t is string => typeof t === 'string')
     : []
 
-  const termsStr = queryTerms.length > 0 ? queryTerms.join(', ') : '(none)'
-  stdout.write(`Hits (${hits.length} found, query terms: ${termsStr}):\n`)
+  if (options.semantic) {
+    stdout.write('=== Commander Memory (cue-based recall) ===\n')
+  }
 
-  for (let i = 0; i < hits.length; i++) {
-    const hit = hits[i] as unknown
-    if (!isObject(hit)) continue
+  writeLexicalHits(stdout, hits, queryTerms)
 
-    const h: RecollectionHit = {
-      type: typeof hit.type === 'string' ? hit.type : 'unknown',
-      score: typeof hit.score === 'number' ? hit.score : 0,
-      title: typeof hit.title === 'string' ? hit.title : '(untitled)',
-      excerpt: typeof hit.excerpt === 'string' ? hit.excerpt : '',
-      reason: typeof hit.reason === 'string' ? hit.reason : '',
-    }
+  if (!options.semantic) {
+    return 0
+  }
 
-    const paddedType = `[${h.type}]`.padEnd(10)
-    stdout.write(`${i + 1}. ${paddedType} ${h.score.toFixed(3)} — ${h.title}\n`)
-    if (h.excerpt) {
-      stdout.write(`   excerpt: "${h.excerpt}"\n`)
-    }
-    if (h.reason) {
-      stdout.write(`   reason: ${h.reason}\n`)
-    }
+  try {
+    const semanticResults = await runSemanticSearch(options.query, options.topK ?? DEFAULT_SEMANTIC_TOP_K)
+    stdout.write('\n')
+    writeSemanticHits(stdout, semanticResults)
+  } catch (error) {
+    stderr.write(
+      `Warning: semantic search skipped: ${error instanceof Error ? error.message : String(error)}\n`,
+    )
   }
 
   return 0
@@ -610,6 +823,7 @@ export async function runMemoryCli(
   const stderr = dependencies.stderr ?? process.stderr
   const fetchImpl = dependencies.fetchImpl ?? fetch
   const readConfig = dependencies.readConfig ?? readHammurabiConfig
+  const runSemanticSearch = dependencies.runSemanticSearch ?? runKnowledgeSearchScript
 
   const command = args[0]
   if (
@@ -645,7 +859,7 @@ export async function runMemoryCli(
       printUsage(stdout)
       return 1
     }
-    return runFind(config, fetchImpl, findOptions, stdout, stderr)
+    return runFind(config, fetchImpl, findOptions, runSemanticSearch, stdout, stderr)
   }
 
   if (command === 'export') {

@@ -1,9 +1,9 @@
 /**
  * Choose between fat and thin heartbeat modes.
  *
- * - **Thin heartbeat**: standard quest check message (default).
+ * - **Thin heartbeat**: rendered configured heartbeat message.
  * - **Fat heartbeat**: includes HEARTBEAT.md checklist appended after
- *   the standard message (via buildFatHeartbeatMessage).
+ *   the rendered message.
  *
  * Mode selection is sync; message enrichment is async.
  */
@@ -13,8 +13,6 @@ import * as path from 'node:path'
 import { resolveCommanderPaths } from './paths.js'
 
 const DEFAULT_FAT_PIN_INTERVAL = 4
-
-export const THIN_HEARTBEAT_PROMPT = 'Check your quest board and continue your current task.'
 
 export type HeartbeatMode = 'fat' | 'thin'
 

@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { Clock3, ExternalLink, MessageSquare, Square, Trash2, Triangle } from 'lucide-react'
+import { Clock3, ExternalLink, MessageSquare, Plus, Square, Trash2, Triangle } from 'lucide-react'
 import { cn, formatCost, timeAgo } from '@/lib/utils'
 import { fetchJson } from '../../../src/lib/api'
 import type {
@@ -8,6 +8,7 @@ import type {
   CommanderCreateInput,
   CommanderSession,
 } from '../hooks/useCommander'
+import { ModalFormContainer } from '../../components/ModalFormContainer'
 import { CreateCommanderForm } from './CreateCommanderForm'
 
 declare module '../hooks/useCommander' {
@@ -129,6 +130,8 @@ export function CommanderList({
   const [manualHeartbeatRunIdByCommander, setManualHeartbeatRunIdByCommander] = useState<Record<string, string>>({})
   const [manualHeartbeatErrorByCommander, setManualHeartbeatErrorByCommander] = useState<Record<string, string>>({})
   const [manualHeartbeatToast, setManualHeartbeatToast] = useState<string | null>(null)
+  const [showCreateCommanderForm, setShowCreateCommanderForm] = useState(false)
+  const closeCreateCommanderForm = useCallback(() => setShowCreateCommanderForm(false), [])
   const manualHeartbeatToastTimer = useRef<number | null>(null)
 
   function showManualHeartbeatToast(message: string): void {
@@ -174,8 +177,16 @@ export function CommanderList({
 
   return (
     <section className="relative min-h-[16rem] xl:h-full card-sumi overflow-hidden flex flex-col">
-      <header className="px-4 py-3 border-b border-ink-border bg-washi-aged/60">
+      <header className="px-4 py-3 border-b border-ink-border bg-washi-aged/60 flex items-center justify-between gap-3">
         <h3 className="section-title">Commander List</h3>
+        <button
+          type="button"
+          onClick={() => setShowCreateCommanderForm(true)}
+          className="btn-ghost !px-3 !py-1.5 text-xs inline-flex min-h-[44px] items-center gap-1.5"
+        >
+          <Plus size={12} />
+          + New Commander
+        </button>
       </header>
 
       {manualHeartbeatToast && (
@@ -393,9 +404,17 @@ export function CommanderList({
         })}
       </div>
 
-      <div className="p-3 border-t border-ink-border">
-        <CreateCommanderForm onAdd={onAddCommander} isPending={isAddingCommander} />
-      </div>
+      <ModalFormContainer
+        open={showCreateCommanderForm}
+        title="New Commander"
+        onClose={closeCreateCommanderForm}
+      >
+        <CreateCommanderForm
+          onAdd={onAddCommander}
+          isPending={isAddingCommander}
+          onClose={closeCreateCommanderForm}
+        />
+      </ModalFormContainer>
     </section>
   )
 }

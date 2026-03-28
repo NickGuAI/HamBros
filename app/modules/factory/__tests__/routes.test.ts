@@ -66,7 +66,7 @@ function createTestApiKeyStore(): ApiKeyStoreLike {
 
 function createMockCommandRunner(): CommandRunner {
   return {
-    exec: vi.fn(async (command: string, args: string[]) => {
+    exec: vi.fn(async (command: string, args: string[], options?: { cwd?: string }) => {
       // Mock git symbolic-ref HEAD (bare clone has HEAD, not refs/remotes/origin/HEAD)
       if (command === 'git' && args[0] === 'symbolic-ref') {
         return { stdout: 'refs/heads/main\n', stderr: '' }
@@ -96,10 +96,25 @@ function createMockCommandRunner(): CommandRunner {
       }
       // Mock git rev-parse
       if (command === 'git' && args[0] === 'rev-parse') {
+        if (args.includes('--show-toplevel')) {
+          return { stdout: `${options?.cwd ?? tmpDir}\n`, stderr: '' }
+        }
         if (args.includes('--short') && args.includes('HEAD')) {
           return { stdout: 'abc1234\n', stderr: '' }
         }
         return { stdout: 'main\n', stderr: '' }
+      }
+      if (command === 'git' && args[0] === 'status') {
+        return {
+          stdout: '## feature-x...origin/feature-x [ahead 1]\n M src/index.ts\n?? notes.md\n',
+          stderr: '',
+        }
+      }
+      if (command === 'git' && args[0] === 'log') {
+        return {
+          stdout: 'abcdef1234567890\x1fabcdef1\x1fAssistant\x1f2026-03-27T00:00:00.000Z\x1fInitial commit\n',
+          stderr: '',
+        }
       }
       return { stdout: '', stderr: '' }
     }),
@@ -571,6 +586,51 @@ describe('factory routes', () => {
 
       expect(response.status).toBe(403)
       await server.close()
+    })
+  })
+
+  describe('workspace routes', () => {
+    it('serves worktree tree, file preview, and git routes', async () => {
+      const worktreePath = path.join(tmpDir, 'owner', 'repo', 'worktrees', 'feature-x')
+      await fs.mkdir(path.join(worktreePath, 'src'), { recursive: true })
+      await fs.writeFile(path.join(worktreePath, 'README.md'), 'Factory workspace\n', 'utf8')
+
+      const server = await startServer({ commandRunner: createMockCommandRunner() })
+
+      try {
+        const treeResponse = await fetch(
+          `${server.baseUrl}/api/factory/repos/owner/repo/worktrees/feature-x/workspace/tree`,
+          { headers: AUTH_HEADERS },
+        )
+        expect(treeResponse.status).toBe(200)
+        const treeBody = await treeResponse.json()
+        expect(treeBody.nodes.map((node: { name: string }) => node.name)).toEqual(['src', 'README.md'])
+
+        const fileResponse = await fetch(
+          `${server.baseUrl}/api/factory/repos/owner/repo/worktrees/feature-x/workspace/file?path=README.md`,
+          { headers: AUTH_HEADERS },
+        )
+        expect(fileResponse.status).toBe(200)
+        const fileBody = await fileResponse.json()
+        expect(fileBody.kind).toBe('text')
+        expect(fileBody.content).toContain('Factory workspace')
+
+        const gitStatusResponse = await fetch(
+          `${server.baseUrl}/api/factory/repos/owner/repo/worktrees/feature-x/workspace/git/status`,
+          { headers: AUTH_HEADERS },
+        )
+        expect(gitStatusResponse.status).toBe(200)
+        const gitStatusBody = await gitStatusResponse.json()
+        expect(gitStatusBody.enabled).toBe(true)
+        expect(gitStatusBody.entries).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ path: 'src/index.ts' }),
+            expect.objectContaining({ path: 'notes.md' }),
+          ]),
+        )
+      } finally {
+        await server.close()
+      }
     })
   })
 })

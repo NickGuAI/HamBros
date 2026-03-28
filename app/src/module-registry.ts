@@ -40,9 +40,16 @@ export const modules: FrontendModule[] = [
   {
     name: 'command-room',
     label: 'Command Room',
-    icon: 'Server',
+    icon: 'CalendarClock',
     path: '/command-room',
     component: () => import('@modules/command-room/page'),
+  },
+  {
+    name: 'workspace',
+    label: 'Workspace',
+    icon: 'FolderOpen',
+    path: '/workspace',
+    component: () => import('@modules/workspace/page'),
   },
   {
     name: 'rpg',

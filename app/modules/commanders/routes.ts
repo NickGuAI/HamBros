@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto'
+import { execFile } from 'node:child_process'
 import type { Dirent } from 'node:fs'
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
+import { access, mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { promisify } from 'node:util'
 import cron from 'node-cron'
-import { Router, type Request } from 'express'
+import { Router, type Request, type Response as ExpressResponse } from 'express'
 import type { AuthUser } from '@hambros/auth-providers'
 import type { ApiKeyStoreLike } from '../../server/api-keys/store.js'
 import { combinedAuth } from '../../server/middleware/combined-auth.js'
@@ -28,6 +30,7 @@ import {
 import type { GHIssue } from './memory/skill-matcher.js'
 import {
   CommanderHeartbeatManager,
+  DEFAULT_HEARTBEAT_MESSAGE,
   createDefaultHeartbeatState,
   mergeHeartbeatState,
   parseHeartbeatPatch,
@@ -43,7 +46,6 @@ import {
   buildFatHeartbeatMessage as appendHeartbeatChecklist,
   chooseHeartbeatMode,
   resolveFatPinInterval,
-  THIN_HEARTBEAT_PROMPT,
 } from './choose-heartbeat-mode.js'
 import {
   CommanderSessionStore,
@@ -58,6 +60,7 @@ import {
   readCommanderIdentity,
   scaffoldCommanderIdentity,
 } from './templates/render.js'
+import { scaffoldCommanderWorkflow } from './templates/workflow.js'
 import {
   QuestStore,
   type QuestArtifact,
@@ -79,6 +82,15 @@ import {
   defaultCommandRoomRunStorePath,
   type WorkflowRun,
 } from '../command-room/run-store.js'
+import {
+  listWorkspaceTree,
+  readWorkspaceFilePreview,
+  readWorkspaceGitLog,
+  readWorkspaceGitStatus,
+  resolveWorkspaceRoot,
+  toWorkspaceError,
+  WorkspaceError,
+} from '../workspace/index.js'
 
 const SESSION_ID_PATTERN = /^[a-zA-Z0-9_-]+$/
 const HOST_PATTERN = /^[a-zA-Z0-9_-]+$/
@@ -113,6 +125,9 @@ const STARTUP_PROMPT = 'Commander runtime started. Acknowledge readiness and awa
 const BASE_SYSTEM_PROMPT =
   'You are Commander, the orchestration agent for GitHub task execution. Follow repo instructions exactly.'
 const COMMANDER_SESSION_NAME_PREFIX = 'commander-'
+const KNOWLEDGE_SEARCH_SCRIPT_PATH = '/home/ec2-user/App/agent-skills/pkos/knowledge-search/knowledge_search.py'
+const KAIZEN_OS_ENV_PATH = '/home/ec2-user/App/apps/kaizen_os/app/.env'
+const DEFAULT_SEMANTIC_SEARCH_TOP_K = 10
 const DEFAULT_AGENTS_SESSION_STORE_PATH = 'data/agents/stream-sessions.json'
 const COLLECT_MODE_DEBOUNCE_MS = 1_000
 
@@ -136,6 +151,9 @@ const CHANNEL_PROVIDER_LABELS: Record<CommanderChannelMeta['provider'], string> 
 
 type StreamEvent = Record<string, unknown>
 type CommanderMessageMode = 'collect' | 'followup'
+type SemanticSearchRunner = (query: string, topK: number) => Promise<SemanticSearchResult[]>
+
+const execFileAsync = promisify(execFile)
 
 interface CommanderSubAgentEntry {
   sessionId: string
@@ -151,8 +169,6 @@ interface ContextPressureBridge {
 
 interface CommanderRuntime {
   manager: CommanderManager
-  agent: CommanderAgent
-  baseSystemPrompt: string
   flusher: EmergencyFlusher
   workingMemory: WorkingMemoryStore
   contextPressureBridge: ContextPressureBridge
@@ -210,6 +226,7 @@ export interface CommandersRouterOptions {
   githubToken?: string
   agentsSessionStorePath?: string
   remoteSyncSharedSecret?: string
+  semanticSearchRunner?: SemanticSearchRunner
   channelReplyDispatchers?: Partial<Record<CommanderChannelMeta['provider'], CommanderChannelReplyDispatcher>>
 }
 
@@ -234,8 +251,153 @@ interface GitHubIssueUrlParts {
   normalizedUrl: string
 }
 
+interface SemanticSearchResult {
+  score: number
+  text: string
+  source_file: string
+  section_header: string
+  chunk_index: number
+}
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
+}
+
+function parseTrimmedString(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null
+  }
+
+  const trimmed = value.trim()
+  return trimmed.length > 0 ? trimmed : null
+}
+
+function stripOptionalQuotes(value: string): string {
+  if (
+    (value.startsWith('"') && value.endsWith('"'))
+    || (value.startsWith("'") && value.endsWith("'"))
+  ) {
+    return value.slice(1, -1)
+  }
+  return value
+}
+
+function parseEnvAssignment(fileContents: string, key: string): string | null {
+  for (const rawLine of fileContents.split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (!line || line.startsWith('#')) {
+      continue
+    }
+
+    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/)
+    if (!match || match[1] !== key) {
+      continue
+    }
+
+    let value = match[2]?.trim() ?? ''
+    if (!value) {
+      return null
+    }
+
+    const isQuoted = (
+      (value.startsWith('"') && value.endsWith('"'))
+      || (value.startsWith("'") && value.endsWith("'"))
+    )
+    if (!isQuoted) {
+      value = value.split(/\s+#/, 1)[0]?.trim() ?? ''
+    }
+
+    return parseTrimmedString(stripOptionalQuotes(value))
+  }
+
+  return null
+}
+
+async function resolveGeminiApiKey(envFilePath = KAIZEN_OS_ENV_PATH): Promise<string | null> {
+  const explicit = parseTrimmedString(process.env.GEMINI_API_KEY)
+  if (explicit) {
+    return explicit
+  }
+
+  try {
+    const envFile = await readFile(envFilePath, 'utf8')
+    return parseEnvAssignment(envFile, 'GEMINI_API_KEY')
+  } catch {
+    return null
+  }
+}
+
+function parseSemanticSearchResults(stdout: string): SemanticSearchResult[] {
+  let parsed: unknown
+
+  try {
+    parsed = JSON.parse(stdout) as unknown
+  } catch (error) {
+    throw new Error(
+      `knowledge_search.py returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
+
+  if (!Array.isArray(parsed)) {
+    throw new Error('knowledge_search.py returned an unexpected payload')
+  }
+
+  return parsed.flatMap((entry) => {
+    if (!isObject(entry)) {
+      return []
+    }
+
+    const score = typeof entry.score === 'number' ? entry.score : null
+    const text = typeof entry.text === 'string' ? entry.text : null
+    const sourceFile = typeof entry.source_file === 'string' ? entry.source_file : null
+    const sectionHeader = typeof entry.section_header === 'string' ? entry.section_header : null
+    const chunkIndex = typeof entry.chunk_index === 'number' ? entry.chunk_index : 0
+
+    if (score === null || text === null || sourceFile === null || sectionHeader === null) {
+      return []
+    }
+
+    return [{
+      score,
+      text,
+      source_file: sourceFile,
+      section_header: sectionHeader,
+      chunk_index: chunkIndex,
+    }]
+  })
+}
+
+async function runSemanticSearchScript(
+  query: string,
+  topK: number,
+  envFilePath = KAIZEN_OS_ENV_PATH,
+): Promise<SemanticSearchResult[]> {
+  await access(KNOWLEDGE_SEARCH_SCRIPT_PATH)
+
+  const apiKey = await resolveGeminiApiKey(envFilePath)
+  if (!apiKey) {
+    throw new Error(`GEMINI_API_KEY not found in environment or ${envFilePath}`)
+  }
+
+  const result = await execFileAsync(
+    'python3',
+    [
+      KNOWLEDGE_SEARCH_SCRIPT_PATH,
+      query,
+      '--top-k',
+      String(topK),
+      '--json',
+    ],
+    {
+      env: {
+        ...process.env,
+        GEMINI_API_KEY: apiKey,
+      },
+      maxBuffer: 10 * 1024 * 1024,
+    },
+  )
+
+  return parseSemanticSearchResults(result.stdout)
 }
 
 function parseSessionId(raw: unknown): string | null {
@@ -798,19 +960,24 @@ function summarizeQuestInstruction(instruction: string): string {
   return firstLine ?? instruction
 }
 
-function prependPendingQuestsToMessage(
-  message: string,
+function parseQuestIssueNumber(quest: Pick<CommanderQuest, 'githubIssueUrl'>): number | null {
+  if (!quest.githubIssueUrl) {
+    return null
+  }
+  const parsed = parseGitHubIssueUrl(quest.githubIssueUrl)
+  return parsed?.issueNumber ?? null
+}
+
+function formatPendingQuestsSummary(
   pendingQuests: CommanderQuest[],
-): string {
+): string | null {
   if (pendingQuests.length === 0) {
-    return message
+    return null
   }
 
   return [
     '[QUEST BOARD] Top pending quests:',
     ...pendingQuests.slice(0, 3).map((quest, index) => `${index + 1}. ${summarizeQuestInstruction(quest.instruction)}`),
-    '',
-    message,
   ].join('\n')
 }
 
@@ -1157,6 +1324,15 @@ async function resolveCommanderWorkflow(
   }
 }
 
+async function commanderWorkflowFileExists(cwd: string): Promise<boolean> {
+  try {
+    await access(path.join(cwd, COMMANDER_WORKFLOW_FILE))
+    return true
+  } catch {
+    return false
+  }
+}
+
 function resolveEffectiveBasePrompt(workflow: CommanderWorkflow | null): string {
   return workflow?.systemPromptTemplate?.trim().length
     ? workflow.systemPromptTemplate
@@ -1170,12 +1346,16 @@ function resolveEffectiveHeartbeat(
   const workflowHeartbeatIntervalMs = resolveWorkflowHeartbeatIntervalMs(
     workflow?.heartbeatInterval,
   )
+  const shouldApplyWorkflowInterval = workflowHeartbeatIntervalMs !== undefined
+    && heartbeat.intervalOverridden !== true
+  const shouldApplyWorkflowMessage = workflow?.heartbeatMessage !== undefined
+    && heartbeat.messageTemplate.trim() === DEFAULT_HEARTBEAT_MESSAGE.trim()
   return {
     ...heartbeat,
-    ...(workflowHeartbeatIntervalMs !== undefined
+    ...(shouldApplyWorkflowInterval
       ? { intervalMs: workflowHeartbeatIntervalMs }
       : {}),
-    ...(workflow?.heartbeatMessage !== undefined
+    ...(shouldApplyWorkflowMessage
       ? { messageTemplate: workflow.heartbeatMessage }
       : {}),
   }
@@ -1297,14 +1477,30 @@ function extractFileMentionsFromMessage(message: string): string[] {
   return deduped
 }
 
-function normalizeHeartbeatSummary(message: string): string {
-  return message
-    .replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z/g, '<timestamp>')
-    .replace(/\d{4}-\d{2}-\d{2}/g, '<date>')
-    .replace(/\d{2}:\d{2}:\d{2}/g, '<time>')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 260)
+function compactSingleLine(message: string, maxLen: number = 260): string {
+  const normalized = message.replace(/\s+/g, ' ').trim()
+  if (normalized.length <= maxLen) {
+    return normalized
+  }
+  return `${normalized.slice(0, Math.max(0, maxLen - 3))}...`
+}
+
+function formatSubAgentLifecycleSummary(event: CommanderSubagentLifecycleEvent): string {
+  const prefix = event.state === 'running'
+    ? 'Sub-agent dispatched'
+    : event.state === 'completed'
+      ? 'Sub-agent completed'
+      : 'Sub-agent failed'
+  const details = event.result?.trim()
+    ? ` — ${compactSingleLine(event.result, 180)}`
+    : ''
+  return `${prefix}: ${event.sessionId}${details}`
+}
+
+function resolveSubAgentLifecycleSalience(event: CommanderSubagentLifecycleEvent): JournalEntry['salience'] {
+  if (event.state === 'failed') return 'SPIKE'
+  if (event.state === 'completed') return 'NOTABLE'
+  return 'ROUTINE'
 }
 
 function listSubAgentEntries(runtime: CommanderRuntime | undefined): CommanderSubAgentEntry[] {
@@ -1328,17 +1524,14 @@ function consumeCompletedSubAgentEntries(runtime: CommanderRuntime): CommanderSu
   return completed
 }
 
-function appendSubAgentResultsToHeartbeat(
-  message: string,
+function formatSubAgentResultsSection(
   completedEntries: CommanderSubAgentEntry[],
-): string {
+): string | null {
   if (completedEntries.length === 0) {
-    return message
+    return null
   }
 
   return [
-    message,
-    '',
     '[SUB-AGENT RESULTS]',
     ...completedEntries.map((entry, index) => {
       const summary = entry.result?.trim() || 'No sub-agent summary provided.'
@@ -1421,7 +1614,7 @@ function buildGitHubHeaders(token: string | null): Record<string, string> {
   }
 }
 
-async function readGitHubError(response: Response): Promise<string> {
+async function readGitHubError(response: globalThis.Response): Promise<string> {
   try {
     const payload = (await response.json()) as { message?: string }
     if (payload?.message && payload.message.trim()) {
@@ -1675,7 +1868,42 @@ export function createCommandersRouter(
   const commandRoomSchedulerInitialized = commandRoomScheduler
     ? (options.commandRoomSchedulerInitialized ?? Promise.resolve())
     : Promise.resolve()
+  const runSemanticSearch = options.semanticSearchRunner ?? runSemanticSearchScript
   const commanderCronStoresById = new Map<string, CommanderCronStores>()
+  function sendWorkspaceError(res: ExpressResponse, error: unknown): void {
+    const workspaceError = toWorkspaceError(error)
+    res.status(workspaceError.statusCode).json({ error: workspaceError.message })
+  }
+
+  async function resolveCommanderWorkspace(rawCommanderId: unknown) {
+    const commanderId = parseSessionId(rawCommanderId)
+    if (!commanderId) {
+      throw new WorkspaceError(400, 'Invalid commander id')
+    }
+
+    const session = await sessionStore.get(commanderId)
+    if (!session) {
+      throw new WorkspaceError(404, `Commander "${commanderId}" not found`)
+    }
+
+    return resolveWorkspaceRoot({
+      rootPath: session.cwd,
+      source: {
+        kind: 'commander',
+        id: session.id,
+        label: session.host,
+        host: session.remoteOrigin?.machineId,
+        readOnly: true,
+        repo: session.taskSource
+          ? {
+              owner: session.taskSource.owner,
+              repo: session.taskSource.repo,
+            }
+          : undefined,
+      },
+    })
+  }
+
   const getCommanderCronStores = (commanderId: string): CommanderCronStores => {
     if (sharedCommanderCronStores) {
       return sharedCommanderCronStores
@@ -1799,6 +2027,44 @@ export function createCommandersRouter(
       dispatchedAt: existing?.dispatchedAt ?? event.dispatchedAt,
       state: event.state,
       result: event.result?.trim() || existing?.result,
+    })
+
+    void (async () => {
+      const session = await sessionStore.get(commanderId)
+      const issueNumber = session?.currentTask?.issueNumber ?? null
+      const repo = toSessionRepo(session)
+      const summary = formatSubAgentLifecycleSummary(event)
+
+      await runtime.workingMemory.update({
+        source: 'system',
+        summary,
+        issueNumber,
+        repo,
+        tags: ['subagent', event.state],
+      })
+
+      if (event.state === 'running') {
+        return
+      }
+
+      await runtime.manager.journalWriter.append({
+        timestamp: now().toISOString(),
+        issueNumber,
+        repo,
+        outcome: event.state === 'completed' ? 'Sub-agent result captured' : 'Sub-agent failure captured',
+        durationMin: null,
+        salience: resolveSubAgentLifecycleSalience(event),
+        body: [
+          `- Session: \`${event.sessionId}\``,
+          `- State: ${event.state}`,
+          `- Result: ${event.result?.trim() || '_no summary provided_'}`,
+        ].join('\n'),
+      })
+    })().catch((error) => {
+      console.error(
+        `[commanders] Failed to persist sub-agent lifecycle memory for "${commanderId}":`,
+        error,
+      )
     })
   }
 
@@ -1947,24 +2213,15 @@ export function createCommandersRouter(
       const activeAgentSession = sessionsInterface.getSession(activeSession.sessionName)
       let heartbeatMessage: string
       const buildFatHeartbeatMessage = async (
-        baseSystemPrompt: string,
-        agent: CommanderAgent,
+        commanderBody: string,
         completedSubAgentEntries: CommanderSubAgentEntry[],
       ): Promise<string> => {
         const pendingQuests = await questStore.listPending(commanderId, 3)
-        const heartbeatInstruction = prependPendingQuestsToMessage(renderedMessage, pendingQuests)
-        const heartbeatWithSubagents = appendSubAgentResultsToHeartbeat(
-          heartbeatInstruction,
-          completedSubAgentEntries,
-        )
-        const built = await agent.buildTaskPickupSystemPrompt(
-          baseSystemPrompt,
-          {
-            currentTask: toPromptIssue(session),
-            recentConversation: [],
-          },
-        )
-        return `${built.systemPrompt}\n\n${heartbeatWithSubagents}`
+        const pendingQuestsSummary = formatPendingQuestsSummary(pendingQuests)
+        const subAgentResultsSection = formatSubAgentResultsSection(completedSubAgentEntries)
+        return [commanderBody.trim(), pendingQuestsSummary, renderedMessage.trim(), subAgentResultsSection]
+          .filter((section): section is string => typeof section === 'string' && section.trim().length > 0)
+          .join('\n\n')
       }
 
       // After server restart reconciliation we may have an active stream session
@@ -1979,11 +2236,10 @@ export function createCommandersRouter(
             session.cwd,
             commanderBasePath,
           )
-          runtime.baseSystemPrompt = resolveEffectiveBasePrompt(workflow.workflow)
+          const commanderBody = resolveEffectiveBasePrompt(workflow.workflow)
           const completedSubAgentEntries = consumeCompletedSubAgentEntries(runtime)
           heartbeatMessage = await buildFatHeartbeatMessage(
-            runtime.baseSystemPrompt,
-            runtime.agent,
+            commanderBody,
             completedSubAgentEntries,
           )
           const enriched = await appendHeartbeatChecklist(
@@ -1993,7 +2249,7 @@ export function createCommandersRouter(
           )
           if (enriched) heartbeatMessage = enriched
         } else {
-          heartbeatMessage = THIN_HEARTBEAT_PROMPT
+          heartbeatMessage = renderedMessage
         }
 
         runtime.heartbeatCount += 1
@@ -2002,10 +2258,10 @@ export function createCommandersRouter(
         runtime.pendingSpikeObservations = []
         void runtime.workingMemory.update({
           source: 'heartbeat',
-          summary: normalizeHeartbeatSummary(heartbeatMessage),
+          summary: '{heartbeat}',
           issueNumber: session.currentTask?.issueNumber ?? null,
           repo: toSessionRepo(session),
-          tags: ['heartbeat'],
+          tags: ['heartbeat', heartbeatMode],
         }).catch((error) => {
           console.error(`[commanders] Failed to update working memory on heartbeat for "${commanderId}":`, error)
         })
@@ -2025,9 +2281,8 @@ export function createCommandersRouter(
             session.cwd,
             commanderBasePath,
           )
-          const baseSystemPrompt = resolveEffectiveBasePrompt(workflow.workflow)
-          const fallbackAgent = new CommanderAgent(commanderId, commanderBasePath)
-          heartbeatMessage = await buildFatHeartbeatMessage(baseSystemPrompt, fallbackAgent, [])
+          const commanderBody = resolveEffectiveBasePrompt(workflow.workflow)
+          heartbeatMessage = await buildFatHeartbeatMessage(commanderBody, [])
           const enriched = await appendHeartbeatChecklist(
             heartbeatMessage,
             commanderId,
@@ -2035,7 +2290,7 @@ export function createCommandersRouter(
           )
           if (enriched) heartbeatMessage = enriched
         } else {
-          heartbeatMessage = THIN_HEARTBEAT_PROMPT
+          heartbeatMessage = renderedMessage
         }
       }
 
@@ -2325,6 +2580,66 @@ export function createCommandersRouter(
     res.json({ entries })
   })
 
+  router.get('/:id/workspace/tree', requireReadAccess, async (req, res) => {
+    try {
+      const workspace = await resolveCommanderWorkspace(req.params.id)
+      const tree = await listWorkspaceTree(
+        workspace,
+        typeof req.query.path === 'string' ? req.query.path : '',
+      )
+      res.json(tree)
+    } catch (error) {
+      sendWorkspaceError(res, error)
+    }
+  })
+
+  router.get('/:id/workspace/expand', requireReadAccess, async (req, res) => {
+    try {
+      const workspace = await resolveCommanderWorkspace(req.params.id)
+      const tree = await listWorkspaceTree(
+        workspace,
+        typeof req.query.path === 'string' ? req.query.path : '',
+      )
+      res.json(tree)
+    } catch (error) {
+      sendWorkspaceError(res, error)
+    }
+  })
+
+  router.get('/:id/workspace/file', requireReadAccess, async (req, res) => {
+    try {
+      if (typeof req.query.path !== 'string' || !req.query.path.trim()) {
+        throw new WorkspaceError(400, 'path query parameter is required')
+      }
+      const workspace = await resolveCommanderWorkspace(req.params.id)
+      const preview = await readWorkspaceFilePreview(workspace, req.query.path)
+      res.json(preview)
+    } catch (error) {
+      sendWorkspaceError(res, error)
+    }
+  })
+
+  router.get('/:id/workspace/git/status', requireReadAccess, async (req, res) => {
+    try {
+      const workspace = await resolveCommanderWorkspace(req.params.id)
+      const status = await readWorkspaceGitStatus(workspace)
+      res.json(status)
+    } catch (error) {
+      sendWorkspaceError(res, error)
+    }
+  })
+
+  router.get('/:id/workspace/git/log', requireReadAccess, async (req, res) => {
+    try {
+      const workspace = await resolveCommanderWorkspace(req.params.id)
+      const limit = typeof req.query.limit === 'string' ? Number.parseInt(req.query.limit, 10) : 15
+      const log = await readWorkspaceGitLog(workspace, Number.isFinite(limit) ? limit : 15)
+      res.json(log)
+    } catch (error) {
+      sendWorkspaceError(res, error)
+    }
+  })
+
   router.post('/remote/register', requireWriteAccess, async (req, res) => {
     const machineId = parseMachineId(req.body?.machineId)
     const label = parseLabel(req.body?.label)
@@ -2398,6 +2713,11 @@ export function createCommandersRouter(
             host: created.host,
             created: created.created,
           },
+          commanderBasePath,
+        )
+        await scaffoldCommanderWorkflow(
+          created.id,
+          {},
           commanderBasePath,
         )
       } catch (scaffoldError) {
@@ -2503,6 +2823,15 @@ export function createCommandersRouter(
           },
           commanderBasePath,
         )
+        if (!created.cwd || !(await commanderWorkflowFileExists(created.cwd))) {
+          await scaffoldCommanderWorkflow(
+            created.id,
+            {
+              cwd: created.cwd,
+            },
+            commanderBasePath,
+          )
+        }
       } catch (scaffoldError) {
         // Rollback the persisted session so retries don't hit the host-conflict check.
         await sessionStore.delete(created.id).catch(() => {})
@@ -2765,8 +3094,6 @@ export function createCommandersRouter(
 
       const runtime: CommanderRuntime = {
         manager,
-        agent,
-        baseSystemPrompt: effectiveBasePrompt,
         flusher,
         workingMemory,
         contextPressureBridge,
@@ -3167,7 +3494,11 @@ export function createCommandersRouter(
 
     res.json({
       id: updated.id,
-      heartbeat: updated.heartbeat,
+      heartbeat: {
+        intervalMs: updated.heartbeat.intervalMs,
+        messageTemplate: updated.heartbeat.messageTemplate,
+        lastSentAt: updated.heartbeat.lastSentAt,
+      },
       lastHeartbeat: updated.lastHeartbeat,
     })
   })
@@ -3249,6 +3580,39 @@ export function createCommandersRouter(
 
     try {
       const quest = await questStore.claimNext(commanderId)
+      if (quest) {
+        const runtime = runtimes.get(commanderId)
+        const issueNumber = parseQuestIssueNumber(quest)
+        const repo = toSessionRepo(session)
+        const summary = `Quest claimed: ${summarizeQuestInstruction(quest.instruction)}`
+        const workingMemory = runtime?.workingMemory ?? new WorkingMemoryStore(commanderId, commanderBasePath)
+        const journalWriter = runtime?.manager.journalWriter ?? new JournalWriter(commanderId, commanderBasePath)
+
+        await Promise.all([
+          workingMemory.update({
+            source: 'system',
+            summary,
+            issueNumber,
+            repo,
+            tags: ['quest', 'claimed', quest.source],
+          }),
+          journalWriter.append({
+            timestamp: now().toISOString(),
+            issueNumber,
+            repo,
+            outcome: 'Quest claimed',
+            durationMin: null,
+            salience: 'ROUTINE',
+            body: [
+              `- Quest ID: \`${quest.id}\``,
+              `- Source: ${quest.source}`,
+              `- Instruction: ${summarizeQuestInstruction(quest.instruction)}`,
+            ].join('\n'),
+          }),
+        ]).catch((error) => {
+          console.error(`[commanders] Failed to persist quest claim activity for "${commanderId}":`, error)
+        })
+      }
       res.json({ quest })
     } catch (error) {
       res.status(500).json({
@@ -3640,8 +4004,15 @@ export function createCommandersRouter(
       return
     }
 
-    if (!(await sessionStore.get(commanderId))) {
+    const commanderSession = await sessionStore.get(commanderId)
+    if (!commanderSession) {
       res.status(404).json({ error: `Commander "${commanderId}" not found` })
+      return
+    }
+
+    const existingQuest = await questStore.get(commanderId, questId)
+    if (!existingQuest) {
+      res.status(404).json({ error: `Quest "${questId}" not found` })
       return
     }
 
@@ -3698,6 +4069,52 @@ export function createCommandersRouter(
         res.status(404).json({ error: `Quest "${questId}" not found` })
         return
       }
+
+      if (update.status && update.status !== existingQuest.status) {
+        const runtime = runtimes.get(commanderId)
+        const repo = toSessionRepo(commanderSession)
+        const issueNumber = parseQuestIssueNumber(updated)
+        const summaryPrefix = update.status === 'done'
+          ? 'Quest completed'
+          : update.status === 'failed'
+            ? 'Quest failed'
+            : update.status === 'active'
+              ? 'Quest activated'
+              : 'Quest moved to pending'
+        const summary = `${summaryPrefix}: ${summarizeQuestInstruction(updated.instruction)}`
+        const workingMemory = runtime?.workingMemory ?? new WorkingMemoryStore(commanderId, commanderBasePath)
+        const journalWriter = runtime?.manager.journalWriter ?? new JournalWriter(commanderId, commanderBasePath)
+
+        await Promise.all([
+          workingMemory.update({
+            source: 'system',
+            summary,
+            issueNumber,
+            repo,
+            tags: ['quest', update.status, updated.source],
+          }),
+          journalWriter.append({
+            timestamp: now().toISOString(),
+            issueNumber,
+            repo,
+            outcome: summaryPrefix,
+            durationMin: null,
+            salience: update.status === 'failed'
+              ? 'SPIKE'
+              : update.status === 'done'
+                ? 'NOTABLE'
+                : 'ROUTINE',
+            body: [
+              `- Quest ID: \`${updated.id}\``,
+              `- Status: ${existingQuest.status} -> ${update.status}`,
+              `- Instruction: ${summarizeQuestInstruction(updated.instruction)}`,
+            ].join('\n'),
+          }),
+        ]).catch((error) => {
+          console.error(`[commanders] Failed to persist quest status activity for "${commanderId}":`, error)
+        })
+      }
+
       res.json(updated)
     } catch (error) {
       res.status(500).json({
@@ -4221,6 +4638,39 @@ export function createCommandersRouter(
     } catch (error) {
       res.status(500).json({
         error: error instanceof Error ? error.message : 'Failed to recall memory',
+      })
+    }
+  })
+
+  router.post('/:id/memory/semantic-search', requireWriteAccess, async (req, res) => {
+    const commanderId = parseSessionId(req.params.id)
+    if (!commanderId) {
+      res.status(400).json({ error: 'Invalid commander id' })
+      return
+    }
+
+    if (!(await sessionStore.get(commanderId))) {
+      res.status(404).json({ error: `Commander "${commanderId}" not found` })
+      return
+    }
+
+    const body = isObject(req.body) ? req.body : {}
+    const query = typeof body.query === 'string' ? body.query.trim() : ''
+    if (!query) {
+      res.status(400).json({ error: 'query is required' })
+      return
+    }
+
+    const topK = typeof body.topK === 'number' && body.topK > 0
+      ? body.topK
+      : DEFAULT_SEMANTIC_SEARCH_TOP_K
+
+    try {
+      const results = await runSemanticSearch(query, topK)
+      res.json(results)
+    } catch (error) {
+      res.status(500).json({
+        error: error instanceof Error ? error.message : 'Failed to run semantic search',
       })
     }
   })

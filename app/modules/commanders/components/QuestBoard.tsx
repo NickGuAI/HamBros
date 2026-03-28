@@ -1,7 +1,7 @@
 import { type FormEvent, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ChevronUp, Plus, X } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { cn, timeAgo } from '@/lib/utils'
 import { fetchJson, fetchVoid } from '@/lib/api'
 import type { CommanderSession } from '../hooks/useCommander'
 import { ModalFormContainer } from '../../components/ModalFormContainer'
@@ -17,6 +17,7 @@ import {
 
 type QuestStatus = 'pending' | 'active' | 'done' | 'failed'
 type QuestDisplayStatus = QuestStatus | 'unknown'
+const ONE_DAY_MS = 24 * 60 * 60 * 1000
 
 interface QuestContract {
   cwd?: string | null
@@ -38,6 +39,8 @@ interface CommanderQuest {
   status: QuestStatus | string
   instruction: string
   source: QuestSource | string
+  createdAt?: string | null
+  completedAt?: string | null
   githubIssueUrl?: string | null
   artifacts?: QuestArtifact[] | null
   contract?: QuestContract | null
@@ -269,6 +272,151 @@ async function deleteCommanderQuest(input: DeleteQuestInput): Promise<void> {
   )
 }
 
+function parseDateMillis(value: string | null | undefined): number | null {
+  const raw = nonEmpty(value)
+  if (!raw) {
+    return null
+  }
+
+  const timestamp = new Date(raw).getTime()
+  if (Number.isNaN(timestamp)) {
+    return null
+  }
+  return timestamp
+}
+
+function formatRelativeTime(value: string | null | undefined): string | null {
+  const raw = nonEmpty(value)
+  if (!raw) {
+    return null
+  }
+
+  const parsed = new Date(raw)
+  if (Number.isNaN(parsed.getTime())) {
+    return null
+  }
+  return timeAgo(parsed.toISOString())
+}
+
+function resolveCompletedTimestamp(quest: CommanderQuest): number | null {
+  return parseDateMillis(quest.completedAt) ?? parseDateMillis(quest.createdAt)
+}
+
+function isCompletedWithin24Hours(quest: CommanderQuest, nowMillis: number): boolean {
+  const completedTimestamp = resolveCompletedTimestamp(quest)
+  if (completedTimestamp === null) {
+    return false
+  }
+  return nowMillis - completedTimestamp <= ONE_DAY_MS
+}
+
+function sortByMostRecent(quests: CommanderQuest[]): CommanderQuest[] {
+  return [...quests].sort((left, right) => {
+    const leftTimestamp = resolveCompletedTimestamp(left) ?? 0
+    const rightTimestamp = resolveCompletedTimestamp(right) ?? 0
+    if (leftTimestamp !== rightTimestamp) {
+      return rightTimestamp - leftTimestamp
+    }
+    return left.id.localeCompare(right.id)
+  })
+}
+
+function questTimeLabel(quest: CommanderQuest, status: QuestDisplayStatus): string {
+  const created = formatRelativeTime(quest.createdAt)
+  const completed = formatRelativeTime(quest.completedAt) ?? created
+
+  if (status === 'done') {
+    return completed ? `done ${completed}` : 'done'
+  }
+  if (status === 'failed') {
+    return completed ? `failed ${completed}` : 'failed'
+  }
+  if (status === 'active') {
+    return created ? `claimed ${created}` : 'claimed'
+  }
+  return created ? `created ${created}` : 'created'
+}
+
+function QuestCard({
+  quest,
+  isDeleting,
+  onDelete,
+}: {
+  quest: CommanderQuest
+  isDeleting: boolean
+  onDelete: (quest: CommanderQuest) => Promise<void>
+}) {
+  const status = normalizeStatus(quest.status)
+  const statusMeta = STATUS_META[status]
+  const note = latestQuestNote(quest)
+  const contract = contractSummary(quest.contract)
+  const questArtifacts = parseQuestArtifacts(quest.artifacts)
+
+  return (
+    <article className="rounded-lg border border-ink-border bg-washi-white px-3 py-2.5">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-sm text-sumi-black line-clamp-2">
+            <span className="font-mono mr-2">{statusMeta.symbol}</span>
+            {quest.instruction}
+          </p>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <span className={cn('badge-sumi', statusMeta.badgeClassName)}>
+            {statusMeta.label}
+          </span>
+          <button
+            type="button"
+            onClick={() => void onDelete(quest)}
+            disabled={isDeleting}
+            title="Delete quest"
+            className="rounded border border-ink-border p-1 text-sumi-diluted hover:text-accent-vermillion hover:border-accent-vermillion/40 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+          >
+            <X size={12} />
+          </button>
+        </div>
+      </div>
+
+      {contract && (
+        <p className="text-whisper text-sumi-diluted mt-1 truncate">{contract}</p>
+      )}
+
+      {note && (
+        <p className="text-whisper text-sumi-mist mt-1 line-clamp-2">
+          {status === 'done' ? 'Completed:' : status === 'failed' ? 'Failed:' : 'Note:'} {note}
+        </p>
+      )}
+
+      {questArtifacts.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          {questArtifacts.map((artifact, index) => {
+            const isHttp = /^https?:\/\//i.test(artifact.href)
+            return (
+              <a
+                key={`${quest.id}-${artifact.type}-${artifact.href}-${index}`}
+                href={artifact.href}
+                target={isHttp ? '_blank' : undefined}
+                rel={isHttp ? 'noreferrer' : undefined}
+                className="inline-flex max-w-full items-center rounded border border-ink-border bg-washi-aged px-2 py-0.5 text-whisper text-sumi-diluted hover:border-ink-border-hover hover:text-sumi-black transition-colors"
+                title={artifact.href}
+              >
+                <span className="truncate">
+                  [{QUEST_ARTIFACT_PREFIX[artifact.type]}] {artifact.label}
+                </span>
+              </a>
+            )
+          })}
+        </div>
+      )}
+
+      <div className="mt-2 flex items-center justify-between gap-3">
+        <span className="text-whisper text-sumi-diluted truncate">{sourceLabel(quest.source)}</span>
+        <span className="text-whisper text-sumi-diluted shrink-0">{questTimeLabel(quest, status)}</span>
+      </div>
+    </article>
+  )
+}
+
 export function QuestBoard({
   commander,
 }: {
@@ -444,14 +592,18 @@ export function QuestBoard({
   }
 
   const quests = questsQuery.data ?? []
-  const activeQuests = [...quests.filter((q) => {
-    const s = normalizeStatus(q.status)
-    return s === 'pending' || s === 'active' || s === 'unknown'
-  })].reverse()
-  const completedQuests = [...quests.filter((q) => {
-    const s = normalizeStatus(q.status)
-    return s === 'done' || s === 'failed'
-  })].reverse()
+  const pendingQuests = sortByMostRecent(quests.filter((quest) => normalizeStatus(quest.status) === 'pending'))
+  const activeQuests = sortByMostRecent(quests.filter((quest) => {
+    const status = normalizeStatus(quest.status)
+    return status === 'active' || status === 'unknown'
+  }))
+  const completedQuests = sortByMostRecent(quests.filter((quest) => {
+    const status = normalizeStatus(quest.status)
+    return status === 'done' || status === 'failed'
+  }))
+  const nowMillis = Date.now()
+  const recentCompletedQuests = completedQuests.filter((quest) => isCompletedWithin24Hours(quest, nowMillis))
+  const olderCompletedQuests = completedQuests.filter((quest) => !isCompletedWithin24Hours(quest, nowMillis))
   const apiError = toErrorMessage(questsQuery.error) ?? toErrorMessage(createQuestMutation.error)
 
   return (
@@ -462,7 +614,7 @@ export function QuestBoard({
           type="button"
           onClick={() => setShowForm((current) => !current)}
           disabled={!commander}
-          className="btn-ghost !px-3 !py-1.5 text-xs inline-flex items-center gap-1.5 disabled:opacity-60 disabled:cursor-not-allowed"
+          className="btn-ghost !px-3 !py-1.5 text-xs inline-flex min-h-[44px] items-center gap-1.5 disabled:opacity-60 disabled:cursor-not-allowed"
         >
           <Plus size={12} />
           {showForm ? 'Close' : 'Add Quest'}
@@ -523,177 +675,107 @@ export function QuestBoard({
           <p className="text-sm text-sumi-diluted">No quests created for this commander.</p>
         )}
 
-        {commander && activeQuests.map((quest) => {
-          const status = normalizeStatus(quest.status)
-          const statusMeta = STATUS_META[status]
-          const note = latestQuestNote(quest)
-          const contract = contractSummary(quest.contract)
-          const questArtifacts = parseQuestArtifacts(quest.artifacts)
-          const isDeleting = deletingQuestId === quest.id
-
-          return (
-            <div
-              key={quest.id}
-              className="rounded-lg border border-ink-border bg-washi-white px-3 py-2.5"
-            >
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <p className="text-sm text-sumi-black line-clamp-2">
-                    <span className="font-mono mr-2">{statusMeta.symbol}</span>
-                    <span className="mr-2">{statusMeta.label}</span>
-                    {quest.instruction}
+        {commander && quests.length > 0 && (
+          <div className="space-y-3">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <section className="space-y-2">
+                <div className="flex items-center justify-between rounded-lg border border-ink-border bg-washi-aged/60 px-3 py-2">
+                  <p className="text-whisper uppercase tracking-wide text-sumi-diluted">Pending</p>
+                  <span className="font-mono text-whisper text-sumi-mist">{pendingQuests.length}</span>
+                </div>
+                {pendingQuests.length === 0 && (
+                  <p className="rounded-lg border border-dashed border-ink-border px-3 py-2 text-whisper text-sumi-diluted">
+                    No pending quests.
                   </p>
+                )}
+                {pendingQuests.map((quest) => (
+                  <QuestCard
+                    key={quest.id}
+                    quest={quest}
+                    isDeleting={deleteQuestMutation.isPending || deletingQuestId === quest.id}
+                    onDelete={handleDelete}
+                  />
+                ))}
+              </section>
+
+              <section className="space-y-2">
+                <div className="flex items-center justify-between rounded-lg border border-ink-border bg-washi-aged/60 px-3 py-2">
+                  <p className="text-whisper uppercase tracking-wide text-sumi-diluted">Active</p>
+                  <span className="font-mono text-whisper text-sumi-mist">{activeQuests.length}</span>
                 </div>
-                <div className="flex shrink-0 items-center gap-2">
-                  <span className={cn('badge-sumi', statusMeta.badgeClassName)}>
-                    {statusMeta.label}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => void handleDelete(quest)}
-                    disabled={isDeleting || deleteQuestMutation.isPending}
-                    title="Delete quest"
-                    className="rounded border border-ink-border p-1 text-sumi-diluted hover:text-accent-vermillion hover:border-accent-vermillion/40 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
-                  >
-                    <X size={12} />
-                  </button>
-                </div>
+                {activeQuests.length === 0 && (
+                  <p className="rounded-lg border border-dashed border-ink-border px-3 py-2 text-whisper text-sumi-diluted">
+                    No active quests.
+                  </p>
+                )}
+                {activeQuests.map((quest) => (
+                  <QuestCard
+                    key={quest.id}
+                    quest={quest}
+                    isDeleting={deleteQuestMutation.isPending || deletingQuestId === quest.id}
+                    onDelete={handleDelete}
+                  />
+                ))}
+              </section>
+            </div>
+
+            <section className="space-y-2">
+              <div className="flex items-center justify-between rounded-lg border border-ink-border bg-washi-aged/60 px-3 py-2">
+                <p className="text-whisper uppercase tracking-wide text-sumi-diluted">Completed</p>
+                <span className="font-mono text-whisper text-sumi-mist">
+                  {completedQuests.length} completed
+                </span>
               </div>
 
-              {contract && (
-                <p className="text-whisper text-sumi-diluted mt-1 truncate">{contract}</p>
-              )}
-
-              {note && (
-                <p className="text-whisper text-sumi-mist mt-1 line-clamp-2">
-                  {status === 'done' ? 'Completed:' : status === 'failed' ? 'Failed:' : 'Note:'} {note}
+              {recentCompletedQuests.length === 0 && completedQuests.length === 0 && (
+                <p className="rounded-lg border border-dashed border-ink-border px-3 py-2 text-whisper text-sumi-diluted">
+                  No completed quests yet.
                 </p>
               )}
 
-              {questArtifacts.length > 0 && (
-                <div className="mt-2 flex flex-wrap gap-1.5">
-                  {questArtifacts.map((artifact, index) => {
-                    const isHttp = /^https?:\/\//i.test(artifact.href)
-                    return (
-                      <a
-                        key={`${quest.id}-${artifact.type}-${artifact.href}-${index}`}
-                        href={artifact.href}
-                        target={isHttp ? '_blank' : undefined}
-                        rel={isHttp ? 'noreferrer' : undefined}
-                        className="inline-flex max-w-full items-center rounded border border-ink-border bg-washi-aged px-2 py-0.5 text-whisper text-sumi-diluted hover:border-ink-border-hover hover:text-sumi-black transition-colors"
-                        title={artifact.href}
-                      >
-                        <span className="truncate">
-                          [{QUEST_ARTIFACT_PREFIX[artifact.type]}] {artifact.label}
-                        </span>
-                      </a>
-                    )
-                  })}
-                </div>
-              )}
-
-              <div className="mt-2 flex items-center justify-between gap-3">
-                <span className="text-whisper text-sumi-diluted">{sourceLabel(quest.source)}</span>
-              </div>
-            </div>
-          )
-        })}
-
-        {commander && completedQuests.length > 0 && (
-          <>
-            <button
-              type="button"
-              onClick={() => setCompletedOpen((prev) => !prev)}
-              className="w-full flex items-center gap-2 rounded-lg border border-ink-border bg-washi-aged/60 px-3 py-2 text-xs text-sumi-diluted hover:bg-ink-wash transition-colors"
-            >
-              <ChevronUp
-                size={14}
-                className={cn(
-                  'transition-transform duration-200',
-                  completedOpen ? '' : 'rotate-180',
-                )}
-              />
-              <span className="font-mono">
-                {completedQuests.length} completed quest{completedQuests.length !== 1 ? 's' : ''}
-              </span>
-            </button>
-
-            {completedOpen && completedQuests.map((quest) => {
-              const status = normalizeStatus(quest.status)
-              const statusMeta = STATUS_META[status]
-              const note = latestQuestNote(quest)
-              const contract = contractSummary(quest.contract)
-              const questArtifacts = parseQuestArtifacts(quest.artifacts)
-              const isDeleting = deletingQuestId === quest.id
-
-              return (
-                <div
+              {recentCompletedQuests.map((quest) => (
+                <QuestCard
                   key={quest.id}
-                  className="rounded-lg border border-ink-border bg-washi-white px-3 py-2.5"
+                  quest={quest}
+                  isDeleting={deleteQuestMutation.isPending || deletingQuestId === quest.id}
+                  onDelete={handleDelete}
+                />
+              ))}
+
+              {olderCompletedQuests.length > 0 && (
+                <details
+                  open={completedOpen}
+                  onToggle={(event) => {
+                    setCompletedOpen(event.currentTarget.open)
+                  }}
+                  className="rounded-lg border border-ink-border bg-washi-aged/40"
                 >
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <p className="text-sm text-sumi-black line-clamp-2">
-                        <span className="font-mono mr-2">{statusMeta.symbol}</span>
-                        <span className="mr-2">{statusMeta.label}</span>
-                        {quest.instruction}
-                      </p>
-                    </div>
-                    <div className="flex shrink-0 items-center gap-2">
-                      <span className={cn('badge-sumi', statusMeta.badgeClassName)}>
-                        {statusMeta.label}
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => void handleDelete(quest)}
-                        disabled={isDeleting || deleteQuestMutation.isPending}
-                        title="Delete quest"
-                        className="rounded border border-ink-border p-1 text-sumi-diluted hover:text-accent-vermillion hover:border-accent-vermillion/40 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
-                      >
-                        <X size={12} />
-                      </button>
-                    </div>
+                  <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-xs text-sumi-diluted">
+                    <ChevronUp
+                      size={14}
+                      className={cn(
+                        'transition-transform duration-200',
+                        completedOpen ? '' : 'rotate-180',
+                      )}
+                    />
+                    <span className="font-mono">
+                      {olderCompletedQuests.length} older completed quest{olderCompletedQuests.length !== 1 ? 's' : ''} (&gt;24h)
+                    </span>
+                  </summary>
+                  <div className="space-y-2 border-t border-ink-border px-2 py-2">
+                    {olderCompletedQuests.map((quest) => (
+                      <QuestCard
+                        key={quest.id}
+                        quest={quest}
+                        isDeleting={deleteQuestMutation.isPending || deletingQuestId === quest.id}
+                        onDelete={handleDelete}
+                      />
+                    ))}
                   </div>
-
-                  {contract && (
-                    <p className="text-whisper text-sumi-diluted mt-1 truncate">{contract}</p>
-                  )}
-
-                  {note && (
-                    <p className="text-whisper text-sumi-mist mt-1 line-clamp-2">
-                      {status === 'done' ? 'Completed:' : status === 'failed' ? 'Failed:' : 'Note:'} {note}
-                    </p>
-                  )}
-
-                  {questArtifacts.length > 0 && (
-                    <div className="mt-2 flex flex-wrap gap-1.5">
-                      {questArtifacts.map((artifact, index) => {
-                        const isHttp = /^https?:\/\//i.test(artifact.href)
-                        return (
-                          <a
-                            key={`${quest.id}-${artifact.type}-${artifact.href}-${index}`}
-                            href={artifact.href}
-                            target={isHttp ? '_blank' : undefined}
-                            rel={isHttp ? 'noreferrer' : undefined}
-                            className="inline-flex max-w-full items-center rounded border border-ink-border bg-washi-aged px-2 py-0.5 text-whisper text-sumi-diluted hover:border-ink-border-hover hover:text-sumi-black transition-colors"
-                            title={artifact.href}
-                          >
-                            <span className="truncate">
-                              [{QUEST_ARTIFACT_PREFIX[artifact.type]}] {artifact.label}
-                            </span>
-                          </a>
-                        )
-                      })}
-                    </div>
-                  )}
-
-                  <div className="mt-2 flex items-center justify-between gap-3">
-                    <span className="text-whisper text-sumi-diluted">{sourceLabel(quest.source)}</span>
-                  </div>
-                </div>
-              )
-            })}
-          </>
+                </details>
+              )}
+            </section>
+          </div>
         )}
       </div>
 

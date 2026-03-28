@@ -182,7 +182,7 @@ export default function CommandersPage() {
                     type="button"
                     onClick={() => setShowCronForm((v) => !v)}
                     disabled={!commander.selectedCommander}
-                    className="btn-ghost !px-3 !py-1.5 text-xs inline-flex items-center gap-1.5 disabled:opacity-60 disabled:cursor-not-allowed"
+                    className="btn-ghost !px-3 !py-1.5 text-xs inline-flex min-h-[44px] items-center gap-1.5 disabled:opacity-60 disabled:cursor-not-allowed"
                   >
                     <Plus size={12} />
                     {showCronForm ? 'Close' : 'Add Scheduled Run'}

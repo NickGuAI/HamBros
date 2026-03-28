@@ -131,7 +131,7 @@ describe('AgentsPage default session tab', () => {
     expect(html).not.toContain('>Kill<')
   })
 
-  it('shows completed indicator and dimmed style for sessions with all workers done', () => {
+  it('shows done-worker summary for sessions with all workers completed', () => {
     const sessions = [
       {
         name: 'commander-completed-workers',
@@ -157,9 +157,7 @@ describe('AgentsPage default session tab', () => {
     const html = renderAgentsPageHtml()
 
     expect(html).toContain('commander-completed-workers')
-    expect(html).toContain('>completed<')
     expect(html).toContain('✓ 2 done')
-    expect(html).toContain('opacity-75')
     expect(html).toContain('>Kill<')
   })
 })

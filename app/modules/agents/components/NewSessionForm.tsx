@@ -1,4 +1,4 @@
-import { type FormEvent, type ReactNode, useEffect, useState } from 'react'
+import { memo, type FormEvent, type ReactNode, useEffect, useState } from 'react'
 import { AlertTriangle, Plus } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { AgentType, ClaudePermissionMode, Machine, SessionType } from '@/types'
@@ -42,7 +42,7 @@ export const CODEX_MODE_OPTIONS: Array<{
 const DEFAULT_AGENT_OPTIONS: AgentType[] = ['claude', 'codex', 'openclaw']
 const NOOP_SET_STRING = (_value: string): undefined => undefined
 
-export function NewSessionForm({
+function NewSessionFormComponent({
   name = '',
   setName = NOOP_SET_STRING,
   cwd,
@@ -384,3 +384,6 @@ export function NewSessionForm({
     </form>
   )
 }
+
+export const NewSessionForm = memo(NewSessionFormComponent)
+NewSessionForm.displayName = 'NewSessionForm'

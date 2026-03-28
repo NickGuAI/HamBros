@@ -1,4 +1,4 @@
-import { Router } from 'express'
+import { Router, type Response } from 'express'
 import { WebSocketServer, WebSocket, type RawData } from 'ws'
 import type { IncomingMessage } from 'node:http'
 import type { Duplex } from 'node:stream'
@@ -25,6 +25,24 @@ import {
 import { JournalWriter, EmergencyFlusher } from '../commanders/memory/index.js'
 import { KeyedAsyncQueue } from './message-queue.js'
 import { QuestStore } from '../commanders/quest-store.js'
+import {
+  createWorkspaceFile,
+  createWorkspaceFolder,
+  createWorkspaceUploadMiddleware,
+  deleteWorkspaceEntry,
+  initWorkspaceGit,
+  listWorkspaceTree,
+  readWorkspaceFilePreview,
+  readWorkspaceGitLog,
+  readWorkspaceGitStatus,
+  renameWorkspaceEntry,
+  resolveWorkspacePath,
+  resolveWorkspaceRoot,
+  resolveWorkspaceUploadDestination,
+  saveWorkspaceTextFile,
+  toWorkspaceError,
+  WorkspaceError,
+} from '../workspace/index.js'
 
 const DEFAULT_MAX_SESSIONS = 10
 const DEFAULT_TASK_DELAY_MS = 3000
@@ -48,6 +66,7 @@ const DEFAULT_ROWS = 40
 const DEFAULT_SESSION_STORE_PATH = 'data/agents/stream-sessions.json'
 const COMMAND_ROOM_SESSION_PREFIX = 'command-room-'
 const FACTORY_SESSION_PREFIX = 'factory-'
+const AGENT_SESSION_PREFIX = 'agent-'
 const COMMANDER_SESSION_NAME_PREFIX = 'commander-'
 const COMMANDER_PATH_SEGMENT_PATTERN = /^[a-zA-Z0-9._-]+$/
 const COMMAND_ROOM_STALE_SESSION_TTL_MS = 15 * 60 * 1000
@@ -426,6 +445,23 @@ function parseFactoryBranch(rawBranch: unknown): string | null | undefined {
   }
 
   return normalized
+}
+
+function parseDispatchWorkerType(rawWorkerType: unknown): 'factory' | 'agent' | null {
+  if (rawWorkerType === undefined || rawWorkerType === null || rawWorkerType === '') {
+    return 'factory'
+  }
+
+  if (typeof rawWorkerType !== 'string') {
+    return null
+  }
+
+  const normalized = rawWorkerType.trim()
+  if (normalized === 'factory' || normalized === 'agent') {
+    return normalized
+  }
+
+  return null
 }
 
 function parseGitHubIssueUrl(
@@ -945,8 +981,16 @@ function isFactorySessionName(name: string): boolean {
   return name.startsWith(FACTORY_SESSION_PREFIX)
 }
 
+function isAgentWorkerSessionName(name: string): boolean {
+  return name.startsWith(AGENT_SESSION_PREFIX)
+}
+
+function isWorkerSessionName(name: string): boolean {
+  return isFactorySessionName(name) || isAgentWorkerSessionName(name)
+}
+
 function isOneShotStreamSessionName(name: string): boolean {
-  return isCommandRoomSessionName(name) || isFactorySessionName(name)
+  return isCommandRoomSessionName(name) || isFactorySessionName(name) || isAgentWorkerSessionName(name)
 }
 
 /** Check if a PID is still alive via kill(0). */
@@ -1210,7 +1254,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     for (const session of sessions.values()) {
       if (session.kind !== 'stream') continue
 
-      // One-shot sessions (command-room, factory workers) should not be
+      // One-shot sessions (command-room, factory/agent workers) should not be
       // restored after a completed turn because they are terminal jobs.
       if (isOneShotStreamSessionName(session.name) && session.lastTurnCompleted && session.finalResultEvent) continue
 
@@ -1698,6 +1742,38 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     internalToken: options.internalToken,
   })
 
+  function sendWorkspaceError(
+    res: Response,
+    error: unknown,
+  ): void {
+    const workspaceError = toWorkspaceError(error)
+    res.status(workspaceError.statusCode).json({ error: workspaceError.message })
+  }
+
+  async function resolveAgentWorkspace(
+    rawSessionName: unknown,
+  ) {
+    const sessionName = parseSessionName(rawSessionName)
+    if (!sessionName) {
+      throw new WorkspaceError(400, 'Invalid session name')
+    }
+
+    const session = sessions.get(sessionName)
+    if (!session) {
+      throw new WorkspaceError(404, `Session "${sessionName}" not found`)
+    }
+
+    return resolveWorkspaceRoot({
+      rootPath: session.cwd,
+      source: {
+        kind: 'agent-session',
+        id: session.name,
+        label: session.name,
+        host: session.host,
+      },
+    })
+  }
+
   router.get('/directories', requireReadAccess, async (req, res) => {
     const rawPath = req.query.path
     const rawHost = req.query.host
@@ -1954,6 +2030,188 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     })
   })
 
+  router.get('/sessions/:name/workspace/tree', requireReadAccess, async (req, res) => {
+    try {
+      const workspace = await resolveAgentWorkspace(req.params.name)
+      const tree = await listWorkspaceTree(
+        workspace,
+        typeof req.query.path === 'string' ? req.query.path : '',
+      )
+      res.json(tree)
+    } catch (error) {
+      sendWorkspaceError(res, error)
+    }
+  })
+
+  router.get('/sessions/:name/workspace/expand', requireReadAccess, async (req, res) => {
+    try {
+      const workspace = await resolveAgentWorkspace(req.params.name)
+      const tree = await listWorkspaceTree(
+        workspace,
+        typeof req.query.path === 'string' ? req.query.path : '',
+      )
+      res.json(tree)
+    } catch (error) {
+      sendWorkspaceError(res, error)
+    }
+  })
+
+  router.get('/sessions/:name/workspace/file', requireReadAccess, async (req, res) => {
+    try {
+      const workspace = await resolveAgentWorkspace(req.params.name)
+      if (typeof req.query.path !== 'string' || !req.query.path.trim()) {
+        throw new WorkspaceError(400, 'path query parameter is required')
+      }
+      const preview = await readWorkspaceFilePreview(workspace, req.query.path)
+      res.json(preview)
+    } catch (error) {
+      sendWorkspaceError(res, error)
+    }
+  })
+
+  router.put('/sessions/:name/workspace/file', requireWriteAccess, async (req, res) => {
+    try {
+      if (typeof req.body?.path !== 'string' || !req.body.path.trim()) {
+        throw new WorkspaceError(400, 'path is required')
+      }
+      if (typeof req.body?.content !== 'string') {
+        throw new WorkspaceError(400, 'content must be a string')
+      }
+      const workspace = await resolveAgentWorkspace(req.params.name)
+      const result = await saveWorkspaceTextFile(workspace, req.body.path, req.body.content)
+      res.json(result)
+    } catch (error) {
+      sendWorkspaceError(res, error)
+    }
+  })
+
+  router.get('/sessions/:name/workspace/download', requireReadAccess, async (req, res) => {
+    try {
+      const workspace = await resolveAgentWorkspace(req.params.name)
+      if (typeof req.query.path !== 'string' || !req.query.path.trim()) {
+        throw new WorkspaceError(400, 'path query parameter is required')
+      }
+      const { absolutePath } = await resolveWorkspacePath(workspace, req.query.path, {
+        expectFile: true,
+      })
+      res.download(absolutePath)
+    } catch (error) {
+      sendWorkspaceError(res, error)
+    }
+  })
+
+  router.post('/sessions/:name/workspace/upload', requireWriteAccess, async (req, res) => {
+    try {
+      const workspace = await resolveAgentWorkspace(req.params.name)
+      const destination = await resolveWorkspaceUploadDestination(
+        workspace,
+        typeof req.query.path === 'string' ? req.query.path : '',
+      )
+      const upload = createWorkspaceUploadMiddleware(destination.absolutePath)
+      upload.array('files', 5)(req, res, (error) => {
+        if (error) {
+          sendWorkspaceError(res, error)
+          return
+        }
+
+        const uploaded = (req.files as Express.Multer.File[] | undefined)?.map((file) => file.filename) ?? []
+        res.json({
+          workspace,
+          path: destination.relativePath,
+          uploaded,
+        })
+      })
+    } catch (error) {
+      sendWorkspaceError(res, error)
+    }
+  })
+
+  router.post('/sessions/:name/workspace/new-file', requireWriteAccess, async (req, res) => {
+    try {
+      if (typeof req.body?.path !== 'string' || !req.body.path.trim()) {
+        throw new WorkspaceError(400, 'path is required')
+      }
+      const workspace = await resolveAgentWorkspace(req.params.name)
+      const result = await createWorkspaceFile(workspace, req.body.path)
+      res.status(201).json(result)
+    } catch (error) {
+      sendWorkspaceError(res, error)
+    }
+  })
+
+  router.post('/sessions/:name/workspace/new-folder', requireWriteAccess, async (req, res) => {
+    try {
+      if (typeof req.body?.path !== 'string' || !req.body.path.trim()) {
+        throw new WorkspaceError(400, 'path is required')
+      }
+      const workspace = await resolveAgentWorkspace(req.params.name)
+      const result = await createWorkspaceFolder(workspace, req.body.path)
+      res.status(201).json(result)
+    } catch (error) {
+      sendWorkspaceError(res, error)
+    }
+  })
+
+  router.post('/sessions/:name/workspace/rename', requireWriteAccess, async (req, res) => {
+    try {
+      if (typeof req.body?.fromPath !== 'string' || !req.body.fromPath.trim()) {
+        throw new WorkspaceError(400, 'fromPath is required')
+      }
+      if (typeof req.body?.toPath !== 'string' || !req.body.toPath.trim()) {
+        throw new WorkspaceError(400, 'toPath is required')
+      }
+      const workspace = await resolveAgentWorkspace(req.params.name)
+      const result = await renameWorkspaceEntry(workspace, req.body.fromPath, req.body.toPath)
+      res.json(result)
+    } catch (error) {
+      sendWorkspaceError(res, error)
+    }
+  })
+
+  router.delete('/sessions/:name/workspace/path', requireWriteAccess, async (req, res) => {
+    try {
+      if (typeof req.query.path !== 'string' || !req.query.path.trim()) {
+        throw new WorkspaceError(400, 'path query parameter is required')
+      }
+      const workspace = await resolveAgentWorkspace(req.params.name)
+      const result = await deleteWorkspaceEntry(workspace, req.query.path)
+      res.json(result)
+    } catch (error) {
+      sendWorkspaceError(res, error)
+    }
+  })
+
+  router.get('/sessions/:name/workspace/git/status', requireReadAccess, async (req, res) => {
+    try {
+      const workspace = await resolveAgentWorkspace(req.params.name)
+      const status = await readWorkspaceGitStatus(workspace)
+      res.json(status)
+    } catch (error) {
+      sendWorkspaceError(res, error)
+    }
+  })
+
+  router.get('/sessions/:name/workspace/git/log', requireReadAccess, async (req, res) => {
+    try {
+      const workspace = await resolveAgentWorkspace(req.params.name)
+      const limit = typeof req.query.limit === 'string' ? Number.parseInt(req.query.limit, 10) : 15
+      const log = await readWorkspaceGitLog(workspace, Number.isFinite(limit) ? limit : 15)
+      res.json(log)
+    } catch (error) {
+      sendWorkspaceError(res, error)
+    }
+  })
+
+  router.post('/sessions/:name/workspace/git/init', requireWriteAccess, async (req, res) => {
+    try {
+      const workspace = await resolveAgentWorkspace(req.params.name)
+      const output = await initWorkspaceGit(workspace)
+      res.status(201).json({ workspace, output })
+    } catch (error) {
+      sendWorkspaceError(res, error)
+    }
+  })
+
   router.get('/machines', requireReadAccess, async (_req, res) => {
     try {
       const machines = await readMachineRegistry()
@@ -2011,6 +2269,12 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       return
     }
 
+    const workerType = parseDispatchWorkerType(req.body?.workerType)
+    if (workerType === null) {
+      res.status(400).json({ error: 'Invalid workerType. Expected "factory" or "agent"' })
+      return
+    }
+
     const requestedMachine = parseOptionalHost(req.body?.machine)
     if (requestedMachine === null) {
       res.status(400).json({ error: 'Invalid machine: expected machine ID string' })
@@ -2060,9 +2324,13 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       res.status(400).json({ error: 'Invalid cwd: must be an absolute path' })
       return
     }
-
-    const branch = parsedBranch ?? (parsedIssueUrl ? `feat-${parsedIssueUrl.issueNumber}` : undefined)
-    if (!branch) {
+    const sourceCwd = requestedCwd
+      ?? (targetMachine ? targetMachine.cwd : undefined)
+      ?? parentSession.cwd
+    const branch = workerType === 'factory'
+      ? (parsedBranch ?? (parsedIssueUrl ? `feat-${parsedIssueUrl.issueNumber}` : undefined))
+      : undefined
+    if (workerType === 'factory' && !branch) {
       res.status(400).json({ error: 'Provide branch or issueUrl' })
       return
     }
@@ -2073,20 +2341,10 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       resolvedTask = `/legion-implement ${issueUrl}${rawTask ? `\n\n${rawTask}` : ''}`
     }
 
-    const repoFromIssue = parsedIssueUrl
-      ? { owner: parsedIssueUrl.owner, repo: parsedIssueUrl.repo }
-      : null
-    const sourceCwd = requestedCwd ?? parentSession.cwd
-    const repo = repoFromIssue ?? await resolveGitHubRepoFromCwd(sourceCwd)
-    if (!repo) {
-      res.status(400).json({
-        error: 'Unable to resolve GitHub owner/repo. Provide issueUrl or use a git repo cwd.',
-      })
-      return
-    }
-
     const timestamp = Date.now()
-    const sessionNameBase = `factory-${branch}-${timestamp}`
+    const sessionNameBase = workerType === 'agent'
+      ? `${AGENT_SESSION_PREFIX}${timestamp}`
+      : `${FACTORY_SESSION_PREFIX}${branch}-${timestamp}`
     let workerSessionName = sessionNameBase
     let suffix = 1
     while (sessions.has(workerSessionName)) {
@@ -2095,13 +2353,6 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     }
 
     try {
-      const worktree = await bootstrapFactoryWorktree({
-        owner: repo.owner,
-        repo: repo.repo,
-        feature: branch,
-        machine: targetMachine,
-      })
-
       const requestedAgentType = req.body?.agentType
       const workerAgentType: 'claude' | 'codex' = requestedAgentType === 'codex'
         ? 'codex'
@@ -2111,63 +2362,122 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
             ? 'codex'
             : 'claude'
 
-      // Write a Claude Code Stop hook into the worktree so that when the
-      // agent finishes, it POSTs to the hammurabi API to mark the session
-      // as completed.  This is the primary completion signal.
-      try {
-        const hookApiBase = process.env.HAMBROS_API_URL?.trim() || `http://127.0.0.1:${process.env.PORT || '4200'}`
-        const hookApiKey = process.env.HAMBROS_INTERNAL_TOKEN?.trim() || ''
-        const hookUrl = `${hookApiBase}/api/agents/sessions/${encodeURIComponent(workerSessionName)}/complete`
-        const curlCmd = [
-          'curl -s -X POST',
-          `-H "Content-Type: application/json"`,
-          hookApiKey ? `-H "x-hammurabi-api-key: ${hookApiKey}"` : '',
-          `-d '{"status":"success","comment":"Stop hook fired"}'`,
-          `"${hookUrl}"`,
-        ].filter(Boolean).join(' ')
-        const hookSettings = {
-          hooks: {
-            Stop: [
-              {
-                matcher: '',
-                hooks: [
-                  {
-                    type: 'command',
-                    command: `bash -c '${curlCmd.replace(/'/g, `'\\''`)}'`,
-                  },
-                ],
-              },
-            ],
-          },
-        }
-        const claudeDir = path.join(worktree.path, '.claude')
-        await mkdir(claudeDir, { recursive: true })
-        await writeFile(
-          path.join(claudeDir, 'settings.local.json'),
-          JSON.stringify(hookSettings, null, 2),
-          'utf8',
-        )
-      } catch {
-        // Non-fatal — PID liveness and exit handler are fallbacks.
+      let workerSession: StreamSession
+      const responsePayload: {
+        name: string
+        branch?: string
+        worktree?: string
+        cwd?: string
+        workerType: 'factory' | 'agent'
+      } = {
+        name: workerSessionName,
+        workerType,
       }
 
-      const workerSession = workerAgentType === 'codex'
-        ? await createCodexAppServerSession(
-          workerSessionName,
-          parentSession.mode,
-          resolvedTask,
-          worktree.path,
-          { parentSession: parentSessionName },
-        )
-        : createStreamSession(
-          workerSessionName,
-          parentSession.mode,
-          resolvedTask,
-          worktree.path,
-          targetMachine,
-          workerAgentType,
-          { parentSession: parentSessionName },
-        )
+      if (workerType === 'agent') {
+        workerSession = workerAgentType === 'codex'
+          ? await createCodexAppServerSession(
+            workerSessionName,
+            parentSession.mode,
+            resolvedTask,
+            sourceCwd,
+            { parentSession: parentSessionName },
+          )
+          : createStreamSession(
+            workerSessionName,
+            parentSession.mode,
+            resolvedTask,
+            sourceCwd,
+            targetMachine,
+            workerAgentType,
+            { parentSession: parentSessionName },
+          )
+        responsePayload.cwd = sourceCwd
+      } else {
+        const factoryBranch = branch
+        if (!factoryBranch) {
+          res.status(400).json({ error: 'Provide branch or issueUrl' })
+          return
+        }
+
+        const repoFromIssue = parsedIssueUrl
+          ? { owner: parsedIssueUrl.owner, repo: parsedIssueUrl.repo }
+          : null
+        const repo = repoFromIssue ?? await resolveGitHubRepoFromCwd(sourceCwd)
+        if (!repo) {
+          res.status(400).json({
+            error: 'Unable to resolve GitHub owner/repo. Provide issueUrl or use a git repo cwd.',
+          })
+          return
+        }
+
+        const worktree = await bootstrapFactoryWorktree({
+          owner: repo.owner,
+          repo: repo.repo,
+          feature: factoryBranch,
+          machine: targetMachine,
+        })
+
+        // Write a Claude Code Stop hook into the worktree so that when the
+        // agent finishes, it POSTs to the hammurabi API to mark the session
+        // as completed.  This is the primary completion signal.
+        try {
+          const hookApiBase = process.env.HAMBROS_API_URL?.trim() || `http://127.0.0.1:${process.env.PORT || '4200'}`
+          const hookApiKey = process.env.HAMBROS_INTERNAL_TOKEN?.trim() || ''
+          const hookUrl = `${hookApiBase}/api/agents/sessions/${encodeURIComponent(workerSessionName)}/complete`
+          const curlCmd = [
+            'curl -s -X POST',
+            `-H "Content-Type: application/json"`,
+            hookApiKey ? `-H "x-hammurabi-api-key: ${hookApiKey}"` : '',
+            `-d '{"status":"success","comment":"Stop hook fired"}'`,
+            `"${hookUrl}"`,
+          ].filter(Boolean).join(' ')
+          const hookSettings = {
+            hooks: {
+              Stop: [
+                {
+                  matcher: '',
+                  hooks: [
+                    {
+                      type: 'command',
+                      command: `bash -c '${curlCmd.replace(/'/g, `'\\''`)}'`,
+                    },
+                  ],
+                },
+              ],
+            },
+          }
+          const claudeDir = path.join(worktree.path, '.claude')
+          await mkdir(claudeDir, { recursive: true })
+          await writeFile(
+            path.join(claudeDir, 'settings.local.json'),
+            JSON.stringify(hookSettings, null, 2),
+            'utf8',
+          )
+        } catch {
+          // Non-fatal — PID liveness and exit handler are fallbacks.
+        }
+
+        workerSession = workerAgentType === 'codex'
+          ? await createCodexAppServerSession(
+            workerSessionName,
+            parentSession.mode,
+            resolvedTask,
+            worktree.path,
+            { parentSession: parentSessionName },
+          )
+          : createStreamSession(
+            workerSessionName,
+            parentSession.mode,
+            resolvedTask,
+            worktree.path,
+            targetMachine,
+            workerAgentType,
+            { parentSession: parentSessionName },
+          )
+        responsePayload.branch = worktree.branch
+        responsePayload.worktree = worktree.path
+      }
 
       sessions.set(workerSessionName, workerSession)
       if (!parentSession.spawnedWorkers.includes(workerSessionName)) {
@@ -2192,11 +2502,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
         })
       }
 
-      res.status(202).json({
-        name: workerSessionName,
-        worktree: worktree.path,
-        branch: worktree.branch,
-      })
+      res.status(202).json(responsePayload)
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to dispatch worker'
       if (message.includes('already exists')) {
@@ -2330,7 +2636,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       return
     }
 
-      const active = sessions.get(name)
+    const active = sessions.get(name)
     if (active) {
       if (
         active.kind === 'stream' &&
@@ -2357,11 +2663,11 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
         return
       }
 
-      // PID liveness fallback: if the factory worker's PID is dead but the
-      // process exit handler hasn't fired yet, synthesize completion now.
-      if (active.kind === 'stream' && isFactorySessionName(name)) {
-        const factoryPid = active.process.pid ?? 0
-        if (factoryPid > 0 && !isPidAlive(factoryPid)) {
+      // PID liveness fallback: if a worker's PID is dead but the process
+      // exit handler hasn't fired yet, synthesize completion now.
+      if (active.kind === 'stream' && isWorkerSessionName(name)) {
+        const workerPid = active.process.pid ?? 0
+        if (workerPid > 0 && !isPidAlive(workerPid)) {
           const exitEvent: StreamJsonEvent = { type: 'exit', exitCode: -1, text: 'Process not found (PID liveness check)' }
           const completed = active.finalResultEvent
             ? toCompletedSession(name, active.completedTurnAt ?? new Date().toISOString(), active.finalResultEvent, active.usage.costUsd)
@@ -3139,6 +3445,33 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     session.pendingMessageCount = 0
   }
 
+  function stopSessionRuntime(
+    session: PtySession | StreamSession | OpenClawSession,
+    options: { closeClients?: boolean; closeReason?: string } = {},
+  ): void {
+    const shouldCloseClients = options.closeClients !== false
+    if (shouldCloseClients) {
+      for (const client of session.clients) {
+        client.close(1000, options.closeReason ?? 'Session ended')
+      }
+      session.clients.clear()
+    }
+
+    if (session.kind === 'stream') {
+      cleanupStreamMessageQueue(session)
+      session.process.kill('SIGTERM')
+      return
+    }
+
+    if (session.kind === 'openclaw') {
+      session.gatewayWs?.close()
+      session.gatewayWs = null
+      return
+    }
+
+    session.pty.kill()
+  }
+
   function waitForTurnCompletion(session: StreamSession): Promise<void> {
     if (session.lastTurnCompleted) {
       return Promise.resolve()
@@ -3789,8 +4122,8 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
           ),
         )
         scheduleCompletedSessionsWrite()
-      } else if (isCommandRoomSessionName(sessionName) || isFactorySessionName(sessionName)) {
-        // One-shot sessions (command-room, factory workers): process may exit
+      } else if (isCommandRoomSessionName(sessionName) || isWorkerSessionName(sessionName)) {
+        // Command-room and worker sessions: process may exit
         // without emitting a result event. Synthesize completion so status
         // queries detect the session as finished.
         completedSessions.set(
@@ -3808,7 +4141,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
 
       // Snapshot events before removing the session so the messages endpoint
       // can still serve conversation history for completed one-shot sessions (P2-5).
-      if (session.events.length > 0 && (isCommandRoomSessionName(sessionName) || isFactorySessionName(sessionName))) {
+      if (session.events.length > 0 && (isCommandRoomSessionName(sessionName) || isWorkerSessionName(sessionName))) {
         completedSessionEvents.set(sessionName, session.events.slice())
       }
 
@@ -3842,7 +4175,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       // On spawn failure (e.g. ENOENT), 'error' may fire without a
       // subsequent 'exit' event.  Clean up the session to prevent zombie
       // entries that never auto-clean.
-      if ((isCommandRoomSessionName(sessionName) || isFactorySessionName(sessionName)) && !session.finalResultEvent) {
+      if ((isCommandRoomSessionName(sessionName) || isWorkerSessionName(sessionName)) && !session.finalResultEvent) {
         completedSessions.set(
           sessionName,
           toExitBasedCompletedSession(sessionName, errorEvent, session.usage.costUsd),
@@ -4571,7 +4904,17 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     }
 
     const userMsg = JSON.stringify({ type: 'user', message: { role: 'user', content: text } })
-    const sent = writeToStdin(session, userMsg + '\n')
+    const sent = session.codexThreadId
+      ? await startCodexTurn(session, text)
+      : writeToStdin(session, userMsg + '\n')
+    if (sent) {
+      const userEvent: StreamJsonEvent = {
+        type: 'user',
+        message: { role: 'user', content: text },
+      } as unknown as StreamJsonEvent
+      appendStreamEvent(session, userEvent)
+      broadcastStreamEvent(session, userEvent)
+    }
     res.json({ sent })
   })
 
@@ -5463,7 +5806,19 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
           { systemPrompt, resumeSessionId, maxTurns },
         )
       }
+
+      const existing = sessions.get(name)
+      if (existing) {
+        for (const client of existing.clients) {
+          session.clients.add(client)
+        }
+        existing.clients.clear()
+      }
+
       sessions.set(name, session)
+      if (existing) {
+        stopSessionRuntime(existing, { closeClients: false })
+      }
       schedulePersistedSessionsWrite()
       return session
     },
@@ -5488,7 +5843,16 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       }
 
       const userMsg = JSON.stringify({ type: 'user', message: { role: 'user', content: text } })
-      return writeToStdin(session, userMsg + '\n')
+      const sent = writeToStdin(session, userMsg + '\n')
+      if (sent) {
+        const userEvent: StreamJsonEvent = {
+          type: 'user',
+          message: { role: 'user', content: text },
+        } as unknown as StreamJsonEvent
+        appendStreamEvent(session, userEvent)
+        broadcastStreamEvent(session, userEvent)
+      }
+      return sent
     },
     deleteSession(name) {
       const session = sessions.get(name)
@@ -5496,21 +5860,9 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
         return
       }
 
-      for (const client of session.clients) {
-        client.close(1000, 'Commander stopped')
-      }
-
-      if (session.kind === 'stream') {
-        session.process.kill('SIGTERM')
-      } else if (session.kind === 'openclaw') {
-        session.gatewayWs?.close()
-        session.gatewayWs = null
-      } else {
-        session.pty.kill()
-      }
-
       sessions.delete(name)
       sessionEventHandlers.delete(name)
+      stopSessionRuntime(session, { closeReason: 'Commander stopped' })
       schedulePersistedSessionsWrite()
     },
     getSession(name) {

@@ -132,7 +132,7 @@ export function ModalFormContainer({
               <button
                 type="button"
                 onClick={onClose}
-                className="rounded-lg border border-ink-border p-1 text-sumi-diluted hover:text-sumi-black hover:border-ink-border-hover transition-colors"
+                className="inline-flex min-h-[44px] min-w-[44px] items-center justify-center rounded-lg border border-ink-border p-1 text-sumi-diluted hover:text-sumi-black hover:border-ink-border-hover transition-colors"
                 aria-label="Close"
               >
                 <X size={14} />
@@ -160,7 +160,7 @@ export function ModalFormContainer({
             <button
               type="button"
               onClick={onClose}
-              className="rounded-lg border border-ink-border p-1 text-sumi-diluted hover:text-sumi-black hover:border-ink-border-hover transition-colors"
+              className="inline-flex min-h-[44px] min-w-[44px] items-center justify-center rounded-lg border border-ink-border p-1 text-sumi-diluted hover:text-sumi-black hover:border-ink-border-hover transition-colors"
               aria-label="Close"
             >
               <X size={14} />

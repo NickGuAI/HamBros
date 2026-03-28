@@ -329,6 +329,59 @@ describe('runWorkersCli', () => {
     expect(fetchImpl).not.toHaveBeenCalled()
   })
 
+  it('sends a message via POST /sessions/:name/send', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ sent: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
+    const stdout = createBufferWriter()
+    const stderr = createBufferWriter()
+
+    const exitCode = await runWorkersCli(['send', 'factory-feat-42', 'hello worker'], {
+      fetchImpl,
+      readConfig: async () => config,
+      stdout: stdout.writer,
+      stderr: stderr.writer,
+    })
+
+    expect(exitCode).toBe(0)
+    expect(stderr.read()).toBe('')
+    expect(stdout.read()).toContain('sent: true')
+    expect(fetchImpl).toHaveBeenCalledWith(
+      'https://hammurabi.gehirn.ai/api/agents/sessions/factory-feat-42/send',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({
+          authorization: 'Bearer hmrb_test_key',
+          'content-type': 'application/json',
+        }),
+        body: JSON.stringify({ text: 'hello worker' }),
+      }),
+    )
+  })
+
+  it('requires a session name and text for send', async () => {
+    const fetchImpl = vi.fn<typeof fetch>()
+    const stdout = createBufferWriter()
+
+    const missingTextExitCode = await runWorkersCli(['send', 'factory-feat-42'], {
+      fetchImpl,
+      readConfig: async () => config,
+      stdout: stdout.writer,
+    })
+    expect(missingTextExitCode).toBe(1)
+
+    const blankTextExitCode = await runWorkersCli(['send', 'factory-feat-42', '   '], {
+      fetchImpl,
+      readConfig: async () => config,
+      stdout: stdout.writer,
+    })
+    expect(blankTextExitCode).toBe(1)
+    expect(fetchImpl).not.toHaveBeenCalled()
+  })
+
   it('fails when config is missing', async () => {
     const fetchImpl = vi.fn<typeof fetch>()
     const stderr = createBufferWriter()
