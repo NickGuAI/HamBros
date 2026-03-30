@@ -1,7 +1,6 @@
 import { existsSync } from 'node:fs'
 import { createServer } from 'node:http'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import express from 'express'
 import cors from 'cors'
 import { ApiKeyJsonStore } from './api-keys/store.js'
@@ -73,8 +72,7 @@ for (const mod of modules) {
   app.use(mod.routePrefix, mod.router)
 }
 
-const appRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const distDir = path.resolve(appRoot, 'dist')
+const distDir = path.resolve(process.cwd(), 'dist')
 if (process.env.NODE_ENV === 'production' && existsSync(distDir)) {
   app.use(express.static(distDir))
   app.get('*', (req, res, next) => {

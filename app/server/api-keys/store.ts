@@ -1,10 +1,6 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
-
-/** App root directory (apps/hammurabi/), resolved from this file's location. */
-const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
 
 export const API_KEY_SCOPES = [
   'telemetry:read',
@@ -143,7 +139,7 @@ export function hashApiKey(rawKey: string): string {
 }
 
 export function defaultApiKeyStorePath(): string {
-  return path.resolve(APP_ROOT, 'data/api-keys/keys.json')
+  return path.resolve(process.cwd(), 'data/api-keys/keys.json')
 }
 
 const DEFAULT_LAST_USED_WRITE_INTERVAL_MS = 60_000
