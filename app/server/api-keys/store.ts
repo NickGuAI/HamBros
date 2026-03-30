@@ -206,6 +206,37 @@ export class ApiKeyJsonStore implements ApiKeyStoreLike {
     })
   }
 
+  /**
+   * Seeds a default master key on first boot when no keys exist.
+   * The raw key value is determined by the caller (e.g. "HAMBROS!" for HamBros).
+   * Returns the raw key if seeded, or null if keys already exist.
+   */
+  async seedDefaultKey(rawKey: string, label = 'Master Key'): Promise<string | null> {
+    const hasKeys = await this.hasAnyKeys()
+    if (hasKeys) return null
+
+    return this.withMutationLock(async () => {
+      // Double-check inside lock to avoid races.
+      const records = await this.readRecords()
+      if (records.length > 0) return null
+
+      const record: ApiKeyRecord = {
+        id: randomUUID(),
+        name: label,
+        keyHash: hashApiKey(rawKey),
+        prefix: rawKey.slice(0, 9),
+        createdBy: 'system',
+        createdAt: new Date().toISOString(),
+        lastUsedAt: null,
+        scopes: [...API_KEY_SCOPES],
+      }
+
+      records.push(record)
+      await this.writeRecords(records)
+      return rawKey
+    })
+  }
+
   async revokeKey(id: string): Promise<boolean> {
     return this.withMutationLock(async () => {
       const records = await this.readRecords()

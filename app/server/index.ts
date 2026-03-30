@@ -13,6 +13,18 @@ const app = express()
 const port = parseInt(process.env.PORT ?? '20001', 10)
 const allowedCorsOrigins = parseAllowedCorsOrigins(process.env.HAMBROS_ALLOWED_ORIGINS)
 const apiKeyStore = new ApiKeyJsonStore()
+
+// Seed a default master key on first boot when no keys exist.
+// HAMBROS_DEFAULT_KEY can be set to any value; defaults to "HAMMURABI!".
+// The SOP-15 HamBros sync rewrites this to HAMBROS_DEFAULT_KEY / "HAMBROS!".
+const defaultKeyValue = process.env.HAMBROS_DEFAULT_KEY ?? 'HAMBROS!'
+apiKeyStore.seedDefaultKey(defaultKeyValue).then((seeded) => {
+  if (seeded) {
+    console.log(`[api-keys] Seeded default master key. Use "${seeded}" to authenticate.`)
+    console.log('[api-keys] ⚠ Change this key in production: Settings → API Keys → Revoke & create new.')
+  }
+}).catch(() => { /* best-effort — server starts regardless */ })
+
 const transcriptionKeyStore = new OpenAITranscriptionKeyStore()
 const maxAgentSessions = process.env.HAMBROS_MAX_AGENT_SESSIONS
   ? parseInt(process.env.HAMBROS_MAX_AGENT_SESSIONS, 10)
