@@ -252,6 +252,67 @@ function connectWs(
   })
 }
 
+async function seedCommanderSessionFixture(options: {
+  commanderDataDir: string
+  commanderId: string
+  cwd?: string
+  agentType?: 'claude' | 'codex'
+  workflowPrompt: string
+  identityBody: string
+}) {
+  const {
+    commanderDataDir,
+    commanderId,
+    cwd = '/tmp',
+    agentType = 'claude',
+    workflowPrompt,
+    identityBody,
+  } = options
+
+  const commanderRoot = join(commanderDataDir, commanderId)
+  const memoryRoot = join(commanderRoot, '.memory')
+  await mkdir(join(memoryRoot, 'journal'), { recursive: true })
+  await mkdir(join(memoryRoot, 'backlog'), { recursive: true })
+  await mkdir(join(memoryRoot, 'repos'), { recursive: true })
+  await writeFile(join(commanderRoot, 'COMMANDER.md'), workflowPrompt, 'utf8')
+  await writeFile(
+    join(memoryRoot, 'identity.md'),
+    [
+      '---',
+      `id: "${commanderId}"`,
+      '---',
+      '',
+      '# Identity',
+      '',
+      identityBody,
+    ].join('\n'),
+    'utf8',
+  )
+  await writeFile(join(memoryRoot, 'MEMORY.md'), '# Commander Memory\n\n- Keep changes surgical.\n', 'utf8')
+
+  const store = new CommanderSessionStore(join(commanderDataDir, 'sessions.json'))
+  const session: CommanderSession = {
+    id: commanderId,
+    host: 'test-host',
+    pid: 123,
+    state: 'running',
+    created: '2026-03-20T00:00:00Z',
+    agentType,
+    cwd,
+    heartbeat: {
+      intervalMs: 60_000,
+      messageTemplate: 'heartbeat',
+      lastSentAt: null,
+    },
+    lastHeartbeat: null,
+    taskSource: null,
+    currentTask: null,
+    completedTasks: 0,
+    totalCostUsd: 0,
+  }
+  await store.create(session)
+}
+
 function installMockProcess(options?: { pid?: number }) {
   const mock = createMockChildProcess(options?.pid)
   mockedSpawn.mockReturnValue(mock.cp as never)
@@ -2426,6 +2487,13 @@ describe('stream sessions', () => {
     let server: RunningServer | null = null
 
     try {
+      await seedCommanderSessionFixture({
+        commanderDataDir,
+        commanderId: 'alpha',
+        workflowPrompt: 'Commander Alpha workflow prompt',
+        identityBody: 'Commander Alpha identity body.',
+      })
+
       server = await startServer({
         autoRotateEntryThreshold: 1,
         commanderSessionStorePath: join(commanderDataDir, 'sessions.json'),
@@ -2518,6 +2586,18 @@ describe('stream sessions', () => {
       const claudeSpawnCalls = mockedSpawn.mock.calls.filter(([command]) => command === 'claude')
       expect(claudeSpawnCalls).toHaveLength(2)
       expect(claudeSpawnCalls[1][1]).not.toContain('--resume')
+      expect(claudeSpawnCalls[1][1]).not.toContain('--max-turns')
+      expect(claudeSpawnCalls[1][1]).toContain('--system-prompt')
+      const promptArgIndex = claudeSpawnCalls[1][1].indexOf('--system-prompt')
+      const rotatedPrompt = claudeSpawnCalls[1][1][promptArgIndex + 1]
+      expect(rotatedPrompt).toContain('Commander Alpha workflow prompt')
+      expect(rotatedPrompt).toContain('Commander Alpha identity body.')
+
+      await vi.waitFor(() => {
+        expect(processMocks[1].getStdinWrites().some((write) => (
+          write.includes('Session rotated. Continuing as commander.')
+        ))).toBe(true)
+      })
 
       ws.close()
     } finally {
@@ -3939,27 +4019,37 @@ describe('stream sessions', () => {
   })
 
   it('resets commander stream sessions in place via HTTP /message /reset', async () => {
-    const mock = installMockProcess()
+    const processMocks: Array<ReturnType<typeof createMockChildProcess>> = []
+    mockedSpawn.mockImplementation(() => {
+      const mock = createMockChildProcess()
+      processMocks.push(mock)
+      return mock.cp as never
+    })
     const sessionStoreDir = await mkdtemp(join(tmpdir(), 'hammurabi-stream-session-store-'))
     const sessionStorePath = join(sessionStoreDir, 'stream-sessions.json')
-    const server = await startServer({ sessionStorePath })
+    const commanderDataDir = join(sessionStoreDir, 'commanders-data')
+    await seedCommanderSessionFixture({
+      commanderDataDir,
+      commanderId: 'reset-test',
+      workflowPrompt: 'Reset workflow prompt from COMMANDER.md',
+      identityBody: 'Reset identity body from identity.md.',
+    })
+    const server = await startServer({
+      sessionStorePath,
+      commanderSessionStorePath: join(commanderDataDir, 'sessions.json'),
+    })
 
     try {
-      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          name: 'commander-reset-test',
-          mode: 'default',
-          sessionType: 'stream',
-        }),
+      await server.sessionsInterface.createCommanderSession({
+        name: 'commander-reset-test',
+        systemPrompt: 'Old commander prompt',
+        agentType: 'claude',
+        cwd: '/tmp',
+        maxTurns: 7,
       })
-      expect(createResponse.status).toBe(201)
+      expect(processMocks).toHaveLength(1)
 
-      mock.emitStdout('{"type":"system","subtype":"init","session_id":"claude-reset-old"}\n')
+      processMocks[0].emitStdout('{"type":"system","subtype":"init","session_id":"claude-reset-old"}\n')
 
       await vi.waitFor(async () => {
         const raw = await readFile(sessionStorePath, 'utf8')
@@ -3971,7 +4061,7 @@ describe('stream sessions', () => {
       })
 
       // Keep turn active so /reset must wait for completion before clearing.
-      mock.emitStdout('{"type":"message_start","message":{"id":"m1","role":"assistant"}}\n')
+      processMocks[0].emitStdout('{"type":"message_start","message":{"id":"m1","role":"assistant"}}\n')
 
       let resetSettled = false
       const resetPromise = fetch(`${server.baseUrl}/api/agents/sessions/commander-reset-test/message`, {
@@ -3990,8 +4080,10 @@ describe('stream sessions', () => {
       await new Promise((resolve) => setTimeout(resolve, 50))
       expect(resetSettled).toBe(false)
 
-      mock.emitStdout('{"type":"result","result":"done"}\n')
+      processMocks[0].emitStdout('{"type":"result","result":"done"}\n')
       await resetPromise
+      expect(processMocks).toHaveLength(2)
+      expect(processMocks[0].cp.kill).toHaveBeenCalledWith('SIGTERM')
 
       const sessionsResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
         headers: AUTH_HEADERS,
@@ -4000,13 +4092,22 @@ describe('stream sessions', () => {
       const listedSessions = await sessionsResponse.json() as Array<{ name: string }>
       expect(listedSessions.some((session) => session.name === 'commander-reset-test')).toBe(true)
 
-      await vi.waitFor(async () => {
-        const raw = await readFile(sessionStorePath, 'utf8')
-        const parsed = JSON.parse(raw) as {
-          sessions: Array<{ name: string; claudeSessionId?: string }>
-        }
-        const saved = parsed.sessions.find((session) => session.name === 'commander-reset-test')
-        expect(saved).toBeUndefined()
+      const secondCall = mockedSpawn.mock.calls[1]
+      expect(secondCall[0]).toBe('claude')
+      const secondArgs = secondCall[1] as string[]
+      expect(secondArgs).toContain('--system-prompt')
+      expect(secondArgs).not.toContain('--resume')
+      expect(secondArgs).not.toContain('--max-turns')
+      const promptIndex = secondArgs.indexOf('--system-prompt')
+      const resetPrompt = secondArgs[promptIndex + 1]
+      expect(resetPrompt).toContain('Reset workflow prompt from COMMANDER.md')
+      expect(resetPrompt).toContain('Reset identity body from identity.md.')
+      expect(resetPrompt).not.toBe('Old commander prompt')
+
+      await vi.waitFor(() => {
+        expect(processMocks[1].getStdinWrites().some((write) => (
+          write.includes('Session rotated. Continuing as commander.')
+        ))).toBe(true)
       })
 
       const followUpResponse = await fetch(`${server.baseUrl}/api/agents/sessions/commander-reset-test/message`, {
@@ -4021,15 +4122,9 @@ describe('stream sessions', () => {
       expect(await followUpResponse.json()).toEqual({ queued: true, queueDepth: 1 })
 
       await vi.waitFor(() => {
-        expect(mock.getStdinWrites().some((write) => write.includes('message after reset'))).toBe(true)
+        expect(processMocks[1].getStdinWrites().some((write) => write.includes('message after reset'))).toBe(true)
       })
-
-      const resumeCall = mockedSpawn.mock.calls.find(([command, args]) => (
-        command === 'claude' &&
-        Array.isArray(args) &&
-        args.includes('--resume')
-      ))
-      expect(resumeCall).toBeUndefined()
+      expect(processMocks[0].getStdinWrites().some((write) => write.includes('message after reset'))).toBe(false)
     } finally {
       await server.close()
       await waitForPersistedSessionFlush()
@@ -5793,40 +5888,31 @@ describe('stream sessions', () => {
       return mock.cp as never
     })
 
-    const server = await startServer()
+    const workDir = await mkdtemp(join(tmpdir(), 'hammurabi-command-reset-http-'))
+    const commanderDataDir = join(workDir, 'commanders-data')
+    await seedCommanderSessionFixture({
+      commanderDataDir,
+      commanderId: 'reset-test',
+      workflowPrompt: 'HTTP reset workflow prompt from COMMANDER.md',
+      identityBody: 'HTTP reset identity body from identity.md.',
+    })
+    const server = await startServer({
+      commanderSessionStorePath: join(commanderDataDir, 'sessions.json'),
+    })
 
     try {
-      // Create a commander stream session.
-      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          name: 'commander-reset-test',
-          mode: 'default',
-          sessionType: 'stream',
-        }),
+      await server.sessionsInterface.createCommanderSession({
+        name: 'commander-reset-test',
+        systemPrompt: 'Stale reset prompt',
+        agentType: 'claude',
+        cwd: '/tmp',
+        maxTurns: 9,
       })
-      expect(createResponse.status).toBe(201)
       expect(processMocks).toHaveLength(1)
 
       // Emit a result so the session is in a completed-turn state.
       processMocks[0].emitStdout('{"type":"result","result":"done"}\n')
       await waitForPersistedSessionFlush()
-
-      // Connect a WS client so we can verify event broadcast after reset.
-      const ws = await connectWs(server.baseUrl, 'commander-reset-test')
-      const wsEvents: Array<Record<string, unknown>> = []
-      ws.on('message', (data) => {
-        const parsed = JSON.parse(data.toString()) as Record<string, unknown>
-        if (parsed.type !== 'replay') {
-          wsEvents.push(parsed)
-        }
-      })
-      // Allow WS connection to fully establish.
-      await new Promise<void>((resolve) => setTimeout(resolve, 50))
 
       // Reset the session.
       const resetResponse = await fetch(
@@ -5850,16 +5936,13 @@ describe('stream sessions', () => {
       // New process should NOT have --resume flag.
       const lastSpawnArgs = mockedSpawn.mock.calls[mockedSpawn.mock.calls.length - 1]
       expect(lastSpawnArgs[1]).not.toContain('--resume')
-
-      // WS client should have received the system reset event.
-      await vi.waitFor(() => {
-        expect(wsEvents.some((event) => (
-          event.type === 'system' &&
-          event.subtype === 'session_reset' &&
-          typeof event.text === 'string' &&
-          (event.text as string).includes('Session rotated')
-        ))).toBe(true)
-      })
+      expect(lastSpawnArgs[1]).not.toContain('--max-turns')
+      expect(lastSpawnArgs[1]).toContain('--system-prompt')
+      const promptIndex = lastSpawnArgs[1].indexOf('--system-prompt')
+      const resetPrompt = lastSpawnArgs[1][promptIndex + 1]
+      expect(resetPrompt).toContain('HTTP reset workflow prompt from COMMANDER.md')
+      expect(resetPrompt).toContain('HTTP reset identity body from identity.md.')
+      expect(resetPrompt).not.toBe('Stale reset prompt')
 
       // Session should still exist in the session list.
       const listResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
@@ -5868,9 +5951,14 @@ describe('stream sessions', () => {
       const sessions = (await listResponse.json()) as Array<{ name: string }>
       expect(sessions.some((s) => s.name === 'commander-reset-test')).toBe(true)
 
-      ws.close()
+      await vi.waitFor(() => {
+        expect(processMocks[1].getStdinWrites().some((write) => (
+          write.includes('Session rotated. Continuing as commander.')
+        ))).toBe(true)
+      })
     } finally {
       await server.close()
+      await rm(workDir, { recursive: true, force: true })
     }
   })
 
@@ -5996,12 +6084,24 @@ describe('stream sessions', () => {
     const mock1 = createMockChildProcess()
     mockedSpawn.mockReturnValueOnce(mock1.cp as never)
 
-    const server = await startServer()
+    const workDir = await mkdtemp(join(tmpdir(), 'hammurabi-respawn-seed-'))
+    const commanderDataDir = join(workDir, 'commanders-data')
+    await seedCommanderSessionFixture({
+      commanderDataDir,
+      commanderId: 'respawn-test',
+      workflowPrompt: 'Fresh respawn workflow prompt',
+      identityBody: 'Fresh respawn identity body.',
+    })
+
+    const server = await startServer({
+      commanderSessionStorePath: join(commanderDataDir, 'sessions.json'),
+    })
 
     // Create a commander session with a system prompt
     server.sessionsInterface.createCommanderSession({
       name: 'commander-respawn-test',
       systemPrompt: 'You are Commander Beta',
+      agentType: 'claude',
       cwd: '/tmp',
       maxTurns: 5,
     })
@@ -6046,7 +6146,10 @@ describe('stream sessions', () => {
     const args = secondCall[1] as string[]
     expect(args).toContain('--system-prompt')
     const spIdx = args.indexOf('--system-prompt')
-    expect(args[spIdx + 1]).toBe('You are Commander Beta')
+    const respawnPrompt = args[spIdx + 1]
+    expect(respawnPrompt).toContain('Fresh respawn workflow prompt')
+    expect(respawnPrompt).toContain('Fresh respawn identity body.')
+    expect(respawnPrompt).not.toBe('You are Commander Beta')
 
     // Also verify --max-turns is preserved
     expect(args).toContain('--max-turns')
@@ -6059,6 +6162,7 @@ describe('stream sessions', () => {
     ws.close()
     server.sessionsInterface.deleteSession('commander-respawn-test')
     await server.close()
+    await rm(workDir, { recursive: true, force: true })
   })
 })
 

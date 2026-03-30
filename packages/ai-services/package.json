@@ -1,7 +1,22 @@
 {
-  "name": "@gehirn/ai-services",
-  "version": "0.0.1",
+  "name": "@hambros/ai-services",
+  "version": "0.1.0",
   "private": true,
-  "description": "Stub — real implementation lives in the parent monorepo",
-  "main": "index.js"
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.1.76",
+    "@openai/codex-sdk": "^0.90.0"
+  },
+  "peerDependencies": {
+    "@anthropic-ai/claude-agent-sdk": ">=0.1.0",
+    "@openai/codex-sdk": ">=0.90.0"
+  },
+  "peerDependenciesMeta": {
+    "@anthropic-ai/claude-agent-sdk": { "optional": true },
+    "@openai/codex-sdk": { "optional": true }
+  }
 }

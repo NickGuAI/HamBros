@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { ChevronRight, FolderOpen } from 'lucide-react'
+import { FolderOpen } from 'lucide-react'
 import { useAgentSessions } from '@/hooks/use-agents'
 import { cn } from '@/lib/utils'
 import type { AgentSession } from '@/types'
@@ -8,10 +8,8 @@ import { WorkspacePanel } from './components/WorkspacePanel'
 
 type SourceEntry = {
   label: string
-  sessionName: string
   source: WorkspaceSource
   cwd?: string
-  isCommander: boolean
 }
 
 function buildSources(sessions: AgentSession[]): SourceEntry[] {
@@ -22,10 +20,8 @@ function buildSources(sessions: AgentSession[]): SourceEntry[] {
     }
     entries.push({
       label: session.label ?? session.name,
-      sessionName: session.name,
       source: { kind: 'agent-session', sessionName: session.name },
       cwd: session.cwd,
-      isCommander: session.name.startsWith('commander-'),
     })
   }
   return entries
@@ -72,34 +68,19 @@ export default function WorkspacePage() {
             <div className="space-y-1">
               {sources.map((entry, index) => (
                 <button
-                  key={entry.sessionName}
+                  key={entry.label}
                   type="button"
                   className={cn(
-                    'w-full text-left px-3 py-2.5 rounded-lg transition-colors border',
+                    'w-full text-left px-3 py-2.5 rounded-lg transition-colors',
                     selectedIndex === index
-                      ? 'bg-washi-aged/60 border-sumi-black/10'
-                      : 'hover:bg-ink-wash border-transparent',
-                    entry.isCommander && 'border-l-2 border-l-accent-indigo',
+                      ? 'bg-washi-aged/60 border border-sumi-black/10'
+                      : 'hover:bg-ink-wash border border-transparent',
                   )}
-                  onClick={() => setSelectedIndex(selectedIndex === index ? null : index)}
+                  onClick={() => setSelectedIndex(index)}
                 >
-                  <div className="flex items-center gap-2">
-                    <ChevronRight
-                      size={14}
-                      className={cn(
-                        'shrink-0 text-sumi-mist transition-transform duration-200',
-                        selectedIndex === index && 'rotate-90',
-                      )}
-                    />
-                    <div className="min-w-0 flex-1">
-                      <p className="font-mono text-sm text-sumi-black truncate">{entry.label}</p>
-                    </div>
-                    {entry.isCommander && (
-                      <span className="badge-sumi bg-accent-indigo/10 text-accent-indigo text-[10px] shrink-0">cmdr</span>
-                    )}
-                  </div>
-                  {selectedIndex === index && entry.cwd && (
-                    <p className="text-whisper text-sumi-mist mt-1 ml-5 truncate">{entry.cwd}</p>
+                  <p className="font-mono text-sm text-sumi-black truncate">{entry.label}</p>
+                  {entry.cwd && (
+                    <p className="text-whisper text-sumi-mist mt-0.5 truncate">{entry.cwd}</p>
                   )}
                 </button>
               ))}

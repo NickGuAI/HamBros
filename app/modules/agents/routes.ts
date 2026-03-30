@@ -15,6 +15,7 @@ import { combinedAuth } from '../../server/middleware/combined-auth.js'
 import { createAuth0Verifier } from '../../server/middleware/auth0.js'
 import { bootstrapFactoryWorktree } from '../factory/worktree.js'
 import { resolveCommanderDataDir, resolveCommanderNamesPath } from '../commanders/paths.js'
+import { buildCommanderSessionSeed } from '../commanders/routes.js'
 import { CommanderSessionStore, type CommanderSession } from '../commanders/store.js'
 import {
   extractMessages,
@@ -47,7 +48,7 @@ import {
 const DEFAULT_MAX_SESSIONS = 10
 const DEFAULT_TASK_DELAY_MS = 3000
 const DEFAULT_WS_KEEPALIVE_INTERVAL_MS = 30000
-const DEFAULT_AUTO_ROTATE_ENTRY_THRESHOLD = 2000
+const DEFAULT_AUTO_ROTATE_ENTRY_THRESHOLD = 500
 const MAX_BUFFER_BYTES = 256 * 1024
 const MAX_STREAM_EVENTS = 1000
 const MAX_PENDING_SESSION_MESSAGES = 50
@@ -68,6 +69,7 @@ const COMMAND_ROOM_SESSION_PREFIX = 'command-room-'
 const FACTORY_SESSION_PREFIX = 'factory-'
 const AGENT_SESSION_PREFIX = 'agent-'
 const COMMANDER_SESSION_NAME_PREFIX = 'commander-'
+const COMMANDER_ROTATION_CONTINUATION_PROMPT = 'Session rotated. Continuing as commander.'
 const COMMANDER_PATH_SEGMENT_PATTERN = /^[a-zA-Z0-9._-]+$/
 const COMMAND_ROOM_STALE_SESSION_TTL_MS = 15 * 60 * 1000
 const COMMAND_ROOM_COMPLETED_SESSION_TTL_MS = 24 * 60 * 60 * 1000
@@ -284,6 +286,8 @@ interface CodexSessionCreateOptions {
   createdAt?: string
   parentSession?: string
   spawnedWorkers?: string[]
+  systemPrompt?: string
+  maxTurns?: number
 }
 
 type AnySession = PtySession | StreamSession | OpenClawSession
@@ -2967,18 +2971,84 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     }
   }
 
-  async function createRotatedStreamSession(sessionName: string, session: StreamSession): Promise<StreamSession> {
+  async function buildSeededSystemPrompt(
+    sessionName: string,
+    session: Pick<StreamSession, 'cwd' | 'systemPrompt'>,
+  ): Promise<string | undefined> {
+    if (!sessionName.startsWith(COMMANDER_SESSION_NAME_PREFIX)) {
+      return session.systemPrompt
+    }
+
+    const commanderId = sessionName.slice(COMMANDER_SESSION_NAME_PREFIX.length).trim()
+    if (!commanderId) {
+      return session.systemPrompt
+    }
+
+    try {
+      const commanderStore = options.commanderSessionStorePath !== undefined
+        ? new CommanderSessionStore(options.commanderSessionStorePath)
+        : new CommanderSessionStore()
+      const commanderSession = await commanderStore.get(commanderId)
+      const built = await buildCommanderSessionSeed({
+        commanderId,
+        cwd: commanderSession?.cwd ?? session.cwd,
+        currentTask: commanderSession?.currentTask ?? null,
+        taskSource: commanderSession?.taskSource ?? null,
+        memoryBasePath: commanderDataDir,
+      })
+      return built.systemPrompt
+    } catch {
+      return session.systemPrompt
+    }
+  }
+
+  async function sendTextToStreamSession(session: StreamSession, text: string): Promise<boolean> {
+    if (session.agentType === 'codex') {
+      if (!session.codexThreadId) {
+        return false
+      }
+      const completed = await waitForTurnCompletionWithTimeout(
+        session,
+        CODEX_TURN_COMPLETION_TIMEOUT_MS,
+      )
+      if (!completed) {
+        return false
+      }
+      return startCodexTurn(session, text)
+    }
+
+    const userMsg = JSON.stringify({ type: 'user', message: { role: 'user', content: text } })
+    const sent = writeToStdin(session, userMsg + '\n')
+    if (sent) {
+      const userEvent: StreamJsonEvent = {
+        type: 'user',
+        message: { role: 'user', content: text },
+      } as unknown as StreamJsonEvent
+      appendStreamEvent(session, userEvent)
+      broadcastStreamEvent(session, userEvent)
+    }
+    return sent
+  }
+
+  async function createReplacementStreamSession(
+    sessionName: string,
+    session: StreamSession,
+    options: { preserveMaxTurns?: boolean; resumeSessionId?: string } = {},
+  ): Promise<StreamSession> {
+    const systemPrompt = await buildSeededSystemPrompt(sessionName, session)
     const commonOptions = {
       createdAt: session.createdAt,
       parentSession: session.parentSession,
       spawnedWorkers: session.spawnedWorkers,
+      systemPrompt,
+      maxTurns: options.preserveMaxTurns ? session.maxTurns : undefined,
     }
 
     if (session.agentType === 'codex') {
       return createCodexAppServerSession(
         sessionName,
         session.mode,
-        '',
+        systemPrompt ?? '',
         session.cwd,
         commonOptions,
       )
@@ -2989,7 +3059,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       const machines = await readMachineRegistry()
       machine = machines.find((entry) => entry.id === session.host)
       if (!machine) {
-        throw new Error(`Host machine "${session.host}" is unavailable for rotation`)
+        throw new Error(`Host machine "${session.host}" is unavailable for session replacement`)
       }
     }
 
@@ -3000,8 +3070,15 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       session.cwd,
       machine,
       'claude',
-      commonOptions,
+      {
+        ...commonOptions,
+        resumeSessionId: options.resumeSessionId,
+      },
     )
+  }
+
+  async function createRotatedStreamSession(sessionName: string, session: StreamSession): Promise<StreamSession> {
+    return createReplacementStreamSession(sessionName, session)
   }
 
   async function rotateStreamSessionIfNeeded(
@@ -3065,6 +3142,9 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       sessions.set(sessionName, rotated)
       cleanupStreamMessageQueue(live)
       live.process.kill('SIGTERM')
+      if (sessionName.startsWith(COMMANDER_SESSION_NAME_PREFIX)) {
+        await sendTextToStreamSession(rotated, COMMANDER_ROTATION_CONTINUATION_PROMPT)
+      }
       schedulePersistedSessionsWrite()
       return rotated
     } catch (error) {
@@ -4574,6 +4654,8 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       lastEventAt: initializedAt,
       usage: { inputTokens: 0, outputTokens: 0, costUsd: 0 },
       stdoutBuffer: '',
+      systemPrompt: options.systemPrompt,
+      maxTurns: options.maxTurns,
       stdinDraining: false,
       lastTurnCompleted: true,
       messageQueue: new KeyedAsyncQueue(),
@@ -4944,11 +5026,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       sessionName.startsWith(COMMANDER_SESSION_NAME_PREFIX) &&
       session.kind === 'stream'
     ) {
-      await waitForTurnCompletion(session)
-      session.claudeSessionId = undefined
-      session.conversationEntryCount = 0
-      session.autoRotatePending = false
-      schedulePersistedSessionsWrite()
+      await resetCommanderSession(sessionName)
       res.json({ reset: true })
       return
     }
@@ -5024,6 +5102,69 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
   // ── Session Reset (commander-only) ──────────────────────────────────
   // Rotates the underlying Claude process: flush journal, kill old process,
   // spawn new one (no --resume), transfer WS clients, broadcast system event.
+  async function resetCommanderSession(sessionName: string): Promise<StreamSession> {
+    const session = sessions.get(sessionName)
+    if (!session || session.kind !== 'stream') {
+      throw new Error(`Session "${sessionName}" not found`)
+    }
+
+    await waitForTurnCompletion(session)
+
+    const live = sessions.get(sessionName)
+    if (!live || live.kind !== 'stream') {
+      throw new Error('Session disappeared during reset')
+    }
+
+    const commanderId = sessionName.slice(COMMANDER_SESSION_NAME_PREFIX.length)
+    try {
+      const journal = new JournalWriter(commanderId)
+      const noOpGhClient = { postIssueComment: async () => {} }
+      const flusher = new EmergencyFlusher(commanderId, journal, noOpGhClient)
+      await flusher.betweenTaskFlush({
+        currentIssue: null,
+        taskState: 'Session reset by user',
+        pendingSpikeObservations: [],
+        trigger: 'between-task',
+      })
+    } catch {
+      // Journal flush is best-effort — do not block reset on failure.
+    }
+
+    const oldClients = new Set(live.clients)
+    const oldEvents = live.events.slice()
+    const oldUsage = { ...live.usage }
+    const oldLastEventAt = live.lastEventAt
+
+    const rotated = await createReplacementStreamSession(sessionName, live)
+
+    const rotationEvent: StreamJsonEvent = {
+      type: 'system',
+      subtype: 'session_reset',
+      text: 'Session rotated — Claude context cleared, memory preserved.',
+    }
+    appendStreamEvent(live, rotationEvent)
+
+    rotated.events = [...oldEvents, rotationEvent]
+    rotated.usage = oldUsage
+    rotated.lastEventAt = oldLastEventAt
+    rotated.conversationEntryCount = 0
+    rotated.autoRotatePending = false
+
+    for (const client of oldClients) {
+      rotated.clients.add(client)
+    }
+    live.clients.clear()
+
+    sessions.set(sessionName, rotated)
+    cleanupStreamMessageQueue(live)
+    live.process.kill('SIGTERM')
+
+    broadcastStreamEvent(rotated, rotationEvent)
+    await sendTextToStreamSession(rotated, COMMANDER_ROTATION_CONTINUATION_PROMPT)
+    schedulePersistedSessionsWrite()
+    return rotated
+  }
+
   router.post('/sessions/:name/reset', requireWriteAccess, async (req, res) => {
     const sessionName = parseSessionName(req.params.name)
     if (!sessionName) {
@@ -5048,95 +5189,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     }
 
     try {
-      // Wait for any in-progress turn to finish before rotating.
-      await waitForTurnCompletion(session)
-
-      const live = sessions.get(sessionName)
-      if (!live || live.kind !== 'stream') {
-        res.status(409).json({ error: 'Session disappeared during reset' })
-        return
-      }
-
-      // ① Flush journal for this commander.
-      const commanderId = sessionName.slice(COMMANDER_SESSION_NAME_PREFIX.length)
-      try {
-        const journal = new JournalWriter(commanderId)
-        const noOpGhClient = { postIssueComment: async () => {} }
-        const flusher = new EmergencyFlusher(commanderId, journal, noOpGhClient)
-        await flusher.betweenTaskFlush({
-          currentIssue: null,
-          taskState: 'Session reset by user',
-          pendingSpikeObservations: [],
-          trigger: 'between-task',
-        })
-      } catch {
-        // Journal flush is best-effort — do not block reset on failure.
-      }
-
-      // ② Capture metadata from old session.
-      const oldClients = new Set(live.clients)
-      const oldEvents = live.events.slice()
-      const oldUsage = { ...live.usage }
-      const oldCreatedAt = live.createdAt
-      const oldParentSession = live.parentSession
-      const oldSpawnedWorkers = live.spawnedWorkers
-
-      // ③ Kill old process.
-      cleanupStreamMessageQueue(live)
-      live.clients.clear()
-      live.process.kill('SIGTERM')
-
-      // ④ Resolve machine config for remote sessions.
-      let machine: MachineConfig | undefined
-      if (live.host) {
-        const machines = await readMachineRegistry()
-        machine = machines.find((entry) => entry.id === live.host)
-        if (!machine) {
-          res.status(400).json({ error: `Cannot reset: remote host "${live.host}" not found in machine registry` })
-          return
-        }
-      }
-
-      // ⑤ Spawn new session (no --resume), preserving original agent type.
-      const rotated = createStreamSession(
-        sessionName,
-        live.mode,
-        '',
-        live.cwd,
-        machine,
-        live.agentType,
-        {
-          createdAt: oldCreatedAt,
-          parentSession: oldParentSession,
-          spawnedWorkers: oldSpawnedWorkers,
-        },
-      )
-
-      // ⑥ Transfer history, usage, and WS clients.
-      const rotationEvent: StreamJsonEvent = {
-        type: 'system',
-        subtype: 'session_reset',
-        text: 'Session rotated — Claude context cleared, memory preserved.',
-      }
-      appendStreamEvent(live, rotationEvent)
-
-      rotated.events = [...oldEvents, rotationEvent]
-      rotated.usage = oldUsage
-      rotated.lastEventAt = live.lastEventAt
-
-      for (const client of oldClients) {
-        rotated.clients.add(client)
-      }
-
-      // ⑦ Swap session in the map.
-      sessions.set(sessionName, rotated)
-
-      // ⑧ Broadcast system event to transferred WS clients.
-      broadcastStreamEvent(rotated, rotationEvent)
-
-      // ⑨ Persist.
-      schedulePersistedSessionsWrite()
-
+      await resetCommanderSession(sessionName)
       res.json({ reset: true, sessionName })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
@@ -5601,23 +5654,19 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
                     const resumeId = liveSession.claudeSessionId
                     const pendingInput = userMsg + '\n'
                     void readMachineRegistry()
-                      .then((machines) => {
+                      .then(async (machines) => {
                         const machine = liveSession.host
                           ? machines.find((m) => m.id === liveSession.host)
                           : undefined
-                        const newSession = createStreamSession(
+                        if (liveSession.host && !machine) {
+                          throw new Error(`Remote host "${liveSession.host}" unavailable for session respawn`)
+                        }
+                        const newSession = await createReplacementStreamSession(
                           sessionName,
-                          liveSession.mode,
-                          '',
-                          liveSession.cwd,
-                          machine,
-                          'claude',
+                          liveSession,
                           {
                             resumeSessionId: resumeId,
-                            parentSession: liveSession.parentSession,
-                            spawnedWorkers: liveSession.spawnedWorkers,
-                            systemPrompt: liveSession.systemPrompt,
-                            maxTurns: liveSession.maxTurns,
+                            preserveMaxTurns: true,
                           },
                         )
                         newSession.events = liveSession.events.slice()
@@ -5778,6 +5827,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
               sessionCwd,
               resumeCodexThreadId,
               '',
+              { systemPrompt, maxTurns },
             )
           } catch {
             session = await createCodexAppServerSession(
@@ -5785,6 +5835,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
               'dangerouslySkipPermissions',
               systemPrompt,
               sessionCwd,
+              { systemPrompt, maxTurns },
             )
           }
         } else {
@@ -5793,6 +5844,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
             'dangerouslySkipPermissions',
             systemPrompt,
             sessionCwd,
+            { systemPrompt, maxTurns },
           )
         }
       } else {
@@ -5827,32 +5879,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       if (!session || session.kind !== 'stream') {
         return false
       }
-
-      if (session.agentType === 'codex') {
-        if (!session.codexThreadId) {
-          return false
-        }
-        const completed = await waitForTurnCompletionWithTimeout(
-          session,
-          CODEX_TURN_COMPLETION_TIMEOUT_MS,
-        )
-        if (!completed) {
-          return false
-        }
-        return startCodexTurn(session, text)
-      }
-
-      const userMsg = JSON.stringify({ type: 'user', message: { role: 'user', content: text } })
-      const sent = writeToStdin(session, userMsg + '\n')
-      if (sent) {
-        const userEvent: StreamJsonEvent = {
-          type: 'user',
-          message: { role: 'user', content: text },
-        } as unknown as StreamJsonEvent
-        appendStreamEvent(session, userEvent)
-        broadcastStreamEvent(session, userEvent)
-      }
-      return sent
+      return sendTextToStreamSession(session, text)
     },
     deleteSession(name) {
       const session = sessions.get(name)

@@ -50,15 +50,9 @@ function TreeBranch({
               )}
               style={{ paddingLeft: `${depth * 12 + 8}px` }}
               onClick={() => {
+                onSelectPath(node.path)
                 if (isDirectory) {
                   onToggleDirectory(node.path)
-                } else {
-                  onSelectPath(node.path)
-                }
-              }}
-              onDoubleClick={() => {
-                if (isDirectory) {
-                  onSelectPath(node.path)
                 }
               }}
             >

@@ -259,6 +259,14 @@ interface SemanticSearchResult {
   chunk_index: number
 }
 
+interface CommanderSessionSeedParams {
+  commanderId: string
+  cwd?: string
+  currentTask: CommanderCurrentTask | null
+  taskSource: CommanderTaskSource | null
+  memoryBasePath?: string
+}
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
 }
@@ -1409,21 +1417,59 @@ function isInputTokenContextPressureEvent(
   return Number.isFinite(sessionInputTokens) && sessionInputTokens >= threshold
 }
 
-function toPromptIssue(session: CommanderSession): GHIssue | null {
-  if (!session.currentTask || !session.taskSource) {
+function toPromptIssueFromTaskContext(
+  currentTask: CommanderCurrentTask | null,
+  taskSource: CommanderTaskSource | null,
+): GHIssue | null {
+  if (!currentTask || !taskSource) {
     return null
   }
 
-  const labels = session.taskSource.label ? [{ name: session.taskSource.label }] : undefined
+  const labels = taskSource.label ? [{ name: taskSource.label }] : undefined
   return {
-    number: session.currentTask.issueNumber,
-    title: `Issue #${session.currentTask.issueNumber}`,
+    number: currentTask.issueNumber,
+    title: `Issue #${currentTask.issueNumber}`,
     body: '',
     labels,
-    owner: session.taskSource.owner,
-    repo: session.taskSource.repo,
-    repository: `${session.taskSource.owner}/${session.taskSource.repo}`,
+    owner: taskSource.owner,
+    repo: taskSource.repo,
+    repository: `${taskSource.owner}/${taskSource.repo}`,
   }
+}
+
+function toPromptIssue(session: CommanderSession): GHIssue | null {
+  return toPromptIssueFromTaskContext(session.currentTask, session.taskSource)
+}
+
+async function buildCommanderSessionSeedFromResolvedWorkflow(
+  params: CommanderSessionSeedParams,
+  resolvedWorkflow: ResolvedCommanderWorkflow,
+): Promise<{ systemPrompt: string; maxTurns?: number }> {
+  const agent = new CommanderAgent(params.commanderId, params.memoryBasePath)
+  const effectiveBasePrompt = resolveEffectiveBasePrompt(resolvedWorkflow.workflow)
+  const built = await agent.buildTaskPickupSystemPrompt(
+    effectiveBasePrompt,
+    {
+      currentTask: toPromptIssueFromTaskContext(params.currentTask, params.taskSource),
+      recentConversation: [],
+    },
+  )
+
+  return {
+    systemPrompt: built.systemPrompt,
+    maxTurns: resolvedWorkflow.workflow?.maxTurns,
+  }
+}
+
+export async function buildCommanderSessionSeed(
+  params: CommanderSessionSeedParams,
+): Promise<{ systemPrompt: string; maxTurns?: number }> {
+  const resolvedWorkflow = await resolveCommanderWorkflow(
+    params.commanderId,
+    params.cwd,
+    params.memoryBasePath,
+  )
+  return buildCommanderSessionSeedFromResolvedWorkflow(params, resolvedWorkflow)
 }
 
 function buildFlushContext(
@@ -3003,14 +3049,12 @@ export function createCommandersRouter(
         },
       )
       await manager.init()
-      const agent = new CommanderAgent(commanderId, commanderBasePath)
       const contextPressureBridge = createContextPressureBridge()
       const workflow = await resolveCommanderWorkflow(
         commanderId,
         session.cwd,
         commanderBasePath,
       )
-      const effectiveBasePrompt = resolveEffectiveBasePrompt(workflow.workflow)
       const flusher = new EmergencyFlusher(
         commanderId,
         manager.journalWriter,
@@ -3058,13 +3102,15 @@ export function createCommandersRouter(
 
       warnInvalidWorkflowHeartbeatInterval(commanderId, workflow)
       const effectiveHeartbeat = resolveEffectiveHeartbeat(started.heartbeat, workflow.workflow)
-      const contextBuildOptions: Parameters<CommanderAgent['buildTaskPickupSystemPrompt']>[1] = {
-        currentTask: toPromptIssue(started),
-        recentConversation: [],
-      }
-      const built = await agent.buildTaskPickupSystemPrompt(
-        effectiveBasePrompt,
-        contextBuildOptions,
+      const built = await buildCommanderSessionSeedFromResolvedWorkflow(
+        {
+          commanderId,
+          cwd: started.cwd ?? undefined,
+          currentTask: started.currentTask,
+          taskSource: started.taskSource,
+          memoryBasePath: commanderBasePath,
+        },
+        workflow,
       )
 
       if (!sessionsInterface) {
@@ -3080,7 +3126,7 @@ export function createCommandersRouter(
         cwd: started.cwd ?? undefined,
         resumeSessionId: selectedAgentType === 'claude' ? started.claudeSessionId : undefined,
         resumeCodexThreadId: selectedAgentType === 'codex' ? started.codexThreadId : undefined,
-        maxTurns: workflow.workflow?.maxTurns,
+        maxTurns: built.maxTurns,
       }
       await sessionsInterface.createCommanderSession(commanderSessionParams)
 

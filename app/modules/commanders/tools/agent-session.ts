@@ -12,5 +12,5 @@ export type {
   AgentSessionProgress,
   AgentSessionMonitorOptions,
   AgentSessionClientOptions,
-} from '@gehirn/ai-services'
-export { AgentSessionClient } from '@gehirn/ai-services'
+} from '@hambros/ai-services'
+export { AgentSessionClient } from '@hambros/ai-services'

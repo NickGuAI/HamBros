@@ -13,18 +13,21 @@ import {
   Monitor,
   ChevronLeft,
   ChevronRight,
+  ChevronUp,
   X,
   Plus,
   Power,
   AlertTriangle,
   Cpu,
   Warehouse,
+  Coins,
+  MessageSquare,
+  Clock,
   ArrowUp,
   Zap,
   Mic,
   Paperclip,
   RotateCcw,
-  MoreVertical,
 } from 'lucide-react'
 import {
   createSession,
@@ -35,7 +38,7 @@ import {
   useAgentSessions,
   useMachines,
 } from '@/hooks/use-agents'
-import { timeAgo, formatCost, cn } from '@/lib/utils'
+import { timeAgo, formatCost, formatTokens, cn } from '@/lib/utils'
 import { fetchJson, getAccessToken } from '@/lib/api'
 import { getWsBase } from '@/lib/api-base'
 import { useIsMobile } from '@/hooks/use-is-mobile'
@@ -50,7 +53,6 @@ import { DEFAULT_SESSION_TAB, filterSessionsByTab, SESSION_TABS, type SessionTab
 import { NewSessionForm } from './components/NewSessionForm'
 import { SessionMessageList } from './components/SessionMessageList'
 import { SkillsPicker } from './components/SkillsPicker'
-import { WorkspaceOverlay } from './components/WorkspaceOverlay'
 import { capMessages } from './components/session-messages'
 import { useStreamEventProcessor } from './components/use-stream-event-processor'
 
@@ -599,6 +601,33 @@ function StreamingDots() {
   )
 }
 
+function SessionStatsBar({
+  cost,
+  tokens,
+  duration,
+}: {
+  cost: number
+  tokens: number
+  duration: string
+}) {
+  return (
+    <div className="session-stats">
+      <div className="session-stat">
+        <Coins size={10} />
+        <span className="session-stat-value">{formatCost(cost)}</span> cost
+      </div>
+      <div className="session-stat">
+        <MessageSquare size={10} />
+        <span className="session-stat-value">{formatTokens(tokens)}</span> tokens
+      </div>
+      <div className="session-stat">
+        <Clock size={10} />
+        <span className="session-stat-value">{duration}</span>
+      </div>
+    </div>
+  )
+}
+
 // ── MobileSessionView ───────────────────────────────────────────
 
 function MobileSessionView({
@@ -651,9 +680,6 @@ function MobileSessionView({
   const [resetError, setResetError] = useState<string | null>(null)
   const [pendingImages, setPendingImages] = useState<{ mediaType: string; data: string }[]>([])
   const [dismissedWorkers, setDismissedWorkers] = useState<Set<string>>(new Set())
-  const [fileChips, setFileChips] = useState<string[]>([])
-  const [showWorkspaceOverlay, setShowWorkspaceOverlay] = useState(false)
-  const [showOverflowMenu, setShowOverflowMenu] = useState(false)
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const messagesAreaRef = useRef<HTMLDivElement>(null)
@@ -680,25 +706,13 @@ function MobileSessionView({
     isSupported: isMicSupported,
   } = activeTranscription
 
-  // Update elapsed time every second so the header stays current
+  // Update elapsed time every second so the stats bar stays current
   useEffect(() => {
     const timer = setInterval(() => {
       setElapsedSec(Math.floor((Date.now() - startedAt) / 1000))
     }, 1000)
     return () => clearInterval(timer)
   }, [startedAt])
-
-  // Cmd+K / Ctrl+K to toggle workspace overlay
-  useEffect(() => {
-    function handleCmdK(e: KeyboardEvent) {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
-        e.preventDefault()
-        setShowWorkspaceOverlay((prev) => !prev)
-      }
-    }
-    window.addEventListener('keydown', handleCmdK)
-    return () => window.removeEventListener('keydown', handleCmdK)
-  }, [])
 
   // Reset dismissed workers when switching sessions
   useEffect(() => {
@@ -1002,10 +1016,6 @@ function MobileSessionView({
     const text = inputText.trim()
     if ((!text && pendingImages.length === 0) || wsRef.current?.readyState !== WebSocket.OPEN) return
 
-    // Prepend file context references if any chips are selected
-    const fileContext = fileChips.map((f) => `@${f}`).join(' ')
-    const fullText = fileContext ? `${fileContext}\n${text}` : text
-
     const images = pendingImages.slice()
     setMessages((prev) =>
       capMessages([
@@ -1013,15 +1023,14 @@ function MobileSessionView({
         {
           id: `user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           kind: 'user',
-          text: fullText || '[image]',
+          text: text || '[image]',
           images: images.length > 0 ? images : undefined,
         },
       ]),
     )
-    wsRef.current.send(JSON.stringify({ type: 'input', text: fullText, images: images.length > 0 ? images : undefined }))
+    wsRef.current.send(JSON.stringify({ type: 'input', text, images: images.length > 0 ? images : undefined }))
     setInputText('')
     setPendingImages([])
-    setFileChips([])
     autoScrollRef.current = true
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto'
@@ -1228,151 +1237,138 @@ function MobileSessionView({
     return parts.join(' ') || '+'
   })()
 
-  const workspaceSource: import('../../workspace/use-workspace').WorkspaceSource | null =
-    sessionCwd ? { kind: 'agent-session', sessionName } : null
-
-  function handleAddFileChip(filePath: string) {
-    setFileChips((prev) => (prev.includes(filePath) ? prev : [...prev, filePath]))
-  }
-
-  function removeFileChip(filePath: string) {
-    setFileChips((prev) => prev.filter((f) => f !== filePath))
-  }
-
-  function basename(path: string): string {
-    const clean = path.endsWith('/') ? path.slice(0, -1) : path
-    const parts = clean.split('/')
-    const name = parts[parts.length - 1] || clean
-    return path.endsWith('/') ? `${name}/` : name
-  }
-
   return (
     <div className="session-view-overlay">
-      {/* Thin header — line 1: back + name + overflow */}
-      <div className="flex items-center gap-2 px-4 py-2 border-b border-ink-border">
-        <button
-          className="p-1 rounded-lg hover:bg-ink-wash transition-colors shrink-0"
-          onClick={onClose}
-          aria-label="Back to sessions"
-        >
-          <ChevronLeft size={18} className="text-sumi-gray" />
-        </button>
-        <div className="flex-1 min-w-0">
-          <p className="font-medium text-sm truncate text-sumi-black">
-            {sessionLabel ?? sessionName}
-          </p>
-          <p className="text-whisper text-sumi-mist">
-            <span className={cn(
-              'inline-block w-1.5 h-1.5 rounded-full mr-1 align-middle',
-              wsStatus === 'connected' ? 'bg-emerald-500' : wsStatus === 'connecting' ? 'bg-amber-400' : 'bg-sumi-mist',
-            )} />
-            {wsStatus} &middot; {formatCost(usage.costUsd)} &middot; {getDuration()}
-          </p>
-        </div>
-        {/* Overflow menu trigger */}
-        <div className="relative shrink-0">
-          <button
-            className="p-1.5 rounded-lg hover:bg-ink-wash transition-colors"
-            onClick={() => setShowOverflowMenu((prev) => !prev)}
-            aria-label="Session actions"
-          >
-            <MoreVertical size={16} className="text-sumi-diluted" />
+      {/* Header */}
+      <div className="session-header">
+        <div className="session-header-left">
+          <button className="session-back" onClick={onClose} aria-label="Back">
+            <ChevronLeft size={20} />
           </button>
-          {showOverflowMenu && (
-            <>
-              <div className="fixed inset-0 z-40" onClick={() => setShowOverflowMenu(false)} />
-              <div className="absolute right-0 top-full z-50 mt-1 w-52 rounded-xl border border-ink-border bg-washi-white shadow-ink-md overflow-hidden">
-                {isCommanderSession && (
-                  <button
-                    type="button"
-                    className="w-full px-3 py-2.5 text-left text-xs text-sumi-black hover:bg-ink-wash transition-colors flex items-center gap-2"
-                    onClick={() => {
-                      setShowOverflowMenu(false)
-                      setInputText('Create a new quest on your quest board: ')
-                      textareaRef.current?.focus()
-                    }}
-                  >
-                    <Plus size={13} className="text-sumi-diluted shrink-0" />
-                    New Quest
-                  </button>
-                )}
-                {/* Workers pill relocated into overflow */}
-                {showWorkersPill && (
-                  <button
-                    type="button"
-                    className="w-full px-3 py-2.5 text-left text-xs text-sumi-black hover:bg-ink-wash transition-colors flex items-center gap-2"
-                    onClick={() => {
-                      setShowOverflowMenu(false)
-                      setDispatchError(null)
-                      if (isMobile) {
-                        setWorkersOpen(true)
-                      } else {
-                        setWorkersOpen((prev) => !prev)
-                      }
-                    }}
-                  >
-                    <Cpu size={13} className="text-sumi-diluted shrink-0" />
-                    Workers {workerPillText !== '+' ? `(${workerPillText})` : ''}
-                  </button>
-                )}
-                <button
-                  type="button"
-                  className="w-full px-3 py-2.5 text-left text-xs text-sumi-black hover:bg-ink-wash transition-colors flex items-center gap-2"
-                  onClick={() => {
-                    setShowOverflowMenu(false)
-                    setShowWorkspaceOverlay(true)
-                  }}
-                >
-                  <Warehouse size={13} className="text-sumi-diluted shrink-0" />
-                  <span className="flex-1">Workspace</span>
-                  <span className="text-[10px] text-sumi-mist font-mono">
-                    {navigator.platform?.includes('Mac') ? '\u2318' : 'Ctrl+'}K
-                  </span>
-                </button>
-                <div className="border-t border-ink-border" />
-                <button
-                  type="button"
-                  className="w-full px-3 py-2.5 text-left text-xs text-accent-vermillion hover:bg-accent-vermillion/5 transition-colors flex items-center gap-2"
-                  onClick={() => {
-                    setShowOverflowMenu(false)
-                    void handleKill()
-                  }}
-                  disabled={isKilling}
-                >
-                  <Power size={13} className="shrink-0" />
-                  {isKilling ? 'Killing...' : 'Kill Session'}
-                </button>
-                {isCommanderSession && (
-                  <button
-                    type="button"
-                    className="w-full px-3 py-2.5 text-left text-xs text-amber-600 hover:bg-amber-500/5 transition-colors flex items-center gap-2"
-                    onClick={() => {
-                      setShowOverflowMenu(false)
-                      void handleResetSession()
-                    }}
-                    disabled={isResetting}
-                  >
-                    <RotateCcw size={13} className="shrink-0" />
-                    {isResetting ? 'Resetting...' : 'Reset Session'}
-                  </button>
-                )}
-                <div className="border-t border-ink-border" />
-                <button
-                  type="button"
-                  className="w-full px-3 py-2.5 text-left text-xs text-sumi-diluted hover:bg-ink-wash transition-colors flex items-center gap-2"
-                  onClick={() => {
-                    setShowOverflowMenu(false)
-                    onClose()
-                  }}
-                >
-                  <ChevronLeft size={13} className="shrink-0" />
-                  Back to Sessions
-                </button>
-              </div>
-            </>
+          <span className="session-name">{sessionLabel ?? sessionName}</span>
+          <span className={cn('session-badge', wsStatus === 'connected' && 'connected')}>
+            {wsStatus}
+          </span>
+          {showWorkersPill && (
+            <div className="relative" ref={workersMenuRef}>
+              <button
+                type="button"
+                className="inline-flex items-center gap-1 rounded-lg border border-ink-border bg-ink-wash/30 px-2 py-1 text-[11px] text-sumi-diluted hover:bg-ink-wash transition-colors"
+                onClick={() => {
+                  setDispatchError(null)
+                  if (isMobile) {
+                    setWorkersOpen(true)
+                    return
+                  }
+                  setWorkersOpen((prev) => !prev)
+                }}
+                aria-label="Workers"
+              >
+                <span className="font-mono">Workers</span>
+                <span className="font-mono">{workerPillText}</span>
+                <ChevronUp size={12} className={cn('transition-transform', !workersOpen && 'rotate-180')} />
+              </button>
+
+              {!isMobile && workersOpen && (
+                <div className="absolute right-0 top-full z-50 mt-2 w-72 rounded-xl border border-ink-border bg-washi-white shadow-ink-md">
+                  <div className="px-3 py-2 border-b border-ink-border text-xs font-mono text-sumi-diluted">Workers</div>
+                  <div className="max-h-64 overflow-y-auto">
+                    {workerRows.map((worker) => (
+                      <button
+                        key={worker.name}
+                        type="button"
+                        className="w-full px-3 py-2 border-b border-ink-border last:border-b-0 flex items-center justify-between hover:bg-washi-shadow/60 text-left"
+                        onClick={() => handleOpenWorker(worker.name)}
+                      >
+                        <div className="min-w-0">
+                          <div className="truncate text-xs font-mono text-sumi-black">
+                            <span className={cn('mr-1', workerStatusClass(worker.status))}>
+                              {workerStatusSymbol(worker.status)}
+                            </span>
+                            {worker.name}
+                          </div>
+                          <div className="text-[10px] text-sumi-diluted">{worker.status}</div>
+                        </div>
+                        <ChevronRight size={14} className="text-sumi-mist" />
+                      </button>
+                    ))}
+                  </div>
+                  <div className="p-2 border-t border-ink-border flex gap-2">
+                    {hasDoneWorkers && (
+                      <button
+                        type="button"
+                        className="flex-1 rounded-lg border border-ink-border px-2 py-1.5 text-xs text-sumi-diluted hover:bg-washi-shadow/60"
+                        onClick={async () => {
+                          await fetchJson<{ cleared: number }>(
+                            `/api/agents/sessions/${encodeURIComponent(sessionName)}/workers/done`,
+                            { method: 'DELETE' },
+                          )
+                          await refreshWorkers()
+                        }}
+                      >
+                        Clear done
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="flex-1 rounded-lg border border-ink-border px-2 py-1.5 text-xs text-sumi-black hover:bg-washi-shadow/60"
+                      onClick={() => {
+                        setDispatchError(null)
+                        setDispatchOpen(true)
+                      }}
+                    >
+                      + Dispatch
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
           )}
         </div>
+        <div className="session-header-actions">
+          {isCommanderSession && (
+            <button
+              className="p-2 rounded-lg hover:bg-ink-wash transition-colors inline-flex items-center gap-1.5"
+              onClick={() => {
+                setInputText('Create a new quest on your quest board: ')
+                textareaRef.current?.focus()
+              }}
+              aria-label="Add quest"
+            >
+              <Plus size={14} className="text-sumi-diluted" />
+              <span className="text-xs text-sumi-diluted font-mono">+ Quest</span>
+            </button>
+          )}
+          {isCommanderSession && (
+            <button
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs text-amber-500 hover:bg-amber-500/10 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+              onClick={handleResetSession}
+              disabled={isResetting}
+            >
+              <RotateCcw size={14} />
+              {isResetting ? '...' : 'Reset Session'}
+            </button>
+          )}
+          <button
+            className="session-action-btn"
+            onClick={handleKill}
+            disabled={isKilling}
+          >
+            <Power size={14} />
+            {isKilling ? '...' : 'Kill'}
+          </button>
+          <button className="session-close-btn" onClick={onClose} aria-label="Close">
+            <X size={16} />
+          </button>
+        </div>
       </div>
+
+      {/* Stats bar */}
+      <SessionStatsBar
+        cost={usage.costUsd}
+        tokens={usage.inputTokens + usage.outputTokens}
+        duration={getDuration()}
+      />
 
       {resetError && (
         <div className="mx-3 mt-2 flex items-start gap-2 rounded border border-accent-vermillion/40 bg-accent-vermillion/10 px-3 py-2 text-whisper text-accent-vermillion">
@@ -1381,7 +1377,7 @@ function MobileSessionView({
         </div>
       )}
 
-      {/* Messages area — fills remaining height */}
+      {/* Messages area */}
       <div
         className="messages-area"
         ref={messagesAreaRef}
@@ -1392,29 +1388,8 @@ function MobileSessionView({
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Input bar — pinned to bottom */}
+      {/* Input bar */}
       <div className="input-bar">
-        {/* File context chips */}
-        {fileChips.length > 0 && (
-          <div className="flex flex-wrap gap-1.5 px-1 pb-1">
-            {fileChips.map((f) => (
-              <span
-                key={f}
-                className="file-chip"
-                title={f}
-              >
-                {basename(f)}
-                <button
-                  type="button"
-                  onClick={() => removeFileChip(f)}
-                  className="file-chip-remove"
-                >
-                  ×
-                </button>
-              </span>
-            ))}
-          </div>
-        )}
         {pendingImages.length > 0 && (
           <div className="flex flex-wrap gap-2 px-2 pb-2">
             {pendingImages.map((img, i) => (
@@ -1444,9 +1419,7 @@ function MobileSessionView({
             multiple
             className="hidden"
             onChange={(e) => {
-              if (e.target.files) {
-                handleImageFiles(e.target.files)
-              }
+              if (e.target.files) handleImageFiles(e.target.files)
               e.target.value = ''
             }}
           />
@@ -1502,19 +1475,8 @@ function MobileSessionView({
             <ArrowUp size={18} />
           </button>
         </div>
-        {/* Cmd+K hint */}
-        <div className="flex justify-end px-3 pb-1 pt-0.5">
-          <button
-            type="button"
-            className="text-[10px] text-sumi-mist hover:text-sumi-diluted transition-colors font-mono"
-            onClick={() => setShowWorkspaceOverlay(true)}
-          >
-            {navigator.platform?.includes('Mac') ? '\u2318' : 'Ctrl+'}K workspace
-          </button>
-        </div>
       </div>
 
-      {/* Dispatch worker modal (desktop) */}
       {!isMobile && dispatchOpen && (
         <div className="fixed inset-0 z-[60] flex items-center justify-center bg-sumi-black/50 px-4">
           <div className="w-full max-w-md rounded-xl border border-ink-border bg-washi-white p-4 shadow-ink-md">
@@ -1576,7 +1538,6 @@ function MobileSessionView({
         </div>
       )}
 
-      {/* Workers / Dispatch bottom sheets (mobile) */}
       {isMobile && (
         <>
           <div
@@ -1720,74 +1681,6 @@ function MobileSessionView({
         </>
       )}
 
-      {/* Desktop workers dropdown (inline popover, not bottom sheet) */}
-      {!isMobile && workersOpen && (
-        <div ref={workersMenuRef}>
-          <div className="fixed inset-0 z-40" onClick={() => setWorkersOpen(false)} />
-          <div className="fixed right-4 top-16 z-50 w-72 rounded-xl border border-ink-border bg-washi-white shadow-ink-md">
-            <div className="px-3 py-2 border-b border-ink-border text-xs font-mono text-sumi-diluted">Workers</div>
-            <div className="max-h-64 overflow-y-auto">
-              {workerRows.map((worker) => (
-                <button
-                  key={worker.name}
-                  type="button"
-                  className="w-full px-3 py-2 border-b border-ink-border last:border-b-0 flex items-center justify-between hover:bg-washi-shadow/60 text-left"
-                  onClick={() => handleOpenWorker(worker.name)}
-                >
-                  <div className="min-w-0">
-                    <div className="truncate text-xs font-mono text-sumi-black">
-                      <span className={cn('mr-1', workerStatusClass(worker.status))}>
-                        {workerStatusSymbol(worker.status)}
-                      </span>
-                      {worker.name}
-                    </div>
-                    <div className="text-[10px] text-sumi-diluted">{worker.status}</div>
-                  </div>
-                  <ChevronRight size={14} className="text-sumi-mist" />
-                </button>
-              ))}
-            </div>
-            <div className="p-2 border-t border-ink-border flex gap-2">
-              {hasDoneWorkers && (
-                <button
-                  type="button"
-                  className="flex-1 rounded-lg border border-ink-border px-2 py-1.5 text-xs text-sumi-diluted hover:bg-washi-shadow/60"
-                  onClick={async () => {
-                    await fetchJson<{ cleared: number }>(
-                      `/api/agents/sessions/${encodeURIComponent(sessionName)}/workers/done`,
-                      { method: 'DELETE' },
-                    )
-                    await refreshWorkers()
-                  }}
-                >
-                  Clear done
-                </button>
-              )}
-              <button
-                type="button"
-                className="flex-1 rounded-lg border border-ink-border px-2 py-1.5 text-xs text-sumi-black hover:bg-washi-shadow/60"
-                onClick={() => {
-                  setDispatchError(null)
-                  setDispatchOpen(true)
-                }}
-              >
-                + Dispatch
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Workspace overlay (Cmd+K) */}
-      {workspaceSource && (
-        <WorkspaceOverlay
-          open={showWorkspaceOverlay}
-          onClose={() => setShowWorkspaceOverlay(false)}
-          onSelectFile={handleAddFileChip}
-          source={workspaceSource}
-        />
-      )}
-
       <SkillsPicker
         visible={showSkills}
         onSelectSkill={(cmd) => setInputText(cmd + ' ')}
@@ -1927,74 +1820,77 @@ export default function AgentsPage() {
 
   const filteredSessions = filterSessionsByTab(sessionList, sessionTab)
 
-  // Chat-first layout: full-screen list when no session selected,
-  // full-screen chat detail when a session is selected.
-  if (selectedSession) {
-    if (selectedSessionData?.sessionType === 'stream') {
-      return (
-        <MobileSessionView
-          sessionName={selectedSession}
-          sessionLabel={selectedSessionData?.label}
-          agentType={selectedSessionData?.agentType}
-          sessionCwd={selectedSessionData?.cwd}
-          initialSpawnedWorkers={selectedSessionData?.spawnedWorkers}
-          onClose={() => setSelectedSession(null)}
-          onKill={(name, type) => handleKillSession(name, type, selectedSessionData?.sessionType)}
-          onNavigateToSession={(nextSessionName) => setSelectedSession(nextSessionName)}
-          onRefreshSessions={refreshSessions}
-        />
-      )
-    }
-
-    return (
-      <TerminalView
-        sessionName={selectedSession}
-        sessionLabel={selectedSessionData?.label}
-        agentType={selectedSessionData?.agentType}
-        onClose={() => setSelectedSession(null)}
-        onKill={(name, type) => handleKillSession(name, type, selectedSessionData?.sessionType)}
-        isMobileOverlay={isMobile}
-      />
-    )
-  }
-
-  // Sessions list view (no session selected)
   return (
-    <div className="flex flex-col h-full overflow-y-auto pb-20 md:pb-0">
-      <div className="w-full max-w-2xl mx-auto px-4 py-6 md:px-6 md:py-8">
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <h2 className="font-display text-display text-sumi-black">Agents</h2>
-            <p className="mt-2 text-sm text-sumi-diluted leading-relaxed">
-              Active sessions across the system
-            </p>
+    <div className="flex h-full">
+      {/* Session list — full width on mobile, sidebar on desktop when terminal is open */}
+      <div
+        className={cn(
+          'flex flex-col border-r border-ink-border transition-all duration-500 ease-gentle overflow-y-auto pb-20 md:pb-0',
+          selectedSession && !isMobile ? 'w-80' : 'w-full max-w-2xl mx-auto',
+        )}
+      >
+        <div className="px-4 py-6 md:px-6 md:py-8">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <h2 className="font-display text-display text-sumi-black">Agents</h2>
+              <p className="mt-2 text-sm text-sumi-diluted leading-relaxed">
+                Active PTY sessions across the system
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setShowNewSessionForm((current) => !current)
+                setCreateError(null)
+              }}
+              className="btn-ghost inline-flex items-center gap-1.5"
+            >
+              <Plus size={14} />
+              {showNewSessionForm ? 'Close' : 'New Session'}
+            </button>
           </div>
-          <button
-            type="button"
-            onClick={() => {
-              setShowNewSessionForm((current) => !current)
-              setCreateError(null)
-            }}
-            className="btn-ghost inline-flex items-center gap-1.5"
-          >
-            <Plus size={14} />
-            {showNewSessionForm ? 'Close' : 'New Session'}
-          </button>
-        </div>
 
-        {/* New session form: bottom sheet on mobile, inline card on desktop */}
-        {isMobile ? (
-          <>
-            <div
-              className={cn('sheet-backdrop', showNewSessionForm && 'visible')}
-              onClick={() => setShowNewSessionForm(false)}
-            />
-            <div className={cn('sheet', showNewSessionForm && 'visible')}>
-              <div className="sheet-handle">
-                <div className="sheet-handle-bar" />
+          {/* New session form: bottom sheet on mobile, inline card on desktop */}
+          {isMobile ? (
+            <>
+              <div
+                className={cn('sheet-backdrop', showNewSessionForm && 'visible')}
+                onClick={() => setShowNewSessionForm(false)}
+              />
+              <div className={cn('sheet', showNewSessionForm && 'visible')}>
+                <div className="sheet-handle">
+                  <div className="sheet-handle-bar" />
+                </div>
+                <div className="px-5 pb-4">
+                  <h3 className="font-display text-heading text-sumi-black mb-4">New Session</h3>
+                  <NewSessionForm
+                    name={name}
+                    setName={setName}
+                    cwd={cwd}
+                    setCwd={setCwd}
+                    mode={mode}
+                    setMode={setMode}
+                    task={task}
+                    setTask={setTask}
+                    agentType={agentType}
+                    setAgentType={setAgentType}
+                    openclawAgentId={openclawAgentId}
+                    setOpenclawAgentId={setOpenclawAgentId}
+                    sessionType={sessionType}
+                    setSessionType={setSessionType}
+                    machines={machineList}
+                    selectedHost={selectedHost}
+                    setSelectedHost={setSelectedHost}
+                    isCreating={isCreating}
+                    createError={createError}
+                    onSubmit={handleCreateSession}
+                  />
+                </div>
               </div>
-              <div className="px-5 pb-4">
-                <h3 className="font-display text-heading text-sumi-black mb-4">New Session</h3>
+            </>
+          ) : (
+            showNewSessionForm && (
+              <div className="mt-5 card-sumi p-4">
                 <NewSessionForm
                   name={name}
                   setName={setName}
@@ -2018,47 +1914,18 @@ export default function AgentsPage() {
                   onSubmit={handleCreateSession}
                 />
               </div>
-            </div>
-          </>
-        ) : (
-          showNewSessionForm && (
-            <div className="mt-5 card-sumi p-4">
-              <NewSessionForm
-                name={name}
-                setName={setName}
-                cwd={cwd}
-                setCwd={setCwd}
-                mode={mode}
-                setMode={setMode}
-                task={task}
-                setTask={setTask}
-                agentType={agentType}
-                setAgentType={setAgentType}
-                openclawAgentId={openclawAgentId}
-                setOpenclawAgentId={setOpenclawAgentId}
-                sessionType={sessionType}
-                setSessionType={setSessionType}
-                machines={machineList}
-                selectedHost={selectedHost}
-                setSelectedHost={setSelectedHost}
-                isCreating={isCreating}
-                createError={createError}
-                onSubmit={handleCreateSession}
-              />
-            </div>
-          )
-        )}
+            )
+          )}
 
-        {killError && (
-          <div className="mt-3 flex items-start gap-2 rounded-lg bg-accent-vermillion/10 px-3 py-2 text-sm text-accent-vermillion">
-            <AlertTriangle size={15} className="mt-0.5" />
-            <span>{killError}</span>
-          </div>
-        )}
-      </div>
+          {killError && (
+            <div className="mt-3 flex items-start gap-2 rounded-lg bg-accent-vermillion/10 px-3 py-2 text-sm text-accent-vermillion">
+              <AlertTriangle size={15} className="mt-0.5" />
+              <span>{killError}</span>
+            </div>
+          )}
+        </div>
 
-      {/* Session type tabs */}
-      <div className="w-full max-w-2xl mx-auto">
+        {/* Session type tabs */}
         {sessionList.length > 0 && (
           <div className="px-4 pb-3 flex gap-1">
             {SESSION_TABS.map((tab) => (
@@ -2091,8 +1958,12 @@ export default function AgentsPage() {
                 key={session.name}
                 session={session}
                 machine={session.host ? machineMap.get(session.host) : undefined}
-                selected={false}
-                onSelect={() => setSelectedSession(session.name)}
+                selected={selectedSession === session.name}
+                onSelect={() =>
+                  setSelectedSession(
+                    selectedSession === session.name ? null : session.name,
+                  )
+                }
                 onKill={() => handleKillSession(session.name, session.agentType, session.sessionType)}
               />
             ))
@@ -2107,6 +1978,32 @@ export default function AgentsPage() {
           </div>
         )}
       </div>
+
+      {/* Session view: stream sessions use MobileSessionView (chat UI), PTY sessions use TerminalView */}
+      {selectedSession && (
+        selectedSessionData?.sessionType === 'stream' ? (
+          <MobileSessionView
+            sessionName={selectedSession}
+            sessionLabel={selectedSessionData?.label}
+            agentType={selectedSessionData?.agentType}
+            sessionCwd={selectedSessionData?.cwd}
+            initialSpawnedWorkers={selectedSessionData?.spawnedWorkers}
+            onClose={() => setSelectedSession(null)}
+            onKill={(name, type) => handleKillSession(name, type, selectedSessionData?.sessionType)}
+            onNavigateToSession={(nextSessionName) => setSelectedSession(nextSessionName)}
+            onRefreshSessions={refreshSessions}
+          />
+        ) : (
+          <TerminalView
+            sessionName={selectedSession}
+            sessionLabel={selectedSessionData?.label}
+            agentType={selectedSessionData?.agentType}
+            onClose={() => setSelectedSession(null)}
+            onKill={(name, type) => handleKillSession(name, type, selectedSessionData?.sessionType)}
+            isMobileOverlay={isMobile}
+          />
+        )
+      )}
     </div>
   )
 }

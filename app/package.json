@@ -26,7 +26,7 @@
     "@auth0/auth0-react": "^2.4.0",
     "@capacitor/core": "^8.1.0",
     "@capacitor/ios": "^8.1.0",
-    "@gehirn/ai-services": "workspace:*",
+    "@hambros/ai-services": "workspace:*",
     "@hambros/auth-providers": "workspace:*",
     "@hambros/cli": "workspace:*",
     "@hambros/sse-streaming": "workspace:*",
