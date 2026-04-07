@@ -44,19 +44,31 @@ export function resolveStartTarget(
   fileExists: (path: string) => boolean = existsSync,
 ): StartTarget | null {
   const sourceEntry = path.join(appRoot, 'server', 'index.ts')
+  const startupWrapper = path.join(appRoot, 'scripts', 'start-with-memory-restore.sh')
   if (fileExists(sourceEntry)) {
     const hasBuiltClient = fileExists(path.join(appRoot, 'dist', 'index.html'))
     const nodeEnv = normalizeNodeEnv(env, hasBuiltClient ? 'production' : undefined)
+    const nextEnv = nodeEnv
+      ? {
+          ...env,
+          NODE_ENV: nodeEnv,
+        }
+      : { ...env }
+
+    if (fileExists(startupWrapper)) {
+      return {
+        command: 'bash',
+        args: [startupWrapper],
+        cwd: appRoot,
+        env: nextEnv,
+      }
+    }
+
     return {
       command: 'pnpm',
       args: ['tsx', 'server/index.ts'],
       cwd: appRoot,
-      env: nodeEnv
-        ? {
-            ...env,
-            NODE_ENV: nodeEnv,
-          }
-        : { ...env },
+      env: nextEnv,
     }
   }
 
