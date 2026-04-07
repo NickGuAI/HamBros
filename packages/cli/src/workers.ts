@@ -45,13 +45,13 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 function printUsage(stdout: Writable): void {
   stdout.write('Usage:\n')
-  stdout.write('  hammurabi workers list\n')
+  stdout.write('  hambros workers list\n')
   stdout.write(
-    '  hammurabi workers dispatch --session <name> [--type factory|agent] [--issue <url>] [--task <text>] [--branch <name>] [--machine <id>] [--agent claude|codex]\n',
+    '  hambros workers dispatch --session <name> [--type factory|agent] [--issue <url>] [--task <text>] [--branch <name>] [--machine <id>] [--agent claude|codex]\n',
   )
-  stdout.write('  hammurabi workers kill <name>\n')
-  stdout.write('  hammurabi workers status <session-name>\n')
-  stdout.write('  hammurabi workers send <session-name> "<text>"\n')
+  stdout.write('  hambros workers kill <name>\n')
+  stdout.write('  hambros workers status <session-name>\n')
+  stdout.write('  hambros workers send <session-name> "<text>"\n')
 }
 
 function buildApiUrl(endpoint: string, apiPath: string): string {
@@ -515,7 +515,7 @@ export async function runWorkersCli(
 
   const config = await readConfig()
   if (!config) {
-    stderr.write('Hammurabi config not found. Run `hammurabi onboard` first.\n')
+    stderr.write('HamBros config not found. Run `hambros init` first.\n')
     return 1
   }
 

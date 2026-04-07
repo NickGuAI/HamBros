@@ -77,7 +77,7 @@ Each task maintains a history of recent executions with:
 Any task can be triggered immediately regardless of its schedule. Use the dashboard button or the CLI:
 
 ```bash
-hammurabi cron trigger --instruction "Run the daily report now"
+hambros cron trigger --instruction "Run the daily report now"
 ```
 
 ## Creating Tasks
@@ -92,7 +92,7 @@ hammurabi cron trigger --instruction "Run the daily report now"
 ### Via CLI
 
 ```bash
-hammurabi cron add \
+hambros cron add \
   --commander <commander-id> \
   --schedule "0 9 * * *" \
   --instruction "Review open PRs and summarize status" \

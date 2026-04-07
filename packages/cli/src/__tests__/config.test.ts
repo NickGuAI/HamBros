@@ -41,7 +41,7 @@ describe('readHammurabiConfig/writeHammurabiConfig', () => {
   it('writes and reads a config file from a custom path', async () => {
     const directory = await mkdtemp(path.join(tmpdir(), 'hammurabi-cli-config-'))
     createdDirectories.push(directory)
-    const configPath = path.join(directory, '.hammurabi.json')
+    const configPath = path.join(directory, '.hambros.json')
 
     const config = createHammurabiConfig({
       endpoint: 'https://hammurabi.gehirn.ai',
@@ -57,7 +57,7 @@ describe('readHammurabiConfig/writeHammurabiConfig', () => {
   it('returns null when config file does not exist', async () => {
     const directory = await mkdtemp(path.join(tmpdir(), 'hammurabi-cli-config-'))
     createdDirectories.push(directory)
-    const configPath = path.join(directory, '.hammurabi.json')
+    const configPath = path.join(directory, '.hambros.json')
 
     await expect(readHammurabiConfig(configPath)).resolves.toBeNull()
   })

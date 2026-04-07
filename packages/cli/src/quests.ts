@@ -56,17 +56,17 @@ interface CreateOptions {
 
 function printUsage(stdout: Writable): void {
   stdout.write('Usage:\n')
-  stdout.write('  hammurabi quests list\n')
+  stdout.write('  hambros quests list\n')
   stdout.write(
-    '  hammurabi quests create (--instruction "<text>" | --issue <url>) [--cwd <path>] [--mode <mode>] [--agent <type>] [--skills <s1,s2>] [--source <source>] [--note "<text>"]\n',
+    '  hambros quests create (--instruction "<text>" | --issue <url>) [--cwd <path>] [--mode <mode>] [--agent <type>] [--skills <s1,s2>] [--source <source>] [--note "<text>"]\n',
   )
-  stdout.write('  hammurabi quests delete <id>\n')
-  stdout.write('  hammurabi quests claim <id>\n')
-  stdout.write('  hammurabi quests note <id> "<text>"\n')
-  stdout.write('  hammurabi quests done <id> --note "<text>"\n')
-  stdout.write('  hammurabi quests fail <id> --note "<text>"\n')
-  stdout.write('  hammurabi quests artifact add <id> --type <type> --label <label> --href <href>\n')
-  stdout.write('  hammurabi quests artifact remove <id> <href>\n')
+  stdout.write('  hambros quests delete <id>\n')
+  stdout.write('  hambros quests claim <id>\n')
+  stdout.write('  hambros quests note <id> "<text>"\n')
+  stdout.write('  hambros quests done <id> --note "<text>"\n')
+  stdout.write('  hambros quests fail <id> --note "<text>"\n')
+  stdout.write('  hambros quests artifact add <id> --type <type> --label <label> --href <href>\n')
+  stdout.write('  hambros quests artifact remove <id> <href>\n')
 }
 
 function resolveCommanderId(value: string | null | undefined): string | null {
@@ -306,7 +306,7 @@ async function resolveCommandContext(
   const readConfig = dependencies.readConfig ?? readHammurabiConfig
   const config = await readConfig()
   if (!config) {
-    stderr.write('Hammurabi config not found. Run `hammurabi onboard` first.\n')
+    stderr.write('HamBros config not found. Run `hambros init` first.\n')
     return null
   }
 

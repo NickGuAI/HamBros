@@ -1,32 +1,61 @@
 # CLI Reference
 
-The `hammurabi` CLI provides command-line access to HamBros features including agent onboarding, quest management, worker dispatch, memory operations, and cron scheduling.
+The `hambros` CLI provides command-line access to local install setup, startup, agent onboarding, quest management, worker dispatch, memory operations, and cron scheduling.
 
 ## Installation
 
-The CLI is included in the HamBros monorepo as `@hambros/cli`:
+The CLI is included in the HamBros monorepo as `@hambros/cli`, and `install.sh` installs it onto your `PATH` as `hambros`:
 
 ```bash
 # From the HamBros root
 pnpm --filter app run build:deps
 ```
 
-The CLI binary is available at `packages/cli/bin/hammurabi.mjs`.
+The CLI binary is available at `packages/cli/bin/hambros.mjs`.
 
 ## Commands
 
 ---
 
-### `hammurabi onboard`
+### `hambros init`
+
+Interactive local setup for a self-hosted HamBros install.
+
+```bash
+hambros init
+```
+
+The wizard:
+- Detects whether `~/.hambros/app/.env` already exists
+- Prompts for the server port and admin API key
+- Lets you choose which local agents to instrument
+- Writes `app/.env` and `~/.hambros.json`
+- Prints the next step: `hambros start`
+
+---
+
+### `hambros start`
+
+Launches HamBros from the installed app root, not from your current shell directory.
+
+```bash
+hambros start
+```
+
+When a production client build exists, `hambros start` runs the source server with `NODE_ENV=production` so the built UI is served correctly. If compiled server artifacts are the only available entrypoint, it falls back to the built server.
+
+---
+
+### `hambros onboard`
 
 Interactive setup wizard that configures AI agents to send telemetry to your HamBros instance.
 
 ```bash
-hammurabi onboard
+hambros onboard
 ```
 
 The wizard prompts for:
-- **Hammurabi endpoint** — URL of your HamBros instance (default: `https://hammurabi.gehirn.ai`)
+- **HamBros endpoint** — URL of your HamBros instance (default: `http://localhost:20001`)
 - **API key** — authentication key
 - **Agent selection** — which agents to configure (multi-select)
 
@@ -37,11 +66,11 @@ Supported agents:
 - Terminal CRI (manual setup)
 - Anti-Gravity (manual setup)
 
-Configuration is saved to `~/.hammurabi.json`.
+Configuration is saved to `~/.hambros.json`.
 
 ---
 
-### `hammurabi quests`
+### `hambros quests`
 
 Manage the commander quest board.
 
@@ -50,7 +79,7 @@ Manage the commander quest board.
 #### `quests list`
 
 ```bash
-HAMMURABI_COMMANDER_ID=<uuid> hammurabi quests list
+HAMMURABI_COMMANDER_ID=<uuid> hambros quests list
 ```
 
 List pending and active quests.
@@ -58,7 +87,7 @@ List pending and active quests.
 #### `quests create`
 
 ```bash
-hammurabi quests create \
+hambros quests create \
   --instruction "Fix the login page redirect bug" \
   --cwd /path/to/project \
   --mode default \
@@ -99,7 +128,7 @@ Mark a quest as failed with a failure note.
 #### `quests artifact add <id>`
 
 ```bash
-hammurabi quests artifact add <quest-id> \
+hambros quests artifact add <quest-id> \
   --type github_pr \
   --label "Fix PR" \
   --href https://github.com/org/repo/pull/43
@@ -113,7 +142,7 @@ Remove an artifact from a quest.
 
 ---
 
-### `hammurabi workers`
+### `hambros workers`
 
 Manage factory worker sessions.
 
@@ -124,7 +153,7 @@ List active factory workers.
 #### `workers dispatch`
 
 ```bash
-hammurabi workers dispatch \
+hambros workers dispatch \
   --session main-session \
   --issue https://github.com/org/repo/issues/42 \
   --branch fix-issue-42 \
@@ -157,14 +186,14 @@ Send a message to a running worker.
 
 ---
 
-### `hammurabi memory`
+### `hambros memory`
 
 Manage commander memory.
 
 #### `memory find`
 
 ```bash
-hammurabi memory find --commander <id> "authentication redirect"
+hambros memory find --commander <id> "authentication redirect"
 ```
 
 | Flag | Required | Description |
@@ -175,13 +204,13 @@ hammurabi memory find --commander <id> "authentication redirect"
 #### `memory save`
 
 ```bash
-hammurabi memory save --commander <id> "Auth redirects require URL encoding"
+hambros memory save --commander <id> "Auth redirects require URL encoding"
 ```
 
 Multiple facts can be saved:
 
 ```bash
-hammurabi memory save --commander <id> \
+hambros memory save --commander <id> \
   "Auth redirects require URL encoding" \
   --fact "Login page uses /callback as redirect path"
 ```
@@ -189,27 +218,27 @@ hammurabi memory save --commander <id> \
 #### `memory compact`
 
 ```bash
-hammurabi memory compact --commander <id>
+hambros memory compact --commander <id>
 ```
 
 Consolidates memory, extracts facts, and prunes stale entries.
 
 ---
 
-### `hammurabi cron`
+### `hambros cron`
 
 Manage scheduled tasks.
 
 #### `cron list`
 
 ```bash
-hammurabi cron list --commander <id>
+hambros cron list --commander <id>
 ```
 
 #### `cron add`
 
 ```bash
-hammurabi cron add \
+hambros cron add \
   --commander <id> \
   --schedule "0 9 * * *" \
   --instruction "Review open PRs" \
@@ -233,7 +262,7 @@ hammurabi cron add \
 #### `cron update <id>`
 
 ```bash
-hammurabi cron update <cron-id> \
+hambros cron update <cron-id> \
   --schedule "0 */6 * * *" \
   --enabled false
 ```
@@ -241,26 +270,26 @@ hammurabi cron update <cron-id> \
 #### `cron delete`
 
 ```bash
-hammurabi cron delete --commander <id> <cron-id>
+hambros cron delete --commander <id> <cron-id>
 ```
 
 #### `cron trigger`
 
 ```bash
-HAMMURABI_COMMANDER_ID=<uuid> hammurabi cron trigger \
+HAMMURABI_COMMANDER_ID=<uuid> hambros cron trigger \
   --instruction "Run the daily report now"
 ```
 
 ---
 
-### `hammurabi commander`
+### `hambros commander`
 
 Initialize and configure commander instances.
 
 #### `commander init`
 
 ```bash
-hammurabi commander init
+hambros commander init
 ```
 
 Interactive setup that creates a local `COMMANDER.md` configuration.
@@ -268,7 +297,7 @@ Interactive setup that creates a local `COMMANDER.md` configuration.
 #### `commander init --remote`
 
 ```bash
-hammurabi commander init \
+hambros commander init \
   --remote https://your-server.com \
   --token sync-token-123 \
   --commander <id> \

@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "bin": {
+    "hambros": "./hambros-cli.mjs",
     "hammurabi": "./hammurabi-cli.mjs"
   },
   "scripts": {
@@ -16,7 +17,8 @@
     "preview": "vite preview",
     "test": "pnpm run build:deps && vitest run",
     "lint": "eslint src server modules --ext .ts,.tsx",
-    "onboard": "hammurabi onboard",
+    "onboard": "hambros onboard",
+    "init": "hambros init",
     "cap:sync": "cap sync ios",
     "cap:ios": "cap open ios",
     "cap:build": "pnpm build && cap sync ios"

@@ -36,7 +36,7 @@ releases/hambros/
     ├── auth-providers/   # Auth0 / API-key auth abstractions
     ├── telemetry/        # Cost and usage tracking
     ├── sse-streaming/    # Server-Sent Events utilities
-    ├── cli/              # HamBros onboarding CLI
+    ├── cli/              # HamBros CLI
     └── tsconfig/         # Shared TypeScript base config
 ```
 
@@ -51,21 +51,20 @@ releases/hambros/
 ## Quick Start
 
 ```bash
-# 1. Clone
+curl -fsSL https://raw.githubusercontent.com/NickGuAI/HamBros/main/install.sh | bash
+hambros init
+hambros start
+```
+
+This installs HamBros into `~/.hambros` by default, writes `app/.env` via the interactive init flow, and starts the server from the correct app root regardless of your current working directory.
+
+## Development Setup
+
+```bash
 git clone https://github.com/NickGuAI/HamBros.git
 cd HamBros
-
-# 2. Install dependencies
 pnpm install
-
-# 3. Configure environment
-cp app/.env.example app/.env
-# Minimum required: set HAMBROS_ALLOWED_ORIGINS=http://localhost:5173
-
-# 4. Build internal packages
 pnpm --filter hambros run build:deps
-
-# 5. Start dev server (API + frontend hot-reload)
 pnpm --filter hambros run dev
 ```
 
@@ -176,9 +175,10 @@ HamBros accepts OTLP/HTTP traces and logs on the Express server:
 
 Point your OTEL exporter at `http://localhost:20001` to start ingesting.
 
-Use the `@hambros/cli` package to onboard agents:
+Use the `@hambros/cli` package to initialize a local install or onboard agents:
 
 ```bash
+pnpm --filter hambros run init
 pnpm --filter hambros run onboard
 ```
 

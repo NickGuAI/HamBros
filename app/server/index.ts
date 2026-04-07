@@ -8,6 +8,7 @@ import { OpenAITranscriptionKeyStore } from './api-keys/transcription-store.js'
 import { createModules } from './module-registry.js'
 import { isCorsOriginAllowed, parseAllowedCorsOrigins } from './cors.js'
 import { createApiKeysRouter } from './routes/api-keys.js'
+import { DIST_DIR } from './runtime-paths.js'
 
 const app = express()
 const port = parseInt(process.env.PORT ?? '20001', 10)
@@ -72,15 +73,14 @@ for (const mod of modules) {
   app.use(mod.routePrefix, mod.router)
 }
 
-const distDir = path.resolve(process.cwd(), 'dist')
-if (process.env.NODE_ENV === 'production' && existsSync(distDir)) {
-  app.use(express.static(distDir))
+if (process.env.NODE_ENV === 'production' && existsSync(DIST_DIR)) {
+  app.use(express.static(DIST_DIR))
   app.get('*', (req, res, next) => {
     if (req.path.startsWith('/api/') || req.path.startsWith('/v1/')) {
       next()
       return
     }
-    res.sendFile(path.join(distDir, 'index.html'))
+    res.sendFile(path.join(DIST_DIR, 'index.html'))
   })
 }
 

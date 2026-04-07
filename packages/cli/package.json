@@ -2,15 +2,16 @@
   "name": "@hambros/cli",
   "version": "0.1.0",
   "private": false,
-  "description": "Hammurabi onboarding CLI — configure agents to send telemetry.",
+  "description": "HamBros CLI — local install setup, telemetry onboarding, and automation commands.",
   "type": "module",
   "bin": {
+    "hambros": "./bin/hambros.mjs",
     "hammurabi": "./bin/hammurabi.mjs"
   },
-  "main": "./dist/onboard.js",
+  "main": "./dist/index.js",
   "exports": {
     ".": {
-      "import": "./dist/onboard.js"
+      "import": "./dist/index.js"
     }
   },
   "files": [

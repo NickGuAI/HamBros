@@ -22,7 +22,7 @@ importers:
       '@capacitor/ios':
         specifier: ^8.1.0
         version: 8.1.0(@capacitor/core@8.1.0)
-      '@gehirn/ai-services':
+      '@hambros/ai-services':
         specifier: workspace:*
         version: link:../packages/ai-services
       '@hambros/auth-providers':
@@ -226,7 +226,14 @@ importers:
         specifier: ^5.7.0
         version: 5.9.3
 
-  packages/ai-services: {}
+  packages/ai-services:
+    dependencies:
+      '@anthropic-ai/claude-agent-sdk':
+        specifier: ^0.1.76
+        version: 0.1.77(zod@4.3.6)
+      '@openai/codex-sdk':
+        specifier: ^0.90.0
+        version: 0.90.0
 
   packages/auth-providers:
     dependencies:
@@ -1265,6 +1272,10 @@ packages:
   '@nodelib/fs.walk@1.2.8':
     resolution: {integrity: sha512-oGB+UxlgWcgQkgwo8GcEGwemoTFt3FIO9ababBmaGwXIoBKZ+GTy0pP185beGg7Llih/NSHSV2XAs1lnznocSg==}
     engines: {node: '>= 8'}
+
+  '@openai/codex-sdk@0.90.0':
+    resolution: {integrity: sha512-6Mht5GMWsImJggut/WYu8Y37kIQaOdynZU27GLXwSkmtU50w8xnxy+Ksubcu32P5Odxm+od7B5iyLGpQY5w2kg==}
+    engines: {node: '>=18'}
 
   '@pixi/colord@2.9.6':
     resolution: {integrity: sha512-nezytU2pw587fQstUu1AsJZDVEynjskwOL+kibwcdxsMBFqPsFFNA7xl0ii/gXuDi6M0xj3mfRJj8pBSc2jCfA==}
@@ -4697,6 +4708,8 @@ snapshots:
     dependencies:
       '@nodelib/fs.scandir': 2.1.5
       fastq: 1.20.1
+
+  '@openai/codex-sdk@0.90.0': {}
 
   '@pixi/colord@2.9.6': {}
 

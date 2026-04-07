@@ -2,7 +2,8 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
 
-export const HAMMURABI_CONFIG_FILENAME = '.hammurabi.json'
+export const HAMBROS_CONFIG_FILENAME = '.hambros.json'
+export const LEGACY_HAMMURABI_CONFIG_FILENAME = '.hammurabi.json'
 
 export const HAMMURABI_AGENTS = [
   'claude-code',
@@ -50,7 +51,11 @@ export function isHammurabiAgent(value: string): value is HammurabiAgent {
 }
 
 export function defaultConfigPath(): string {
-  return path.join(homedir(), HAMMURABI_CONFIG_FILENAME)
+  return path.join(homedir(), HAMBROS_CONFIG_FILENAME)
+}
+
+export function legacyConfigPath(): string {
+  return path.join(homedir(), LEGACY_HAMMURABI_CONFIG_FILENAME)
 }
 
 export function createHammurabiConfig(input: CreateConfigInput): HammurabiConfig {
@@ -111,6 +116,9 @@ export async function readHammurabiConfig(
     raw = await readFile(configPath, 'utf8')
   } catch (error) {
     if (isErrnoException(error) && error.code === 'ENOENT') {
+      if (configPath === defaultConfigPath()) {
+        return readHammurabiConfig(legacyConfigPath())
+      }
       return null
     }
     throw error

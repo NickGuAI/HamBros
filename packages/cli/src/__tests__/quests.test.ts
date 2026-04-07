@@ -559,7 +559,7 @@ describe('runQuestsCli', () => {
     expect(call?.[1]).toMatchObject({ method: 'DELETE' })
   })
 
-  it('fails when hammurabi config is missing', async () => {
+  it('fails when hambros config is missing', async () => {
     const fetchImpl = vi.fn<typeof fetch>()
     const stderr = createBufferWriter()
 
@@ -571,7 +571,7 @@ describe('runQuestsCli', () => {
     })
 
     expect(exitCode).toBe(1)
-    expect(stderr.read()).toContain('Hammurabi config not found.')
+    expect(stderr.read()).toContain('HamBros config not found.')
     expect(fetchImpl).not.toHaveBeenCalled()
   })
 })

@@ -1,5 +1,15 @@
 # Installation
 
+## One-Line Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/NickGuAI/HamBros/main/install.sh | bash
+hambros init
+hambros start
+```
+
+`install.sh` installs or upgrades HamBros into `~/.hambros` (or `$HAMBROS_HOME`), builds the app, and installs a persistent `hambros` CLI on your `PATH`.
+
 ## Prerequisites
 
 | Requirement | Version | Check |
@@ -14,7 +24,7 @@ If you don't have pnpm installed:
 npm install -g pnpm
 ```
 
-## Clone and Install
+## Clone and Install From Source
 
 ```bash
 git clone https://github.com/NickGuAI/HamBros.git
@@ -29,7 +39,7 @@ pnpm install
 HamBros has several shared packages that must be compiled before the main app:
 
 ```bash
-pnpm --filter app run build:deps
+pnpm --filter hambros run build:deps
 ```
 
 This builds:
@@ -54,7 +64,7 @@ At minimum, the defaults work for local development. See [Configuration](/docs/g
 pnpm --filter app run dev
 ```
 
-This runs both the Vite dev server (port 5200) and the Express API server (port 20001) concurrently. The Vite dev server proxies `/api` requests to Express.
+This runs both the Vite dev server (port 5173) and the Express API server (port 20001) concurrently. The Vite dev server proxies `/api` requests to Express.
 
 You can also run them separately:
 
@@ -86,7 +96,7 @@ HamBros/
 │   └── public/           # Static assets
 ├── packages/             # Shared packages
 │   ├── auth-providers/   # @hambros/auth-providers
-│   ├── cli/              # @hambros/cli (hammurabi CLI)
+│   ├── cli/              # @hambros/cli (hambros CLI)
 │   ├── telemetry/        # @hambros/telemetry
 │   ├── sse-streaming/    # @hambros/sse-streaming
 │   └── tsconfig/         # Shared TypeScript config

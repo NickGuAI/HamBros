@@ -15,7 +15,7 @@ import {
 } from './prompts.js'
 import { validateTelemetryWriteKey } from './validate.js'
 
-const DEFAULT_ENDPOINT = 'https://hammurabi.gehirn.ai'
+const DEFAULT_ENDPOINT = 'http://localhost:20001'
 const DEFAULT_AGENTS: readonly HammurabiAgent[] = [
   'claude-code',
   'codex',
@@ -53,7 +53,7 @@ const AGENT_INSTRUCTIONS: readonly AgentInstruction[] = [
   {
     id: 'terminal-cri',
     label: 'Terminal CRI',
-    lines: ['Already integrated. Hammurabi agents read ~/.hammurabi.json directly; no extra setup is required.'],
+    lines: ['Already integrated. HamBros agents read ~/.hambros.json directly; no extra setup is required.'],
   },
   {
     id: 'cursor',
@@ -78,7 +78,7 @@ const AGENT_INSTRUCTIONS: readonly AgentInstruction[] = [
 ]
 
 function printUsage(): void {
-  process.stdout.write('Usage: hammurabi onboard\n')
+  process.stdout.write('Usage: hambros onboard\n')
 }
 
 function printSelectedAgentInstructions(
@@ -127,10 +127,10 @@ export async function runCli(args: readonly string[]): Promise<number> {
       return 1
     }
 
-    process.stdout.write('Hammurabi onboard\n')
-    process.stdout.write('Configure agents to send telemetry to your Hammurabi instance.\n\n')
+    process.stdout.write('HamBros onboard\n')
+    process.stdout.write('Configure agents to send telemetry to your HamBros instance.\n\n')
 
-    const endpoint = await promptText('Hammurabi endpoint', {
+    const endpoint = await promptText('HamBros endpoint', {
       defaultValue: DEFAULT_ENDPOINT,
       required: true,
     })

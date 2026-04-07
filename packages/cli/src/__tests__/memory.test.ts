@@ -42,11 +42,11 @@ describe('runMemoryCli', () => {
 
     expect(exitCode).toBe(1)
     expect(stdout.read()).toContain('Usage:')
-    expect(stdout.read()).toContain('hammurabi memory compact')
-    expect(stdout.read()).toContain('hammurabi memory find')
-    expect(stdout.read()).toContain('hammurabi memory save')
-    expect(stdout.read()).toContain('hammurabi memory export')
-    expect(stdout.read()).toContain('hammurabi memory journal')
+    expect(stdout.read()).toContain('hambros memory compact')
+    expect(stdout.read()).toContain('hambros memory find')
+    expect(stdout.read()).toContain('hambros memory save')
+    expect(stdout.read()).toContain('hambros memory export')
+    expect(stdout.read()).toContain('hambros memory journal')
   })
 
   it('prints usage for unknown subcommand', async () => {
@@ -586,6 +586,6 @@ describe('runMemoryCli', () => {
     })
 
     expect(exitCode).toBe(1)
-    expect(stderr.read()).toContain('Hammurabi config not found')
+    expect(stderr.read()).toContain('HamBros config not found')
   })
 })

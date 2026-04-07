@@ -72,14 +72,14 @@ Recurring tasks can be scheduled with cron expressions. Each cron job specifies:
 Or via the CLI:
 
 ```bash
-hammurabi commander init
+hambros commander init
 ```
 
 ## Quest Workflow Example
 
 ```bash
 # Create a quest
-hammurabi quests create \
+hambros quests create \
   --instruction "Fix the login page redirect bug" \
   --cwd /home/user/project \
   --mode default \
@@ -87,13 +87,13 @@ hammurabi quests create \
   --issue https://github.com/org/repo/issues/42
 
 # Claim it
-hammurabi quests claim <quest-id>
+hambros quests claim <quest-id>
 
 # Add progress notes
-hammurabi quests note <quest-id> "Root cause identified: missing redirect URL encoding"
+hambros quests note <quest-id> "Root cause identified: missing redirect URL encoding"
 
 # Complete it
-hammurabi quests done <quest-id> --note "Fixed in commit abc123, PR #43 created"
+hambros quests done <quest-id> --note "Fixed in commit abc123, PR #43 created"
 ```
 
 ## S3 Sync

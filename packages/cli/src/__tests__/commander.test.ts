@@ -32,7 +32,7 @@ describe('runCommanderCli', () => {
     const exitCode = await runCommanderCli([], { stdout: stdout.writer, stderr: stderr.writer })
 
     expect(exitCode).toBe(1)
-    expect(stdout.read()).toContain('hammurabi commander init')
+    expect(stdout.read()).toContain('hambros commander init')
   })
 
   it('prints usage and returns 1 for unknown subcommand', async () => {
@@ -42,7 +42,7 @@ describe('runCommanderCli', () => {
     const exitCode = await runCommanderCli(['unknown'], { stdout: stdout.writer, stderr: stderr.writer })
 
     expect(exitCode).toBe(1)
-    expect(stdout.read()).toContain('hammurabi commander init')
+    expect(stdout.read()).toContain('hambros commander init')
   })
 
   it('creates COMMANDER.md when it does not exist', async () => {
@@ -112,7 +112,7 @@ describe('runCommanderCli', () => {
     expect(body).toContain('## Quest Board')
     expect(body).toContain('## Memory')
     expect(body).toContain('.memory/MEMORY.md')
-    expect(body).toContain('hammurabi memory find --commander [COMMANDER_ID] "<query>"')
+    expect(body).toContain('hambros memory find --commander [COMMANDER_ID] "<query>"')
   })
 
   it('errors and returns 1 when COMMANDER.md already exists', async () => {

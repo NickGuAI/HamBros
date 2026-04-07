@@ -67,15 +67,15 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 function printUsage(stdout: Writable): void {
   stdout.write('Usage:\n')
-  stdout.write('  hammurabi cron list --commander <id>\n')
+  stdout.write('  hambros cron list --commander <id>\n')
   stdout.write(
-    '  hammurabi cron add --commander <id> --schedule "<cron>" --instruction "<text>" [--name <str>] [--agent claude|codex] [--session-type stream|pty] [--permission-mode <str>] [--work-dir /abs/path] [--machine <id>] [--disabled]\n',
+    '  hambros cron add --commander <id> --schedule "<cron>" --instruction "<text>" [--name <str>] [--agent claude|codex] [--session-type stream|pty] [--permission-mode <str>] [--work-dir /abs/path] [--machine <id>] [--disabled]\n',
   )
-  stdout.write('  hammurabi cron delete --commander <id> <cron-id>\n')
+  stdout.write('  hambros cron delete --commander <id> <cron-id>\n')
   stdout.write(
-    '  hammurabi cron update <id> [--commander <id>] [--schedule "<cron>"] [--instruction "<text>"] [--enabled | --disabled | --enabled true|false]\n',
+    '  hambros cron update <id> [--commander <id>] [--schedule "<cron>"] [--instruction "<text>"] [--enabled | --disabled | --enabled true|false]\n',
   )
-  stdout.write('  hammurabi cron trigger [--commander <id>] [--instruction "<text>"]\n')
+  stdout.write('  hambros cron trigger [--commander <id>] [--instruction "<text>"]\n')
 }
 
 function parseNonEmpty(value: string | undefined): string | null {
@@ -345,7 +345,7 @@ async function resolveCommandContext(
   const readConfig = dependencies.readConfig ?? readHammurabiConfig
   const config = await readConfig()
   if (!config) {
-    stderr.write('Hammurabi config not found. Run `hammurabi onboard` first.\n')
+    stderr.write('HamBros config not found. Run `hambros init` first.\n')
     return null
   }
 
@@ -685,7 +685,7 @@ export async function runCronCli(
   if (command === 'list') {
     const config = await readConfig()
     if (!config) {
-      stderr.write('Hammurabi config not found. Run `hammurabi onboard` first.\n')
+      stderr.write('HamBros config not found. Run `hambros init` first.\n')
       return 1
     }
     const listOptions = parseListOptions(args.slice(1))
@@ -699,7 +699,7 @@ export async function runCronCli(
   if (command === 'add') {
     const config = await readConfig()
     if (!config) {
-      stderr.write('Hammurabi config not found. Run `hammurabi onboard` first.\n')
+      stderr.write('HamBros config not found. Run `hambros init` first.\n')
       return 1
     }
     const addOptions = parseAddOptions(args.slice(1))
@@ -713,7 +713,7 @@ export async function runCronCli(
   if (command === 'delete') {
     const config = await readConfig()
     if (!config) {
-      stderr.write('Hammurabi config not found. Run `hammurabi onboard` first.\n')
+      stderr.write('HamBros config not found. Run `hambros init` first.\n')
       return 1
     }
     const deleteOptions = parseDeleteOptions(args.slice(1))

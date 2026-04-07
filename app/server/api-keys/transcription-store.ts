@@ -1,6 +1,7 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { resolveDataPath } from '../runtime-paths.js'
 
 const OPENAI_TRANSCRIPTION_SECRET_ID = 'openai-realtime-transcription'
 const DEFAULT_ENV_KEY_NAME = 'HAMBROS_SETTINGS_ENCRYPTION_KEY'
@@ -138,11 +139,11 @@ function decryptSecret(record: EncryptedSecretRecord, key: Buffer): string | nul
 }
 
 export function defaultTranscriptionSecretStorePath(): string {
-  return path.resolve(process.cwd(), 'data/api-keys/transcription-secrets.json')
+  return resolveDataPath('api-keys', 'transcription-secrets.json')
 }
 
 export function defaultTranscriptionSecretKeyPath(): string {
-  return path.resolve(process.cwd(), 'data/api-keys/transcription-secrets.key')
+  return resolveDataPath('api-keys', 'transcription-secrets.key')
 }
 
 export class OpenAITranscriptionKeyStore implements OpenAITranscriptionKeyStoreLike {

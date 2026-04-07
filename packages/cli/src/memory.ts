@@ -42,12 +42,12 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 function printUsage(stdout: Writable): void {
   stdout.write('Usage:\n')
-  stdout.write('  hammurabi memory compact --commander <id>\n')
-  stdout.write('  hammurabi memory find --commander <id> "<query>" [--top <k>] [--semantic]\n')
-  stdout.write('  hammurabi memory save --commander <id> "<fact>" [--fact "<another>"]\n')
-  stdout.write('  hammurabi memory export --commander <id>\n')
+  stdout.write('  hambros memory compact --commander <id>\n')
+  stdout.write('  hambros memory find --commander <id> "<query>" [--top <k>] [--semantic]\n')
+  stdout.write('  hambros memory save --commander <id> "<fact>" [--fact "<another>"]\n')
+  stdout.write('  hambros memory export --commander <id>\n')
   stdout.write(
-    '  hammurabi memory journal --commander <id> --body "<text>" [--timestamp <iso>] [--outcome "<text>"] [--salience SPIKE|NOTABLE|ROUTINE] [--issue-number <n>] [--repo <name>] [--duration-min <n>]\n',
+    '  hambros memory journal --commander <id> --body "<text>" [--timestamp <iso>] [--outcome "<text>"] [--salience SPIKE|NOTABLE|ROUTINE] [--issue-number <n>] [--repo <name>] [--duration-min <n>]\n',
   )
 }
 
@@ -840,7 +840,7 @@ export async function runMemoryCli(
 
   const config = await readConfig()
   if (!config) {
-    stderr.write('Hammurabi config not found. Run `hammurabi onboard` first.\n')
+    stderr.write('HamBros config not found. Run `hambros init` first.\n')
     return 1
   }
 

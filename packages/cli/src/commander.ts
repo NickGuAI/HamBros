@@ -28,10 +28,10 @@ Workspace: [WORKSPACE_CWD]
 ## Quest Board (your primary work queue)
 
 \`\`\`
-hammurabi quests list
-hammurabi quests claim <quest-id>
-hammurabi quests note <quest-id> "<progress text>"
-hammurabi quests done <quest-id> --note "<summary>"
+hambros quests list
+hambros quests claim <quest-id>
+hambros quests note <quest-id> "<progress text>"
+hambros quests done <quest-id> --note "<summary>"
 \`\`\`
 
 Rules:
@@ -58,9 +58,9 @@ cat .memory/MEMORY.md
 cat .memory/LONG_TERM_MEM.md
 cat .memory/working-memory.md
 ls .memory/journal
-hammurabi memory find --commander [COMMANDER_ID] "<query>"
-hammurabi memory save --commander [COMMANDER_ID] "<fact>"
-hammurabi memory compact --commander [COMMANDER_ID]
+hambros memory find --commander [COMMANDER_ID] "<query>"
+hambros memory save --commander [COMMANDER_ID] "<fact>"
+hambros memory compact --commander [COMMANDER_ID]
 \`\`\`
 
 ### When to read
@@ -76,7 +76,7 @@ hammurabi memory compact --commander [COMMANDER_ID]
 - After compaction or when the task direction changes materially
 
 Rules:
-- Use \`cat\` when you know the file you need; use \`hammurabi memory find\` when you need recall.
+- Use \`cat\` when you know the file you need; use \`hambros memory find\` when you need recall.
 - Save durable facts, not transient chatter.
 - Compact after major work or context pressure.
 `
@@ -121,8 +121,8 @@ export interface CommanderCliDependencies {
 
 function printUsage(stdout: Writable): void {
   stdout.write('Usage:\n')
-  stdout.write('  hammurabi commander init\n')
-  stdout.write('  hammurabi commander init --remote <server-url> --token <sync-token> [--commander <id>] [--poll-interval <seconds>] [--once]\n')
+  stdout.write('  hambros commander init\n')
+  stdout.write('  hambros commander init --remote <server-url> --token <sync-token> [--commander <id>] [--poll-interval <seconds>] [--once]\n')
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
