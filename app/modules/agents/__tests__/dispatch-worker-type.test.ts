@@ -14,10 +14,19 @@ vi.mock('node:child_process', async (importOriginal) => {
   }
 })
 
+vi.mock('../../factory/worktree.js', () => ({
+  bootstrapFactoryWorktree: vi.fn(async ({ feature }: { feature: string }) => ({
+    path: `/tmp/.factory/mock/${feature}`,
+    branch: feature,
+  })),
+}))
+
 import { spawn as spawnFn } from 'node:child_process'
+import { bootstrapFactoryWorktree } from '../../factory/worktree.js'
 import { createAgentsRouter, type AgentsRouterOptions } from '../routes'
 
 const mockedSpawn = vi.mocked(spawnFn)
+const mockedBootstrapFactoryWorktree = vi.mocked(bootstrapFactoryWorktree)
 
 interface MockChildProcess {
   cp: ChildProcess
@@ -161,6 +170,7 @@ async function createCommanderSession(baseUrl: string, name = 'commander-main'):
 beforeEach(() => {
   let nextPid = 1000
   spawnedProcesses = []
+  mockedBootstrapFactoryWorktree.mockClear()
   mockedSpawn.mockReset()
   mockedSpawn.mockImplementation(() => {
     const mock = createMockChildProcess(nextPid)
@@ -239,6 +249,83 @@ describe('dispatch-worker --type agent', () => {
       expect(workers).toEqual(expect.arrayContaining([
         expect.objectContaining({ name: workerName, status: 'done' }),
       ]))
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('rejects standalone agent workers when parentSession is omitted', async () => {
+    const server = await startServer()
+
+    try {
+      const dispatchResponse = await fetch(`${server.baseUrl}/api/agents/sessions/dispatch-worker`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          workerType: 'agent',
+          task: 'Investigate standalone worker',
+        }),
+      })
+
+      expect(dispatchResponse.status).toBe(400)
+      expect(await dispatchResponse.json()).toEqual({ error: 'Provide parentSession for agent workers' })
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('creates standalone factory workers with branch/task and no parent session', async () => {
+    const server = await startServer()
+
+    try {
+      const dispatchResponse = await fetch(`${server.baseUrl}/api/agents/sessions/dispatch-worker`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          branch: 'feat-standalone',
+          task: 'Handle standalone factory worker',
+          issueUrl: 'https://github.com/example-user/example-repo/issues/818',
+        }),
+      })
+
+      expect(dispatchResponse.status).toBe(202)
+      const dispatchPayload = await dispatchResponse.json() as {
+        name: string
+        workerType: 'factory' | 'agent'
+        branch?: string
+        worktree?: string
+      }
+
+      expect(dispatchPayload.workerType).toBe('factory')
+      expect(dispatchPayload.name).toMatch(/^factory-feat-standalone-\d+/)
+      expect(dispatchPayload.branch).toBe('feat-standalone')
+      expect(dispatchPayload.worktree).toBe('/tmp/.factory/mock/feat-standalone')
+      expect(mockedBootstrapFactoryWorktree).toHaveBeenCalledWith(expect.objectContaining({
+        owner: 'example-user',
+        repo: 'example-repo',
+        feature: 'feat-standalone',
+      }))
+
+      const workerName = dispatchPayload.name
+      const statusResponse = await fetch(
+        `${server.baseUrl}/api/agents/sessions/${encodeURIComponent(workerName)}`,
+        { headers: AUTH_HEADERS },
+      )
+      expect(statusResponse.status).toBe(200)
+      const statusPayload = await statusResponse.json() as {
+        completed: boolean
+        agentType?: string
+        parentSession?: string
+      }
+      expect(statusPayload.completed).toBe(false)
+      expect(statusPayload.agentType).toBe('claude')
+      expect(statusPayload.parentSession).toBeUndefined()
     } finally {
       await server.close()
     }

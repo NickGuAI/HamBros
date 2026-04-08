@@ -3,7 +3,7 @@ import express from 'express'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { execFile } from 'node:child_process'
+import { execFile, spawn as spawnChild } from 'node:child_process'
 import type { ApiKeyStoreLike } from '../../../server/api-keys/store'
 import { createServicesRouter, parseLaunchScript, parseListeningPorts } from '../routes'
 
@@ -700,6 +700,63 @@ describe('services restart', () => {
     })
 
     expect(response.status).toBe(403)
+    await server.close()
+  })
+
+  it('sanitizes inherited env before spawning a restart script', async () => {
+    const scriptsDir = await createScriptsDir({
+      'launch_alpha.sh': 'PORT=3001\n',
+    })
+
+    mockExecFile((_command, _args, callback) => {
+      callback(null, '', '')
+    })
+
+    const mockedSpawn = spawnChild as unknown as ReturnType<typeof vi.fn>
+    const unref = vi.fn()
+    mockedSpawn.mockReturnValue({ unref } as never)
+
+    const server = await startServer({
+      scriptsDir,
+      env: {
+        HOME: '/tmp/hammurabi-home',
+        PATH: '/usr/local/bin:/usr/bin:/bin',
+        USER: 'hammurabi-user',
+        SHELL: '/bin/bash',
+        LANG: 'en_US.UTF-8',
+        AUTH0_DOMAIN: 'hammurabi.example',
+        VITE_AUTH0_DOMAIN: 'hammurabi-vite.example',
+        DATABASE_URL: 'postgres://hammurabi-db',
+      } as NodeJS.ProcessEnv,
+    })
+
+    const response = await fetch(`${server.baseUrl}/api/services/alpha/restart`, {
+      method: 'POST',
+      headers: AUTH_HEADERS,
+    })
+
+    expect(response.status).toBe(200)
+    expect(mockedSpawn).toHaveBeenCalledTimes(1)
+    expect(unref).toHaveBeenCalledTimes(1)
+
+    const spawnArgs = mockedSpawn.mock.calls[0] as [
+      string,
+      string[],
+      {
+        env?: NodeJS.ProcessEnv
+      },
+    ]
+    expect(spawnArgs[0]).toBe('bash')
+    expect(spawnArgs[1]).toEqual([expect.stringContaining('launch_alpha.sh')])
+
+    const spawnedEnv = spawnArgs[2].env ?? {}
+    expect(spawnedEnv.HOME).toBe('/tmp/hammurabi-home')
+    expect(spawnedEnv.PATH).toBe('/usr/local/bin:/usr/bin:/bin')
+    expect(spawnedEnv.LAUNCH_HERMETIC_ENV).toBe('1')
+    expect(spawnedEnv.AUTH0_DOMAIN).toBeUndefined()
+    expect(spawnedEnv.VITE_AUTH0_DOMAIN).toBeUndefined()
+    expect(spawnedEnv.DATABASE_URL).toBeUndefined()
+
     await server.close()
   })
 

@@ -5,14 +5,21 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { ApiKeyStoreLike } from '../../../server/api-keys/store'
+import { CommanderEmailConfigStore } from '../email-config'
 import { createCommandersRouter, type CommandersRouterOptions } from '../routes'
 import type { CommanderSessionsInterface } from '../../agents/routes'
+import { CommandRoomExecutor } from '../../command-room/executor'
+import { CommandRoomRunStore } from '../../command-room/run-store'
+import { CommandRoomScheduler, type CronScheduler } from '../../command-room/scheduler'
+import { CommandRoomTaskStore } from '../../command-room/task-store'
 import { CommanderSessionStore } from '../store'
 import { JournalWriter } from '../memory/journal'
+import { QuestStore } from '../quest-store'
 import {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   DEFAULT_HEARTBEAT_MESSAGE,
 } from '../heartbeat'
+import type { CommanderEmailClient, CommanderInboundEmail } from '../email-poller'
 
 const AUTH_HEADERS = {
   'x-hammurabi-api-key': 'test-key',
@@ -31,7 +38,6 @@ interface MockSessionEntry {
   agentType: 'claude' | 'codex'
   cwd?: string
   resumeSessionId?: string
-  resumeCodexThreadId?: string
   maxTurns?: number
 }
 
@@ -46,6 +52,61 @@ interface MockSessionsInterface {
     outputTokens?: number
     costUsd?: number
   }) => void
+}
+
+class StubEmailClient implements CommanderEmailClient {
+  readonly getCalls: Array<{ account: string; messageId: string }> = []
+  readonly replyCalls: Array<{
+    account: string
+    messageId: string
+    threadId?: string
+    to: string
+    subject: string
+    body: string
+    from?: string
+  }> = []
+  private readonly message: CommanderInboundEmail
+
+  constructor(message: CommanderInboundEmail) {
+    this.message = message
+  }
+
+  async searchMessages(): Promise<Array<{ id: string }>> {
+    return []
+  }
+
+  async getMessage(account: string, messageId: string): Promise<CommanderInboundEmail> {
+    this.getCalls.push({ account, messageId })
+    return {
+      ...this.message,
+      gmailMessageId: messageId,
+    }
+  }
+
+  async sendReply(input: {
+    account: string
+    messageId: string
+    threadId?: string
+    to: string
+    subject: string
+    body: string
+    from?: string
+  }): Promise<void> {
+    this.replyCalls.push(input)
+  }
+}
+
+interface MockCronJob {
+  stop: ReturnType<typeof vi.fn>
+  destroy: ReturnType<typeof vi.fn>
+  getNextRun: ReturnType<typeof vi.fn>
+}
+
+interface ScheduledRegistration {
+  expression: string
+  task: () => Promise<void> | void
+  options?: { name?: string; timezone?: string }
+  job: MockCronJob
 }
 
 const tempDirs: string[] = []
@@ -112,9 +173,13 @@ function createMockSessionsInterface(opts: {
 
   const mock: CommanderSessionsInterface = {
     async createCommanderSession(params) {
-      createCalls.push(params)
+      const agentType = params.agentType ?? 'claude'
+      createCalls.push({
+        ...params,
+        agentType,
+      })
       activeSessions.add(params.name)
-      agentTypeBySessionName.set(params.name, params.agentType)
+      agentTypeBySessionName.set(params.name, agentType)
       // Return a minimal fake StreamSession (interface uses opaque return type)
       return { kind: 'stream', name: params.name } as unknown as Awaited<ReturnType<
         CommanderSessionsInterface['createCommanderSession']
@@ -171,6 +236,27 @@ function createMockSessionsInterface(opts: {
       }
     },
   }
+}
+
+function createMockCronScheduler(nextRuns: Date[]): {
+  scheduler: CronScheduler
+  scheduled: ScheduledRegistration[]
+} {
+  const scheduled: ScheduledRegistration[] = []
+  const scheduler: CronScheduler = {
+    validate: vi.fn((expression: string) => expression !== 'invalid cron'),
+    schedule: vi.fn((expression, task, options) => {
+      const nextRun = nextRuns.shift() ?? null
+      const job: MockCronJob = {
+        stop: vi.fn(),
+        destroy: vi.fn(),
+        getNextRun: vi.fn(() => nextRun),
+      }
+      scheduled.push({ expression, task, options, job })
+      return job
+    }),
+  }
+  return { scheduler, scheduled }
 }
 
 async function startServer(
@@ -295,6 +381,93 @@ describe('commanders routes', () => {
     }
   })
 
+  it('includes quest and schedule counts in commander responses', async () => {
+    const dir = await createTempDir('hammurabi-commanders-panel-counts-')
+    const storePath = join(dir, 'sessions.json')
+    const questStore = new QuestStore(dir)
+    const commandRoomTaskStore = new CommandRoomTaskStore(join(dir, 'command-room-tasks.json'))
+    await writeFile(
+      storePath,
+      JSON.stringify(
+        {
+          sessions: [
+            {
+              id: 'cmdr-1',
+              host: 'host-a',
+              pid: null,
+              state: 'idle',
+              created: '2026-02-20T00:00:00.000Z',
+              lastHeartbeat: null,
+              taskSource: { owner: 'example-user', repo: 'example-repo', label: 'commander' },
+              currentTask: null,
+              completedTasks: 0,
+              totalCostUsd: 0,
+            },
+          ],
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    )
+    await questStore.create({
+      commanderId: 'cmdr-1',
+      status: 'pending',
+      source: 'manual',
+      instruction: 'Investigate quests panel mismatch',
+      contract: {
+        cwd: '/home/ec2-user/App',
+        permissionMode: 'acceptEdits',
+        agentType: 'claude',
+        skillsToUse: [],
+      },
+    })
+    await questStore.create({
+      commanderId: 'cmdr-1',
+      status: 'done',
+      source: 'manual',
+      instruction: 'Audit schedule rendering',
+      contract: {
+        cwd: '/home/ec2-user/App',
+        permissionMode: 'acceptEdits',
+        agentType: 'claude',
+        skillsToUse: [],
+      },
+    })
+    await commandRoomTaskStore.createTask({
+      name: 'cmdr-1-daily-review',
+      schedule: '0 * * * *',
+      machine: 'local',
+      workDir: '/home/ec2-user/App',
+      agentType: 'claude',
+      instruction: 'Run commander review',
+      enabled: true,
+      commanderId: 'cmdr-1',
+    })
+
+    const server = await startServer({
+      sessionStorePath: storePath,
+      questStore,
+      commandRoomTaskStore,
+    })
+    try {
+      const response = await fetch(`${server.baseUrl}/api/commanders`, {
+        headers: AUTH_HEADERS,
+      })
+
+      expect(response.status).toBe(200)
+      expect(await response.json()).toEqual([
+        expect.objectContaining({
+          id: 'cmdr-1',
+          questCount: 2,
+          scheduleCount: 1,
+        }),
+      ])
+    } finally {
+      await server.close()
+    }
+  })
+
   it('creates idle commander and rejects duplicate host', async () => {
     const dir = await createTempDir('hammurabi-commanders-create-')
     const storePath = join(dir, 'sessions.json')
@@ -374,6 +547,168 @@ describe('commanders routes', () => {
       const workflow = await readFile(join(memoryBasePath, created.id, 'COMMANDER.md'), 'utf8')
       expect(workflow).toContain(`hammurabi memory find --commander ${created.id}`)
       expect(workflow).toContain('.memory/MEMORY.md')
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('persists commander email config and returns it through the API', async () => {
+    const dir = await createTempDir('hammurabi-commanders-email-config-route-')
+    const storePath = join(dir, 'sessions.json')
+    const emailConfigStore = new CommanderEmailConfigStore(dir)
+    const server = await startServer({
+      sessionStorePath: storePath,
+      emailConfigStore,
+    })
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          host: 'worker-email-config',
+          taskSource: { owner: 'example-user', repo: 'example-repo', label: 'commander' },
+        }),
+      })
+      const created = (await createResponse.json()) as { id: string }
+
+      const putResponse = await fetch(
+        `${server.baseUrl}/api/commanders/${created.id}/email/config`,
+        {
+          method: 'PUT',
+          headers: {
+            ...AUTH_HEADERS,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            account: 'assistant@pioneeringminds.ai',
+            query: 'label:commander',
+            pollIntervalMinutes: 5,
+            replyAccount: 'nickgu@gehirn.ai',
+            enabled: true,
+          }),
+        },
+      )
+
+      expect(putResponse.status).toBe(200)
+      expect(await putResponse.json()).toEqual({
+        config: {
+          account: 'assistant@pioneeringminds.ai',
+          query: 'label:commander',
+          pollIntervalMinutes: 5,
+          replyAccount: 'nickgu@gehirn.ai',
+          enabled: true,
+        },
+      })
+
+      const getResponse = await fetch(
+        `${server.baseUrl}/api/commanders/${created.id}/email/config`,
+        {
+          headers: AUTH_HEADERS,
+        },
+      )
+      expect(getResponse.status).toBe(200)
+      expect(await getResponse.json()).toEqual({
+        config: {
+          account: 'assistant@pioneeringminds.ai',
+          query: 'label:commander',
+          pollIntervalMinutes: 5,
+          replyAccount: 'nickgu@gehirn.ai',
+          enabled: true,
+        },
+      })
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('sends threaded replies through the commander email reply endpoint', async () => {
+    const dir = await createTempDir('hammurabi-commanders-email-reply-route-')
+    const storePath = join(dir, 'sessions.json')
+    const emailConfigStore = new CommanderEmailConfigStore(dir)
+    const mock = createMockSessionsInterface()
+    const emailClient = new StubEmailClient({
+      gmailMessageId: 'mid-1',
+      threadId: 'thread-1',
+      from: '"Nick Gu" <nickgu@gehirn.ai>',
+      to: 'assistant@pioneeringminds.ai',
+      subject: 'Need commander help',
+      body: 'Original message',
+      labels: ['INBOX'],
+      attachments: [],
+      replyTo: 'nickgu@gehirn.ai',
+      receivedAt: '2026-04-03T10:00:00.000Z',
+      references: [],
+    })
+
+    const server = await startServer({
+      sessionStorePath: storePath,
+      sessionsInterface: mock.interface,
+      emailConfigStore,
+      emailClient,
+    })
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          host: 'worker-email-reply',
+          taskSource: { owner: 'example-user', repo: 'example-repo', label: 'commander' },
+        }),
+      })
+      const created = (await createResponse.json()) as { id: string }
+
+      await emailConfigStore.set(created.id, {
+        account: 'assistant@pioneeringminds.ai',
+        query: 'label:commander',
+        pollIntervalMinutes: 5,
+        replyAccount: 'nickgu@gehirn.ai',
+        enabled: true,
+      })
+
+      const response = await fetch(
+        `${server.baseUrl}/api/commanders/${created.id}/email/reply`,
+        {
+          method: 'POST',
+          headers: {
+            ...AUTH_HEADERS,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            messageId: 'mid-1',
+            threadId: 'thread-1',
+            body: 'Commander reply body',
+          }),
+        },
+      )
+
+      expect(response.status).toBe(200)
+      expect(await response.json()).toEqual({
+        accepted: true,
+        account: 'nickgu@gehirn.ai',
+        threadId: 'thread-1',
+        messageId: 'mid-1',
+      })
+      expect(emailClient.getCalls).toEqual([
+        { account: 'assistant@pioneeringminds.ai', messageId: 'mid-1' },
+      ])
+      expect(emailClient.replyCalls).toEqual([
+        {
+          account: 'nickgu@gehirn.ai',
+          messageId: 'mid-1',
+          threadId: 'thread-1',
+          to: 'nickgu@gehirn.ai',
+          subject: 'Re: Need commander help',
+          body: 'Commander reply body',
+        },
+      ])
     } finally {
       await server.close()
     }
@@ -1262,6 +1597,110 @@ describe('commanders routes', () => {
     }
   })
 
+  it('dedupes pre-compaction flushes per compaction cycle and rearms after recovery', async () => {
+    const dir = await createTempDir('hammurabi-commanders-pressure-dedupe-')
+    const storePath = join(dir, 'sessions.json')
+    const memoryBasePath = join(dir, 'memory')
+    const mock = createMockSessionsInterface()
+
+    const server = await startServer({
+      sessionStorePath: storePath,
+      memoryBasePath,
+      sessionsInterface: mock.interface,
+    })
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          host: 'worker-pressure-dedupe',
+          taskSource: { owner: 'example-user', repo: 'example-repo', label: 'commander' },
+        }),
+      })
+      const created = (await createResponse.json()) as { id: string }
+
+      const startResponse = await fetch(`${server.baseUrl}/api/commanders/${created.id}/start`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+      })
+      expect(startResponse.status).toBe(200)
+
+      const journal = new JournalWriter(created.id, memoryBasePath)
+      const sessionName = `commander-${created.id}`
+
+      const countPreCompactionFlushes = async (): Promise<number> => {
+        const entries = await journal.readRecent()
+        return entries.filter((entry) =>
+          entry.outcome === PRE_COMPACTION_OUTCOME &&
+          entry.body.includes('- Trigger: `pre-compaction`')).length
+      }
+
+      mock.triggerEvent(sessionName, { type: 'message_start' })
+      mock.setUsage({ inputTokens: 900_000 })
+      mock.triggerEvent(sessionName, {
+        type: 'message_delta',
+        usage: { input_tokens: 900_000, output_tokens: 900_000 },
+      })
+      mock.triggerEvent(sessionName, {
+        type: 'result',
+        usage: { input_tokens: 900_000, output_tokens: 900_000 },
+        total_cost_usd: 0.25,
+      })
+
+      await vi.waitFor(async () => {
+        expect(await countPreCompactionFlushes()).toBe(1)
+      }, { timeout: 3000 })
+
+      mock.triggerEvent(sessionName, { type: 'message_start' })
+      mock.setUsage({ inputTokens: 920_000 })
+      mock.triggerEvent(sessionName, {
+        type: 'message_delta',
+        usage: { input_tokens: 920_000, output_tokens: 920_000 },
+      })
+      mock.triggerEvent(sessionName, {
+        type: 'result',
+        usage: { input_tokens: 920_000, output_tokens: 920_000 },
+        total_cost_usd: 0.25,
+      })
+
+      await sleep(75)
+      expect(await countPreCompactionFlushes()).toBe(1)
+
+      mock.triggerEvent(sessionName, { type: 'message_start' })
+      mock.setUsage({ inputTokens: 400_000 })
+      mock.triggerEvent(sessionName, {
+        type: 'result',
+        usage: { input_tokens: 400_000, output_tokens: 400_000 },
+        total_cost_usd: 0.25,
+      })
+
+      mock.triggerEvent(sessionName, { type: 'message_start' })
+      mock.setUsage({ inputTokens: 940_000 })
+      mock.triggerEvent(sessionName, {
+        type: 'message_delta',
+        usage: { input_tokens: 940_000, output_tokens: 940_000 },
+      })
+      mock.triggerEvent(sessionName, {
+        type: 'result',
+        usage: { input_tokens: 940_000, output_tokens: 940_000 },
+        total_cost_usd: 0.25,
+      })
+
+      await vi.waitFor(async () => {
+        expect(await countPreCompactionFlushes()).toBe(2)
+      }, { timeout: 3000 })
+    } finally {
+      await server.close()
+    }
+  })
+
   it('triggers pre-compaction flush from result usage pressure events', async () => {
     const dir = await createTempDir('hammurabi-commanders-result-pressure-')
     const storePath = join(dir, 'sessions.json')
@@ -1414,7 +1853,7 @@ describe('commanders routes', () => {
     }
   })
 
-  it('reuses persisted claude session id when restarting commander chat', async () => {
+  it('always starts fresh claude session (no resume) so COMMANDER.md is authoritative', async () => {
     const dir = await createTempDir('hammurabi-commanders-claude-restart-')
     const storePath = join(dir, 'sessions.json')
     const memoryBasePath = join(dir, 'memory')
@@ -1465,10 +1904,11 @@ describe('commanders routes', () => {
 
       expect(mock.createCalls).toHaveLength(2)
       expect(mock.createCalls[0]?.agentType).toBe('claude')
+      // Second start must NOT resume — always fresh so COMMANDER.md is injected (#727)
       expect(mock.createCalls[1]).toEqual(
         expect.objectContaining({
           agentType: 'claude',
-          resumeSessionId: 'claude-resume-123',
+          resumeSessionId: undefined,
         }),
       )
     } finally {
@@ -1521,7 +1961,6 @@ describe('commanders routes', () => {
         expect.objectContaining({
           agentType: 'codex',
           resumeSessionId: undefined,
-          resumeCodexThreadId: undefined,
         }),
       )
       expect(mock.sendCalls[0]?.text).toBe(
@@ -1554,12 +1993,87 @@ describe('commanders routes', () => {
 
       expect(mock.createCalls).toHaveLength(2)
       expect(mock.createCalls[0]?.agentType).toBe('codex')
+      // Second start must NOT resume — always fresh so COMMANDER.md is injected (#727)
       expect(mock.createCalls[1]).toEqual(
         expect.objectContaining({
           agentType: 'codex',
-          resumeCodexThreadId: 'codex-thread-123',
         }),
       )
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('rolls back commander state when codex bootstrap throws before the session registers', async () => {
+    const dir = await createTempDir('hammurabi-commanders-codex-bootstrap-failure-')
+    const storePath = join(dir, 'sessions.json')
+    const memoryBasePath = join(dir, 'memory')
+    const sessionStore = new CommanderSessionStore(storePath)
+    const mock = createMockSessionsInterface()
+    const originalCreateCommanderSession = mock.interface.createCommanderSession.bind(mock.interface)
+    let createAttempts = 0
+
+    mock.interface.createCommanderSession = vi.fn(async (params) => {
+      createAttempts += 1
+      if (createAttempts === 1) {
+        throw new Error('Injected codex bootstrap failure')
+      }
+      return originalCreateCommanderSession(params)
+    })
+
+    const server = await startServer({
+      sessionStore,
+      sessionStorePath: storePath,
+      memoryBasePath,
+      sessionsInterface: mock.interface,
+    })
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          host: 'worker-codex-bootstrap-failure',
+          taskSource: { owner: 'example-user', repo: 'example-repo', label: 'commander' },
+        }),
+      })
+      const created = (await createResponse.json()) as { id: string }
+
+      const firstStartResponse = await fetch(`${server.baseUrl}/api/commanders/${created.id}/start`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ agentType: 'codex' }),
+      })
+      expect(firstStartResponse.status).toBe(500)
+      expect(await firstStartResponse.json()).toEqual({
+        error: 'Injected codex bootstrap failure',
+      })
+
+      const afterFailure = await sessionStore.get(created.id)
+      expect(afterFailure).toMatchObject({
+        id: created.id,
+        state: 'idle',
+        agentType: 'codex',
+        pid: null,
+      })
+      expect(mock.activeSessions.has(`commander-${created.id}`)).toBe(false)
+
+      const secondStartResponse = await fetch(`${server.baseUrl}/api/commanders/${created.id}/start`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+      })
+      expect(secondStartResponse.status).toBe(200)
+      expect(mock.createCalls).toHaveLength(1)
+      expect(mock.createCalls[0]).toEqual(expect.objectContaining({ agentType: 'codex' }))
     } finally {
       await server.close()
     }
@@ -1793,6 +2307,206 @@ describe('commanders routes', () => {
 
       const callBody = String(fetchMock.mock.calls[0]?.[1]?.body ?? '')
       expect(callBody).toContain('"labels":["commander"]')
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('routes commander cron CRUD through the shared scheduler and exposes live cron metadata', async () => {
+    const dir = await createTempDir('hammurabi-commanders-cron-routes-')
+    const storePath = join(dir, 'sessions.json')
+    const taskStore = new CommandRoomTaskStore(join(dir, 'tasks.json'))
+    const runStore = new CommandRoomRunStore(join(dir, 'runs.json'))
+    const createSession = vi.fn(async () => ({ sessionId: 'session-cron-1' }))
+    const monitorSession = vi.fn(async () => ({
+      sessionId: 'session-cron-1',
+      status: 'SUCCESS' as const,
+      finalComment: 'Commander cron run done.',
+      filesChanged: 0,
+      durationMin: 1,
+      raw: { total_cost_usd: 0.09 },
+    }))
+    const now = () => new Date('2026-03-05T10:00:00.000Z')
+    const executor = new CommandRoomExecutor({
+      taskStore,
+      runStore,
+      now,
+      agentSessionFactory: () => ({
+        createSession,
+        monitorSession,
+      }),
+    })
+    const { scheduler: cronEngine, scheduled } = createMockCronScheduler([
+      new Date('2026-03-05T10:05:00.000Z'),
+      new Date('2026-03-05T10:10:00.000Z'),
+      new Date('2026-03-05T10:15:00.000Z'),
+    ])
+    const commandRoomScheduler = new CommandRoomScheduler({
+      taskStore,
+      executor,
+      scheduler: cronEngine,
+    })
+    const commandRoomSchedulerReady = commandRoomScheduler.initialize()
+
+    const server = await startServer({
+      sessionStorePath: storePath,
+      sessionStore: new CommanderSessionStore(storePath),
+      commandRoomTaskStore: taskStore,
+      commandRoomRunStore: runStore,
+      commandRoomScheduler,
+      commandRoomSchedulerReady,
+      now,
+    })
+
+    try {
+      const createCommanderResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          host: 'worker-cron-routes',
+          taskSource: { owner: 'example-user', repo: 'example-repo', label: 'commander' },
+        }),
+      })
+      expect(createCommanderResponse.status).toBe(201)
+      const commander = (await createCommanderResponse.json()) as { id: string }
+
+      const createCronResponse = await fetch(`${server.baseUrl}/api/commanders/${commander.id}/crons`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          schedule: '*/5 * * * *',
+          instruction: 'Check the park status.',
+          enabled: true,
+          agentType: 'claude',
+          workDir: '/tmp/example-repo',
+        }),
+      })
+      expect(createCronResponse.status).toBe(201)
+      const createdCron = (await createCronResponse.json()) as {
+        id: string
+        lastRun: string | null
+        nextRun: string | null
+      }
+      expect(createdCron.lastRun).toBeNull()
+      expect(createdCron.nextRun).toBe('2026-03-05T10:10:00.000Z')
+      expect(scheduled).toHaveLength(2)
+
+      const listBeforeRunResponse = await fetch(
+        `${server.baseUrl}/api/commanders/${commander.id}/crons`,
+        { headers: AUTH_HEADERS },
+      )
+      expect(listBeforeRunResponse.status).toBe(200)
+      const listedBeforeRun = (await listBeforeRunResponse.json()) as Array<{
+        id: string
+        lastRun: string | null
+        nextRun: string | null
+      }>
+      const listedCreatedBeforeRun = listedBeforeRun.find((entry) => entry.id === createdCron.id)
+      expect(listedCreatedBeforeRun).toEqual(expect.objectContaining({
+        id: createdCron.id,
+        lastRun: null,
+        nextRun: '2026-03-05T10:10:00.000Z',
+      }))
+
+      const scheduledCallback = scheduled
+        .find((entry) => entry.options?.name === `command-room-${createdCron.id}`)
+        ?.task
+      if (!scheduledCallback) {
+        throw new Error('Expected commander cron callback to be registered')
+      }
+      await scheduledCallback()
+
+      await vi.waitFor(async () => {
+        const runs = await runStore.listRunsForTask(createdCron.id)
+        expect(runs).toHaveLength(1)
+      })
+
+      const listAfterRunResponse = await fetch(
+        `${server.baseUrl}/api/commanders/${commander.id}/crons`,
+        { headers: AUTH_HEADERS },
+      )
+      expect(listAfterRunResponse.status).toBe(200)
+      const listedAfterRun = (await listAfterRunResponse.json()) as Array<{
+        id: string
+        lastRun: string | null
+        nextRun: string | null
+      }>
+      const listedCreatedAfterRun = listedAfterRun.find((entry) => entry.id === createdCron.id)
+      expect(listedCreatedAfterRun).toEqual(expect.objectContaining({
+        id: createdCron.id,
+        lastRun: '2026-03-05T10:00:00.000Z',
+        nextRun: '2026-03-05T10:10:00.000Z',
+      }))
+      expect(createSession).toHaveBeenCalledTimes(1)
+      expect(monitorSession).toHaveBeenCalledWith('session-cron-1', undefined)
+
+      const updateCronResponse = await fetch(
+        `${server.baseUrl}/api/commanders/${commander.id}/crons/${createdCron.id}`,
+        {
+          method: 'PATCH',
+          headers: {
+            ...AUTH_HEADERS,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            schedule: '0 11 * * *',
+          }),
+        },
+      )
+      expect(updateCronResponse.status).toBe(200)
+      const updatedCron = (await updateCronResponse.json()) as {
+        nextRun: string | null
+      }
+      expect(updatedCron.nextRun).toBe('2026-03-05T10:15:00.000Z')
+      expect(scheduled).toHaveLength(3)
+      expect(scheduled[1]?.job.stop).toHaveBeenCalledTimes(1)
+      expect(scheduled[1]?.job.destroy).toHaveBeenCalledTimes(1)
+
+      const disableCronResponse = await fetch(
+        `${server.baseUrl}/api/commanders/${commander.id}/crons/${createdCron.id}`,
+        {
+          method: 'PATCH',
+          headers: {
+            ...AUTH_HEADERS,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            enabled: false,
+          }),
+        },
+      )
+      expect(disableCronResponse.status).toBe(200)
+      const disabledCron = (await disableCronResponse.json()) as {
+        nextRun: string | null
+      }
+      expect(disabledCron.nextRun).toBeNull()
+      expect(scheduled[2]?.job.stop).toHaveBeenCalledTimes(1)
+      expect(scheduled[2]?.job.destroy).toHaveBeenCalledTimes(1)
+
+      const deleteCronResponse = await fetch(
+        `${server.baseUrl}/api/commanders/${commander.id}/crons/${createdCron.id}`,
+        {
+          method: 'DELETE',
+          headers: AUTH_HEADERS,
+        },
+      )
+      expect(deleteCronResponse.status).toBe(204)
+
+      expect(await runStore.listRunsForTask(createdCron.id)).toEqual([])
+
+      const emptyListResponse = await fetch(`${server.baseUrl}/api/commanders/${commander.id}/crons`, {
+        headers: AUTH_HEADERS,
+      })
+      expect(emptyListResponse.status).toBe(200)
+      const remaining = await emptyListResponse.json() as Array<{ id: string; taskType?: string }>
+      expect(remaining.some((task) => task.id === createdCron.id)).toBe(false)
+      expect(remaining.some((task) => task.taskType === 'memory_compact')).toBe(true)
     } finally {
       await server.close()
     }
@@ -2193,12 +2907,15 @@ describe('commanders routes', () => {
 
   describe('memory CLI endpoints', () => {
     async function createServerWithCommander(
-      options: Partial<CommandersRouterOptions> = {},
+      options: Partial<CommandersRouterOptions> & {
+        state?: 'idle' | 'running' | 'paused' | 'stopped'
+      } = {},
     ): Promise<{
       server: RunningServer
       commanderId: string
       memoryBasePath: string
     }> {
+      const { state = 'idle', ...routerOptions } = options
       const dir = await createTempDir('hammurabi-memory-routes-')
       const storePath = join(dir, 'sessions.json')
       const memoryBasePath = join(dir, 'commanders')
@@ -2211,7 +2928,7 @@ describe('commanders routes', () => {
               id: commanderId,
               host: 'test-host',
               pid: null,
-              state: 'idle',
+              state,
               created: '2026-03-01T00:00:00.000Z',
               lastHeartbeat: null,
               taskSource: { owner: 'example-user', repo: 'example-repo', label: 'commander' },
@@ -2226,7 +2943,7 @@ describe('commanders routes', () => {
         sessionStorePath: storePath,
         memoryBasePath,
         agentsSessionStorePath: join(dir, 'agents-sessions.json'),
-        ...options,
+        ...routerOptions,
       })
       return { server, commanderId, memoryBasePath }
     }
@@ -2265,6 +2982,50 @@ describe('commanders routes', () => {
           },
         )
         expect(response.status).toBe(404)
+      } finally {
+        await server.close()
+      }
+    })
+
+    it('POST /:id/memory/compact skips cron compaction while commander is running', async () => {
+      const { server, commanderId } = await createServerWithCommander({ state: 'running' })
+      try {
+        const response = await fetch(
+          `${server.baseUrl}/api/commanders/${commanderId}/memory/compact`,
+          {
+            method: 'POST',
+            headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+            body: JSON.stringify({
+              source: 'cron',
+              targetDate: '2026-03-10',
+            }),
+          },
+        )
+        expect(response.status).toBe(200)
+        const body = await response.json()
+        expect(body).toEqual(expect.objectContaining({
+          skipped: true,
+          reason: 'commander_running',
+          commanderId,
+          targetDate: '2026-03-10',
+        }))
+      } finally {
+        await server.close()
+      }
+    })
+
+    it('POST /:id/memory/compact returns 409 for manual compaction while commander is running', async () => {
+      const { server, commanderId } = await createServerWithCommander({ state: 'running' })
+      try {
+        const response = await fetch(
+          `${server.baseUrl}/api/commanders/${commanderId}/memory/compact`,
+          {
+            method: 'POST',
+            headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
+            body: JSON.stringify({}),
+          },
+        )
+        expect(response.status).toBe(409)
       } finally {
         await server.close()
       }

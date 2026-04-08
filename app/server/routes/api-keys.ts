@@ -91,7 +91,10 @@ export function createApiKeysRouter(options: ApiKeysRouterOptions = {}): Router 
     options.transcriptionKeyStore ?? new OpenAITranscriptionKeyStore()
   const now = options.now ?? (() => new Date())
 
-  router.use(auth0Middleware(options))
+  router.use(auth0Middleware({
+    ...options,
+    requiredPermissions: API_KEY_SCOPES,
+  }))
 
   router.post('/keys', async (req, res) => {
     const name = parseName(req.body?.name)

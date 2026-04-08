@@ -224,6 +224,26 @@
     text-overflow: ellipsis;
     min-width: 0;
   }
+  .session-view-overlay .session-header-center {
+    flex: 1;
+    min-width: 0;
+    text-align: center;
+  }
+  .session-view-overlay .session-header-name {
+    font-family: var(--font-mono);
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--msg-text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .session-view-overlay .session-header-meta {
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    line-height: 1.4;
+    color: var(--msg-text-muted);
+  }
   .session-view-overlay .session-badge {
     display: inline-flex;
     align-items: center;
@@ -807,6 +827,26 @@
     background: var(--msg-surface);
     border-top: 1px solid var(--msg-border);
     flex-shrink: 0;
+  }
+  .session-view-overlay .file-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    background: var(--msg-surface-elevated);
+    border: 1px solid var(--msg-border);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--msg-text);
+  }
+  .session-view-overlay .file-chip-remove {
+    color: var(--msg-text-muted);
+    cursor: pointer;
+    line-height: 1;
+  }
+  .session-view-overlay .file-chip-remove:hover {
+    color: var(--msg-text);
   }
   .session-view-overlay .input-field {
     flex: 1;

@@ -1,7 +1,6 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import { resolveDataPath } from '../runtime-paths.js'
 
 export const API_KEY_SCOPES = [
   'telemetry:read',
@@ -140,7 +139,7 @@ export function hashApiKey(rawKey: string): string {
 }
 
 export function defaultApiKeyStorePath(): string {
-  return resolveDataPath('api-keys', 'keys.json')
+  return path.resolve(process.cwd(), 'data/api-keys/keys.json')
 }
 
 const DEFAULT_LAST_USED_WRITE_INTERVAL_MS = 60_000

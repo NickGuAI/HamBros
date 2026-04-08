@@ -21,6 +21,11 @@ function listIanaTimezones(): string[] {
 }
 
 const TIMEZONE_OPTIONS = listIanaTimezones()
+const MODEL_OPTIONS = [
+  'claude-opus-4-6',
+  'claude-sonnet-4-6',
+  'claude-haiku-3-5',
+] as const
 
 type CronTaskWithDescription = CronTask & { description?: string }
 
@@ -47,6 +52,7 @@ interface EditableTaskState {
   timezone: string
   description: string
   instruction: string
+  model: string
   machine: string
   workDir: string
   agentType: AgentType
@@ -71,6 +77,7 @@ export function EditTaskForm({ task, machines, onSaved, onCancel }: EditTaskForm
     timezone: task.timezone ?? '',
     description: readDescription(task),
     instruction: task.instruction,
+    model: task.model ?? '',
     machine: task.machine,
     workDir: task.workDir,
     agentType: task.agentType,
@@ -113,11 +120,13 @@ export function EditTaskForm({ task, machines, onSaved, onCancel }: EditTaskForm
     const trimmedTimezone = editState.timezone.trim()
     const trimmedDescription = editState.description.trim()
     const trimmedMachine = editState.machine.trim()
+    const trimmedModel = editState.model.trim()
     const patchPayload: Record<string, unknown> = {
       name: trimmedName,
       schedule: trimmedSchedule,
       description: trimmedDescription,
       instruction: trimmedInstruction,
+      model: trimmedModel.length > 0 ? trimmedModel : null,
       agentType: editState.agentType as CommandRoomAgentType,
       permissionMode: editState.permissionMode,
       sessionType: editState.sessionType,
@@ -225,6 +234,21 @@ export function EditTaskForm({ task, machines, onSaved, onCancel }: EditTaskForm
             </button>
           ))}
         </div>
+      </div>
+      <div>
+        <label className="section-title block mb-2">Model</label>
+        <select
+          value={editState.model}
+          onChange={(event) => update({ model: event.target.value })}
+          className="w-full px-3 py-2 rounded-lg border border-ink-border bg-washi-aged text-[16px] md:text-sm focus:outline-none focus:border-ink-border-hover"
+        >
+          <option value="">— Default —</option>
+          {MODEL_OPTIONS.map((option) => (
+            <option key={option} value={option}>
+              {option}
+            </option>
+          ))}
+        </select>
       </div>
       <div>
         <label className="section-title block mb-2">Session Type</label>

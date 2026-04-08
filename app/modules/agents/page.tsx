@@ -1,6 +1,6 @@
-import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react'
+import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { useQueryClient } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
@@ -13,32 +13,30 @@ import {
   Monitor,
   ChevronLeft,
   ChevronRight,
-  ChevronUp,
   X,
   Plus,
   Power,
   AlertTriangle,
   Cpu,
   Warehouse,
-  Coins,
-  MessageSquare,
-  Clock,
   ArrowUp,
   Zap,
   Mic,
   Paperclip,
   RotateCcw,
+  MoreVertical,
 } from 'lucide-react'
 import {
   createSession,
   killSession,
+  resumeSession as resumeAgentSession,
   triggerPreKillDebrief,
   getDebriefStatus,
   resetSession,
   useAgentSessions,
   useMachines,
 } from '@/hooks/use-agents'
-import { timeAgo, formatCost, formatTokens, cn } from '@/lib/utils'
+import { timeAgo, formatCost, cn } from '@/lib/utils'
 import { fetchJson, getAccessToken } from '@/lib/api'
 import { getWsBase } from '@/lib/api-base'
 import { useIsMobile } from '@/hooks/use-is-mobile'
@@ -53,6 +51,7 @@ import { DEFAULT_SESSION_TAB, filterSessionsByTab, SESSION_TABS, type SessionTab
 import { NewSessionForm } from './components/NewSessionForm'
 import { SessionMessageList } from './components/SessionMessageList'
 import { SkillsPicker } from './components/SkillsPicker'
+import { WorkspaceOverlay } from './components/WorkspaceOverlay'
 import { capMessages } from './components/session-messages'
 import { useStreamEventProcessor } from './components/use-stream-event-processor'
 
@@ -74,6 +73,8 @@ interface WorkerSummary {
 
 type AgentSessionWithWorkers = AgentSession & {
   processAlive?: boolean
+  hadResult?: boolean
+  resumedFrom?: string
   parentSession?: string
   spawnedWorkers?: string[]
   workerSummary?: WorkerSummary
@@ -143,7 +144,11 @@ function getKillConfirmationMessage(sessionName: string, agentType?: AgentType |
   if (!shouldAttemptDebriefOnKill(agentType)) {
     return `Kill session "${sessionName}"?`
   }
-  return `Kill session "${sessionName}"?\n\nA debrief will be attempted before termination.`
+  return `Kill session "${sessionName}"?\n\nIf available, a debrief will be attempted before termination.`
+}
+
+function isNotFoundRequestFailure(caughtError: unknown): boolean {
+  return caughtError instanceof Error && caughtError.message.includes('Request failed (404):')
 }
 
 function SessionCard({
@@ -152,12 +157,16 @@ function SessionCard({
   selected,
   onSelect,
   onKill,
+  onResume,
+  onNavigateToSession,
 }: {
   session: AgentSessionWithWorkers
   machine?: Machine
   selected: boolean
   onSelect: () => void
   onKill: () => Promise<void> | void
+  onResume: () => Promise<void> | void
+  onNavigateToSession?: (sessionName: string) => void
 }) {
   const isFactory = session.name.startsWith('factory-')
   const isCommander = session.name.startsWith('commander-')
@@ -179,12 +188,15 @@ function SessionCard({
   )
   const processAlive = rawAgentType === 'openclaw' ? true : session.processAlive !== false
   const workerOrchestrationComplete = isWorkerOrchestrationComplete(workerSummary)
+  const canResume = isStream && session.resumeAvailable === true
 
   return (
     <div
       role="button"
       tabIndex={0}
-      onClick={onSelect}
+      onClick={() => {
+        onSelect()
+      }}
       onKeyDown={(event) => {
         if (event.target !== event.currentTarget) {
           return
@@ -195,7 +207,8 @@ function SessionCard({
         }
       }}
       className={cn(
-        'w-full text-left p-5 card-sumi transition-all duration-300 ease-gentle cursor-pointer',
+        'w-full text-left p-5 card-sumi transition-all duration-300 ease-gentle',
+        'cursor-pointer',
         isFactory && 'border-l-2 border-l-accent-indigo',
         session.sessionType === 'pty' && 'border-2 border-sumi-black',
         workerOrchestrationComplete && !isCommander && 'opacity-75',
@@ -223,8 +236,25 @@ function SessionCard({
           {workerOrchestrationComplete && !isCommander && (
             <span className="badge-sumi bg-ink-wash text-sumi-diluted text-[10px]">completed</span>
           )}
+          {session.status === 'stale' && (
+            <span className="badge-sumi bg-amber-500/10 text-amber-700 text-[10px]">stale</span>
+          )}
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
+          {canResume && processAlive && (
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation()
+                void Promise.resolve(onResume()).catch(() => {
+                  // error handled by page-level state
+                })
+              }}
+              className="badge-sumi px-2 py-1 text-[10px] text-accent-indigo hover:bg-accent-indigo/10 transition-colors"
+            >
+              Resume
+            </button>
+          )}
           {processAlive ? (
             <button
               type="button"
@@ -235,7 +265,7 @@ function SessionCard({
                   return
                 }
                 void Promise.resolve(onKill()).catch(() => {
-                  // error handled by handleKillSession (sets killError state)
+                  // error handled by page-level session action state
                 })
               }}
               className="badge-sumi px-2 py-1 text-[10px] text-accent-vermillion hover:bg-accent-vermillion/10 transition-colors"
@@ -243,9 +273,35 @@ function SessionCard({
               Kill
             </button>
           ) : (
-            <span className="badge-sumi px-2 py-1 text-[10px] bg-ink-wash text-sumi-diluted">
-              exited
-            </span>
+            <>
+              {canResume && (
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    void Promise.resolve(onResume()).catch(() => {
+                      // error handled by page-level state
+                    })
+                  }}
+                  className="badge-sumi px-2 py-1 text-[10px] text-accent-indigo hover:bg-accent-indigo/10 transition-colors"
+                >
+                  Resume
+                </button>
+              )}
+              <span className="badge-sumi px-2 py-1 text-[10px] bg-ink-wash text-sumi-diluted">
+                {session.hadResult ? 'completed' : 'exited'}
+              </span>
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation()
+                  void Promise.resolve(onKill()).catch(() => {})
+                }}
+                className="badge-sumi px-2 py-1 text-[10px] text-sumi-diluted hover:text-accent-vermillion hover:bg-accent-vermillion/10 transition-colors"
+              >
+                Dismiss
+              </button>
+            </>
           )}
           <ChevronRight
             size={16}
@@ -288,6 +344,24 @@ function SessionCard({
       {isStream && session.parentSession && (
         <div className="mt-2 text-whisper text-sumi-diluted">
           ↖ spawned by: <span className="font-mono">{session.parentSession}</span>
+        </div>
+      )}
+
+      {isStream && session.resumedFrom && (
+        <div className="mt-2 text-whisper text-sumi-diluted">
+          ↺ resumed from:{' '}
+          <button
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation()
+              if (session.resumedFrom) {
+                onNavigateToSession?.(session.resumedFrom)
+              }
+            }}
+            className="font-mono underline decoration-sumi-mist/80 underline-offset-2 hover:text-sumi-gray"
+          >
+            {session.resumedFrom}
+          </button>
         </div>
       )}
     </div>
@@ -601,33 +675,6 @@ function StreamingDots() {
   )
 }
 
-function SessionStatsBar({
-  cost,
-  tokens,
-  duration,
-}: {
-  cost: number
-  tokens: number
-  duration: string
-}) {
-  return (
-    <div className="session-stats">
-      <div className="session-stat">
-        <Coins size={10} />
-        <span className="session-stat-value">{formatCost(cost)}</span> cost
-      </div>
-      <div className="session-stat">
-        <MessageSquare size={10} />
-        <span className="session-stat-value">{formatTokens(tokens)}</span> tokens
-      </div>
-      <div className="session-stat">
-        <Clock size={10} />
-        <span className="session-stat-value">{duration}</span>
-      </div>
-    </div>
-  )
-}
-
 // ── MobileSessionView ───────────────────────────────────────────
 
 function MobileSessionView({
@@ -680,6 +727,9 @@ function MobileSessionView({
   const [resetError, setResetError] = useState<string | null>(null)
   const [pendingImages, setPendingImages] = useState<{ mediaType: string; data: string }[]>([])
   const [dismissedWorkers, setDismissedWorkers] = useState<Set<string>>(new Set())
+  const [fileChips, setFileChips] = useState<string[]>([])
+  const [showWorkspaceOverlay, setShowWorkspaceOverlay] = useState(false)
+  const [showOverflowMenu, setShowOverflowMenu] = useState(false)
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const messagesAreaRef = useRef<HTMLDivElement>(null)
@@ -706,13 +756,25 @@ function MobileSessionView({
     isSupported: isMicSupported,
   } = activeTranscription
 
-  // Update elapsed time every second so the stats bar stays current
+  // Update elapsed time every second so the header stays current
   useEffect(() => {
     const timer = setInterval(() => {
       setElapsedSec(Math.floor((Date.now() - startedAt) / 1000))
     }, 1000)
     return () => clearInterval(timer)
   }, [startedAt])
+
+  useEffect(() => {
+    function handleCmdK(event: KeyboardEvent) {
+      if ((event.metaKey || event.ctrlKey) && event.key === 'k') {
+        event.preventDefault()
+        setShowWorkspaceOverlay((prev) => !prev)
+      }
+    }
+
+    window.addEventListener('keydown', handleCmdK)
+    return () => window.removeEventListener('keydown', handleCmdK)
+  }, [])
 
   // Reset dismissed workers when switching sessions
   useEffect(() => {
@@ -773,6 +835,24 @@ function MobileSessionView({
   }, [sessionName])
 
   const isCommanderSession = sessionName.startsWith('commander-')
+  const commanderIdForUi = useMemo(() => {
+    if (!sessionName.startsWith('commander-')) {
+      return null
+    }
+    const id = sessionName.slice('commander-'.length)
+    return id.length > 0 ? id : null
+  }, [sessionName])
+
+  const { data: commanderUiPayload } = useQuery({
+    queryKey: ['commanders', 'detail-ui', commanderIdForUi],
+    queryFn: () =>
+      fetchJson<{
+        avatarUrl?: string | null
+        ui?: { accentColor?: string; borderColor?: string; speakingTone?: string } | null
+      }>(`/api/commanders/${encodeURIComponent(commanderIdForUi!)}`),
+    enabled: Boolean(commanderIdForUi),
+    staleTime: 60_000,
+  })
 
   useEffect(() => {
     if (!initialSpawnedWorkers || initialSpawnedWorkers.length === 0) {
@@ -1016,6 +1096,8 @@ function MobileSessionView({
     const text = inputText.trim()
     if ((!text && pendingImages.length === 0) || wsRef.current?.readyState !== WebSocket.OPEN) return
 
+    const fileContext = fileChips.map((filePath) => `@${filePath}`).join(' ')
+    const fullText = fileContext ? `${fileContext}\n${text}` : text
     const images = pendingImages.slice()
     setMessages((prev) =>
       capMessages([
@@ -1023,14 +1105,19 @@ function MobileSessionView({
         {
           id: `user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           kind: 'user',
-          text: text || '[image]',
+          text: fullText || '[image]',
           images: images.length > 0 ? images : undefined,
         },
       ]),
     )
-    wsRef.current.send(JSON.stringify({ type: 'input', text, images: images.length > 0 ? images : undefined }))
+    wsRef.current.send(JSON.stringify({
+      type: 'input',
+      text: fullText,
+      images: images.length > 0 ? images : undefined,
+    }))
     setInputText('')
     setPendingImages([])
+    setFileChips([])
     autoScrollRef.current = true
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto'
@@ -1237,138 +1324,156 @@ function MobileSessionView({
     return parts.join(' ') || '+'
   })()
 
+  const workspaceSource: import('../../workspace/use-workspace').WorkspaceSource | null =
+    sessionCwd ? { kind: 'agent-session', sessionName } : null
+
+  function handleAddFileChip(filePath: string) {
+    setFileChips((prev) => (prev.includes(filePath) ? prev : [...prev, filePath]))
+  }
+
+  function removeFileChip(filePath: string) {
+    setFileChips((prev) => prev.filter((entry) => entry !== filePath))
+  }
+
+  function basename(filePath: string): string {
+    const cleanPath = filePath.endsWith('/') ? filePath.slice(0, -1) : filePath
+    const parts = cleanPath.split('/')
+    const name = parts[parts.length - 1] || cleanPath
+    return filePath.endsWith('/') ? `${name}/` : name
+  }
+
   return (
     <div className="session-view-overlay">
-      {/* Header */}
+      {/* Thin header — back + centered meta + overflow actions */}
       <div className="session-header">
-        <div className="session-header-left">
-          <button className="session-back" onClick={onClose} aria-label="Back">
-            <ChevronLeft size={20} />
-          </button>
-          <span className="session-name">{sessionLabel ?? sessionName}</span>
-          <span className={cn('session-badge', wsStatus === 'connected' && 'connected')}>
-            {wsStatus}
-          </span>
-          {showWorkersPill && (
-            <div className="relative" ref={workersMenuRef}>
-              <button
-                type="button"
-                className="inline-flex items-center gap-1 rounded-lg border border-ink-border bg-ink-wash/30 px-2 py-1 text-[11px] text-sumi-diluted hover:bg-ink-wash transition-colors"
-                onClick={() => {
-                  setDispatchError(null)
-                  if (isMobile) {
-                    setWorkersOpen(true)
-                    return
-                  }
-                  setWorkersOpen((prev) => !prev)
-                }}
-                aria-label="Workers"
-              >
-                <span className="font-mono">Workers</span>
-                <span className="font-mono">{workerPillText}</span>
-                <ChevronUp size={12} className={cn('transition-transform', !workersOpen && 'rotate-180')} />
-              </button>
-
-              {!isMobile && workersOpen && (
-                <div className="absolute right-0 top-full z-50 mt-2 w-72 rounded-xl border border-ink-border bg-washi-white shadow-ink-md">
-                  <div className="px-3 py-2 border-b border-ink-border text-xs font-mono text-sumi-diluted">Workers</div>
-                  <div className="max-h-64 overflow-y-auto">
-                    {workerRows.map((worker) => (
-                      <button
-                        key={worker.name}
-                        type="button"
-                        className="w-full px-3 py-2 border-b border-ink-border last:border-b-0 flex items-center justify-between hover:bg-washi-shadow/60 text-left"
-                        onClick={() => handleOpenWorker(worker.name)}
-                      >
-                        <div className="min-w-0">
-                          <div className="truncate text-xs font-mono text-sumi-black">
-                            <span className={cn('mr-1', workerStatusClass(worker.status))}>
-                              {workerStatusSymbol(worker.status)}
-                            </span>
-                            {worker.name}
-                          </div>
-                          <div className="text-[10px] text-sumi-diluted">{worker.status}</div>
-                        </div>
-                        <ChevronRight size={14} className="text-sumi-mist" />
-                      </button>
-                    ))}
-                  </div>
-                  <div className="p-2 border-t border-ink-border flex gap-2">
-                    {hasDoneWorkers && (
-                      <button
-                        type="button"
-                        className="flex-1 rounded-lg border border-ink-border px-2 py-1.5 text-xs text-sumi-diluted hover:bg-washi-shadow/60"
-                        onClick={async () => {
-                          await fetchJson<{ cleared: number }>(
-                            `/api/agents/sessions/${encodeURIComponent(sessionName)}/workers/done`,
-                            { method: 'DELETE' },
-                          )
-                          await refreshWorkers()
-                        }}
-                      >
-                        Clear done
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      className="flex-1 rounded-lg border border-ink-border px-2 py-1.5 text-xs text-sumi-black hover:bg-washi-shadow/60"
-                      onClick={() => {
-                        setDispatchError(null)
-                        setDispatchOpen(true)
-                      }}
-                    >
-                      + Dispatch
-                    </button>
-                  </div>
-                </div>
+        <button
+          className="session-back"
+          onClick={onClose}
+          aria-label="Back to sessions"
+        >
+          <ChevronLeft size={18} />
+        </button>
+        <div className="session-header-center">
+          <p className="session-header-name">{sessionLabel ?? sessionName}</p>
+          <p className="session-header-meta">
+            <span
+              className={cn(
+                'inline-block w-1.5 h-1.5 rounded-full mr-1 align-middle',
+                wsStatus === 'connected'
+                  ? 'bg-emerald-500'
+                  : wsStatus === 'connecting'
+                    ? 'bg-amber-400'
+                    : 'bg-sumi-mist',
               )}
-            </div>
-          )}
+            />
+            {wsStatus} &middot; {formatCost(usage.costUsd)} &middot; {getDuration()}
+          </p>
         </div>
-        <div className="session-header-actions">
-          {isCommanderSession && (
-            <button
-              className="p-2 rounded-lg hover:bg-ink-wash transition-colors inline-flex items-center gap-1.5"
-              onClick={() => {
-                setInputText('Create a new quest on your quest board: ')
-                textareaRef.current?.focus()
-              }}
-              aria-label="Add quest"
-            >
-              <Plus size={14} className="text-sumi-diluted" />
-              <span className="text-xs text-sumi-diluted font-mono">+ Quest</span>
-            </button>
-          )}
-          {isCommanderSession && (
-            <button
-              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs text-amber-500 hover:bg-amber-500/10 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
-              onClick={handleResetSession}
-              disabled={isResetting}
-            >
-              <RotateCcw size={14} />
-              {isResetting ? '...' : 'Reset Session'}
-            </button>
-          )}
+        <div className="relative shrink-0">
           <button
-            className="session-action-btn"
-            onClick={handleKill}
-            disabled={isKilling}
+            className="p-1.5 rounded-lg hover:bg-ink-wash transition-colors"
+            onClick={() => setShowOverflowMenu((prev) => !prev)}
+            aria-label="Session actions"
           >
-            <Power size={14} />
-            {isKilling ? '...' : 'Kill'}
+            <MoreVertical size={16} className="text-sumi-diluted" />
           </button>
-          <button className="session-close-btn" onClick={onClose} aria-label="Close">
-            <X size={16} />
-          </button>
+          {showOverflowMenu && (
+            <>
+              <div
+                className="fixed inset-0 z-40"
+                onClick={() => setShowOverflowMenu(false)}
+              />
+              <div className="absolute right-0 top-full z-50 mt-1 w-52 overflow-hidden rounded-xl border border-ink-border bg-washi-white shadow-ink-md">
+                {isCommanderSession && (
+                  <button
+                    type="button"
+                    className="flex w-full items-center gap-2 px-3 py-2.5 text-left text-xs text-sumi-black transition-colors hover:bg-ink-wash"
+                    onClick={() => {
+                      setShowOverflowMenu(false)
+                      setInputText('Create a new quest on your quest board: ')
+                      textareaRef.current?.focus()
+                    }}
+                  >
+                    <Plus size={13} className="shrink-0 text-sumi-diluted" />
+                    New Quest
+                  </button>
+                )}
+                {showWorkersPill && (
+                  <button
+                    type="button"
+                    className="flex w-full items-center gap-2 px-3 py-2.5 text-left text-xs text-sumi-black transition-colors hover:bg-ink-wash"
+                    onClick={() => {
+                      setShowOverflowMenu(false)
+                      setDispatchError(null)
+                      if (isMobile) {
+                        setWorkersOpen(true)
+                        return
+                      }
+                      setWorkersOpen((prev) => !prev)
+                    }}
+                  >
+                    <Cpu size={13} className="shrink-0 text-sumi-diluted" />
+                    Workers {workerPillText !== '+' ? `(${workerPillText})` : ''}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="flex w-full items-center gap-2 px-3 py-2.5 text-left text-xs text-sumi-black transition-colors hover:bg-ink-wash"
+                  onClick={() => {
+                    setShowOverflowMenu(false)
+                    setShowWorkspaceOverlay(true)
+                  }}
+                >
+                  <Warehouse size={13} className="shrink-0 text-sumi-diluted" />
+                  <span className="flex-1">Workspace</span>
+                  <span className="font-mono text-[10px] text-sumi-mist">
+                    {navigator.platform?.includes('Mac') ? '\u2318' : 'Ctrl+'}K
+                  </span>
+                </button>
+                <div className="border-t border-ink-border" />
+                <button
+                  type="button"
+                  className="flex w-full items-center gap-2 px-3 py-2.5 text-left text-xs text-accent-vermillion transition-colors hover:bg-accent-vermillion/5"
+                  onClick={() => {
+                    setShowOverflowMenu(false)
+                    void handleKill()
+                  }}
+                  disabled={isKilling}
+                >
+                  <Power size={13} className="shrink-0" />
+                  {isKilling ? 'Killing...' : 'Kill Session'}
+                </button>
+                {isCommanderSession && (
+                  <button
+                    type="button"
+                    className="flex w-full items-center gap-2 px-3 py-2.5 text-left text-xs text-amber-600 transition-colors hover:bg-amber-500/5"
+                    onClick={() => {
+                      setShowOverflowMenu(false)
+                      void handleResetSession()
+                    }}
+                    disabled={isResetting}
+                  >
+                    <RotateCcw size={13} className="shrink-0" />
+                    {isResetting ? 'Resetting...' : 'Reset Session'}
+                  </button>
+                )}
+                <div className="border-t border-ink-border" />
+                <button
+                  type="button"
+                  className="flex w-full items-center gap-2 px-3 py-2.5 text-left text-xs text-sumi-diluted transition-colors hover:bg-ink-wash"
+                  onClick={() => {
+                    setShowOverflowMenu(false)
+                    onClose()
+                  }}
+                >
+                  <ChevronLeft size={13} className="shrink-0" />
+                  Back to Sessions
+                </button>
+              </div>
+            </>
+          )}
         </div>
       </div>
-
-      {/* Stats bar */}
-      <SessionStatsBar
-        cost={usage.costUsd}
-        tokens={usage.inputTokens + usage.outputTokens}
-        duration={getDuration()}
-      />
 
       {resetError && (
         <div className="mx-3 mt-2 flex items-start gap-2 rounded border border-accent-vermillion/40 bg-accent-vermillion/10 px-3 py-2 text-whisper text-accent-vermillion">
@@ -1377,19 +1482,45 @@ function MobileSessionView({
         </div>
       )}
 
-      {/* Messages area */}
+      {/* Messages area — fills remaining height */}
       <div
         className="messages-area"
         ref={messagesAreaRef}
         onScroll={handleScroll}
       >
-        <SessionMessageList messages={messages} onAnswer={handleAnswer} emptyLabel="Session started" />
+        <SessionMessageList
+          messages={messages}
+          onAnswer={handleAnswer}
+          emptyLabel="Session started"
+          agentAvatarUrl={isCommanderSession ? commanderUiPayload?.avatarUrl : undefined}
+          agentAccentColor={isCommanderSession ? commanderUiPayload?.ui?.accentColor : undefined}
+        />
         {isStreaming && <StreamingDots />}
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Input bar */}
+      {/* Input bar — pinned to bottom */}
       <div className="input-bar">
+        {fileChips.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 px-1 pb-1">
+            {fileChips.map((filePath) => (
+              <span
+                key={filePath}
+                className="file-chip"
+                title={filePath}
+              >
+                {basename(filePath)}
+                <button
+                  type="button"
+                  onClick={() => removeFileChip(filePath)}
+                  className="file-chip-remove"
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
         {pendingImages.length > 0 && (
           <div className="flex flex-wrap gap-2 px-2 pb-2">
             {pendingImages.map((img, i) => (
@@ -1419,7 +1550,9 @@ function MobileSessionView({
             multiple
             className="hidden"
             onChange={(e) => {
-              if (e.target.files) handleImageFiles(e.target.files)
+              if (e.target.files) {
+                handleImageFiles(e.target.files)
+              }
               e.target.value = ''
             }}
           />
@@ -1475,8 +1608,18 @@ function MobileSessionView({
             <ArrowUp size={18} />
           </button>
         </div>
+        <div className="flex justify-end px-3 pb-1 pt-0.5">
+          <button
+            type="button"
+            className="font-mono text-[10px] text-sumi-mist transition-colors hover:text-sumi-diluted"
+            onClick={() => setShowWorkspaceOverlay(true)}
+          >
+            {navigator.platform?.includes('Mac') ? '\u2318' : 'Ctrl+'}K workspace
+          </button>
+        </div>
       </div>
 
+      {/* Dispatch worker modal (desktop) */}
       {!isMobile && dispatchOpen && (
         <div className="fixed inset-0 z-[60] flex items-center justify-center bg-sumi-black/50 px-4">
           <div className="w-full max-w-md rounded-xl border border-ink-border bg-washi-white p-4 shadow-ink-md">
@@ -1538,6 +1681,7 @@ function MobileSessionView({
         </div>
       )}
 
+      {/* Workers / Dispatch bottom sheets (mobile) */}
       {isMobile && (
         <>
           <div
@@ -1681,6 +1825,66 @@ function MobileSessionView({
         </>
       )}
 
+      {!isMobile && workersOpen && (
+        <div ref={workersMenuRef}>
+          <div className="fixed inset-0 z-40" onClick={() => setWorkersOpen(false)} />
+          <div className="fixed right-4 top-16 z-50 w-72 rounded-xl border border-ink-border bg-washi-white shadow-ink-md">
+            <div className="border-b border-ink-border px-3 py-2 text-xs font-mono text-sumi-diluted">Workers</div>
+            <div className="max-h-64 overflow-y-auto">
+              {workerRows.map((worker) => (
+                <button
+                  key={worker.name}
+                  type="button"
+                  className="flex w-full items-center justify-between border-b border-ink-border px-3 py-2 text-left last:border-b-0 hover:bg-washi-shadow/60"
+                  onClick={() => handleOpenWorker(worker.name)}
+                >
+                  <div className="min-w-0">
+                    <div className="truncate text-xs font-mono text-sumi-black">
+                      <span className={cn('mr-1', workerStatusClass(worker.status))}>
+                        {workerStatusSymbol(worker.status)}
+                      </span>
+                      {worker.name}
+                    </div>
+                    <div className="text-[10px] text-sumi-diluted">{worker.status}</div>
+                  </div>
+                  <ChevronRight size={14} className="text-sumi-mist" />
+                </button>
+              ))}
+            </div>
+            <div className="flex gap-2 border-t border-ink-border p-2">
+              {hasDoneWorkers && (
+                <button
+                  type="button"
+                  className="flex-1 rounded-lg border border-ink-border px-2 py-1.5 text-xs text-sumi-diluted hover:bg-washi-shadow/60"
+                  onClick={handleClearDone}
+                >
+                  Clear done
+                </button>
+              )}
+              <button
+                type="button"
+                className="flex-1 rounded-lg border border-ink-border px-2 py-1.5 text-xs text-sumi-black hover:bg-washi-shadow/60"
+                onClick={() => {
+                  setDispatchError(null)
+                  setDispatchOpen(true)
+                }}
+              >
+                + Dispatch
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {workspaceSource && (
+        <WorkspaceOverlay
+          open={showWorkspaceOverlay}
+          onClose={() => setShowWorkspaceOverlay(false)}
+          onSelectFile={handleAddFileChip}
+          source={workspaceSource}
+        />
+      )}
+
       <SkillsPicker
         visible={showSkills}
         onSelectSkill={(cmd) => setInputText(cmd + ' ')}
@@ -1694,7 +1898,7 @@ export default function AgentsPage() {
   const isMobile = useIsMobile()
   const queryClient = useQueryClient()
   const [searchParams, setSearchParams] = useSearchParams()
-  const { data: sessions, isLoading } = useAgentSessions()
+  const { data: sessions, isLoading, isFetching } = useAgentSessions()
   const { data: machines } = useMachines()
   const [selectedSession, setSelectedSession] = useState<string | null>(null)
   const [showNewSessionForm, setShowNewSessionForm] = useState(false)
@@ -1702,30 +1906,42 @@ export default function AgentsPage() {
   const [mode, setMode] = useState<ClaudePermissionMode>('default')
   const [task, setTask] = useState('')
   const [cwd, setCwd] = useState('')
+  const [resumeFromSession, setResumeFromSession] = useState('')
   const [agentType, setAgentType] = useState<AgentType>('claude')
   const [openclawAgentId, setOpenclawAgentId] = useState('')
   const [sessionType, setSessionType] = useState<SessionType>('stream')
   const [selectedHost, setSelectedHost] = useState('')
   const [isCreating, setIsCreating] = useState(false)
   const [createError, setCreateError] = useState<string | null>(null)
-  const [killError, setKillError] = useState<string | null>(null)
+  const [sessionActionError, setSessionActionError] = useState<string | null>(null)
   const [sessionTab, setSessionTab] = useState<SessionTab>(DEFAULT_SESSION_TAB)
   const machineList = machines ?? []
   const sessionList = (sessions ?? []) as AgentSessionWithWorkers[]
   const machineMap = new Map(machineList.map((machine) => [machine.id, machine]))
+  const resumableSessions = sessionList
+    .filter((session) => session.resumeAvailable)
+    .sort((left, right) => Date.parse(right.created) - Date.parse(left.created))
+  const resumeSource = resumableSessions.find((session) => session.name === resumeFromSession) ?? null
 
   useEffect(() => {
     const paramCwd = searchParams.get('cwd')
     const paramName = searchParams.get('name')
     const paramSession = searchParams.get('session')
-    if (paramCwd || paramName || paramSession) {
+    const paramAgentType = searchParams.get('agentType')
+    if (paramCwd || paramName || paramSession || paramAgentType) {
       if (paramCwd) setCwd(paramCwd)
       if (paramName) setName(paramName)
       if (paramSession) setSelectedSession(paramSession)
+      if (paramAgentType === 'codex' || paramAgentType === 'claude') {
+        setAgentType(paramAgentType)
+      }
       if (paramCwd || paramName) setShowNewSessionForm(true)
+      if (paramSession) {
+        void queryClient.invalidateQueries({ queryKey: ['agents', 'sessions'] })
+      }
       setSearchParams({}, { replace: true })
     }
-  }, [searchParams, setSearchParams])
+  }, [searchParams, setSearchParams, queryClient])
 
   useEffect(() => {
     if (!selectedSession) {
@@ -1736,10 +1952,48 @@ export default function AgentsPage() {
     }
 
     const stillExists = sessionList.some((session) => session.name === selectedSession)
-    if (!stillExists) {
-      setSelectedSession(null)
+    if (stillExists) {
+      return
     }
-  }, [selectedSession, sessionList, isLoading])
+    // Commander-backed streams are registered on start; list can lag one refetch behind navigation.
+    if (selectedSession.startsWith('commander-') && isFetching) {
+      return
+    }
+    setSelectedSession(null)
+  }, [selectedSession, sessionList, isLoading, isFetching])
+
+  useEffect(() => {
+    if (!resumeFromSession) {
+      return
+    }
+    if (resumableSessions.some((session) => session.name === resumeFromSession)) {
+      return
+    }
+    setResumeFromSession('')
+  }, [resumeFromSession, resumableSessions])
+
+  useEffect(() => {
+    if (!resumeSource) {
+      return
+    }
+
+    if (resumeSource.agentType && resumeSource.agentType !== agentType) {
+      setAgentType(resumeSource.agentType)
+    }
+    if (sessionType !== 'stream') {
+      setSessionType('stream')
+    }
+
+    const nextCwd = resumeSource.cwd ?? ''
+    if (cwd !== nextCwd) {
+      setCwd(nextCwd)
+    }
+
+    const nextHost = resumeSource.host ?? ''
+    if (selectedHost !== nextHost) {
+      setSelectedHost(nextHost)
+    }
+  }, [resumeSource, agentType, sessionType, cwd, selectedHost])
 
   async function refreshSessions() {
     await queryClient.invalidateQueries({ queryKey: ['agents', 'sessions'] })
@@ -1760,6 +2014,7 @@ export default function AgentsPage() {
         mode,
         task: task.trim() || undefined,
         cwd: cwd.trim() || undefined,
+        resumeFromSession: resumeFromSession || undefined,
         sessionType,
         agentType,
         host: selectedHost || undefined,
@@ -1769,6 +2024,7 @@ export default function AgentsPage() {
       setName('')
       setTask('')
       setCwd('')
+      setResumeFromSession('')
       setMode('default')
       setAgentType('claude')
       setOpenclawAgentId('')
@@ -1789,19 +2045,27 @@ export default function AgentsPage() {
     agentType?: AgentType,
     sessionType?: SessionType,
   ) {
+    setSessionActionError(null)
+
     try {
       const isStream = sessionType === 'stream'
       const shouldDebrief = isStream && shouldAttemptDebriefOnKill(agentType)
 
       if (shouldDebrief) {
-        const preResp = await triggerPreKillDebrief(sessionName)
-        if (preResp.debriefStarted && preResp.timeoutMs) {
-          const deadline = Date.now() + preResp.timeoutMs
-          const pollIntervalMs = 2000
-          while (Date.now() < deadline) {
-            const { status } = await getDebriefStatus(sessionName)
-            if (status === 'completed' || status === 'timed-out') break
-            await new Promise((r) => setTimeout(r, pollIntervalMs))
+        try {
+          const preResp = await triggerPreKillDebrief(sessionName)
+          if (preResp.debriefStarted && preResp.timeoutMs) {
+            const deadline = Date.now() + preResp.timeoutMs
+            const pollIntervalMs = 2000
+            while (Date.now() < deadline) {
+              const { status } = await getDebriefStatus(sessionName)
+              if (status === 'completed' || status === 'timed-out') break
+              await new Promise((r) => setTimeout(r, pollIntervalMs))
+            }
+          }
+        } catch (caughtError) {
+          if (!isNotFoundRequestFailure(caughtError)) {
+            throw caughtError
           }
         }
       }
@@ -1811,7 +2075,21 @@ export default function AgentsPage() {
       await refreshSessions()
     } catch (caughtError) {
       const message = formatError(caughtError, 'Failed to kill session')
-      setKillError(message)
+      setSessionActionError(message)
+      throw caughtError
+    }
+  }
+
+  async function handleResumeSession(sessionName: string) {
+    setSessionActionError(null)
+
+    try {
+      const resumed = await resumeAgentSession(sessionName)
+      setSelectedSession(resumed.name)
+      await refreshSessions()
+    } catch (caughtError) {
+      const message = formatError(caughtError, 'Failed to resume session')
+      setSessionActionError(message)
       throw caughtError
     }
   }
@@ -1868,6 +2146,10 @@ export default function AgentsPage() {
                     setName={setName}
                     cwd={cwd}
                     setCwd={setCwd}
+                    resumeOptions={resumableSessions}
+                    resumeSource={resumeSource}
+                    resumeSourceName={resumeFromSession}
+                    setResumeSourceName={setResumeFromSession}
                     mode={mode}
                     setMode={setMode}
                     task={task}
@@ -1896,6 +2178,10 @@ export default function AgentsPage() {
                   setName={setName}
                   cwd={cwd}
                   setCwd={setCwd}
+                  resumeOptions={resumableSessions}
+                  resumeSource={resumeSource}
+                  resumeSourceName={resumeFromSession}
+                  setResumeSourceName={setResumeFromSession}
                   mode={mode}
                   setMode={setMode}
                   task={task}
@@ -1917,10 +2203,10 @@ export default function AgentsPage() {
             )
           )}
 
-          {killError && (
+          {sessionActionError && (
             <div className="mt-3 flex items-start gap-2 rounded-lg bg-accent-vermillion/10 px-3 py-2 text-sm text-accent-vermillion">
               <AlertTriangle size={15} className="mt-0.5" />
-              <span>{killError}</span>
+              <span>{sessionActionError}</span>
             </div>
           )}
         </div>
@@ -1959,12 +2245,14 @@ export default function AgentsPage() {
                 session={session}
                 machine={session.host ? machineMap.get(session.host) : undefined}
                 selected={selectedSession === session.name}
-                onSelect={() =>
+                onSelect={() => {
                   setSelectedSession(
                     selectedSession === session.name ? null : session.name,
                   )
-                }
+                }}
                 onKill={() => handleKillSession(session.name, session.agentType, session.sessionType)}
+                onResume={() => handleResumeSession(session.name)}
+                onNavigateToSession={(sessionName) => setSelectedSession(sessionName)}
               />
             ))
           )}

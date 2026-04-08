@@ -41,6 +41,8 @@ export function ModalFormContainer({
 }: ModalFormContainerProps) {
   const mobileDialogRef = useRef<HTMLDivElement | null>(null)
   const desktopDialogRef = useRef<HTMLDivElement | null>(null)
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
 
   useEffect(() => {
     if (!open || typeof window === 'undefined') {
@@ -62,7 +64,7 @@ export function ModalFormContainer({
     function handleKeyDown(event: KeyboardEvent): void {
       if (event.key === 'Escape') {
         event.preventDefault()
-        onClose()
+        onCloseRef.current()
         return
       }
 
@@ -99,7 +101,7 @@ export function ModalFormContainer({
       document.removeEventListener('keydown', handleKeyDown)
       previousActiveElement?.focus()
     }
-  }, [open, onClose])
+  }, [open])
 
   if (!open) {
     return null

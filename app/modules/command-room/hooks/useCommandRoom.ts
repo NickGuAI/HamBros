@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { fetchJson } from '@/lib/api'
 
 const TASKS_QUERY_KEY = ['command-room', 'tasks'] as const
-const RUNS_QUERY_KEY = (taskId: string | null) => ['command-room', 'runs', taskId] as const
+export const RUNS_QUERY_KEY = (taskId: string | null) => ['command-room', 'runs', taskId] as const
 
 export type CommandRoomAgentType = 'claude' | 'codex'
 export type WorkflowRunStatus = 'running' | 'complete' | 'failed' | 'timeout'
@@ -17,6 +17,7 @@ export interface CronTask {
   workDir: string
   agentType: CommandRoomAgentType
   instruction: string
+  model?: string
   enabled: boolean
   createdAt: string
   nextRun?: string | null
@@ -45,6 +46,7 @@ export interface CreateCronTaskInput {
   workDir: string
   agentType: CommandRoomAgentType
   instruction: string
+  model?: string
   enabled: boolean
   permissionMode?: string
   sessionType?: 'stream' | 'pty'
@@ -59,7 +61,7 @@ async function fetchTasks(): Promise<CronTask[]> {
   return fetchJson<CronTask[]>('/api/command-room/tasks')
 }
 
-async function fetchRuns(taskId: string): Promise<WorkflowRun[]> {
+export async function fetchRuns(taskId: string): Promise<WorkflowRun[]> {
   return fetchJson<WorkflowRun[]>(`/api/command-room/tasks/${encodeURIComponent(taskId)}/runs`)
 }
 

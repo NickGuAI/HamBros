@@ -69,6 +69,20 @@ export function resolveCommanderSessionStorePath(
   return path.join(path.resolve(dataDir), 'sessions.json')
 }
 
+export function resolveCommanderEmailConfigPath(
+  commanderId: string,
+  dataDir: string = resolveCommanderDataDir(),
+): string {
+  return path.join(resolveCommanderPaths(commanderId, dataDir).commanderRoot, 'email-config.json')
+}
+
+export function resolveCommanderEmailSeenPath(
+  commanderId: string,
+  dataDir: string = resolveCommanderDataDir(),
+): string {
+  return path.join(resolveCommanderPaths(commanderId, dataDir).commanderRoot, 'email-seen.json')
+}
+
 export function resolveCommanderNamesPath(
   dataDir: string = resolveCommanderDataDir(),
 ): string {

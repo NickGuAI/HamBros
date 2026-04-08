@@ -193,6 +193,7 @@ export function TaskList({
                     </p>
                     <p className="font-mono truncate">{task.machine || 'local'}</p>
                     <p className="font-mono truncate">{task.workDir || '~'}</p>
+                    <p className="font-mono truncate">{task.model || 'default model'}</p>
                   </div>
                 </button>
                 <div className="mt-3 flex flex-wrap items-center gap-2">

@@ -2,7 +2,11 @@ import { readFile } from 'node:fs/promises'
 import * as path from 'node:path'
 import { GoalsStore } from './goals-store.js'
 import { JournalWriter } from './journal.js'
-import { MemoryRecollection, type RecollectionHit } from './recollection.js'
+import {
+  createCommanderMemoryRecollection,
+  rankHybridTextEntries,
+  type RecollectionOptions,
+} from './recollection.js'
 import { WorkingMemoryStore } from './working-memory.js'
 import type { JournalEntry } from './types.js'
 import { type GHIssue } from './skill-matcher.js'
@@ -80,6 +84,10 @@ interface Layer4Result {
   skillsMatched: string[]
 }
 
+export interface MemoryContextBuilderOptions {
+  recollectionOptions?: RecollectionOptions
+}
+
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4)
 }
@@ -135,34 +143,25 @@ function tokenizeRelevance(text: string): string[] {
   return out
 }
 
-function scoreRelevance(corpus: string, terms: string[]): number {
-  if (terms.length === 0) return 0
-  const normalized = corpus.toLowerCase()
-  let score = 0
-  for (const term of terms) {
-    if (!normalized.includes(term)) continue
-    score += 1
-    if (normalized.includes(`${term}/`) || normalized.includes(`/${term}`)) {
-      score += 0.2
-    }
-  }
-  return score
-}
-
 export class MemoryContextBuilder {
   private readonly memoryRoot: string
   private readonly journal: JournalWriter
-  private readonly recollection: MemoryRecollection
+  private readonly recollection: ReturnType<typeof createCommanderMemoryRecollection>
   private readonly workingMemory: WorkingMemoryStore
   private readonly goalsStore: GoalsStore
 
   constructor(
     commanderId: string,
     basePath?: string,
+    options: MemoryContextBuilderOptions = {},
   ) {
     this.memoryRoot = resolveCommanderPaths(commanderId, basePath).memoryRoot
     this.journal = new JournalWriter(commanderId, basePath)
-    this.recollection = new MemoryRecollection(commanderId, basePath)
+    this.recollection = createCommanderMemoryRecollection(
+      commanderId,
+      basePath,
+      options.recollectionOptions,
+    )
     this.workingMemory = new WorkingMemoryStore(commanderId, basePath)
     this.goalsStore = new GoalsStore(commanderId, basePath)
   }
@@ -170,12 +169,13 @@ export class MemoryContextBuilder {
   async build(options: ContextBuildOptions): Promise<BuiltContext> {
     const tokenBudget = options.tokenBudget ?? DEFAULT_TOKEN_BUDGET
     const task = options.currentTask
-    const relevanceTerms = this.buildRelevanceTerms(task, options.recentConversation)
+    const relevanceCue = this.buildRelevanceCue(task, options.recentConversation)
+    const relevanceTerms = tokenizeRelevance(relevanceCue)
 
     const [layer1, layerGoals, layer2, layer3, layer4, layer5] = await Promise.all([
       this.buildLayer1(task),
       this.goalsStore.buildContextSection(),
-      this.buildLayer2(task, relevanceTerms),
+      this.buildLayer2(task, relevanceCue, relevanceTerms),
       this.buildLayer3(),
       this.buildLayer4(task, options.recentConversation),
       this.buildLayer5(),
@@ -194,19 +194,22 @@ export class MemoryContextBuilder {
 
     let systemPromptSection = this.renderSection(layers)
     let tokenEstimate = estimateTokens(systemPromptSection)
+    const tokenEstimateAtBudgetCheck = tokenEstimate
     const droppedLayers: number[] = []
 
     for (const layerId of LAYER_DROP_ORDER) {
       if (tokenEstimate <= tokenBudget) break
       if (!layers.has(layerId)) continue
-      const tokenEstimateBeforeDrop = tokenEstimate
       layers.delete(layerId)
       droppedLayers.push(layerId)
-      console.warn(
-        `[heartbeat] Layer ${this.resolveLayerName(layerId)} dropped — budget exceeded (${tokenEstimateBeforeDrop}/${tokenBudget} tokens)`,
-      )
       systemPromptSection = this.renderSection(layers)
       tokenEstimate = estimateTokens(systemPromptSection)
+    }
+    if (droppedLayers.length > 0) {
+      const droppedLayerNames = droppedLayers.map((layerId) => this.resolveLayerName(layerId)).join(', ')
+      console.warn(
+        `[WARN] ${new Date().toISOString()} [heartbeat] ${droppedLayers.length} layer(s) dropped - budget exceeded (est ${tokenEstimateAtBudgetCheck}/${tokenBudget} tokens): ${droppedLayerNames}`,
+      )
     }
 
     const layersIncluded = PRIORITY_ORDER.filter((layerId) => layers.has(layerId))
@@ -266,6 +269,7 @@ export class MemoryContextBuilder {
 
   private async buildLayer2(
     task: GHIssue | null,
+    relevanceCue: string,
     relevanceTerms: string[],
   ): Promise<string> {
     const memoryPath = path.join(this.memoryRoot, 'MEMORY.md')
@@ -285,10 +289,10 @@ export class MemoryContextBuilder {
 
     const isTaskScoped = Boolean(task)
     const factual = isTaskScoped
-      ? this.selectRelevantMemoryFacts(memoryContent, relevanceTerms)
+      ? this.selectRelevantMemoryFacts(memoryContent, relevanceCue, relevanceTerms)
       : trimLines(memoryContent, MAX_LONG_TERM_LINES)
     const narrative = isTaskScoped
-      ? this.selectRelevantNarrative(longTermNarrativeContent, relevanceTerms)
+      ? this.selectRelevantNarrative(longTermNarrativeContent, relevanceCue, relevanceTerms)
       : trimLastLines(longTermNarrativeContent, MAX_LONG_TERM_NARRATIVE_LINES)
     const lines = [
       '### Long-term Memory',
@@ -340,7 +344,7 @@ export class MemoryContextBuilder {
       const issueSuffix = hit.issueNumber != null ? ` #${hit.issueNumber}` : ''
       const repoSuffix = hit.repo ? ` [${hit.repo}]` : ''
       const salienceSuffix = hit.salience ? ` ${hit.salience}` : ''
-      lines.push(`- [${hit.type}] ${hit.title}${issueSuffix}${repoSuffix}${salienceSuffix} (score ${score})`)
+      lines.push(`- [${hit.attribution}] ${hit.title}${issueSuffix}${repoSuffix}${salienceSuffix} (score ${score})`)
       lines.push(`  reason: ${hit.reason}`)
       lines.push(`  excerpt: ${hit.excerpt}`)
       if (hit.stale && hit.staleReason) {
@@ -410,7 +414,7 @@ export class MemoryContextBuilder {
     return trimmed || null
   }
 
-  private buildRelevanceTerms(task: GHIssue | null, recentConversation: Message[]): string[] {
+  private buildRelevanceCue(task: GHIssue | null, recentConversation: Message[]): string {
     const chunks: string[] = []
     if (task) {
       chunks.push(
@@ -431,10 +435,10 @@ export class MemoryContextBuilder {
         chunks.push(message.content)
       }
     }
-    return tokenizeRelevance(chunks.join('\n'))
+    return chunks.join('\n')
   }
 
-  private selectRelevantMemoryFacts(content: string, terms: string[]): string {
+  private selectRelevantMemoryFacts(content: string, cue: string, terms: string[]): string {
     const lines = content.split(/\r?\n/)
     const candidates = lines
       .map((line, index) => ({ line: line.trim(), index }))
@@ -448,10 +452,21 @@ export class MemoryContextBuilder {
       return trimLines(content, MAX_TASK_RELEVANT_FACT_LINES)
     }
 
+    const relevance = rankHybridTextEntries({
+      cue,
+      queryTerms: terms,
+      entries: candidates.map((candidate) => ({
+        id: `fact:${candidate.index}`,
+        corpus: candidate.line,
+      })),
+      topK: Math.max(candidates.length, MAX_TASK_RELEVANT_FACT_LINES * 2),
+      minScore: 0,
+    })
+
     const scored = candidates
       .map((candidate) => ({
         ...candidate,
-        score: scoreRelevance(candidate.line, terms),
+        score: relevance.get(`fact:${candidate.index}`)?.hybridScore ?? 0,
       }))
       .filter((candidate) => candidate.score > 0)
       .sort((left, right) => right.score - left.score || left.index - right.index)
@@ -470,7 +485,7 @@ export class MemoryContextBuilder {
     return `${selected}\n\n_...${omittedCount} additional facts omitted by relevance filter._`
   }
 
-  private selectRelevantNarrative(content: string, terms: string[]): string {
+  private selectRelevantNarrative(content: string, cue: string, terms: string[]): string {
     const blocks = content
       .split(/\n\s*\n/g)
       .map((block) => block.trim())
@@ -484,11 +499,22 @@ export class MemoryContextBuilder {
       return trimLastLines(content, MAX_TASK_RELEVANT_FACT_LINES)
     }
 
+    const relevance = rankHybridTextEntries({
+      cue,
+      queryTerms: terms,
+      entries: blocks.map((block, index) => ({
+        id: `narrative:${index}`,
+        corpus: block,
+      })),
+      topK: Math.max(blocks.length, MAX_TASK_RELEVANT_NARRATIVE_BLOCKS * 2),
+      minScore: 0,
+    })
+
     const scored = blocks
       .map((block, index) => ({
         block,
         index,
-        score: scoreRelevance(block, terms),
+        score: relevance.get(`narrative:${index}`)?.hybridScore ?? 0,
       }))
       .filter((entry) => entry.score > 0)
       .sort((left, right) => right.score - left.score || left.index - right.index)

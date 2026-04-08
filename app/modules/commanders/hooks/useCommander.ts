@@ -31,6 +31,12 @@ export interface CommanderCurrentTask {
   title?: string
 }
 
+export interface CommanderUiFields {
+  borderColor?: string
+  accentColor?: string
+  speakingTone?: string
+}
+
 export interface CommanderSession {
   id: string
   host: string
@@ -39,12 +45,19 @@ export interface CommanderSession {
   created: string
   agentType?: CommanderAgentType
   cwd?: string
+  persona?: string
   heartbeat: CommanderHeartbeatState
   lastHeartbeat: string | null
   taskSource: CommanderTaskSource | null
   currentTask: CommanderCurrentTask | null
   completedTasks: number
+  questCount: number
+  scheduleCount: number
   totalCostUsd: number
+  /** From `.memory/profile.json` — border / chat accent / tone */
+  ui?: CommanderUiFields | null
+  /** Present when `profile.json` references an on-disk avatar image */
+  avatarUrl?: string | null
 }
 
 export interface CommanderTask {
@@ -76,6 +89,19 @@ export interface CommanderCreateInput {
   host: string
   taskSource?: { owner: string; repo: string; label?: string }
   cwd?: string
+}
+
+export interface CommanderProfileUpdateInput {
+  commanderId: string
+  persona?: string
+  borderColor?: string
+  accentColor?: string
+  speakingTone?: string
+}
+
+export interface CommanderAvatarUploadInput {
+  commanderId: string
+  file: File
 }
 
 interface CommanderMessageInput {
@@ -417,6 +443,28 @@ async function deleteCommanderSession(commanderId: string): Promise<void> {
   })
 }
 
+async function updateCommanderProfile(input: CommanderProfileUpdateInput): Promise<void> {
+  return fetchVoid(`/api/commanders/${encodeURIComponent(input.commanderId)}/profile`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      persona: input.persona,
+      borderColor: input.borderColor,
+      accentColor: input.accentColor,
+      speakingTone: input.speakingTone,
+    }),
+  })
+}
+
+async function uploadCommanderAvatar(input: CommanderAvatarUploadInput): Promise<{ avatarUrl: string }> {
+  const formData = new FormData()
+  formData.append('avatar', input.file)
+  return fetchJson<{ avatarUrl: string }>(
+    `/api/commanders/${encodeURIComponent(input.commanderId)}/avatar`,
+    { method: 'POST', body: formData },
+  )
+}
+
 function commanderWsUrl(commanderId: string, token: string | null): string {
   const query = new URLSearchParams()
   if (token) {
@@ -646,7 +694,11 @@ export function useCommander() {
   const startMutation = useMutation({
     mutationFn: startCommanderSession,
     onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: COMMANDERS_QUERY_KEY })
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: COMMANDERS_QUERY_KEY }),
+        // Commander stream sessions live in the agents router; refresh so Chat → Agents sees the session.
+        queryClient.invalidateQueries({ queryKey: ['agents', 'sessions'] }),
+      ])
     },
   })
 
@@ -711,6 +763,20 @@ export function useCommander() {
 
   const deleteSessionMutation = useMutation({
     mutationFn: deleteCommanderSession,
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: COMMANDERS_QUERY_KEY })
+    },
+  })
+
+  const updateProfileMutation = useMutation({
+    mutationFn: updateCommanderProfile,
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: COMMANDERS_QUERY_KEY })
+    },
+  })
+
+  const uploadAvatarMutation = useMutation({
+    mutationFn: uploadCommanderAvatar,
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: COMMANDERS_QUERY_KEY })
     },
@@ -786,6 +852,20 @@ export function useCommander() {
     [deleteSessionMutation],
   )
 
+  const updateProfile = useCallback(
+    async (input: CommanderProfileUpdateInput) => {
+      await updateProfileMutation.mutateAsync(input)
+    },
+    [updateProfileMutation],
+  )
+
+  const uploadAvatar = useCallback(
+    async (input: CommanderAvatarUploadInput) => {
+      await uploadAvatarMutation.mutateAsync(input)
+    },
+    [uploadAvatarMutation],
+  )
+
   return {
     commanders,
     selectedCommanderId,
@@ -813,6 +893,8 @@ export function useCommander() {
     updateCron,
     deleteCron,
     deleteCommander,
+    updateProfile,
+    uploadAvatar,
     createCommanderPending: createSessionMutation.isPending,
     startPending: startMutation.isPending,
     stopPending: stopMutation.isPending,
@@ -823,6 +905,8 @@ export function useCommander() {
     updateCronPending: updateCronMutation.isPending,
     deleteCronPending: deleteCronMutation.isPending,
     deleteCommanderPending: deleteSessionMutation.isPending,
+    updateProfilePending: updateProfileMutation.isPending,
+    uploadAvatarPending: uploadAvatarMutation.isPending,
     actionError:
       toErrorMessage(createSessionMutation.error) ??
       toErrorMessage(startMutation.error) ??

@@ -290,7 +290,9 @@ export function useStreamEventProcessor(options?: {
 
         case 'user': {
           const content = event.message?.content
+          const hasActiveAgentTool = activeAgentMessageIdsRef.current.length > 0
           if (typeof content === 'string' && content.trim() && isReplay) {
+            if (hasActiveAgentTool) break
             setMessages((prev) =>
               capMessages([...prev, { id: nextId(), kind: 'user', text: content.trim() }]),
             )
@@ -303,6 +305,7 @@ export function useStreamEventProcessor(options?: {
             const hasToolResult = content.some((b) => b.type === 'tool_result')
             const hasTextOrImage = content.some((b) => b.type === 'text' || b.type === 'image')
             if (!hasToolResult && hasTextOrImage) {
+              if (hasActiveAgentTool) break
               let text = '[image]'
               const images: { mediaType: string; data: string }[] = []
               for (const b of content) {
@@ -314,7 +317,15 @@ export function useStreamEventProcessor(options?: {
                 }
               }
               setMessages((prev) =>
-                capMessages([...prev, { id: nextId(), kind: 'user', text, images: images.length > 0 ? images : undefined }]),
+                capMessages([
+                  ...prev,
+                  {
+                    id: nextId(),
+                    kind: 'user',
+                    text,
+                    images: images.length > 0 ? images : undefined,
+                  },
+                ]),
               )
               break
             }

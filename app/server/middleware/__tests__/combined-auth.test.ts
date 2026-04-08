@@ -103,6 +103,73 @@ describe('combinedAuth', () => {
     await server.close()
   })
 
+  it('allows Auth0 users that carry the required permissions', async () => {
+    const middleware = combinedAuth({
+      requiredApiKeyScopes: ['services:write'],
+      verifyToken: async (token) => {
+        if (token !== 'auth0-token') {
+          throw new Error('invalid')
+        }
+
+        return {
+          id: 'auth0|user-allowed',
+          email: 'user@example.com',
+          metadata: {
+            permissions: ['services:write'],
+          },
+        }
+      },
+    })
+    const server = await startServer(middleware)
+
+    const response = await fetch(`${server.baseUrl}/protected`, {
+      headers: {
+        authorization: 'Bearer auth0-token',
+      },
+    })
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({
+      authMode: 'auth0',
+      userId: 'auth0|user-allowed',
+    })
+
+    await server.close()
+  })
+
+  it('returns 403 when a valid Auth0 user lacks the required permissions', async () => {
+    const middleware = combinedAuth({
+      apiKeyStore: createManagedKeyStore(),
+      requiredApiKeyScopes: ['services:write'],
+      verifyToken: async (token) => {
+        if (token !== 'auth0-token') {
+          throw new Error('invalid')
+        }
+
+        return {
+          id: 'auth0|user-denied',
+          email: 'user@example.com',
+          metadata: {
+            permissions: ['services:read'],
+          },
+        }
+      },
+    })
+    const server = await startServer(middleware)
+
+    const response = await fetch(`${server.baseUrl}/protected`, {
+      headers: {
+        authorization: 'Bearer auth0-token',
+        'x-hammurabi-api-key': 'managed-key',
+      },
+    })
+    expect(response.status).toBe(403)
+    expect(await response.json()).toEqual({
+      error: 'Insufficient permissions',
+    })
+
+    await server.close()
+  })
+
   it('falls back to API key auth when Auth0 verification fails', async () => {
     const middleware = combinedAuth({
       apiKeyStore: createManagedKeyStore(),

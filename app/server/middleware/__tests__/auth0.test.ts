@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import express from 'express'
-import { auth0Middleware } from '../auth0'
+import { auth0Middleware, auth0PermissionsFromClaims } from '../auth0'
 
 interface RunningServer {
   baseUrl: string
@@ -38,6 +38,19 @@ async function startServer(options: Parameters<typeof auth0Middleware>[0]): Prom
 }
 
 describe('auth0Middleware', () => {
+  it('extracts permissions from standard, scope, and namespaced Auth0 claims', () => {
+    expect(auth0PermissionsFromClaims({
+      permissions: ['agents:read', 'agents:write'],
+      scope: 'telemetry:write agents:read',
+      'https://hambros.example.com/permissions': ['factory:write'],
+    })).toEqual([
+      'agents:read',
+      'agents:write',
+      'telemetry:write',
+      'factory:write',
+    ])
+  })
+
   it('returns 503 when Auth0 is not configured', async () => {
     vi.stubEnv('AUTH0_DOMAIN', '')
     vi.stubEnv('AUTH0_AUDIENCE', '')

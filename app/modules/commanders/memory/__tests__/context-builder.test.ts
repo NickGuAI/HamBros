@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -350,5 +350,36 @@ describe('MemoryContextBuilder.build()', () => {
     expect(built.layersIncluded).toContain(1.5)
     expect(built.layersIncluded).toContain(2)
     expect(built.systemPromptSection).toContain('### Active Goals')
+  })
+
+  it('wires transcript-backed recollection consistently through builder options', async () => {
+    const transcriptSearch = vi.fn(async () => [{
+      score: 0.812,
+      text: 'We validated staged token rollout behavior during the incident review.',
+      sourceFile: join(commanderRoot, 'sessions', '2026-03-10.jsonl'),
+      transcriptId: '2026-03-10',
+      timestamp: '2026-03-10T12:00:00.000Z',
+      role: 'assistant' as const,
+      turnNumber: 21,
+      messageIndex: 1,
+    }])
+
+    const builder = new MemoryContextBuilder(commanderId, tmpDir, {
+      recollectionOptions: {
+        transcriptSearch,
+        hybridSearch: async () => new Map(),
+      },
+    })
+
+    const built = await builder.build({
+      currentTask: null,
+      recentConversation: [
+        { role: 'user', content: 'What did we learn about staged rollout?' },
+      ],
+    })
+
+    expect(transcriptSearch).toHaveBeenCalledTimes(1)
+    expect(built.systemPromptSection).toContain('transcript: 2026-03-10 turn 21')
+    expect(built.systemPromptSection).toContain('semantic 0.812')
   })
 })

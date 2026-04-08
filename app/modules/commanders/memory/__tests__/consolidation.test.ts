@@ -316,6 +316,54 @@ describe('NightlyConsolidation.run()', () => {
     expect(await readFile(join(memoryRoot, 'working-memory.md'), 'utf-8')).toBe('')
   })
 
+  it('uses an explicit targetDate window when provided', async () => {
+    const now = () => new Date('2026-03-11T02:00:00.000Z')
+    const writer = new JournalWriter('cmdr-window', tmpDir)
+    await writer.scaffold()
+    const memoryRoot = join(tmpDir, 'cmdr-window', '.memory')
+    const journalDir = join(memoryRoot, 'journal')
+
+    await writeFile(
+      join(journalDir, '2026-03-10.md'),
+      block({
+        time: '08:00',
+        outcome: 'Previous day spike',
+        salience: 'SPIKE',
+        body: 'This entry should be compacted when targetDate is provided.',
+      }),
+      'utf-8',
+    )
+    await writeFile(
+      join(journalDir, '2026-03-11.md'),
+      block({
+        time: '09:00',
+        outcome: 'Current day spike',
+        salience: 'SPIKE',
+        body: 'This entry should be ignored for explicit targetDate runs.',
+      }),
+      'utf-8',
+    )
+
+    const consolidation = new NightlyConsolidation({
+      basePath: tmpDir,
+      debriefDir,
+      now,
+    })
+
+    await consolidation.run('cmdr-window', { targetDate: '2026-03-10' })
+
+    const memory = await readFile(join(memoryRoot, 'MEMORY.md'), 'utf-8')
+    expect(memory).toContain('SPIKE: Previous day spike')
+    expect(memory).not.toContain('SPIKE: Current day spike')
+
+    const longTerm = await readFile(join(memoryRoot, 'LONG_TERM_MEM.md'), 'utf-8')
+    expect(longTerm).toContain('## 2026-03-10')
+    expect(longTerm).not.toContain('## 2026-03-11')
+
+    const log = await readFile(join(memoryRoot, 'consolidation-log.md'), 'utf-8')
+    expect(log).toContain('## 2026-03-10')
+  })
+
   it('registers with cron at 02:00 and runs configured commanders', async () => {
     const consolidation = new NightlyConsolidation({
       commanderIdsForCron: ['cmdr-a', 'cmdr-b'],

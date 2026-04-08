@@ -6,6 +6,7 @@ import type { WorkflowTriggerSource } from './executor.js'
 interface CronScheduledJob {
   stop?: () => void
   destroy?: () => void
+  getNextRun?: () => Date | null
 }
 
 export interface CronScheduler {
@@ -119,6 +120,14 @@ export class CommandRoomScheduler {
     for (const [taskId] of this.activeJobs) {
       this.unregisterJob(taskId)
     }
+  }
+
+  getNextRun(taskId: string): Date | null {
+    const nextRun = this.activeJobs.get(taskId)?.getNextRun?.()
+    if (!(nextRun instanceof Date) || Number.isNaN(nextRun.getTime())) {
+      return null
+    }
+    return nextRun
   }
 
   private assertValidExpression(expression: string): void {

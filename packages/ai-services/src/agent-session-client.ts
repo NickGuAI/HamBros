@@ -18,6 +18,7 @@ export interface AgentSessionCreateInput {
   agentType?: AgentType
   cwd?: string
   host?: string
+  model?: string
 }
 
 export interface CreatedAgentSession {
@@ -196,6 +197,7 @@ export class AgentSessionClient {
         agentType: input.agentType ?? 'claude',
         cwd: input.cwd,
         host: input.host,
+        model: input.model,
       }),
     })
 

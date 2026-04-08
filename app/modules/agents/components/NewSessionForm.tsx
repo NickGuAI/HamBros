@@ -1,7 +1,7 @@
 import { memo, type FormEvent, type ReactNode, useEffect, useState } from 'react'
 import { AlertTriangle, Plus } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import type { AgentType, ClaudePermissionMode, Machine, SessionType } from '@/types'
+import type { AgentSession, AgentType, ClaudePermissionMode, Machine, SessionType } from '@/types'
 import { ScheduleExpressionField } from '../../components/ScheduleExpressionField'
 import { DirectoryPicker } from './DirectoryPicker'
 
@@ -42,6 +42,24 @@ export const CODEX_MODE_OPTIONS: Array<{
 const DEFAULT_AGENT_OPTIONS: AgentType[] = ['claude', 'codex', 'openclaw']
 const NOOP_SET_STRING = (_value: string): undefined => undefined
 
+function getResumeSourceStateLabel(session: AgentSession | null): string {
+  if (!session?.status) {
+    return session?.processAlive === false ? 'exited' : 'active'
+  }
+  return session.status
+}
+
+function getMachineDisplayValue(session: AgentSession | null, machines: Machine[]): string {
+  if (!session?.host) {
+    return 'Local (this server)'
+  }
+  const machine = machines.find((entry) => entry.id === session.host)
+  if (!machine) {
+    return session.host
+  }
+  return `${machine.label} (${machine.user ? `${machine.user}@` : ''}${machine.host})`
+}
+
 function NewSessionFormComponent({
   name = '',
   setName = NOOP_SET_STRING,
@@ -63,6 +81,10 @@ function NewSessionFormComponent({
   isCreating,
   createError,
   onSubmit,
+  resumeOptions,
+  resumeSourceName = '',
+  setResumeSourceName,
+  resumeSource = null,
   // cron/context-specific overrides
   schedule,
   setSchedule,
@@ -98,6 +120,10 @@ function NewSessionFormComponent({
   isCreating: boolean
   createError: string | null
   onSubmit: (e: FormEvent<HTMLFormElement>) => void
+  resumeOptions?: AgentSession[]
+  resumeSourceName?: string
+  setResumeSourceName?: (v: string) => void
+  resumeSource?: AgentSession | null
   schedule?: string
   setSchedule?: (v: string) => void
   submitLabel?: string
@@ -114,6 +140,8 @@ function NewSessionFormComponent({
 }) {
   const remoteMachines = machines.filter((machine) => machine.host)
   const showMachineSelector = remoteMachines.length > 0
+  const resumeSelectionEnabled = Array.isArray(resumeOptions) && typeof setResumeSourceName === 'function'
+  const resumeLocked = resumeSource !== null
   const [openclawAgents, setOpenclawAgents] = useState<string[]>([])
   const [openclawGatewayInfo, setOpenclawGatewayInfo] = useState<OpenClawGatewayInfo | null>(null)
   const showOpenClaw = agentOptions.includes('openclaw')
@@ -183,11 +211,13 @@ function NewSessionFormComponent({
               key={type}
               type="button"
               onClick={() => setAgentType(type)}
+              disabled={resumeLocked}
               className={cn(
                 'flex-1 text-center rounded-lg border px-3 py-2 transition-colors min-h-[44px] font-mono text-sm',
                 agentType === type
                   ? 'border-sumi-black bg-sumi-black text-washi-aged'
                   : 'border-ink-border bg-washi-aged text-sumi-black hover:border-ink-border-hover',
+                resumeLocked && 'cursor-not-allowed opacity-60 hover:border-ink-border',
               )}
             >
               {type}
@@ -208,11 +238,13 @@ function NewSessionFormComponent({
                 key={option.value}
                 type="button"
                 onClick={() => setSessionType(option.value)}
+                disabled={resumeLocked}
                 className={cn(
                   'flex-1 text-left rounded-lg border px-3 py-2 transition-colors min-h-[44px]',
                   sessionType === option.value
                     ? 'border-sumi-black bg-sumi-black text-washi-aged'
                     : 'border-ink-border bg-washi-aged text-sumi-black hover:border-ink-border-hover',
+                  resumeLocked && 'cursor-not-allowed opacity-60 hover:border-ink-border',
                 )}
               >
                 <div className="font-mono text-xs">{option.label}</div>
@@ -231,6 +263,38 @@ function NewSessionFormComponent({
             <div className="mt-2 flex items-start gap-2 rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-700">
               <AlertTriangle size={13} className="mt-0.5 shrink-0" />
               <span>PTY sessions cannot be resumed after server restart</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {resumeSelectionEnabled && (
+        <div>
+          <label className="section-title block mb-2">Resume From Previous Session</label>
+          <select
+            value={resumeSourceName}
+            onChange={(event) => setResumeSourceName?.(event.target.value)}
+            className="w-full px-3 py-2 rounded-lg border border-ink-border bg-washi-aged text-[16px] md:text-sm focus:outline-none focus:border-ink-border-hover"
+          >
+            <option value="">— Start fresh —</option>
+            {(resumeOptions ?? []).map((session) => (
+              <option key={session.name} value={session.name}>
+                {session.name} · {session.agentType ?? 'claude'} · {getResumeSourceStateLabel(session)}
+              </option>
+            ))}
+          </select>
+          <p className="mt-1 text-whisper text-sumi-mist">
+            Only resumable Claude and Codex sessions appear here.
+          </p>
+          {resumeSource && (
+            <div className="mt-2 rounded-lg border border-ink-border bg-washi-aged/70 px-3 py-2 text-sm text-sumi-gray">
+              <div className="font-mono text-xs text-sumi-black">{resumeSource.name}</div>
+              <div className="mt-1 text-whisper">State: {getResumeSourceStateLabel(resumeSource)}</div>
+              <div className="text-whisper">Machine: {getMachineDisplayValue(resumeSource, machines)}</div>
+              <div className="text-whisper break-all">Workspace: {resumeSource.cwd ?? 'Home directory'}</div>
+              <div className="mt-1 text-whisper text-sumi-mist">
+                Agent, session type, machine, and workspace are locked to the selected source.
+              </div>
             </div>
           )}
         </div>
@@ -278,18 +342,24 @@ function NewSessionFormComponent({
       {agentType !== 'openclaw' && showMachineSelector && (
         <div>
           <label className="section-title block mb-2">Machine</label>
-          <select
-            value={selectedHost}
-            onChange={(event) => setSelectedHost(event.target.value)}
-            className="w-full px-3 py-2 rounded-lg border border-ink-border bg-washi-aged text-[16px] md:text-sm focus:outline-none focus:border-ink-border-hover"
-          >
-            <option value="">Local (this server)</option>
-            {remoteMachines.map((machine) => (
-              <option key={machine.id} value={machine.id}>
-                {machine.label} ({machine.user ? `${machine.user}@` : ''}{machine.host})
-              </option>
-            ))}
-          </select>
+          {resumeLocked ? (
+            <div className="w-full rounded-lg border border-ink-border bg-washi-aged px-3 py-2 text-sm text-sumi-black">
+              {getMachineDisplayValue(resumeSource, machines)}
+            </div>
+          ) : (
+            <select
+              value={selectedHost}
+              onChange={(event) => setSelectedHost(event.target.value)}
+              className="w-full px-3 py-2 rounded-lg border border-ink-border bg-washi-aged text-[16px] md:text-sm focus:outline-none focus:border-ink-border-hover"
+            >
+              <option value="">Local (this server)</option>
+              {remoteMachines.map((machine) => (
+                <option key={machine.id} value={machine.id}>
+                  {machine.label} ({machine.user ? `${machine.user}@` : ''}{machine.host})
+                </option>
+              ))}
+            </select>
+          )}
         </div>
       )}
 
@@ -319,7 +389,13 @@ function NewSessionFormComponent({
 
       <div>
         <label className="section-title block mb-2">Working Directory</label>
-        <DirectoryPicker value={cwd} onChange={setCwd} host={selectedHost || undefined} />
+        {resumeLocked ? (
+          <div className="rounded-lg border border-ink-border bg-washi-aged px-3 py-2 font-mono text-[16px] text-sumi-black md:text-sm">
+            {cwd || '~'}
+          </div>
+        ) : (
+          <DirectoryPicker value={cwd} onChange={setCwd} host={selectedHost || undefined} />
+        )}
       </div>
 
       {agentType !== 'openclaw' && (

@@ -12,6 +12,8 @@ import { createCommandersRouter, type CommandersRouterOptions } from '../routes.
 const AUTH_HEADERS = {
   'x-hammurabi-api-key': 'test-key',
 }
+const MEMORY_COMPACT_TASK_TYPE = 'memory_compact'
+const MEMORY_COMPACT_INSTRUCTION = 'Run internal commander memory compaction maintenance.'
 
 interface RunningServer {
   baseUrl: string
@@ -95,6 +97,10 @@ async function createTempDir(prefix: string): Promise<string> {
   return dir
 }
 
+async function sleep(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, ms))
+}
+
 async function createCommanderCronTask(baseUrl: string, commanderId: string): Promise<{ id: string }> {
   const response = await fetch(`${baseUrl}/api/commanders/${commanderId}/crons`, {
     method: 'POST',
@@ -121,6 +127,105 @@ afterEach(async () => {
 })
 
 describe('commander cron route storage', () => {
+  it('backfills memory_compact cron tasks for existing commanders', async () => {
+    const dir = await createTempDir('hammurabi-commanders-cron-backfill-')
+    const memoryBasePath = join(dir, 'memory')
+    const sessionStorePath = join(dir, 'sessions.json')
+    const commanderId = 'commander-backfill'
+    await writeFile(
+      sessionStorePath,
+      JSON.stringify({
+        sessions: [
+          {
+            id: commanderId,
+            host: 'backfill-host',
+            pid: null,
+            state: 'idle',
+            created: '2026-03-11T00:00:00.000Z',
+            heartbeat: {
+              thinIntervalSec: 60,
+              fatIntervalSec: 1200,
+              pinnedFatPulses: 3,
+              idleResetSec: 1800,
+              statusWindowSec: 3600,
+              checkpointsWindowSec: 2700,
+            },
+            lastHeartbeat: null,
+            taskSource: null,
+            currentTask: null,
+            completedTasks: 0,
+            totalCostUsd: 0,
+          },
+        ],
+      }),
+      'utf8',
+    )
+
+    const server = await startServer({
+      memoryBasePath,
+      sessionStorePath,
+    })
+
+    try {
+      let tasks: Array<{ taskType?: string; schedule?: string; instruction?: string }> = []
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const response = await fetch(`${server.baseUrl}/api/commanders/${commanderId}/crons`, {
+          headers: AUTH_HEADERS,
+        })
+        expect(response.status).toBe(200)
+        tasks = await response.json() as Array<{ taskType?: string; schedule?: string; instruction?: string }>
+        if (tasks.some((task) => task.taskType === MEMORY_COMPACT_TASK_TYPE)) {
+          break
+        }
+        await sleep(25)
+      }
+
+      const memoryTask = tasks.find((task) => task.taskType === MEMORY_COMPACT_TASK_TYPE)
+      expect(memoryTask).toBeDefined()
+      expect(memoryTask?.schedule).toBe('0 2 * * *')
+      expect(memoryTask?.instruction).toBe(MEMORY_COMPACT_INSTRUCTION)
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('creates a default memory_compact cron task when a commander is created', async () => {
+    const dir = await createTempDir('hammurabi-commanders-cron-default-memory-')
+    const memoryBasePath = join(dir, 'memory')
+    const sessionStorePath = join(dir, 'sessions.json')
+
+    const server = await startServer({
+      memoryBasePath,
+      sessionStorePath,
+    })
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          host: 'commander-memory-default',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+      const created = await createResponse.json() as { id: string }
+
+      const cronResponse = await fetch(`${server.baseUrl}/api/commanders/${created.id}/crons`, {
+        headers: AUTH_HEADERS,
+      })
+      expect(cronResponse.status).toBe(200)
+      const tasks = await cronResponse.json() as Array<{ taskType?: string; schedule?: string }>
+      const memoryTask = tasks.find((task) => task.taskType === MEMORY_COMPACT_TASK_TYPE)
+      expect(memoryTask).toBeDefined()
+      expect(memoryTask?.schedule).toBe('0 2 * * *')
+    } finally {
+      await server.close()
+    }
+  })
+
   it('persists commander tasks in commander-owned cron store paths', async () => {
     const dir = await createTempDir('hammurabi-commanders-cron-storage-')
     const memoryBasePath = join(dir, 'memory')
@@ -161,6 +266,40 @@ describe('commander cron route storage', () => {
       expect(alpha.tasks?.[0]?.commanderId).toBe('commander-alpha')
       expect(beta.tasks).toHaveLength(1)
       expect(beta.tasks?.[0]?.commanderId).toBe('commander-beta')
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('accepts memory_compact cron creation without free-text instruction', async () => {
+    const dir = await createTempDir('hammurabi-commanders-cron-memory-task-')
+    const memoryBasePath = join(dir, 'memory')
+    const sessionStorePath = join(dir, 'sessions.json')
+    const commanderId = 'commander-memory-task'
+    const server = await startServer({
+      memoryBasePath,
+      sessionStorePath,
+    })
+
+    try {
+      const response = await fetch(`${server.baseUrl}/api/commanders/${commanderId}/crons`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          schedule: '0 2 * * *',
+          taskType: MEMORY_COMPACT_TASK_TYPE,
+          enabled: true,
+        }),
+      })
+
+      expect(response.status).toBe(201)
+      const task = await response.json() as { taskType?: string; instruction?: string; schedule?: string }
+      expect(task.taskType).toBe(MEMORY_COMPACT_TASK_TYPE)
+      expect(task.instruction).toBe(MEMORY_COMPACT_INSTRUCTION)
+      expect(task.schedule).toBe('0 2 * * *')
     } finally {
       await server.close()
     }

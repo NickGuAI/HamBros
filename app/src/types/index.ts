@@ -11,6 +11,16 @@ export interface FrontendModule {
 // Agents types
 export type AgentType = 'claude' | 'codex' | 'openclaw'
 
+export type AgentSessionStatus = 'active' | 'idle' | 'stale' | 'completed' | 'exited'
+
+export interface AgentWorkerSummary {
+  total: number
+  starting: number
+  running: number
+  down: number
+  done: number
+}
+
 export interface AgentSession {
   name: string
   label?: string
@@ -20,6 +30,14 @@ export interface AgentSession {
   agentType?: AgentType
   cwd?: string
   host?: string
+  parentSession?: string
+  spawnedWorkers?: string[]
+  workerSummary?: AgentWorkerSummary
+  processAlive?: boolean
+  hadResult?: boolean
+  resumedFrom?: string
+  status?: AgentSessionStatus
+  resumeAvailable?: boolean
 }
 
 // hamRPG world types
@@ -71,6 +89,7 @@ export interface CreateSessionInput {
   agentType?: AgentType
   host?: string
   agentId?: string
+  resumeFromSession?: string
 }
 
 // AskUserQuestion types

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import express from 'express'
 import { createServer, type Server } from 'node:http'
 import { EventEmitter } from 'node:events'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { WebSocket, WebSocketServer } from 'ws'
@@ -21,12 +21,10 @@ vi.mock('node:child_process', async (importOriginal) => {
 import {
   createAgentsRouter,
   type AgentsRouterOptions,
-  type CommanderSessionsInterface,
   type PtyHandle,
   type PtySpawner,
 } from '../routes'
 import { CommanderSessionStore, type CommanderSession } from '../../commanders/store'
-import { extractMessages, readCommanderTranscript } from '../session-messages'
 import { spawn as spawnFn } from 'node:child_process'
 
 // Typed reference to the mocked spawn function
@@ -89,7 +87,7 @@ interface RunningServer {
   baseUrl: string
   close: () => Promise<void>
   httpServer: Server
-  sessionsInterface: ReturnType<typeof createAgentsRouter>['sessionsInterface']
+  agents: ReturnType<typeof createAgentsRouter>
 }
 
 const AUTH_HEADERS = {
@@ -219,8 +217,8 @@ async function startServer(options: Partial<AgentsRouterOptions> = {}): Promise<
 
   return {
     baseUrl: `http://127.0.0.1:${address.port}`,
+    agents,
     httpServer,
-    sessionsInterface: agents.sessionsInterface,
     close: async () => {
       await new Promise<void>((resolve, reject) => {
         httpServer.close((error) => {
@@ -249,79 +247,6 @@ function connectWs(
     ws.on('unexpected-response', (_req, res) => {
       reject(new Error(`WebSocket upgrade rejected with status ${res.statusCode}`))
     })
-  })
-}
-
-async function seedCommanderSessionFixture(options: {
-  commanderDataDir: string
-  commanderId: string
-  cwd?: string
-  agentType?: 'claude' | 'codex'
-  workflowPrompt: string
-  identityBody: string
-}) {
-  const {
-    commanderDataDir,
-    commanderId,
-    cwd = '/tmp',
-    agentType = 'claude',
-    workflowPrompt,
-    identityBody,
-  } = options
-
-  const commanderRoot = join(commanderDataDir, commanderId)
-  const memoryRoot = join(commanderRoot, '.memory')
-  await mkdir(join(memoryRoot, 'journal'), { recursive: true })
-  await mkdir(join(memoryRoot, 'backlog'), { recursive: true })
-  await mkdir(join(memoryRoot, 'repos'), { recursive: true })
-  await writeFile(join(commanderRoot, 'COMMANDER.md'), workflowPrompt, 'utf8')
-  await writeFile(
-    join(memoryRoot, 'identity.md'),
-    [
-      '---',
-      `id: "${commanderId}"`,
-      '---',
-      '',
-      '# Identity',
-      '',
-      identityBody,
-    ].join('\n'),
-    'utf8',
-  )
-  await writeFile(join(memoryRoot, 'MEMORY.md'), '# Commander Memory\n\n- Keep changes surgical.\n', 'utf8')
-
-  const store = new CommanderSessionStore(join(commanderDataDir, 'sessions.json'))
-  const session: CommanderSession = {
-    id: commanderId,
-    host: 'test-host',
-    pid: 123,
-    state: 'running',
-    created: '2026-03-20T00:00:00Z',
-    agentType,
-    cwd,
-    heartbeat: {
-      intervalMs: 60_000,
-      messageTemplate: 'heartbeat',
-      lastSentAt: null,
-    },
-    lastHeartbeat: null,
-    taskSource: null,
-    currentTask: null,
-    completedTasks: 0,
-    totalCostUsd: 0,
-  }
-  await store.create(session)
-}
-
-function installMockProcess(options?: { pid?: number }) {
-  const mock = createMockChildProcess(options?.pid)
-  mockedSpawn.mockReturnValue(mock.cp as never)
-  return mock
-}
-
-async function waitForPersistedSessionFlush(): Promise<void> {
-  await new Promise<void>((resolve) => {
-    setTimeout(resolve, 50)
   })
 }
 
@@ -360,63 +285,6 @@ describe('agents routes', () => {
     await server.close()
   })
 
-  it('labels commander sessions by host from the commander session store', async () => {
-    installMockProcess()
-    vi.mocked(CommanderSessionStore.prototype.list).mockResolvedValue([
-      {
-        id: 'alpha',
-        host: 'athena',
-        pid: null,
-        state: 'running',
-        created: '2026-03-13T00:00:00.000Z',
-        heartbeat: {
-          intervalMs: 300000,
-          messageTemplate: 'ping',
-          lastSentAt: null,
-        },
-        lastHeartbeat: null,
-        taskSource: null,
-        currentTask: null,
-        completedTasks: 0,
-        totalCostUsd: 0,
-      },
-    ] satisfies CommanderSession[])
-
-    const { spawner } = createMockPtySpawner()
-    const server = await startServer({ ptySpawner: spawner })
-
-    try {
-      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          name: 'commander-alpha',
-          mode: 'default',
-          sessionType: 'stream',
-        }),
-      })
-      expect(createResponse.status).toBe(201)
-
-      const response = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-        headers: AUTH_HEADERS,
-      })
-      const payload = await response.json() as Array<{ name: string; label?: string }>
-
-      expect(response.status).toBe(200)
-      expect(payload).toEqual(expect.arrayContaining([
-        expect.objectContaining({
-          name: 'commander-alpha',
-          label: 'athena',
-        }),
-      ]))
-    } finally {
-      await server.close()
-    }
-  })
-
   it('returns empty world agent list initially', async () => {
     const { spawner } = createMockPtySpawner()
     const server = await startServer({ ptySpawner: spawner })
@@ -441,6 +309,7 @@ describe('agents routes', () => {
         pid: 101,
         state: 'running',
         created: '2026-03-06T00:00:00.000Z',
+        agentType: 'codex',
         heartbeat: {
           intervalMs: 300000,
           messageTemplate: 'ping',
@@ -461,7 +330,6 @@ describe('agents routes', () => {
         host: 'localhost',
         pid: 202,
         state: 'paused',
-        agentType: 'codex',
         created: '2026-03-06T00:02:00.000Z',
         heartbeat: {
           intervalMs: 300000,
@@ -514,7 +382,6 @@ describe('agents routes', () => {
       })
       const payload = await response.json() as Array<{
         id: string
-        agentType: string
         role: string
         status: string
         phase: string
@@ -528,13 +395,13 @@ describe('agents routes', () => {
         }),
         expect.objectContaining({
           id: 'commander-alpha',
+          agentType: 'codex',
           role: 'commander',
           status: 'active',
           phase: 'thinking',
         }),
         expect.objectContaining({
           id: 'commander-beta',
-          agentType: 'codex',
           role: 'commander',
           status: 'idle',
           phase: 'blocked',
@@ -737,6 +604,12 @@ describe('agents routes', () => {
         expect(await statusAt('2026-03-05T00:01:00.000Z')).toBe('idle')
         expect(await statusAt('2026-03-05T00:05:00.000Z')).toBe('idle')
         expect(await statusAt('2026-03-05T00:05:01.000Z')).toBe('stale')
+        const stalePhaseResponse = await fetch(`${server.baseUrl}/api/agents/world`, {
+          headers: AUTH_HEADERS,
+        })
+        expect(stalePhaseResponse.status).toBe(200)
+        const stalePhasePayload = await stalePhaseResponse.json() as Array<{ phase: string }>
+        expect(stalePhasePayload[0].phase).toBe('stale')
 
         streamMock.emitStdout('{"type":"result","result":"done"}\n')
         const completedResponse = await fetch(`${server.baseUrl}/api/agents/world`, {
@@ -746,201 +619,6 @@ describe('agents routes', () => {
         const completedPayload = await completedResponse.json() as Array<{ status: string; phase: string }>
         expect(completedPayload[0].status).toBe('completed')
         expect(completedPayload[0].phase).toBe('completed')
-      } finally {
-        await server.close()
-      }
-    } finally {
-      vi.useRealTimers()
-    }
-  })
-
-  it('commander sessions never show completed status after result event', async () => {
-    vi.useFakeTimers({ toFake: ['Date'] })
-    try {
-      const baseTime = new Date('2026-03-05T00:00:00.000Z')
-      vi.setSystemTime(baseTime)
-
-      const streamMock = createMockChildProcess()
-      mockedSpawn.mockReturnValueOnce(streamMock.cp as never)
-      const server = await startServer()
-
-      try {
-        // Create a commander stream session
-        const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-          method: 'POST',
-          headers: {
-            ...AUTH_HEADERS,
-            'content-type': 'application/json',
-          },
-          body: JSON.stringify({
-            name: 'commander-athena',
-            mode: 'default',
-            sessionType: 'stream',
-          }),
-        })
-        expect(createResponse.status).toBe(201)
-
-        // Simulate a turn completing with a result event
-        streamMock.emitStdout('{"type":"message_start","message":{"id":"m1","role":"assistant"}}\n')
-        streamMock.emitStdout('{"type":"result","result":"quest completed"}\n')
-
-        // Commander should NOT be classified as 'completed'
-        const worldResponse = await fetch(`${server.baseUrl}/api/agents/world`, {
-          headers: AUTH_HEADERS,
-        })
-        expect(worldResponse.status).toBe(200)
-        const payload = await worldResponse.json() as Array<{
-          id: string
-          status: string
-          phase: string
-        }>
-
-        const commander = payload.find((agent) => agent.id === 'commander-athena')
-        expect(commander).toBeDefined()
-        expect(commander!.status).not.toBe('completed')
-        expect(commander!.phase).not.toBe('completed')
-      } finally {
-        await server.close()
-      }
-    } finally {
-      vi.useRealTimers()
-    }
-  })
-
-  it('done workers auto-evict from worker list after TTL expires', async () => {
-    vi.useFakeTimers({ toFake: ['Date'] })
-    try {
-      const baseTime = new Date('2026-03-05T00:00:00.000Z')
-      vi.setSystemTime(baseTime)
-
-      // Create mock processes for parent + worker
-      const parentMock = createMockChildProcess()
-      const workerMock = createMockChildProcess()
-      mockedSpawn.mockReturnValueOnce(parentMock.cp as never)
-      mockedSpawn.mockReturnValueOnce(workerMock.cp as never)
-      const server = await startServer()
-
-      try {
-        // Create parent session
-        const parentResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-          method: 'POST',
-          headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
-          body: JSON.stringify({
-            name: 'commander-parent',
-            mode: 'default',
-            sessionType: 'stream',
-          }),
-        })
-        expect(parentResponse.status).toBe(201)
-
-        // Create worker session
-        const workerResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-          method: 'POST',
-          headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
-          body: JSON.stringify({
-            name: 'factory-worker-01',
-            mode: 'default',
-            sessionType: 'stream',
-            parentSession: 'commander-parent',
-          }),
-        })
-        expect(workerResponse.status).toBe(201)
-
-        // Worker completes with result, then exits
-        workerMock.emitStdout('{"type":"result","result":"done"}\n')
-        workerMock.emitExit(0)
-
-        // Immediately after exit: worker should appear as 'done'
-        const workersBeforeTTL = await fetch(
-          `${server.baseUrl}/api/agents/sessions/commander-parent/workers`,
-          { headers: AUTH_HEADERS },
-        )
-        const beforeList = await workersBeforeTTL.json() as Array<{ name: string; status: string }>
-        expect(beforeList.some((w) => w.name === 'factory-worker-01' && w.status === 'done')).toBe(true)
-
-        // Advance past 30-minute TTL
-        vi.setSystemTime(new Date('2026-03-05T00:31:00.000Z'))
-
-        // After TTL: worker should be evicted from list (filtered as 'down')
-        const workersAfterTTL = await fetch(
-          `${server.baseUrl}/api/agents/sessions/commander-parent/workers`,
-          { headers: AUTH_HEADERS },
-        )
-        const afterList = await workersAfterTTL.json() as Array<{ name: string; status: string }>
-        expect(afterList.some((w) => w.name === 'factory-worker-01')).toBe(false)
-      } finally {
-        await server.close()
-      }
-    } finally {
-      vi.useRealTimers()
-    }
-  })
-
-  it('DELETE /sessions/:name/workers/done clears done workers', async () => {
-    vi.useFakeTimers({ toFake: ['Date'] })
-    try {
-      const baseTime = new Date('2026-03-05T00:00:00.000Z')
-      vi.setSystemTime(baseTime)
-
-      const parentMock = createMockChildProcess()
-      const workerMock = createMockChildProcess()
-      mockedSpawn.mockReturnValueOnce(parentMock.cp as never)
-      mockedSpawn.mockReturnValueOnce(workerMock.cp as never)
-      const server = await startServer()
-
-      try {
-        // Create parent session
-        await fetch(`${server.baseUrl}/api/agents/sessions`, {
-          method: 'POST',
-          headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
-          body: JSON.stringify({
-            name: 'commander-clear-test',
-            mode: 'default',
-            sessionType: 'stream',
-          }),
-        })
-
-        // Create worker
-        await fetch(`${server.baseUrl}/api/agents/sessions`, {
-          method: 'POST',
-          headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
-          body: JSON.stringify({
-            name: 'factory-worker-clear',
-            mode: 'default',
-            sessionType: 'stream',
-            parentSession: 'commander-clear-test',
-          }),
-        })
-
-        // Worker exits with result
-        workerMock.emitStdout('{"type":"result","result":"done"}\n')
-        workerMock.emitExit(0)
-
-        // Verify worker is visible as 'done'
-        const beforeClear = await fetch(
-          `${server.baseUrl}/api/agents/sessions/commander-clear-test/workers`,
-          { headers: AUTH_HEADERS },
-        )
-        const beforeList = await beforeClear.json() as Array<{ name: string; status: string }>
-        expect(beforeList.some((w) => w.name === 'factory-worker-clear' && w.status === 'done')).toBe(true)
-
-        // Clear done workers
-        const clearResponse = await fetch(
-          `${server.baseUrl}/api/agents/sessions/commander-clear-test/workers/done`,
-          { method: 'DELETE', headers: AUTH_HEADERS },
-        )
-        expect(clearResponse.status).toBe(200)
-        const clearPayload = await clearResponse.json() as { cleared: number; workers: Array<{ name: string }> }
-        expect(clearPayload.cleared).toBe(1)
-        expect(clearPayload.workers.some((w) => w.name === 'factory-worker-clear')).toBe(false)
-
-        // Verify workers endpoint also shows cleared state
-        const afterClear = await fetch(
-          `${server.baseUrl}/api/agents/sessions/commander-clear-test/workers`,
-          { headers: AUTH_HEADERS },
-        )
-        const afterList = await afterClear.json() as Array<{ name: string }>
-        expect(afterList.some((w) => w.name === 'factory-worker-clear')).toBe(false)
       } finally {
         await server.close()
       }
@@ -1016,6 +694,230 @@ describe('agents routes', () => {
       expect(await response.json()).toEqual({
         error: 'Invalid machines config: expected "machines" array',
       })
+    } finally {
+      await server.close()
+      await registry.cleanup()
+    }
+  })
+
+  it('adds a machine via POST /machines and persists it to the registry', async () => {
+    const registry = await createTempMachinesRegistry({
+      machines: [
+        { id: 'local', label: 'Local', host: null },
+      ],
+    })
+    const server = await startServer({ machinesFilePath: registry.filePath })
+
+    try {
+      const response = await fetch(`${server.baseUrl}/api/agents/machines`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          id: 'gpu-2',
+          label: 'GPU 2',
+          host: '10.0.1.60',
+          user: 'ec2-user',
+          port: 2222,
+          cwd: '/srv/workspace',
+        }),
+      })
+
+      expect(response.status).toBe(201)
+      expect(await response.json()).toEqual({
+        id: 'gpu-2',
+        label: 'GPU 2',
+        host: '10.0.1.60',
+        user: 'ec2-user',
+        port: 2222,
+        cwd: '/srv/workspace',
+      })
+
+      const stored = JSON.parse(await readFile(registry.filePath, 'utf8')) as { machines: unknown[] }
+      expect(stored.machines).toEqual([
+        { id: 'local', label: 'Local', host: null },
+        {
+          id: 'gpu-2',
+          label: 'GPU 2',
+          host: '10.0.1.60',
+          user: 'ec2-user',
+          port: 2222,
+          cwd: '/srv/workspace',
+        },
+      ])
+    } finally {
+      await server.close()
+      await registry.cleanup()
+    }
+  })
+
+  it('rejects duplicate machine IDs and invalid add payloads', async () => {
+    const registry = await createTempMachinesRegistry({
+      machines: [
+        { id: 'local', label: 'Local', host: null },
+        { id: 'gpu-1', label: 'GPU 1', host: '10.0.1.50' },
+      ],
+    })
+    const server = await startServer({ machinesFilePath: registry.filePath })
+
+    try {
+      const duplicate = await fetch(`${server.baseUrl}/api/agents/machines`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          id: 'gpu-1',
+          label: 'GPU 1 copy',
+          host: '10.0.1.60',
+        }),
+      })
+
+      expect(duplicate.status).toBe(409)
+      expect(await duplicate.json()).toEqual({
+        error: 'Machine "gpu-1" already exists',
+      })
+
+      const invalid = await fetch(`${server.baseUrl}/api/agents/machines`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          id: 'gpu-2',
+          label: 'GPU 2',
+          host: null,
+        }),
+      })
+
+      expect(invalid.status).toBe(400)
+      expect(await invalid.json()).toEqual({
+        error: 'Invalid machines config: machine "gpu-2" host must be string',
+      })
+    } finally {
+      await server.close()
+      await registry.cleanup()
+    }
+  })
+
+  it('removes remote machines and rejects removing the local machine', async () => {
+    const registry = await createTempMachinesRegistry({
+      machines: [
+        { id: 'local', label: 'Local', host: null },
+        { id: 'gpu-1', label: 'GPU 1', host: '10.0.1.50' },
+      ],
+    })
+    const server = await startServer({ machinesFilePath: registry.filePath })
+
+    try {
+      const deleteRemote = await fetch(`${server.baseUrl}/api/agents/machines/gpu-1`, {
+        method: 'DELETE',
+        headers: AUTH_HEADERS,
+      })
+      expect(deleteRemote.status).toBe(204)
+
+      const stored = JSON.parse(await readFile(registry.filePath, 'utf8')) as { machines: unknown[] }
+      expect(stored.machines).toEqual([
+        { id: 'local', label: 'Local', host: null },
+      ])
+
+      const deleteLocal = await fetch(`${server.baseUrl}/api/agents/machines/local`, {
+        method: 'DELETE',
+        headers: AUTH_HEADERS,
+      })
+      expect(deleteLocal.status).toBe(400)
+      expect(await deleteLocal.json()).toEqual({
+        error: 'Machine "local" is the local machine and cannot be removed',
+      })
+
+      const deleteMissing = await fetch(`${server.baseUrl}/api/agents/machines/missing-host`, {
+        method: 'DELETE',
+        headers: AUTH_HEADERS,
+      })
+      expect(deleteMissing.status).toBe(404)
+      expect(await deleteMissing.json()).toEqual({
+        error: 'Machine "missing-host" not found',
+      })
+    } finally {
+      await server.close()
+      await registry.cleanup()
+    }
+  })
+
+  it('returns structured health data for remote machines', async () => {
+    const registry = await createTempMachinesRegistry({
+      machines: [
+        {
+          id: 'gpu-1',
+          label: 'GPU 1',
+          host: '10.0.1.50',
+          user: 'ec2-user',
+          port: 2222,
+          cwd: '/srv/workspace',
+        },
+      ],
+    })
+    const server = await startServer({ machinesFilePath: registry.filePath })
+
+    try {
+      mockedSpawn.mockImplementationOnce(() => {
+        const mock = createMockChildProcess()
+        queueMicrotask(() => {
+          mock.emitStdout([
+            'ssh:ok',
+            'claude:1.0.31',
+            'codex:0.1.2503271400',
+            'git:git version 2.45.1',
+            'node:v22.14.0',
+            '',
+          ].join('\n'))
+          mock.emitExit(0)
+        })
+        return mock.cp as never
+      })
+
+      const response = await fetch(`${server.baseUrl}/api/agents/machines/gpu-1/health`, {
+        headers: AUTH_HEADERS,
+      })
+
+      expect(response.status).toBe(200)
+      expect(await response.json()).toEqual({
+        machineId: 'gpu-1',
+        mode: 'ssh',
+        ssh: {
+          ok: true,
+          destination: 'ec2-user@10.0.1.50',
+        },
+        tools: {
+          claude: { ok: true, version: '1.0.31', raw: '1.0.31' },
+          codex: { ok: true, version: '0.1.2503271400', raw: '0.1.2503271400' },
+          git: { ok: true, version: 'git version 2.45.1', raw: 'git version 2.45.1' },
+          node: { ok: true, version: 'v22.14.0', raw: 'v22.14.0' },
+        },
+      })
+
+      expect(mockedSpawn).toHaveBeenCalledWith(
+        'ssh',
+        expect.arrayContaining([
+          '-o',
+          'BatchMode=yes',
+          '-o',
+          'ConnectTimeout=10',
+          '-p',
+          '2222',
+          'ec2-user@10.0.1.50',
+        ]),
+        expect.objectContaining({
+          stdio: ['ignore', 'pipe', 'pipe'],
+        }),
+      )
+      const sshArgs = mockedSpawn.mock.calls[0][1]
+      expect(sshArgs[sshArgs.length - 1]).toContain('exec /bin/bash -lc')
+      expect(sshArgs[sshArgs.length - 1]).toContain("cd '/srv/workspace'")
     } finally {
       await server.close()
       await registry.cleanup()
@@ -1395,57 +1297,6 @@ describe('agents routes', () => {
     await server.close()
   })
 
-  it('does not count completed factory workers against the max tracked sessions limit', async () => {
-    const firstMock = createMockChildProcess()
-    mockedSpawn.mockReturnValueOnce(firstMock.cp as never)
-    mockedSpawn.mockImplementation(() => createMockChildProcess().cp as never)
-    const server = await startServer({ maxSessions: 1 })
-
-    const firstResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      method: 'POST',
-      headers: {
-        ...AUTH_HEADERS,
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        name: 'factory-feat-limit-1',
-        mode: 'default',
-        sessionType: 'stream',
-        task: '/legion-investigate test',
-      }),
-    })
-    expect(firstResponse.status).toBe(201)
-
-    firstMock.emitStdout('{"type":"result","subtype":"success","result":"done"}\n')
-
-    await vi.waitFor(async () => {
-      const statusResponse = await fetch(`${server.baseUrl}/api/agents/sessions/factory-feat-limit-1`, {
-        headers: AUTH_HEADERS,
-      })
-      expect(statusResponse.status).toBe(200)
-      const payload = await statusResponse.json() as { completed: boolean; status: string }
-      expect(payload.completed).toBe(true)
-      expect(payload.status).toBe('success')
-    })
-
-    const secondResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      method: 'POST',
-      headers: {
-        ...AUTH_HEADERS,
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        name: 'agent-limit-after-factory-complete',
-        mode: 'default',
-        sessionType: 'stream',
-      }),
-    })
-
-    expect(secondResponse.status).toBe(201)
-
-    await server.close()
-  })
-
   it('sends initial task after session creation', async () => {
     const { spawner, lastHandle } = createMockPtySpawner()
     const server = await startServer({
@@ -1513,6 +1364,100 @@ describe('agents routes', () => {
     expect(payload[0].pid).toBe(12345)
 
     await server.close()
+  })
+
+  it('uses commander host as the session label', async () => {
+    vi.mocked(CommanderSessionStore.prototype.list).mockResolvedValue([
+      {
+        id: 'cmdr-athena',
+        host: 'athena',
+      } as unknown as CommanderSession,
+    ])
+
+    const { spawner } = createMockPtySpawner()
+    const server = await startServer({ ptySpawner: spawner })
+
+    await fetch(`${server.baseUrl}/api/agents/sessions`, {
+      method: 'POST',
+      headers: {
+        ...AUTH_HEADERS,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: 'commander-cmdr-athena',
+        mode: 'default',
+      }),
+    })
+
+    const response = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+      headers: AUTH_HEADERS,
+    })
+    const payload = (await response.json()) as Array<{
+      name: string
+      label?: string
+    }>
+
+    expect(response.status).toBe(200)
+    expect(payload).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        name: 'commander-cmdr-athena',
+        label: 'athena',
+      }),
+    ]))
+
+    await server.close()
+  })
+
+  it('exposes agent session workspace tree, file preview, and git status routes', async () => {
+    const workspaceDir = await mkdtemp(join(tmpdir(), 'hammurabi-agent-workspace-'))
+    await writeFile(join(workspaceDir, 'README.md'), 'Agent workspace\n', 'utf8')
+
+    const { spawner } = createMockPtySpawner()
+    const server = await startServer({ ptySpawner: spawner })
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'commander-workspace-01',
+          mode: 'default',
+          cwd: workspaceDir,
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const treeResponse = await fetch(
+        `${server.baseUrl}/api/agents/sessions/commander-workspace-01/workspace/tree`,
+        { headers: AUTH_HEADERS },
+      )
+      expect(treeResponse.status).toBe(200)
+      const treeBody = await treeResponse.json()
+      expect(treeBody.nodes.map((node: { name: string }) => node.name)).toEqual(['README.md'])
+
+      const fileResponse = await fetch(
+        `${server.baseUrl}/api/agents/sessions/commander-workspace-01/workspace/file?path=README.md`,
+        { headers: AUTH_HEADERS },
+      )
+      expect(fileResponse.status).toBe(200)
+      const fileBody = await fileResponse.json()
+      expect(fileBody.kind).toBe('text')
+      expect(fileBody.content).toContain('Agent workspace')
+
+      const gitStatusResponse = await fetch(
+        `${server.baseUrl}/api/agents/sessions/commander-workspace-01/workspace/git/status`,
+        { headers: AUTH_HEADERS },
+      )
+      expect(gitStatusResponse.status).toBe(200)
+      const gitStatusBody = await gitStatusResponse.json()
+      expect(gitStatusBody.enabled).toBe(false)
+    } finally {
+      await server.close()
+      await rm(workspaceDir, { recursive: true, force: true })
+    }
   })
 
   it('kills a session', async () => {
@@ -2195,7 +2140,7 @@ describe('agents directories endpoint', () => {
  * Creates a mock ChildProcess-like object with controllable stdin/stdout
  * for testing stream session behavior without spawning a real process.
  */
-function createMockChildProcess(pid: number = process.pid) {
+function createMockChildProcess() {
   const emitter = new EventEmitter()
   const stdoutEmitter = new EventEmitter()
   const stdinChunks: string[] = []
@@ -2219,7 +2164,7 @@ function createMockChildProcess(pid: number = process.pid) {
 
   // Build a mock ChildProcess with the EventEmitter cast pattern used by routes.ts
   const cp = Object.assign(emitter, {
-    pid,
+    pid: 99999,
     stdout,
     stdin,
     stderr: new EventEmitter(),
@@ -2233,11 +2178,9 @@ function createMockChildProcess(pid: number = process.pid) {
     emitStdout(data: string) {
       stdoutEmitter.emit('data', Buffer.from(data))
     },
-    emitStdoutEnd() {
-      stdoutEmitter.emit('end')
-    },
     emitExit(code: number, signal: string | null = null) {
       emitter.emit('exit', code, signal)
+      emitter.emit('close', code, signal)
     },
     emitError(err: Error) {
       emitter.emit('error', err)
@@ -2248,115 +2191,192 @@ function createMockChildProcess(pid: number = process.pid) {
   }
 }
 
-describe('stream sessions', () => {
-  function installMockCodexSidecar() {
-    const turnStartInputs: string[] = []
-    const requests: Array<{ method: string; params: unknown }> = []
-    const turnScripts: Array<{
-      error?: string
-      notifications?: Array<{ method: string; params: Record<string, unknown> }>
-    }> = []
-    const sidecarEmitter = new EventEmitter()
-    const sidecarProcess = Object.assign(sidecarEmitter, {
-      pid: process.pid,
-      stdin: null,
-      stdout: null,
-      stderr: null,
-      kill: vi.fn(() => true),
-    })
-    let sidecarServer: WebSocketServer | null = null
+type CodexTurnStartBehavior = 'success' | 'error'
 
-    mockedSpawn.mockImplementation((command, args) => {
-      if (command === 'codex' && args[0] === 'app-server' && args[1] === '--listen') {
-        const listenTarget = args[2]
-        const match = typeof listenTarget === 'string' ? listenTarget.match(/:(\d+)$/) : null
-        if (!match) {
-          throw new Error('Missing codex sidecar listen port')
+interface MockCodexSidecar {
+  closeConnection(code?: number, reason?: string): Promise<void>
+  closeServer(): Promise<void>
+  emitProcessError(error: Error): void
+  emitProcessExit(code?: number, signal?: string | null): void
+  emitNotification(method: string, params: Record<string, unknown>): void
+  emitStderr(data: string): void
+  getRequests(method?: string): Array<{ id?: number; method?: string; params?: unknown }>
+  setThreadReadResult(result: unknown): void
+  setThreadReadError(message: string | null): void
+  setTurnStartBehavior(behavior: CodexTurnStartBehavior): void
+  suppressPongResponses(): void
+}
+
+function installMockCodexSidecar(): MockCodexSidecar {
+  const processMock = createMockChildProcess()
+  const requests: Array<{ id?: number; method?: string; params?: unknown }> = []
+  let server: WebSocketServer | null = null
+  let socket: WebSocket | null = null
+  let threadCounter = 0
+  let turnStartBehavior: CodexTurnStartBehavior = 'success'
+  let threadReadResult: unknown = { thread: { id: 'thread-1', turns: [] } }
+  let threadReadError: string | null = null
+  let hasCustomThreadReadResult = false
+
+  mockedSpawn.mockImplementation((command, args) => {
+    if (command !== 'codex' || !Array.isArray(args)) {
+      return processMock.cp as never
+    }
+
+    const listenIndex = args.indexOf('--listen')
+    if (listenIndex === -1 || typeof args[listenIndex + 1] !== 'string') {
+      throw new Error('Missing --listen URL for mocked Codex sidecar')
+    }
+
+    const listenUrl = new URL(args[listenIndex + 1])
+    server = new WebSocketServer({
+      host: listenUrl.hostname,
+      port: Number(listenUrl.port),
+    })
+
+    server.on('connection', (client) => {
+      socket = client as unknown as WebSocket
+      client.on('close', () => {
+        if (socket === (client as unknown as WebSocket)) {
+          socket = null
         }
-        const port = Number(match[1])
-        sidecarServer = new WebSocketServer({ host: '127.0.0.1', port })
-        sidecarServer.on('connection', (socket) => {
-          socket.on('message', (data) => {
-            const raw = JSON.parse(data.toString()) as {
-              id?: number
-              method?: string
-              params?: unknown
-            }
-            if (typeof raw.id !== 'number' || typeof raw.method !== 'string') {
-              return
-            }
-            requests.push({ method: raw.method, params: raw.params })
+      })
+      client.on('message', (data) => {
+        const parsed = JSON.parse(data.toString()) as { id?: number; method?: string; params?: unknown }
+        requests.push(parsed)
 
-            if (raw.method === 'thread/start') {
-              socket.send(JSON.stringify({ id: raw.id, result: { thread: { id: 'thread-test' } } }))
-              return
-            }
-
-            if (raw.method === 'turn/start') {
-              const params = (raw.params && typeof raw.params === 'object')
-                ? raw.params as { input?: Array<{ text?: unknown }>; threadId?: unknown }
-                : {}
-              const textValue = Array.isArray(params.input)
-                && params.input.length > 0
-                && typeof params.input[0]?.text === 'string'
-                ? params.input[0].text
-                : ''
-              const threadId = typeof params.threadId === 'string' ? params.threadId : 'thread-test'
-              turnStartInputs.push(textValue)
-              const script = turnScripts.shift()
-              if (script?.error) {
-                socket.send(JSON.stringify({ id: raw.id, error: { message: script.error } }))
-                return
-              }
-              socket.send(JSON.stringify({ id: raw.id, result: { turn: { id: `turn-${turnStartInputs.length}` } } }))
-              for (const notification of script?.notifications ?? []) {
-                socket.send(JSON.stringify({
-                  method: notification.method,
-                  params: {
-                    threadId,
-                    ...notification.params,
-                  },
-                }))
-              }
-              return
-            }
-
-            socket.send(JSON.stringify({ id: raw.id, result: {} }))
-          })
-        })
-        return sidecarProcess as never
-      }
-
-      return createMockChildProcess().cp as never
-    })
-
-    return {
-      turnStartInputs,
-      requests,
-      queueTurnScript: (script: {
-        error?: string
-        notifications?: Array<{ method: string; params: Record<string, unknown> }>
-      }) => {
-        turnScripts.push(script)
-      },
-      close: async () => {
-        if (!sidecarServer) {
+        if (parsed.id === undefined) {
           return
         }
-        for (const client of sidecarServer.clients) {
-          client.close()
-        }
-        await new Promise<void>((resolve, reject) => {
-          sidecarServer!.close((error) => {
-            if (error) {
-              reject(error)
-              return
+
+        switch (parsed.method) {
+          case 'initialize':
+            client.send(JSON.stringify({ jsonrpc: '2.0', id: parsed.id, result: {} }))
+            break
+          case 'thread/start':
+            threadCounter += 1
+            if (!hasCustomThreadReadResult) {
+              threadReadResult = { thread: { id: `thread-${threadCounter}`, turns: [] } }
             }
-            resolve()
-          })
+            client.send(JSON.stringify({
+              jsonrpc: '2.0',
+              id: parsed.id,
+              result: { thread: { id: `thread-${threadCounter}` } },
+            }))
+            break
+          case 'thread/resume':
+          case 'thread/archive':
+            client.send(JSON.stringify({ jsonrpc: '2.0', id: parsed.id, result: {} }))
+            break
+          case 'thread/read':
+            if (threadReadError) {
+              client.send(JSON.stringify({
+                jsonrpc: '2.0',
+                id: parsed.id,
+                error: { code: -32001, message: threadReadError },
+              }))
+            } else {
+              client.send(JSON.stringify({ jsonrpc: '2.0', id: parsed.id, result: threadReadResult }))
+            }
+            break
+          case 'turn/start':
+            if (turnStartBehavior === 'error') {
+              client.send(JSON.stringify({
+                jsonrpc: '2.0',
+                id: parsed.id,
+                error: { code: -32000, message: 'Injected turn/start failure' },
+              }))
+            } else {
+              client.send(JSON.stringify({ jsonrpc: '2.0', id: parsed.id, result: { accepted: true } }))
+            }
+            break
+          default:
+            client.send(JSON.stringify({ jsonrpc: '2.0', id: parsed.id, result: {} }))
+            break
+        }
+      })
+    })
+
+    return processMock.cp as never
+  })
+
+  return {
+    async closeConnection(code = 1011, reason = 'Injected transport failure') {
+      if (!socket) {
+        return
+      }
+      await new Promise<void>((resolve) => {
+        socket!.once('close', () => resolve())
+        socket!.close(code, reason)
+      })
+    },
+    async closeServer() {
+      if (!server) {
+        return
+      }
+      for (const client of server.clients) {
+        client.terminate()
+      }
+      await new Promise<void>((resolve, reject) => {
+        server!.close((error) => {
+          if (error) {
+            reject(error)
+            return
+          }
+          resolve()
         })
-      },
-    }
+      })
+      server = null
+      socket = null
+    },
+    emitProcessError(error: Error) {
+      processMock.emitError(error)
+    },
+    emitProcessExit(code = 1, signal: string | null = null) {
+      processMock.emitExit(code, signal)
+    },
+    emitNotification(method, params) {
+      socket?.send(JSON.stringify({
+        jsonrpc: '2.0',
+        method,
+        params,
+      }))
+    },
+    emitStderr(data) {
+      processMock.cp.stderr.emit('data', Buffer.from(data))
+    },
+    getRequests(method) {
+      return method ? requests.filter((request) => request.method === method) : [...requests]
+    },
+    setThreadReadResult(result) {
+      threadReadResult = result
+      threadReadError = null
+      hasCustomThreadReadResult = true
+    },
+    setThreadReadError(message) {
+      threadReadError = message
+    },
+    setTurnStartBehavior(behavior) {
+      turnStartBehavior = behavior
+    },
+    suppressPongResponses() {
+      if (!socket) {
+        throw new Error('Codex sidecar socket not connected')
+      }
+      const interceptedPong = vi.fn(() => socket)
+      Object.defineProperty(socket, 'pong', {
+        value: interceptedPong,
+        configurable: true,
+      })
+    },
+  }
+}
+
+describe('stream sessions', () => {
+  function installMockProcess() {
+    const mock = createMockChildProcess()
+    mockedSpawn.mockReturnValue(mock.cp as never)
+    return mock
   }
 
   afterEach(() => {
@@ -2394,7 +2414,7 @@ describe('stream sessions', () => {
     // Verify spawn was called with correct args
     expect(mockedSpawn).toHaveBeenCalledWith(
       'claude',
-      ['-p', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json', '--model', 'claude-opus-4-6'],
+      ['-p', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json'],
       expect.objectContaining({
         stdio: ['pipe', 'pipe', 'pipe'],
       }),
@@ -2415,13 +2435,11 @@ describe('stream sessions', () => {
   it('appends commander stream events to JSONL transcript', async () => {
     const mock = installMockProcess()
     const workDir = await mkdtemp(join(tmpdir(), 'hammurabi-commander-jsonl-'))
-    const commanderDataDir = join(workDir, 'commanders-data')
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(workDir)
     let server: RunningServer | null = null
 
     try {
-      server = await startServer({
-        commanderSessionStorePath: join(commanderDataDir, 'sessions.json'),
-      })
+      server = await startServer()
 
       const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
         method: 'POST',
@@ -2448,7 +2466,9 @@ describe('stream sessions', () => {
       mock.emitStdout(`${JSON.stringify(deltaEvent)}\n`)
 
       const transcriptPath = join(
-        commanderDataDir,
+        workDir,
+        'data',
+        'commanders',
         'alpha',
         'sessions',
         'claude-commander-123.jsonl',
@@ -2468,208 +2488,6 @@ describe('stream sessions', () => {
     } finally {
       if (server) {
         await server.close()
-      }
-      await rm(workDir, { recursive: true, force: true })
-    }
-  })
-
-  it('auto-rotates commander stream sessions after the configured entry threshold', async () => {
-    const processMocks: Array<ReturnType<typeof createMockChildProcess>> = []
-    mockedSpawn.mockImplementation(() => {
-      const mock = createMockChildProcess()
-      processMocks.push(mock)
-      return mock.cp as never
-    })
-
-    const workDir = await mkdtemp(join(tmpdir(), 'hammurabi-commander-rotate-'))
-    const commanderDataDir = join(workDir, 'commanders-data')
-    const sessionStorePath = join(workDir, 'stream-sessions.json')
-    let server: RunningServer | null = null
-
-    try {
-      await seedCommanderSessionFixture({
-        commanderDataDir,
-        commanderId: 'alpha',
-        workflowPrompt: 'Commander Alpha workflow prompt',
-        identityBody: 'Commander Alpha identity body.',
-      })
-
-      server = await startServer({
-        autoRotateEntryThreshold: 1,
-        commanderSessionStorePath: join(commanderDataDir, 'sessions.json'),
-        sessionStorePath,
-      })
-
-      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          name: 'commander-alpha',
-          mode: 'default',
-          sessionType: 'stream',
-        }),
-      })
-      expect(createResponse.status).toBe(201)
-      expect(processMocks).toHaveLength(1)
-
-      const ws = await connectWs(server.baseUrl, 'commander-alpha')
-      const streamedEvents: Array<Record<string, unknown>> = []
-      ws.on('message', (data) => {
-        const parsed = JSON.parse(data.toString()) as Record<string, unknown>
-        if (parsed.type !== 'replay') {
-          streamedEvents.push(parsed)
-        }
-      })
-
-      processMocks[0].emitStdout('{"type":"message_start","message":{"id":"m1","role":"assistant"}}\n')
-      processMocks[0].emitStdout('{"type":"system","subtype":"init","session_id":"claude-rotate-old"}\n')
-      processMocks[0].emitStdout('{"type":"result","result":"turn-1 done"}\n')
-
-      await vi.waitFor(() => {
-        expect(processMocks).toHaveLength(2)
-      })
-
-      await vi.waitFor(() => {
-        expect(streamedEvents.some((event) => (
-          event.type === 'system' && event.subtype === 'session_rotated'
-        ))).toBe(true)
-      })
-
-      processMocks[1].emitStdout('{"type":"system","subtype":"init","session_id":"claude-rotate-new"}\n')
-
-      await vi.waitFor(async () => {
-        const raw = await readFile(sessionStorePath, 'utf8')
-        const parsed = JSON.parse(raw) as {
-          sessions: Array<{ name: string; claudeSessionId?: string; conversationEntryCount?: number }>
-        }
-        const saved = parsed.sessions.find((session) => session.name === 'commander-alpha')
-        expect(saved?.claudeSessionId).toBe('claude-rotate-new')
-        expect(saved?.conversationEntryCount).toBe(0)
-      })
-
-      const oldTranscriptPath = join(
-        commanderDataDir,
-        'alpha',
-        'sessions',
-        'claude-rotate-old.jsonl',
-      )
-      const newTranscriptPath = join(
-        commanderDataDir,
-        'alpha',
-        'sessions',
-        'claude-rotate-new.jsonl',
-      )
-
-      await vi.waitFor(async () => {
-        const raw = await readFile(oldTranscriptPath, 'utf8')
-        const events = raw
-          .split('\n')
-          .filter((line) => line.trim().length > 0)
-          .map((line) => JSON.parse(line) as Record<string, unknown>)
-        expect(events.some((event) => event.subtype === 'session_rotated')).toBe(true)
-      })
-
-      await vi.waitFor(async () => {
-        const raw = await readFile(newTranscriptPath, 'utf8')
-        const events = raw
-          .split('\n')
-          .filter((line) => line.trim().length > 0)
-          .map((line) => JSON.parse(line) as Record<string, unknown>)
-        expect(events).toEqual([
-          { type: 'system', subtype: 'init', session_id: 'claude-rotate-new' },
-        ])
-      })
-
-      const claudeSpawnCalls = mockedSpawn.mock.calls.filter(([command]) => command === 'claude')
-      expect(claudeSpawnCalls).toHaveLength(2)
-      expect(claudeSpawnCalls[1][1]).not.toContain('--resume')
-      expect(claudeSpawnCalls[1][1]).not.toContain('--max-turns')
-      expect(claudeSpawnCalls[1][1]).toContain('--system-prompt')
-      const promptArgIndex = claudeSpawnCalls[1][1].indexOf('--system-prompt')
-      const rotatedPrompt = claudeSpawnCalls[1][1][promptArgIndex + 1]
-      expect(rotatedPrompt).toContain('Commander Alpha workflow prompt')
-      expect(rotatedPrompt).toContain('Commander Alpha identity body.')
-
-      await vi.waitFor(() => {
-        expect(processMocks[1].getStdinWrites().some((write) => (
-          write.includes('Session rotated. Continuing as commander.')
-        ))).toBe(true)
-      })
-
-      ws.close()
-    } finally {
-      if (server) {
-        await server.close()
-      }
-      await rm(workDir, { recursive: true, force: true })
-    }
-  }, 15000)
-
-  it('respects COMMANDER_DATA_DIR and avoids repo-local commander transcript writes', async () => {
-    const mock = installMockProcess()
-    const workDir = await mkdtemp(join(tmpdir(), 'hammurabi-commander-jsonl-env-'))
-    const commanderDataDir = join(workDir, 'external-commander-root')
-    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(workDir)
-    const originalCommanderDataDir = process.env.COMMANDER_DATA_DIR
-    let server: RunningServer | null = null
-
-    try {
-      process.env.COMMANDER_DATA_DIR = commanderDataDir
-      server = await startServer({ commanderSessionStorePath: undefined })
-
-      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          name: 'commander-alpha',
-          mode: 'default',
-          sessionType: 'stream',
-        }),
-      })
-      expect(createResponse.status).toBe(201)
-
-      const event = { type: 'system', subtype: 'init', session_id: 'claude-commander-env-123' }
-      mock.emitStdout(`${JSON.stringify(event)}\n`)
-
-      const expectedTranscriptPath = join(
-        commanderDataDir,
-        'alpha',
-        'sessions',
-        'claude-commander-env-123.jsonl',
-      )
-      const leakedRepoLocalTranscriptPath = join(
-        workDir,
-        'data',
-        'commanders',
-        'alpha',
-        'sessions',
-        'claude-commander-env-123.jsonl',
-      )
-
-      await vi.waitFor(async () => {
-        const raw = await readFile(expectedTranscriptPath, 'utf8')
-        const parsed = raw
-          .split('\n')
-          .filter((line) => line.trim().length > 0)
-          .map((line) => JSON.parse(line) as Record<string, unknown>)
-        expect(parsed).toEqual([event])
-      })
-
-      await expect(readFile(leakedRepoLocalTranscriptPath, 'utf8')).rejects.toThrow()
-    } finally {
-      if (server) {
-        await server.close()
-      }
-      if (originalCommanderDataDir === undefined) {
-        delete process.env.COMMANDER_DATA_DIR
-      } else {
-        process.env.COMMANDER_DATA_DIR = originalCommanderDataDir
       }
       cwdSpy.mockRestore()
       await rm(workDir, { recursive: true, force: true })
@@ -2768,168 +2586,6 @@ describe('stream sessions', () => {
     await server.close()
   })
 
-  it('reports factory stream sessions as completed after result without waiting for exit', async () => {
-    const mock = installMockProcess()
-    const server = await startServer()
-
-    const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      method: 'POST',
-      headers: {
-        ...AUTH_HEADERS,
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        name: 'factory-feat-result-only',
-        mode: 'default',
-        sessionType: 'stream',
-        task: '/legion-investigate test',
-      }),
-    })
-    expect(createResponse.status).toBe(201)
-
-    mock.emitStdout('{"type":"result","subtype":"success","result":"investigation complete","total_cost_usd":0.21}\n')
-
-    await vi.waitFor(async () => {
-      const response = await fetch(`${server.baseUrl}/api/agents/sessions/factory-feat-result-only`, {
-        headers: AUTH_HEADERS,
-      })
-      expect(response.status).toBe(200)
-      const payload = await response.json() as {
-        completed: boolean
-        status: string
-        result?: { status: string; finalComment: string; costUsd: number }
-      }
-      expect(payload.completed).toBe(true)
-      expect(payload.status).toBe('success')
-      expect(payload.result).toMatchObject({
-        status: 'success',
-        finalComment: 'investigation complete',
-        costUsd: 0.21,
-      })
-    })
-
-    const listResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      headers: AUTH_HEADERS,
-    })
-    expect(listResponse.status).toBe(200)
-    const listed = await listResponse.json() as Array<{ name: string }>
-    expect(listed.some((session) => session.name === 'factory-feat-result-only')).toBe(false)
-    expect(mock.cp.kill).not.toHaveBeenCalled()
-
-    await server.close()
-  })
-
-  it('does not reset command-room completion when message_start arrives after result', async () => {
-    // Regression test: newer Claude CLI may emit message_start after the result
-    // event. Completion state must survive that so the executor can detect it.
-    const mock = installMockProcess()
-    const server = await startServer()
-
-    await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      method: 'POST',
-      headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
-      body: JSON.stringify({
-        name: 'command-room-msg-start-after-result',
-        mode: 'default',
-        sessionType: 'stream',
-        task: 'test',
-      }),
-    })
-
-    // Emit result then a spurious message_start (as newer CLI may do).
-    mock.emitStdout('{"type":"result","subtype":"success","result":"done","total_cost_usd":0.05}\n')
-    mock.emitStdout('{"type":"message_start","message":{"id":"m2","role":"assistant"}}\n')
-
-    await vi.waitFor(async () => {
-      const response = await fetch(
-        `${server.baseUrl}/api/agents/sessions/command-room-msg-start-after-result`,
-        { headers: AUTH_HEADERS },
-      )
-      expect(response.status).toBe(200)
-      const payload = await response.json() as { completed: boolean; status: string }
-      expect(payload.completed).toBe(true)
-      expect(payload.status).toBe('success')
-    })
-
-    await server.close()
-  })
-
-  it('flushes stdout buffer on end event so result is detected without trailing newline', async () => {
-    // Regression test: if the result JSON line arrives without a trailing '\n',
-    // it stays in stdoutBuffer. The end handler must flush it before exit fires.
-    const mock = installMockProcess()
-    const server = await startServer()
-
-    await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      method: 'POST',
-      headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
-      body: JSON.stringify({
-        name: 'command-room-no-newline',
-        mode: 'default',
-        sessionType: 'stream',
-        task: 'test',
-      }),
-    })
-
-    // Emit result without trailing newline so it stays in stdoutBuffer.
-    mock.emitStdout('{"type":"result","subtype":"success","result":"flushed","total_cost_usd":0.01}')
-    // Trigger end — routes should flush the buffer.
-    mock.emitStdoutEnd()
-
-    await vi.waitFor(async () => {
-      const response = await fetch(
-        `${server.baseUrl}/api/agents/sessions/command-room-no-newline`,
-        { headers: AUTH_HEADERS },
-      )
-      expect(response.status).toBe(200)
-      const payload = await response.json() as { completed: boolean; status: string; result?: { finalComment: string } }
-      expect(payload.completed).toBe(true)
-      expect(payload.status).toBe('success')
-      expect(payload.result?.finalComment).toBe('flushed')
-    })
-
-    await server.close()
-  })
-
-  it('adds synthetic completion for command-room sessions on DELETE so executor detects termination', async () => {
-    // Regression test: if a command-room session is deleted while the executor
-    // is monitoring it, the executor must get { completed: true } on the next
-    // poll rather than a 404 that would eventually time out.
-    const mock = installMockProcess()
-    const server = await startServer()
-
-    await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      method: 'POST',
-      headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
-      body: JSON.stringify({
-        name: 'command-room-delete-test',
-        mode: 'default',
-        sessionType: 'stream',
-        task: 'test',
-      }),
-    })
-
-    // Session is mid-run (no result yet). Delete it via the API.
-    const deleteResponse = await fetch(`${server.baseUrl}/api/agents/sessions/command-room-delete-test`, {
-      method: 'DELETE',
-      headers: AUTH_HEADERS,
-    })
-    expect(deleteResponse.status).toBe(200)
-
-    // Subsequent poll must return completed (not 404) so the executor does not
-    // time out.
-    const statusResponse = await fetch(
-      `${server.baseUrl}/api/agents/sessions/command-room-delete-test`,
-      { headers: AUTH_HEADERS },
-    )
-    expect(statusResponse.status).toBe(200)
-    const payload = await statusResponse.json() as { completed: boolean; status: string }
-    expect(payload.completed).toBe(true)
-
-    expect(mock.cp.kill).toHaveBeenCalled()
-    await server.close()
-  })
-
   it('never persists command-room sessions for auto-resume', async () => {
     const mock = installMockProcess()
     const sessionStoreDir = await mkdtemp(join(tmpdir(), 'hammurabi-stream-session-store-'))
@@ -2965,8 +2621,99 @@ describe('stream sessions', () => {
       })
     } finally {
       await server.close()
-      await waitForPersistedSessionFlush()
       await rm(sessionStoreDir, { recursive: true, force: true })
+    }
+  })
+
+  it('creates a new Claude stream session from a previous resumable session', async () => {
+    const firstMock = createMockChildProcess()
+    const secondMock = createMockChildProcess()
+    mockedSpawn
+      .mockImplementationOnce(() => firstMock.cp as never)
+      .mockImplementationOnce(() => secondMock.cp as never)
+
+    const server = await startServer()
+
+    try {
+      const createSourceResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'claude-source',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'claude',
+        }),
+      })
+      expect(createSourceResponse.status).toBe(201)
+
+      firstMock.emitStdout('{"type":"system","subtype":"init","session_id":"claude-source-session-id"}\n')
+      firstMock.emitStdout('{"type":"result","subtype":"success","result":"done"}\n')
+      firstMock.emitExit(0)
+
+      await vi.waitFor(async () => {
+        const sessionsResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+          headers: AUTH_HEADERS,
+        })
+        expect(sessionsResponse.status).toBe(200)
+        const listedSessions = await sessionsResponse.json() as Array<{
+          name: string
+          processAlive?: boolean
+          resumeAvailable?: boolean
+        }>
+        const source = listedSessions.find((session) => session.name === 'claude-source')
+        expect(source?.processAlive).toBe(false)
+        expect(source?.resumeAvailable).toBe(true)
+      })
+
+      const createResumedResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'claude-resumed-custom',
+          mode: 'acceptEdits',
+          sessionType: 'stream',
+          resumeFromSession: 'claude-source',
+          task: 'Continue from the previous context',
+        }),
+      })
+      expect(createResumedResponse.status).toBe(201)
+
+      const resumeCall = mockedSpawn.mock.calls.find(([command, args]) => {
+        return (
+          command === 'claude' &&
+          Array.isArray(args) &&
+          args.includes('--resume') &&
+          args.includes('claude-source-session-id') &&
+          args.includes('--permission-mode') &&
+          args.includes('acceptEdits')
+        )
+      })
+      expect(resumeCall).toBeDefined()
+      expect(secondMock.getStdinWrites()).toContain(
+        `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'Continue from the previous context' } })}\n`,
+      )
+
+      const sessionsResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        headers: AUTH_HEADERS,
+      })
+      expect(sessionsResponse.status).toBe(200)
+      const listedSessions = await sessionsResponse.json() as Array<{
+        name: string
+        processAlive?: boolean
+        resumedFrom?: string
+      }>
+      const resumed = listedSessions.find((session) => session.name === 'claude-resumed-custom')
+      expect(resumed?.processAlive).toBe(true)
+      expect(resumed?.resumedFrom).toBe('claude-source')
+    } finally {
+      await server.close()
     }
   })
 
@@ -3022,12 +2769,7 @@ describe('stream sessions', () => {
       })
 
       await vi.waitFor(async () => {
-        const activeServer = secondServer
-        expect(activeServer).not.toBeNull()
-        if (!activeServer) {
-          throw new Error('Expected restart server to be available')
-        }
-        const response = await fetch(`${activeServer.baseUrl}/api/agents/sessions`, {
+        const response = await fetch(`${secondServer.baseUrl}/api/agents/sessions`, {
           headers: AUTH_HEADERS,
         })
         expect(response.status).toBe(200)
@@ -3051,66 +2793,6 @@ describe('stream sessions', () => {
       if (firstServer) {
         await firstServer.close()
       }
-      await waitForPersistedSessionFlush()
-      await rm(sessionStoreDir, { recursive: true, force: true })
-    }
-  })
-
-  it('persists and reuses codex thread ids for commander bridge restart flow', async () => {
-    const codexSidecar = installMockCodexSidecar()
-    const sessionStoreDir = await mkdtemp(join(tmpdir(), 'hammurabi-stream-session-store-'))
-    const sessionStorePath = join(sessionStoreDir, 'stream-sessions.json')
-    let server: RunningServer | null = null
-
-    try {
-      server = await startServer({ sessionStorePath })
-
-      await server.sessionsInterface.createCommanderSession({
-        name: 'commander-codex-bridge',
-        systemPrompt: 'Commander system prompt',
-        agentType: 'codex',
-      })
-      await vi.waitFor(() => {
-        expect(codexSidecar.turnStartInputs).toEqual(['Commander system prompt'])
-      })
-
-      let persistedThreadId = ''
-      await vi.waitFor(async () => {
-        const raw = await readFile(sessionStorePath, 'utf8')
-        const parsed = JSON.parse(raw) as {
-          sessions: Array<{ name: string; agentType?: string; codexThreadId?: string }>
-        }
-        const saved = parsed.sessions.find((session) => session.name === 'commander-codex-bridge')
-        expect(saved?.agentType).toBe('codex')
-        expect(saved?.codexThreadId).toBe('thread-test')
-        persistedThreadId = saved?.codexThreadId ?? ''
-      })
-
-      expect(persistedThreadId).toBe('thread-test')
-      server.sessionsInterface.deleteSession('commander-codex-bridge')
-      await server.sessionsInterface.createCommanderSession({
-        name: 'commander-codex-bridge',
-        systemPrompt: 'Commander system prompt',
-        agentType: 'codex',
-        resumeCodexThreadId: persistedThreadId,
-      })
-
-      const restored = server.sessionsInterface.getSession('commander-codex-bridge')
-      expect(restored?.agentType).toBe('codex')
-      expect(restored?.codexThreadId).toBe('thread-test')
-      await new Promise<void>((resolve) => {
-        setTimeout(resolve, 25)
-      })
-      expect(codexSidecar.turnStartInputs).toEqual(['Commander system prompt'])
-
-      const threadStartRequests = codexSidecar.requests.filter((request) => request.method === 'thread/start')
-      expect(threadStartRequests).toHaveLength(1)
-    } finally {
-      if (server) {
-        await server.close()
-      }
-      await waitForPersistedSessionFlush()
-      await codexSidecar.close()
       await rm(sessionStoreDir, { recursive: true, force: true })
     }
   })
@@ -3201,7 +2883,6 @@ describe('stream sessions', () => {
       if (firstServer) {
         await firstServer.close()
       }
-      await waitForPersistedSessionFlush()
       await rm(sessionStoreDir, { recursive: true, force: true })
     }
   })
@@ -3300,6 +2981,1218 @@ describe('stream sessions', () => {
     }
   })
 
+  it('bootstraps Codex commander sessions with developer instructions and readiness as first turn', async () => {
+    const sidecar = installMockCodexSidecar()
+    const server = await startServer()
+
+    try {
+      const systemPrompt = 'You are the Codex commander seed prompt.'
+      await server.agents.sessionsInterface.createCommanderSession({
+        name: 'commander-codex-bootstrap',
+        systemPrompt,
+        agentType: 'codex',
+      })
+
+      const threadRequests = sidecar.getRequests('thread/start')
+      expect(threadRequests).toHaveLength(1)
+      expect(threadRequests[0].params).toEqual(expect.objectContaining({
+        sandbox: 'danger-full-access',
+        approvalPolicy: 'never',
+        developerInstructions: systemPrompt,
+      }))
+
+      expect(sidecar.getRequests('turn/start')).toHaveLength(0)
+
+      const sent = await server.agents.sessionsInterface.sendToSession(
+        'commander-codex-bootstrap',
+        'Commander runtime started. Acknowledge readiness and await instructions.',
+      )
+      expect(sent).toBe(true)
+
+      const turnRequests = sidecar.getRequests('turn/start')
+      expect(turnRequests).toHaveLength(1)
+      expect(turnRequests[0].params).toEqual({
+        threadId: 'thread-1',
+        input: [{ type: 'text', text: 'Commander runtime started. Acknowledge readiness and await instructions.' }],
+      })
+    } finally {
+      await sidecar.closeServer()
+      await server.close()
+    }
+  })
+
+  it('makes Codex commander sessions visible to Agents Monitor without the old sidecar stall', async () => {
+    const sidecar = installMockCodexSidecar()
+    const server = await startServer()
+
+    try {
+      const startedAt = Date.now()
+      await server.agents.sessionsInterface.createCommanderSession({
+        name: 'commander-codex-visible',
+        systemPrompt: 'You are a Codex commander.',
+        agentType: 'codex',
+      })
+      const elapsedMs = Date.now() - startedAt
+
+      expect(elapsedMs).toBeLessThan(1200)
+
+      const response = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        headers: AUTH_HEADERS,
+      })
+      expect(response.status).toBe(200)
+
+      const sessions = await response.json() as Array<{
+        name: string
+        sessionType?: string
+        agentType?: string
+        processAlive?: boolean
+      }>
+      expect(sessions).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          name: 'commander-codex-visible',
+          sessionType: 'stream',
+          agentType: 'codex',
+          processAlive: true,
+        }),
+      ]))
+    } finally {
+      await sidecar.closeServer()
+      await server.close()
+    }
+  })
+
+  it('keeps Codex stream session task bootstrap as first user turn', async () => {
+    const sidecar = installMockCodexSidecar()
+    const server = await startServer()
+
+    try {
+      const initialTask = 'Summarize open pull requests.'
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-task-bootstrap',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+          task: initialTask,
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const threadRequests = sidecar.getRequests('thread/start')
+      expect(threadRequests).toHaveLength(1)
+      const threadStartParams = threadRequests[0].params as Record<string, unknown>
+      expect(Object.prototype.hasOwnProperty.call(threadStartParams, 'developerInstructions')).toBe(false)
+
+      const turnRequests = sidecar.getRequests('turn/start')
+      expect(turnRequests).toHaveLength(1)
+      expect(turnRequests[0].params).toEqual({
+        threadId: 'thread-1',
+        input: [{ type: 'text', text: initialTask }],
+      })
+    } finally {
+      await sidecar.closeServer()
+      await server.close()
+    }
+  })
+
+  it('delivers REST send requests to Codex sessions through the sidecar transport', async () => {
+    const sidecar = installMockCodexSidecar()
+    const server = await startServer()
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-rest-send',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const ws = await connectWs(server.baseUrl, 'codex-rest-send')
+      const received: Array<{ type: string; message?: { content?: string } }> = []
+      ws.on('message', (data) => {
+        const parsed = JSON.parse(data.toString()) as { type: string; message?: { content?: string } }
+        if (parsed.type !== 'replay') {
+          received.push(parsed)
+        }
+      })
+
+      const sendResponse = await fetch(`${server.baseUrl}/api/agents/sessions/codex-rest-send/send`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ text: 'status?' }),
+      })
+
+      expect(sendResponse.status).toBe(200)
+      expect(await sendResponse.json()).toEqual({ sent: true })
+
+      await vi.waitFor(() => {
+        const userEvent = received.find((event) => event.type === 'user')
+        expect(userEvent).toBeDefined()
+        expect(userEvent?.message?.content).toBe('status?')
+      })
+
+      const turnRequests = sidecar.getRequests('turn/start')
+      expect(turnRequests).toHaveLength(1)
+      expect(turnRequests[0].params).toEqual({
+        threadId: 'thread-1',
+        input: [{ type: 'text', text: 'status?' }],
+      })
+
+      const sessionResponse = await fetch(`${server.baseUrl}/api/agents/sessions/codex-rest-send`, {
+        headers: AUTH_HEADERS,
+      })
+      expect(sessionResponse.status).toBe(200)
+      expect(await sessionResponse.json()).toMatchObject({
+        name: 'codex-rest-send',
+        completed: false,
+        status: 'running',
+        agentType: 'codex',
+      })
+
+      ws.close()
+    } finally {
+      await sidecar.closeServer()
+      await server.close()
+    }
+  })
+
+  it('surfaces Codex turn/start rejection and marks the session failed instead of running', async () => {
+    const sidecar = installMockCodexSidecar()
+    const server = await startServer()
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-turn-start-error',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const ws = await connectWs(server.baseUrl, 'codex-turn-start-error')
+      const received: Array<{ type: string; text?: string; message?: { content?: string } }> = []
+      ws.on('message', (data) => {
+        const parsed = JSON.parse(data.toString()) as { type: string; text?: string; message?: { content?: string } }
+        if (parsed.type !== 'replay') {
+          received.push(parsed)
+        }
+      })
+
+      sidecar.setTurnStartBehavior('error')
+      const sendResponse = await fetch(`${server.baseUrl}/api/agents/sessions/codex-turn-start-error/send`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ text: 'status?' }),
+      })
+
+      expect(sendResponse.status).toBe(503)
+      expect(await sendResponse.json()).toEqual({
+        sent: false,
+        error: 'Stream session unavailable',
+      })
+
+      await vi.waitFor(() => {
+        const systemEvent = received.find((event) => event.type === 'system')
+        expect(systemEvent?.text).toContain('Injected turn/start failure')
+      })
+
+      expect(received.some((event) => event.type === 'user' && event.message?.content === 'status?')).toBe(false)
+      expect(received.some((event) => event.type === 'exit')).toBe(true)
+
+      await vi.waitFor(async () => {
+        const sessionResponse = await fetch(`${server.baseUrl}/api/agents/sessions/codex-turn-start-error`, {
+          headers: AUTH_HEADERS,
+        })
+        expect(sessionResponse.status).toBe(200)
+        expect(await sessionResponse.json()).toMatchObject({
+          name: 'codex-turn-start-error',
+          completed: true,
+          status: 'failed',
+          result: {
+            status: 'failed',
+            finalComment: expect.stringContaining('Injected turn/start failure'),
+          },
+        })
+      })
+
+      const listResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        headers: AUTH_HEADERS,
+      })
+      const sessions = await listResponse.json() as Array<{ name: string; processAlive?: boolean }>
+      const exited = sessions.find((session) => session.name === 'codex-turn-start-error')
+      expect(exited?.processAlive).toBe(false)
+    } finally {
+      await sidecar.closeServer()
+      await server.close()
+    }
+  })
+
+  it('marks Codex sessions failed when the sidecar transport closes', async () => {
+    const sidecar = installMockCodexSidecar()
+    const server = await startServer()
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-sidecar-close',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const ws = await connectWs(server.baseUrl, 'codex-sidecar-close')
+      const received: Array<{ type: string; text?: string }> = []
+      ws.on('message', (data) => {
+        const parsed = JSON.parse(data.toString()) as { type: string; text?: string }
+        if (parsed.type !== 'replay') {
+          received.push(parsed)
+        }
+      })
+
+      await sidecar.closeConnection(1011, 'Injected transport failure')
+
+      await vi.waitFor(() => {
+        const systemEvent = received.find((event) => event.type === 'system')
+        expect(systemEvent?.text).toContain('Injected transport failure')
+      })
+      expect(received.some((event) => event.type === 'exit')).toBe(true)
+
+      await vi.waitFor(async () => {
+        const sessionResponse = await fetch(`${server.baseUrl}/api/agents/sessions/codex-sidecar-close`, {
+          headers: AUTH_HEADERS,
+        })
+        expect(sessionResponse.status).toBe(200)
+        expect(await sessionResponse.json()).toMatchObject({
+          name: 'codex-sidecar-close',
+          completed: true,
+          status: 'failed',
+          result: {
+            status: 'failed',
+            finalComment: expect.stringContaining('Injected transport failure'),
+          },
+        })
+      })
+
+      const listResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        headers: AUTH_HEADERS,
+      })
+      const sessions = await listResponse.json() as Array<{ name: string; processAlive?: boolean }>
+      const exited = sessions.find((session) => session.name === 'codex-sidecar-close')
+      expect(exited?.processAlive).toBe(false)
+    } finally {
+      await sidecar.closeServer()
+      await server.close()
+    }
+  })
+
+  it('fails Codex sessions when sidecar keepalive stops receiving pong frames', async () => {
+    const sidecar = installMockCodexSidecar()
+    const server = await startServer({
+      wsKeepAliveIntervalMs: 20,
+      codexTurnWatchdogTimeoutMs: 1000,
+    })
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-sidecar-keepalive-timeout',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      sidecar.suppressPongResponses()
+
+      const ws = await connectWs(server.baseUrl, 'codex-sidecar-keepalive-timeout')
+      const received: Array<{ type: string; text?: string }> = []
+      ws.on('message', (data) => {
+        const parsed = JSON.parse(data.toString()) as { type: string; text?: string }
+        if (parsed.type !== 'replay') {
+          received.push(parsed)
+        }
+      })
+
+      await vi.waitFor(() => {
+        const systemEvent = received.find((event) => event.type === 'system')
+        expect(systemEvent?.text).toContain('Codex sidecar keepalive timeout')
+      })
+      expect(received.some((event) => event.type === 'exit')).toBe(true)
+
+      await vi.waitFor(async () => {
+        const sessionResponse = await fetch(`${server.baseUrl}/api/agents/sessions/codex-sidecar-keepalive-timeout`, {
+          headers: AUTH_HEADERS,
+        })
+        expect(sessionResponse.status).toBe(200)
+        expect(await sessionResponse.json()).toMatchObject({
+          completed: true,
+          status: 'failed',
+        })
+      })
+    } finally {
+      await sidecar.closeServer()
+      await server.close()
+    }
+  })
+
+  it('logs Codex sidecar stderr output for diagnostics', async () => {
+    const sidecar = installMockCodexSidecar()
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const server = await startServer()
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-sidecar-stderr-log',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      sidecar.emitStderr('Injected sidecar stderr line')
+
+      await vi.waitFor(() => {
+        expect(warnSpy.mock.calls.some(
+          ([message]) => typeof message === 'string'
+            && message.includes('[agents][codex-sidecar][stderr] Injected sidecar stderr line'),
+        )).toBe(true)
+      })
+    } finally {
+      warnSpy.mockRestore()
+      await sidecar.closeServer()
+      await server.close()
+    }
+  })
+
+  it('logs and surfaces unsupported Codex approval requests', async () => {
+    const sidecar = installMockCodexSidecar()
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const server = await startServer()
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-approval-request-log',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const ws = await connectWs(server.baseUrl, 'codex-approval-request-log')
+      const received: Array<{ type: string; text?: string }> = []
+      ws.on('message', (data) => {
+        const parsed = JSON.parse(data.toString()) as { type: string; text?: string }
+        if (parsed.type !== 'replay') {
+          received.push(parsed)
+        }
+      })
+
+      sidecar.emitNotification('item/commandExecution/requestApproval', {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        itemId: 'cmd-1',
+        reason: 'Command writes outside the workspace',
+        risk: 'Potentially destructive shell command',
+      })
+
+      await vi.waitFor(() => {
+        const systemEvent = received.find(
+          (event) => event.type === 'system' && event.text?.includes('Codex is waiting for command execution approval'),
+        )
+        expect(systemEvent?.text).toContain('Command writes outside the workspace')
+      })
+
+      await vi.waitFor(() => {
+        expect(warnSpy.mock.calls.some(
+          ([message]) => typeof message === 'string'
+            && message.includes('Unsupported Codex approval request')
+            && message.includes('item/commandExecution/requestApproval')
+            && message.includes('codex-approval-request-log'),
+        )).toBe(true)
+      })
+
+      ws.close()
+    } finally {
+      warnSpy.mockRestore()
+      await sidecar.closeServer()
+      await server.close()
+    }
+  })
+
+  it('synthesizes Codex turn completion from thread/read when notifications stall after turn acceptance', async () => {
+    const sidecar = installMockCodexSidecar()
+    const server = await startServer({
+      codexTurnWatchdogTimeoutMs: 40,
+    })
+
+    try {
+      sidecar.setThreadReadResult({
+        thread: {
+          id: 'thread-1',
+          tokenUsage: {
+            inputTokens: 40,
+            outputTokens: 12,
+            totalCostUsd: 0.07,
+          },
+          turns: [
+            {
+              id: 'turn-1',
+              status: 'completed',
+              tokenUsage: {
+                inputTokens: 40,
+                outputTokens: 12,
+                totalCostUsd: 0.07,
+              },
+            },
+          ],
+        },
+      })
+
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-watchdog-complete',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const ws = await connectWs(server.baseUrl, 'codex-watchdog-complete')
+      const received: Array<{ type: string; result?: string }> = []
+      ws.on('message', (data) => {
+        const parsed = JSON.parse(data.toString()) as { type: string; result?: string }
+        if (parsed.type !== 'replay') {
+          received.push(parsed)
+        }
+      })
+
+      const sendResponse = await fetch(`${server.baseUrl}/api/agents/sessions/codex-watchdog-complete/send`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ text: 'status?' }),
+      })
+      expect(sendResponse.status).toBe(200)
+
+      await vi.waitFor(() => {
+        const resultEvent = received.find((event) => event.type === 'result')
+        expect(resultEvent?.result).toBe('Turn completed')
+      })
+
+      await vi.waitFor(() => {
+        const threadReadRequests = sidecar.getRequests('thread/read')
+        expect(threadReadRequests.length).toBeGreaterThan(0)
+      })
+
+      await vi.waitFor(async () => {
+        const worldResponse = await fetch(`${server.baseUrl}/api/agents/world`, {
+          headers: AUTH_HEADERS,
+        })
+        expect(worldResponse.status).toBe(200)
+        const world = await worldResponse.json() as Array<{ id: string; status: string; usage: { costUsd: number } }>
+        const entry = world.find((item) => item.id === 'codex-watchdog-complete')
+        expect(entry?.status).toBe('completed')
+        expect(entry?.usage.costUsd).toBe(0.07)
+      })
+
+      ws.close()
+    } finally {
+      await sidecar.closeServer()
+      await server.close()
+    }
+  })
+
+  it('marks Codex sessions stale when watchdog cannot confirm turn completion', async () => {
+    const sidecar = installMockCodexSidecar()
+    const server = await startServer({
+      codexTurnWatchdogTimeoutMs: 40,
+    })
+
+    try {
+      sidecar.setThreadReadResult({
+        thread: {
+          id: 'thread-1',
+          turns: [
+            {
+              id: 'turn-1',
+              status: 'inProgress',
+            },
+          ],
+        },
+      })
+
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-watchdog-stale',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const ws = await connectWs(server.baseUrl, 'codex-watchdog-stale')
+      const received: Array<{ type: string; text?: string }> = []
+      ws.on('message', (data) => {
+        const parsed = JSON.parse(data.toString()) as { type: string; text?: string }
+        if (parsed.type !== 'replay') {
+          received.push(parsed)
+        }
+      })
+
+      const sendResponse = await fetch(`${server.baseUrl}/api/agents/sessions/codex-watchdog-stale/send`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ text: 'status?' }),
+      })
+      expect(sendResponse.status).toBe(200)
+
+      await vi.waitFor(() => {
+        const staleEvent = received.find((event) => event.type === 'system')
+        expect(staleEvent?.text).toContain('Codex turn is stale')
+      })
+
+      await vi.waitFor(async () => {
+        const worldResponse = await fetch(`${server.baseUrl}/api/agents/world`, {
+          headers: AUTH_HEADERS,
+        })
+        expect(worldResponse.status).toBe(200)
+        const world = await worldResponse.json() as Array<{ id: string; status: string; phase: string }>
+        const entry = world.find((item) => item.id === 'codex-watchdog-stale')
+        expect(entry?.status).toBe('stale')
+        expect(entry?.phase).toBe('stale')
+      })
+
+      await vi.waitFor(async () => {
+        const sessionsResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+          headers: AUTH_HEADERS,
+        })
+        expect(sessionsResponse.status).toBe(200)
+        const listedSessions = await sessionsResponse.json() as Array<{
+          name: string
+          status?: string
+          resumeAvailable?: boolean
+        }>
+        const entry = listedSessions.find((item) => item.name === 'codex-watchdog-stale')
+        expect(entry?.status).toBe('stale')
+        expect(entry?.resumeAvailable).toBe(true)
+      })
+
+      expect(received.some((event) => event.type === 'result')).toBe(false)
+      ws.close()
+    } finally {
+      await sidecar.closeServer()
+      await server.close()
+    }
+  })
+
+  it('logs watchdog reconciliation failures before marking Codex sessions stale', async () => {
+    const sidecar = installMockCodexSidecar()
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const server = await startServer({
+      codexTurnWatchdogTimeoutMs: 40,
+    })
+
+    try {
+      sidecar.setThreadReadError('Injected thread/read failure')
+
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-watchdog-thread-read-error',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const ws = await connectWs(server.baseUrl, 'codex-watchdog-thread-read-error')
+      const received: Array<{ type: string; text?: string }> = []
+      ws.on('message', (data) => {
+        const parsed = JSON.parse(data.toString()) as { type: string; text?: string }
+        if (parsed.type !== 'replay') {
+          received.push(parsed)
+        }
+      })
+
+      const sendResponse = await fetch(`${server.baseUrl}/api/agents/sessions/codex-watchdog-thread-read-error/send`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ text: 'status?' }),
+      })
+      expect(sendResponse.status).toBe(200)
+
+      await vi.waitFor(() => {
+        const staleEvent = received.find(
+          (event) => event.type === 'system' && event.text?.includes('Codex turn is stale'),
+        )
+        expect(staleEvent).toBeDefined()
+      })
+
+      await vi.waitFor(() => {
+        expect(warnSpy.mock.calls.some(
+          ([message]) => typeof message === 'string'
+            && message.includes('Codex watchdog thread/read reconciliation failed')
+            && message.includes('Injected thread/read failure'),
+        )).toBe(true)
+      })
+    } finally {
+      warnSpy.mockRestore()
+      await sidecar.closeServer()
+      await server.close()
+    }
+  })
+
+  it('resumes stale live Codex sessions in place', async () => {
+    const sidecar = installMockCodexSidecar()
+    const server = await startServer({
+      codexTurnWatchdogTimeoutMs: 40,
+    })
+
+    try {
+      sidecar.setThreadReadResult({
+        thread: {
+          id: 'thread-1',
+          turns: [
+            {
+              id: 'turn-1',
+              status: 'inProgress',
+            },
+          ],
+        },
+      })
+
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-stale-resume-source',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const sendResponse = await fetch(`${server.baseUrl}/api/agents/sessions/codex-stale-resume-source/send`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ text: 'resume this turn' }),
+      })
+      expect(sendResponse.status).toBe(200)
+
+      await vi.waitFor(async () => {
+        const sessionsResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+          headers: AUTH_HEADERS,
+        })
+        expect(sessionsResponse.status).toBe(200)
+        const listedSessions = await sessionsResponse.json() as Array<{
+          name: string
+          status?: string
+          resumeAvailable?: boolean
+        }>
+        const entry = listedSessions.find((item) => item.name === 'codex-stale-resume-source')
+        expect(entry?.status).toBe('stale')
+        expect(entry?.resumeAvailable).toBe(true)
+      })
+
+      const resumeResponse = await fetch(`${server.baseUrl}/api/agents/sessions/codex-stale-resume-source/resume`, {
+        method: 'POST',
+        headers: AUTH_HEADERS,
+      })
+      expect(resumeResponse.status).toBe(201)
+      const resumed = await resumeResponse.json() as { name: string; resumedFrom: string }
+      expect(resumed.name).toBe('codex-stale-resume-source')
+      expect(resumed.resumedFrom).toBe('codex-stale-resume-source')
+
+      expect(sidecar.getRequests('thread/resume')).toHaveLength(1)
+
+      await vi.waitFor(async () => {
+        const sessionsResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+          headers: AUTH_HEADERS,
+        })
+        expect(sessionsResponse.status).toBe(200)
+        const listedSessions = await sessionsResponse.json() as Array<{
+          name: string
+          processAlive?: boolean
+          resumedFrom?: string
+          status?: string
+          resumeAvailable?: boolean
+        }>
+        const matching = listedSessions.filter((item) => item.name === 'codex-stale-resume-source')
+        expect(matching).toHaveLength(1)
+        expect(matching[0]?.processAlive).toBe(true)
+        expect(matching[0]?.resumeAvailable).toBe(false)
+        expect(matching[0]?.resumedFrom).toBeUndefined()
+      })
+    } finally {
+      await sidecar.closeServer()
+      await server.close()
+    }
+  })
+
+  it('hides Resume for exited Codex sessions when the rollout file is missing', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'hammurabi-codex-home-'))
+    const sessionStoreDir = await mkdtemp(join(tmpdir(), 'hammurabi-codex-store-'))
+    const sessionStorePath = join(sessionStoreDir, 'stream-sessions.json')
+    const originalHome = process.env.HOME
+
+    await writeFile(
+      sessionStorePath,
+      JSON.stringify({
+        sessions: [
+          {
+            name: 'hamkid',
+            agentType: 'codex',
+            mode: 'dangerouslySkipPermissions',
+            cwd: '/home/ec2-user/App',
+            createdAt: '2026-04-07T23:24:35.181Z',
+            codexThreadId: '019d6a43-1781-70b2-b8e0-eb1fda3dead3',
+            sessionState: 'exited',
+            hadResult: false,
+            events: [],
+          },
+        ],
+      }),
+      'utf8',
+    )
+
+    process.env.HOME = homeDir
+    const server = await startServer({
+      autoResumeSessions: true,
+      sessionStorePath,
+    })
+
+    try {
+      const response = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        headers: AUTH_HEADERS,
+      })
+      expect(response.status).toBe(200)
+
+      const sessions = await response.json() as Array<{
+        name: string
+        resumeAvailable?: boolean
+        status?: string
+      }>
+      const hamkid = sessions.find((session) => session.name === 'hamkid')
+      expect(hamkid?.status).toBe('exited')
+      expect(hamkid?.resumeAvailable).toBe(false)
+    } finally {
+      await server.close()
+      if (originalHome === undefined) {
+        delete process.env.HOME
+      } else {
+        process.env.HOME = originalHome
+      }
+      await rm(homeDir, { recursive: true, force: true })
+      await rm(sessionStoreDir, { recursive: true, force: true })
+    }
+  })
+
+  it('returns 409 and clears stale Codex resume metadata when rollout is gone', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'hammurabi-codex-home-'))
+    const sessionStoreDir = await mkdtemp(join(tmpdir(), 'hammurabi-codex-store-'))
+    const sessionStorePath = join(sessionStoreDir, 'stream-sessions.json')
+    const originalHome = process.env.HOME
+
+    await writeFile(
+      sessionStorePath,
+      JSON.stringify({
+        sessions: [
+          {
+            name: 'hamkid',
+            agentType: 'codex',
+            mode: 'dangerouslySkipPermissions',
+            cwd: '/home/ec2-user/App',
+            createdAt: '2026-04-07T23:24:35.181Z',
+            codexThreadId: '019d6a43-1781-70b2-b8e0-eb1fda3dead3',
+            sessionState: 'exited',
+            hadResult: false,
+            events: [],
+          },
+        ],
+      }),
+      'utf8',
+    )
+
+    process.env.HOME = homeDir
+    const server = await startServer({
+      autoResumeSessions: true,
+      sessionStorePath,
+    })
+
+    try {
+      const resumeResponse = await fetch(`${server.baseUrl}/api/agents/sessions/hamkid/resume`, {
+        method: 'POST',
+        headers: AUTH_HEADERS,
+      })
+      expect(resumeResponse.status).toBe(409)
+      expect(await resumeResponse.json()).toEqual({
+        error: 'Session "hamkid" can no longer be resumed because its Codex rollout is unavailable',
+      })
+
+      await vi.waitFor(async () => {
+        const raw = await readFile(sessionStorePath, 'utf8')
+        const parsed = JSON.parse(raw) as { sessions: Array<{ name: string; codexThreadId?: string }> }
+        expect(parsed.sessions.find((session) => session.name === 'hamkid')).toBeUndefined()
+      })
+
+      const sessionsResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        headers: AUTH_HEADERS,
+      })
+      expect(sessionsResponse.status).toBe(200)
+      const sessions = await sessionsResponse.json() as Array<{
+        name: string
+        resumeAvailable?: boolean
+      }>
+      expect(sessions.find((session) => session.name === 'hamkid')).toEqual(
+        expect.objectContaining({
+          name: 'hamkid',
+          resumeAvailable: false,
+        }),
+      )
+    } finally {
+      await server.close()
+      if (originalHome === undefined) {
+        delete process.env.HOME
+      } else {
+        process.env.HOME = originalHome
+      }
+      await rm(homeDir, { recursive: true, force: true })
+      await rm(sessionStoreDir, { recursive: true, force: true })
+    }
+  })
+
+  it('pre-kill-debrief returns immediately for stream sessions so kill can proceed', async () => {
+    installMockProcess()
+    const server = await startServer()
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'stream-kill-debrief',
+          mode: 'default',
+          sessionType: 'stream',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const preResp = await fetch(`${server.baseUrl}/api/agents/sessions/stream-kill-debrief/pre-kill-debrief`, {
+        method: 'POST',
+        headers: AUTH_HEADERS,
+      })
+      expect(preResp.status).toBe(200)
+      expect(await preResp.json()).toEqual({
+        debriefStarted: false,
+        reason: 'not-supported-yet',
+      })
+
+      const statusResp = await fetch(`${server.baseUrl}/api/agents/sessions/stream-kill-debrief/debrief-status`, {
+        headers: AUTH_HEADERS,
+      })
+      expect(statusResp.status).toBe(200)
+      expect(await statusResp.json()).toEqual({ status: 'none' })
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('accounts for Codex thread/tokenUsage/updated notifications in replay usage totals', async () => {
+    const sidecar = installMockCodexSidecar()
+    const server = await startServer()
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-usage-notifications',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      sidecar.emitNotification('thread/tokenUsage/updated', {
+        threadId: 'thread-1',
+        tokenUsage: {
+          inputTokens: 90,
+          outputTokens: 33,
+          totalCostUsd: 0.11,
+        },
+      })
+
+      await new Promise((resolve) => setTimeout(resolve, 50))
+
+      const wsUrl = server.baseUrl.replace('http://', 'ws://') +
+        '/api/agents/sessions/codex-usage-notifications/terminal?api_key=test-key'
+      const ws = new WebSocket(wsUrl)
+      const replayPromise = new Promise<{
+        type: string
+        events: Array<{ type: string; usage?: unknown; usage_is_total?: boolean }>
+        usage: { inputTokens: number; outputTokens: number; costUsd: number }
+      }>((resolve) => {
+        ws.on('message', (data) => {
+          const parsed = JSON.parse(data.toString()) as {
+            type: string
+            events?: Array<{ type: string; usage?: unknown; usage_is_total?: boolean }>
+            usage?: { inputTokens: number; outputTokens: number; costUsd: number }
+          }
+          if (parsed.type === 'replay' && parsed.events && parsed.usage) {
+            resolve({
+              type: parsed.type,
+              events: parsed.events,
+              usage: parsed.usage,
+            })
+          }
+        })
+      })
+      await new Promise<void>((resolve, reject) => {
+        ws.on('open', () => resolve())
+        ws.on('error', reject)
+      })
+
+      const replay = await replayPromise
+
+      expect(replay.usage).toEqual({
+        inputTokens: 90,
+        outputTokens: 33,
+        costUsd: 0.11,
+      })
+      const usageEvent = replay.events.find((event) => event.type === 'message_delta')
+      expect(usageEvent).toMatchObject({
+        usage: { input_tokens: 90, output_tokens: 33 },
+        usage_is_total: true,
+      })
+
+      ws.close()
+    } finally {
+      await sidecar.closeServer()
+      await server.close()
+    }
+  })
+
+  it('routes sessionsInterface.sendToSession through Codex transport', async () => {
+    const sidecar = installMockCodexSidecar()
+    const server = await startServer()
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-interface-send',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const sent = await server.agents.sessionsInterface.sendToSession('codex-interface-send', 'heartbeat')
+      expect(sent).toBe(true)
+
+      await vi.waitFor(() => {
+        const turnRequests = sidecar.getRequests('turn/start')
+        expect(turnRequests).toHaveLength(1)
+        expect(turnRequests[0].params).toEqual({
+          threadId: 'thread-1',
+          input: [{ type: 'text', text: 'heartbeat' }],
+        })
+      })
+
+      const session = server.agents.sessionsInterface.getSession('codex-interface-send')
+      expect(session?.events.some((event) => event.type === 'user')).toBe(true)
+    } finally {
+      await sidecar.closeServer()
+      await server.close()
+    }
+  })
+
+  it('bootstraps Codex commander sessions with developerInstructions and no seed turn', async () => {
+    const sidecar = installMockCodexSidecar()
+    const server = await startServer()
+
+    try {
+      const systemPrompt = 'You are Athena. Follow commander runtime policy.'
+      await server.agents.sessionsInterface.createCommanderSession({
+        name: 'commander-codex-bootstrap',
+        systemPrompt,
+        agentType: 'codex',
+        cwd: '/tmp',
+      })
+
+      await vi.waitFor(() => {
+        const threadRequests = sidecar.getRequests('thread/start')
+        expect(threadRequests).toHaveLength(1)
+        expect(threadRequests[0]?.params).toEqual(expect.objectContaining({
+          cwd: '/tmp',
+          sandbox: 'danger-full-access',
+          approvalPolicy: 'never',
+          developerInstructions: systemPrompt,
+        }))
+      })
+      expect(sidecar.getRequests('turn/start')).toHaveLength(0)
+
+      const startupMessage = 'Commander runtime started. Acknowledge readiness and await instructions.'
+      const sent = await server.agents.sessionsInterface.sendToSession('commander-codex-bootstrap', startupMessage)
+      expect(sent).toBe(true)
+
+      await vi.waitFor(() => {
+        const turnRequests = sidecar.getRequests('turn/start')
+        expect(turnRequests).toHaveLength(1)
+        expect(turnRequests[0]?.params).toEqual({
+          threadId: 'thread-1',
+          input: [{ type: 'text', text: startupMessage }],
+        })
+      })
+    } finally {
+      await sidecar.closeServer()
+      await server.close()
+    }
+  })
+
+  it('keeps non-commander Codex task bootstrap as the first user turn', async () => {
+    const sidecar = installMockCodexSidecar()
+    const server = await startServer()
+
+    try {
+      const task = 'Summarize failing tests before coding.'
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-task-bootstrap',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+          task,
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      await vi.waitFor(() => {
+        const threadRequests = sidecar.getRequests('thread/start')
+        expect(threadRequests).toHaveLength(1)
+      })
+
+      const threadStartParams = sidecar.getRequests('thread/start')[0]?.params as
+        | Record<string, unknown>
+        | undefined
+      expect(threadStartParams?.developerInstructions).toBeUndefined()
+
+      await vi.waitFor(() => {
+        const turnRequests = sidecar.getRequests('turn/start')
+        expect(turnRequests).toHaveLength(1)
+        expect(turnRequests[0]?.params).toEqual({
+          threadId: 'thread-1',
+          input: [{ type: 'text', text: task }],
+        })
+      })
+    } finally {
+      await sidecar.closeServer()
+      await server.close()
+    }
+  })
+
   it('stream session appears in session list with sessionType=stream', async () => {
     installMockProcess()
     const server = await startServer()
@@ -3325,179 +4218,7 @@ describe('stream sessions', () => {
     expect(sessions).toHaveLength(1)
     expect(sessions[0].name).toBe('stream-list-01')
     expect(sessions[0].sessionType).toBe('stream')
-    expect(sessions[0].pid).toBe(process.pid)
-
-    await server.close()
-  })
-
-  it('includes processAlive=true for live stream sessions in /sessions list', async () => {
-    installMockProcess()
-    const server = await startServer()
-
-    await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      method: 'POST',
-      headers: {
-        ...AUTH_HEADERS,
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        name: 'stream-process-alive',
-        mode: 'default',
-        sessionType: 'stream',
-      }),
-    })
-
-    const response = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      headers: AUTH_HEADERS,
-    })
-    const sessions = (await response.json()) as Array<{ name: string; processAlive?: boolean }>
-    const listed = sessions.find((session) => session.name === 'stream-process-alive')
-
-    expect(listed).toBeDefined()
-    expect(listed?.processAlive).toBe(true)
-
-    await server.close()
-  })
-
-  it('keeps dead non-one-shot stream sessions in /sessions list with processAlive=false', async () => {
-    installMockProcess({ pid: 99999 })
-    const server = await startServer()
-
-    await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      method: 'POST',
-      headers: {
-        ...AUTH_HEADERS,
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        name: 'stream-dead-prune',
-        mode: 'default',
-        sessionType: 'stream',
-      }),
-    })
-
-    const listResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      headers: AUTH_HEADERS,
-    })
-    const listed = await listResponse.json() as Array<{ name: string; processAlive?: boolean }>
-    const deadStream = listed.find((session) => session.name === 'stream-dead-prune')
-    expect(deadStream).toBeDefined()
-    expect(deadStream?.processAlive).toBe(false)
-
-    const statusResponse = await fetch(`${server.baseUrl}/api/agents/sessions/stream-dead-prune`, {
-      headers: AUTH_HEADERS,
-    })
-    expect(statusResponse.status).toBe(200)
-
-    await server.close()
-  })
-
-  it('keeps alive parent sessions with all workers done and reports done summary', async () => {
-    installMockProcess()
-    const server = await startServer()
-    const parentSessionName = 'commander-parent-workers-done'
-    const workerSessionName = 'factory-parent-done-worker'
-
-    await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      method: 'POST',
-      headers: {
-        ...AUTH_HEADERS,
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        name: parentSessionName,
-        mode: 'default',
-        sessionType: 'stream',
-      }),
-    })
-
-    const parentSession = server.sessionsInterface.getSession(parentSessionName)
-    expect(parentSession).toBeDefined()
-    parentSession?.spawnedWorkers.push(workerSessionName)
-
-    const completeResponse = await fetch(
-      `${server.baseUrl}/api/agents/sessions/${encodeURIComponent(workerSessionName)}/complete`,
-      {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({ status: 'success', comment: 'done' }),
-      },
-    )
-    expect(completeResponse.status).toBe(200)
-
-    const listResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      headers: AUTH_HEADERS,
-    })
-    const listed = await listResponse.json() as Array<{
-      name: string
-      processAlive?: boolean
-      workerSummary?: {
-        total: number
-        running: number
-        starting: number
-        down: number
-        done: number
-      }
-    }>
-    const parent = listed.find((session) => session.name === parentSessionName)
-
-    expect(parent).toBeDefined()
-    expect(parent?.processAlive).toBe(true)
-    expect(parent?.workerSummary).toEqual({
-      total: 1,
-      running: 0,
-      starting: 0,
-      down: 0,
-      done: 1,
-    })
-
-    await server.close()
-  })
-
-  it('filters dead parent sessions whose spawned workers are all done', async () => {
-    installMockProcess({ pid: 99999 })
-    const server = await startServer()
-    const parentSessionName = 'commander-parent-workers-done-dead'
-    const workerSessionName = 'factory-parent-dead-worker'
-
-    await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      method: 'POST',
-      headers: {
-        ...AUTH_HEADERS,
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        name: parentSessionName,
-        mode: 'default',
-        sessionType: 'stream',
-      }),
-    })
-
-    const parentSession = server.sessionsInterface.getSession(parentSessionName)
-    expect(parentSession).toBeDefined()
-    parentSession?.spawnedWorkers.push(workerSessionName)
-
-    const completeResponse = await fetch(
-      `${server.baseUrl}/api/agents/sessions/${encodeURIComponent(workerSessionName)}/complete`,
-      {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({ status: 'success', comment: 'done' }),
-      },
-    )
-    expect(completeResponse.status).toBe(200)
-
-    const listResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      headers: AUTH_HEADERS,
-    })
-    const listed = await listResponse.json() as Array<{ name: string }>
-    expect(listed.some((session) => session.name === parentSessionName)).toBe(false)
+    expect(sessions[0].pid).toBe(99999)
 
     await server.close()
   })
@@ -3521,7 +4242,7 @@ describe('stream sessions', () => {
 
     expect(mockedSpawn).toHaveBeenCalledWith(
       'claude',
-      ['-p', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json', '--model', 'claude-opus-4-6', '--permission-mode', 'acceptEdits'],
+      ['-p', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json', '--permission-mode', 'acceptEdits'],
       expect.any(Object),
     )
 
@@ -3547,7 +4268,7 @@ describe('stream sessions', () => {
 
     expect(mockedSpawn).toHaveBeenCalledWith(
       'claude',
-      ['-p', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json', '--model', 'claude-opus-4-6', '--dangerously-skip-permissions'],
+      ['-p', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json', '--dangerously-skip-permissions'],
       expect.any(Object),
     )
 
@@ -3803,1102 +4524,6 @@ describe('stream sessions', () => {
     await server.close()
   })
 
-  it('does not duplicate user messages in replay when Claude echoes them back', async () => {
-    const mock = installMockProcess()
-    const server = await startServer()
-
-    await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      method: 'POST',
-      headers: {
-        ...AUTH_HEADERS,
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        name: 'stream-no-dup',
-        mode: 'default',
-        sessionType: 'stream',
-      }),
-    })
-
-    const ws = await connectWs(server.baseUrl, 'stream-no-dup')
-
-    // Send user input — server synthesizes a 'user' event in session.events
-    ws.send(JSON.stringify({ type: 'input', text: 'Hello agent' }))
-    await new Promise((r) => setTimeout(r, 50))
-
-    // Claude's stdout echoes the user message back as a 'user' envelope event.
-    // The fix should skip this so session.events doesn't store a duplicate.
-    mock.emitStdout('{"type":"user","message":{"role":"user","content":"Hello agent"}}\n')
-    mock.emitStdout('{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hi!"}]}}\n')
-    await new Promise((r) => setTimeout(r, 50))
-
-    ws.close()
-    await new Promise<void>((resolve) => ws.on('close', () => resolve()))
-
-    // Reconnect and check replay — should have exactly one user event
-    const ws2Url = server.baseUrl.replace('http://', 'ws://') +
-      '/api/agents/sessions/stream-no-dup/terminal?api_key=test-key'
-    const ws2 = new WebSocket(ws2Url)
-    const messages: Array<{ type: string; events?: Array<{ type: string }> }> = []
-
-    ws2.on('message', (data) => {
-      messages.push(JSON.parse(data.toString()))
-    })
-
-    await new Promise<void>((resolve, reject) => {
-      ws2.on('open', () => resolve())
-      ws2.on('error', reject)
-    })
-
-    await vi.waitFor(() => {
-      expect(messages.length).toBeGreaterThan(0)
-    })
-
-    const replay = messages.find((m) => m.type === 'replay')
-    expect(replay).toBeDefined()
-    const userEvents = replay!.events!.filter((e) => e.type === 'user')
-    expect(userEvents).toHaveLength(1)
-
-    ws2.close()
-    await server.close()
-  })
-
-  it('persists initial task as user event in replay', async () => {
-    installMockProcess()
-    const server = await startServer()
-
-    await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      method: 'POST',
-      headers: {
-        ...AUTH_HEADERS,
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        name: 'stream-task-replay',
-        mode: 'default',
-        sessionType: 'stream',
-        task: 'Explain auth flow',
-      }),
-    })
-
-    // Wait for the initial task to be written to stdin and stored
-    await new Promise((r) => setTimeout(r, 50))
-
-    // Attach message handler BEFORE open to catch the replay sent on upgrade
-    const wsUrl = server.baseUrl.replace('http://', 'ws://') +
-      '/api/agents/sessions/stream-task-replay/terminal?api_key=test-key'
-    const ws = new WebSocket(wsUrl)
-    const messages: Array<{
-      type: string
-      events?: Array<{ type: string; message?: { content: string } }>
-    }> = []
-
-    ws.on('message', (data) => {
-      messages.push(JSON.parse(data.toString()))
-    })
-
-    await new Promise<void>((resolve, reject) => {
-      ws.on('open', () => resolve())
-      ws.on('error', reject)
-    })
-
-    await vi.waitFor(() => {
-      expect(messages.length).toBeGreaterThan(0)
-    })
-
-    const replay = messages.find((m) => m.type === 'replay')
-    expect(replay).toBeDefined()
-    const userEvents = replay!.events!.filter((e) => e.type === 'user')
-    expect(userEvents).toHaveLength(1)
-    expect(userEvents[0].message?.content).toBe('Explain auth flow')
-
-    ws.close()
-    await server.close()
-  })
-
-  it('accepts message body shape on POST /sessions/:name/send', async () => {
-    const mock = installMockProcess()
-    const server = await startServer()
-
-    try {
-      await fetch(`${server.baseUrl}/api/agents/sessions`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          name: 'stream-send-message-shape',
-          mode: 'default',
-          sessionType: 'stream',
-        }),
-      })
-
-      const response = await fetch(`${server.baseUrl}/api/agents/sessions/stream-send-message-shape/send`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({ message: 'send route message field' }),
-      })
-
-      expect(response.status).toBe(200)
-      expect(await response.json()).toEqual({ sent: true })
-      expect(mock.getStdinWrites().some((write) => write.includes('send route message field'))).toBe(true)
-    } finally {
-      await server.close()
-    }
-  })
-
-  it('queues HTTP /message requests and flushes FIFO by turn completion', async () => {
-    const mock = installMockProcess()
-    const server = await startServer()
-
-    try {
-      await fetch(`${server.baseUrl}/api/agents/sessions`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          name: 'stream-http-queue',
-          mode: 'default',
-          sessionType: 'stream',
-        }),
-      })
-
-      // Block queue dispatch until result is emitted.
-      mock.emitStdout('{"type":"message_start","message":{"id":"m1","role":"assistant"}}\n')
-
-      const first = await fetch(`${server.baseUrl}/api/agents/sessions/stream-http-queue/message`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({ message: 'first queued message' }),
-      })
-      expect(first.status).toBe(202)
-      expect(await first.json()).toEqual({ queued: true, queueDepth: 1 })
-
-      const second = await fetch(`${server.baseUrl}/api/agents/sessions/stream-http-queue/message`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({ message: 'second queued message' }),
-      })
-      expect(second.status).toBe(202)
-      expect(await second.json()).toEqual({ queued: true, queueDepth: 2 })
-
-      expect(mock.getStdinWrites().some((write) => write.includes('queued message'))).toBe(false)
-
-      mock.emitStdout('{"type":"result","result":"done"}\n')
-      await vi.waitFor(() => {
-        expect(mock.getStdinWrites().filter((write) => write.includes('queued message'))).toHaveLength(1)
-      })
-      expect(mock.getStdinWrites().some((write) => write.includes('second queued message'))).toBe(false)
-
-      mock.emitStdout('{"type":"result","result":"done"}\n')
-      await vi.waitFor(() => {
-        expect(mock.getStdinWrites().filter((write) => write.includes('queued message'))).toHaveLength(2)
-      })
-
-      const queuedWrites = mock
-        .getStdinWrites()
-        .filter((write) => write.includes('queued message'))
-        .map((write) => JSON.parse(write.replace('\n', '')) as { message: { content: string } })
-        .map((payload) => payload.message.content)
-      expect(queuedWrites).toEqual(['first queued message', 'second queued message'])
-    } finally {
-      await server.close()
-    }
-  })
-
-  it('resets commander stream sessions in place via HTTP /message /reset', async () => {
-    const processMocks: Array<ReturnType<typeof createMockChildProcess>> = []
-    mockedSpawn.mockImplementation(() => {
-      const mock = createMockChildProcess()
-      processMocks.push(mock)
-      return mock.cp as never
-    })
-    const sessionStoreDir = await mkdtemp(join(tmpdir(), 'hammurabi-stream-session-store-'))
-    const sessionStorePath = join(sessionStoreDir, 'stream-sessions.json')
-    const commanderDataDir = join(sessionStoreDir, 'commanders-data')
-    await seedCommanderSessionFixture({
-      commanderDataDir,
-      commanderId: 'reset-test',
-      workflowPrompt: 'Reset workflow prompt from COMMANDER.md',
-      identityBody: 'Reset identity body from identity.md.',
-    })
-    const server = await startServer({
-      sessionStorePath,
-      commanderSessionStorePath: join(commanderDataDir, 'sessions.json'),
-    })
-
-    try {
-      await server.sessionsInterface.createCommanderSession({
-        name: 'commander-reset-test',
-        systemPrompt: 'Old commander prompt',
-        agentType: 'claude',
-        cwd: '/tmp',
-        maxTurns: 7,
-      })
-      expect(processMocks).toHaveLength(1)
-
-      processMocks[0].emitStdout('{"type":"system","subtype":"init","session_id":"claude-reset-old"}\n')
-
-      await vi.waitFor(async () => {
-        const raw = await readFile(sessionStorePath, 'utf8')
-        const parsed = JSON.parse(raw) as {
-          sessions: Array<{ name: string; claudeSessionId?: string }>
-        }
-        const saved = parsed.sessions.find((session) => session.name === 'commander-reset-test')
-        expect(saved?.claudeSessionId).toBe('claude-reset-old')
-      })
-
-      // Keep turn active so /reset must wait for completion before clearing.
-      processMocks[0].emitStdout('{"type":"message_start","message":{"id":"m1","role":"assistant"}}\n')
-
-      let resetSettled = false
-      const resetPromise = fetch(`${server.baseUrl}/api/agents/sessions/commander-reset-test/message`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({ message: '/reset' }),
-      }).then(async (response) => {
-        resetSettled = true
-        expect(response.status).toBe(200)
-        expect(await response.json()).toEqual({ reset: true })
-      })
-
-      await new Promise((resolve) => setTimeout(resolve, 50))
-      expect(resetSettled).toBe(false)
-
-      processMocks[0].emitStdout('{"type":"result","result":"done"}\n')
-      await resetPromise
-      expect(processMocks).toHaveLength(2)
-      expect(processMocks[0].cp.kill).toHaveBeenCalledWith('SIGTERM')
-
-      const sessionsResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-        headers: AUTH_HEADERS,
-      })
-      expect(sessionsResponse.status).toBe(200)
-      const listedSessions = await sessionsResponse.json() as Array<{ name: string }>
-      expect(listedSessions.some((session) => session.name === 'commander-reset-test')).toBe(true)
-
-      const secondCall = mockedSpawn.mock.calls[1]
-      expect(secondCall[0]).toBe('claude')
-      const secondArgs = secondCall[1] as string[]
-      expect(secondArgs).toContain('--system-prompt')
-      expect(secondArgs).not.toContain('--resume')
-      expect(secondArgs).not.toContain('--max-turns')
-      const promptIndex = secondArgs.indexOf('--system-prompt')
-      const resetPrompt = secondArgs[promptIndex + 1]
-      expect(resetPrompt).toContain('Reset workflow prompt from COMMANDER.md')
-      expect(resetPrompt).toContain('Reset identity body from identity.md.')
-      expect(resetPrompt).not.toBe('Old commander prompt')
-
-      await vi.waitFor(() => {
-        expect(processMocks[1].getStdinWrites().some((write) => (
-          write.includes('Session rotated. Continuing as commander.')
-        ))).toBe(true)
-      })
-
-      const followUpResponse = await fetch(`${server.baseUrl}/api/agents/sessions/commander-reset-test/message`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({ message: 'message after reset' }),
-      })
-      expect(followUpResponse.status).toBe(202)
-      expect(await followUpResponse.json()).toEqual({ queued: true, queueDepth: 1 })
-
-      await vi.waitFor(() => {
-        expect(processMocks[1].getStdinWrites().some((write) => write.includes('message after reset'))).toBe(true)
-      })
-      expect(processMocks[0].getStdinWrites().some((write) => write.includes('message after reset'))).toBe(false)
-    } finally {
-      await server.close()
-      await waitForPersistedSessionFlush()
-      await rm(sessionStoreDir, { recursive: true, force: true })
-    }
-  })
-
-  it('passes /reset through to non-commander stream sessions', async () => {
-    const mock = installMockProcess()
-    const server = await startServer()
-
-    try {
-      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          name: 'stream-reset-pass-through',
-          mode: 'default',
-          sessionType: 'stream',
-        }),
-      })
-      expect(createResponse.status).toBe(201)
-
-      const messageResponse = await fetch(`${server.baseUrl}/api/agents/sessions/stream-reset-pass-through/message`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({ message: '/reset' }),
-      })
-
-      expect(messageResponse.status).toBe(202)
-      expect(await messageResponse.json()).toEqual({ queued: true, queueDepth: 1 })
-
-      await vi.waitFor(() => {
-        expect(mock.getStdinWrites().some((write) => write.includes('/reset'))).toBe(true)
-      })
-
-      const resetWrite = mock.getStdinWrites().find((write) => write.includes('/reset'))
-      expect(resetWrite).toBeDefined()
-      const parsed = JSON.parse(resetWrite!.replace('\n', '')) as { message: { content: string } }
-      expect(parsed.message.content).toBe('/reset')
-    } finally {
-      await server.close()
-    }
-  })
-
-  it('returns 500 when commander /reset cannot replace a remote session', async () => {
-    installMockProcess()
-    const registry = await createTempMachinesRegistry({
-      machines: [
-        {
-          id: 'gpu-1',
-          label: 'GPU',
-          host: '10.0.1.50',
-          user: 'ec2-user',
-        },
-      ],
-    })
-    const workDir = await mkdtemp(join(tmpdir(), 'hammurabi-commander-reset-remote-failure-'))
-    const commanderDataDir = join(workDir, 'commanders-data')
-    let server: RunningServer | null = null
-
-    try {
-      await seedCommanderSessionFixture({
-        commanderDataDir,
-        commanderId: 'remote-reset-failure',
-        workflowPrompt: 'Remote reset workflow prompt',
-        identityBody: 'Remote reset identity body.',
-      })
-
-      server = await startServer({
-        commanderSessionStorePath: join(commanderDataDir, 'sessions.json'),
-        machinesFilePath: registry.filePath,
-      })
-
-      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          name: 'commander-remote-reset-failure',
-          mode: 'default',
-          sessionType: 'stream',
-          host: 'gpu-1',
-        }),
-      })
-
-      expect(createResponse.status).toBe(201)
-      await writeFile(registry.filePath, JSON.stringify({ machines: [] }))
-
-      const response = await fetch(`${server.baseUrl}/api/agents/sessions/commander-remote-reset-failure/message`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({ message: '/reset' }),
-      })
-
-      expect(response.status).toBe(500)
-      expect(await response.json()).toEqual({
-        error: 'Reset failed: Host machine "gpu-1" is unavailable for session replacement',
-      })
-      expect(mockedSpawn).toHaveBeenCalledTimes(1)
-    } finally {
-      if (server) {
-        await server.close()
-      }
-      await registry.cleanup()
-      await rm(workDir, { recursive: true, force: true })
-    }
-  })
-
-  it('returns 429 when HTTP /message queue reaches max depth', async () => {
-    const mock = installMockProcess()
-    const server = await startServer()
-
-    try {
-      await fetch(`${server.baseUrl}/api/agents/sessions`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          name: 'stream-queue-overflow',
-          mode: 'default',
-          sessionType: 'stream',
-        }),
-      })
-
-      // Hold queue processing so pending count grows.
-      mock.emitStdout('{"type":"message_start","message":{"id":"m1","role":"assistant"}}\n')
-
-      for (let i = 0; i < 50; i += 1) {
-        const response = await fetch(`${server.baseUrl}/api/agents/sessions/stream-queue-overflow/message`, {
-          method: 'POST',
-          headers: {
-            ...AUTH_HEADERS,
-            'content-type': 'application/json',
-          },
-          body: JSON.stringify({ message: `queued ${i}` }),
-        })
-        expect(response.status).toBe(202)
-      }
-
-      const overflowResponse = await fetch(`${server.baseUrl}/api/agents/sessions/stream-queue-overflow/message`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({ message: 'overflow' }),
-      })
-
-      expect(overflowResponse.status).toBe(429)
-      expect(await overflowResponse.json()).toEqual({ error: 'Queue full' })
-    } finally {
-      await server.close()
-    }
-  })
-
-  it('routes HTTP /message through codex turn/start for codex sessions', async () => {
-    const codexSidecar = installMockCodexSidecar()
-    const server = await startServer()
-
-    try {
-      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          name: 'codex-http-message',
-          mode: 'default',
-          sessionType: 'stream',
-          agentType: 'codex',
-        }),
-      })
-
-      expect(createResponse.status).toBe(201)
-
-      const messageResponse = await fetch(`${server.baseUrl}/api/agents/sessions/codex-http-message/message`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({ message: 'codex queued input' }),
-      })
-
-      expect(messageResponse.status).toBe(202)
-      expect(await messageResponse.json()).toEqual({ queued: true, queueDepth: 1 })
-
-      await vi.waitFor(() => {
-        expect(codexSidecar.turnStartInputs).toEqual(['codex queued input'])
-      })
-    } finally {
-      await server.close()
-      await codexSidecar.close()
-    }
-  })
-
-  it('auto-rotates non-commander codex sessions at the entry threshold', async () => {
-    const codexSidecar = installMockCodexSidecar()
-    const sessionStoreDir = await mkdtemp(join(tmpdir(), 'hammurabi-codex-rotate-store-'))
-    const sessionStorePath = join(sessionStoreDir, 'stream-sessions.json')
-    const server = await startServer({
-      autoRotateEntryThreshold: 1,
-      sessionStorePath,
-    })
-
-    try {
-      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          name: 'codex-auto-rotate',
-          mode: 'default',
-          sessionType: 'stream',
-          agentType: 'codex',
-        }),
-      })
-      expect(createResponse.status).toBe(201)
-
-      const ws = await connectWs(server.baseUrl, 'codex-auto-rotate')
-      const streamedEvents: Array<Record<string, unknown>> = []
-      ws.on('message', (data) => {
-        const parsed = JSON.parse(data.toString()) as Record<string, unknown>
-        if (parsed.type !== 'replay') {
-          streamedEvents.push(parsed)
-        }
-      })
-
-      codexSidecar.queueTurnScript({
-        notifications: [
-          {
-            method: 'turn/started',
-            params: { turn: { id: 'turn-1', status: 'inProgress', items: [] } },
-          },
-          {
-            method: 'turn/completed',
-            params: { turn: { id: 'turn-1', status: 'completed', items: [] } },
-          },
-        ],
-      })
-
-      const firstMessageResponse = await fetch(`${server.baseUrl}/api/agents/sessions/codex-auto-rotate/message`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({ message: 'first codex turn' }),
-      })
-      expect(firstMessageResponse.status).toBe(202)
-
-      await vi.waitFor(() => {
-        expect(codexSidecar.turnStartInputs).toEqual(['first codex turn'])
-      })
-
-      await vi.waitFor(() => {
-        const threadStarts = codexSidecar.requests.filter((request) => request.method === 'thread/start')
-        expect(threadStarts.length).toBeGreaterThanOrEqual(2)
-      })
-
-      await vi.waitFor(() => {
-        expect(streamedEvents.some((event) => (
-          event.type === 'system' && event.subtype === 'session_rotated'
-        ))).toBe(true)
-      })
-
-      await vi.waitFor(async () => {
-        const raw = await readFile(sessionStorePath, 'utf8')
-        const parsed = JSON.parse(raw) as {
-          sessions: Array<{ name: string; conversationEntryCount?: number }>
-        }
-        const saved = parsed.sessions.find((session) => session.name === 'codex-auto-rotate')
-        expect(saved?.conversationEntryCount).toBe(0)
-      })
-
-      codexSidecar.queueTurnScript({})
-      const secondMessageResponse = await fetch(`${server.baseUrl}/api/agents/sessions/codex-auto-rotate/message`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({ message: 'second codex turn' }),
-      })
-      expect(secondMessageResponse.status).toBe(202)
-
-      await vi.waitFor(() => {
-        expect(codexSidecar.turnStartInputs).toEqual(['first codex turn', 'second codex turn'])
-      })
-
-      const sessionsResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-        headers: AUTH_HEADERS,
-      })
-      expect(sessionsResponse.status).toBe(200)
-      const listed = await sessionsResponse.json() as Array<{ name: string }>
-      expect(listed.filter((session) => session.name === 'codex-auto-rotate')).toHaveLength(1)
-
-      ws.close()
-    } finally {
-      await server.close()
-      await codexSidecar.close()
-      await rm(sessionStoreDir, { recursive: true, force: true })
-    }
-  }, 15000)
-
-  it('pre-kill-debrief returns immediately and debrief-status tracks completion for Codex stream session', async () => {
-    const codexSidecar = installMockCodexSidecar()
-    codexSidecar.queueTurnScript({
-      notifications: [
-        {
-          method: 'turn/started',
-          params: { turn: { id: 'turn-debrief', status: 'inProgress', items: [] } },
-        },
-        {
-          method: 'turn/completed',
-          params: { turn: { id: 'turn-debrief', status: 'completed', items: [] } },
-        },
-      ],
-    })
-    const server = await startServer()
-
-    try {
-      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          name: 'codex-kill-debrief',
-          mode: 'default',
-          sessionType: 'stream',
-          agentType: 'codex',
-        }),
-      })
-      expect(createResponse.status).toBe(201)
-
-      const preResp = await fetch(`${server.baseUrl}/api/agents/sessions/codex-kill-debrief/pre-kill-debrief`, {
-        method: 'POST',
-        headers: AUTH_HEADERS,
-      })
-      expect(preResp.status).toBe(200)
-      const preJson = await preResp.json()
-      expect(preJson).toMatchObject({ debriefStarted: true, timeoutMs: 60000 })
-
-      await vi.waitFor(() => {
-        expect(codexSidecar.turnStartInputs).toEqual(['$debrief hotwash'])
-      })
-
-      await vi.waitFor(async () => {
-        const statusResp = await fetch(`${server.baseUrl}/api/agents/sessions/codex-kill-debrief/debrief-status`, {
-          headers: AUTH_HEADERS,
-        })
-        const { status } = await statusResp.json()
-        expect(status).toBe('completed')
-      })
-
-      const deleteResponse = await fetch(`${server.baseUrl}/api/agents/sessions/codex-kill-debrief`, {
-        method: 'DELETE',
-        headers: AUTH_HEADERS,
-      })
-      expect(deleteResponse.status).toBe(200)
-      expect(await deleteResponse.json()).toEqual({ killed: true })
-    } finally {
-      await server.close()
-      await codexSidecar.close()
-    }
-  })
-
-  it('streams Codex text deltas, avoids duplicate user echoes, and tracks usage', async () => {
-    const codexSidecar = installMockCodexSidecar()
-    codexSidecar.queueTurnScript({
-      notifications: [
-        {
-          method: 'turn/started',
-          params: { turn: { id: 'turn-1', status: 'inProgress', items: [] } },
-        },
-        {
-          method: 'item/started',
-          params: {
-            turnId: 'turn-1',
-            item: {
-              id: 'user-1',
-              type: 'userMessage',
-              content: [{ type: 'text', text: 'research please' }],
-            },
-          },
-        },
-        {
-          method: 'item/started',
-          params: {
-            turnId: 'turn-1',
-            item: { id: 'assistant-1', type: 'agentMessage', text: '' },
-          },
-        },
-        {
-          method: 'item/agentMessage/delta',
-          params: { turnId: 'turn-1', itemId: 'assistant-1', delta: 'Hello ' },
-        },
-        {
-          method: 'item/agentMessage/delta',
-          params: { turnId: 'turn-1', itemId: 'assistant-1', delta: 'world' },
-        },
-        {
-          method: 'item/completed',
-          params: {
-            turnId: 'turn-1',
-            item: { id: 'assistant-1', type: 'agentMessage', text: 'Hello world' },
-          },
-        },
-        {
-          method: 'thread/tokenUsage/updated',
-          params: {
-            turnId: 'turn-1',
-            tokenUsage: {
-              last: {
-                cachedInputTokens: 0,
-                inputTokens: 13,
-                outputTokens: 34,
-                reasoningOutputTokens: 0,
-                totalTokens: 47,
-              },
-              total: {
-                cachedInputTokens: 0,
-                inputTokens: 13,
-                outputTokens: 34,
-                reasoningOutputTokens: 0,
-                totalTokens: 47,
-              },
-            },
-          },
-        },
-        {
-          method: 'turn/completed',
-          params: { turn: { id: 'turn-1', status: 'completed', items: [] } },
-        },
-      ],
-    })
-    const server = await startServer()
-
-    try {
-      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          name: 'codex-stream-live',
-          mode: 'default',
-          sessionType: 'stream',
-          agentType: 'codex',
-        }),
-      })
-      expect(createResponse.status).toBe(201)
-
-      const ws = await connectWs(server.baseUrl, 'codex-stream-live')
-      const messages: Array<Record<string, unknown>> = []
-      ws.on('message', (data) => {
-        messages.push(JSON.parse(data.toString()) as Record<string, unknown>)
-      })
-
-      ws.send(JSON.stringify({ type: 'input', text: 'research please' }))
-
-      await vi.waitFor(() => {
-        expect(messages.some((message) => message.type === 'result')).toBe(true)
-      })
-
-      expect(codexSidecar.turnStartInputs).toEqual(['research please'])
-
-      const userMessages = messages.filter((message) => {
-        if (message.type !== 'user') return false
-        const payload = message.message as { content?: unknown } | undefined
-        return payload?.content === 'research please'
-      })
-      expect(userMessages).toHaveLength(1)
-
-      expect(messages.some((message) => message.type === 'content_block_start')).toBe(true)
-      const streamedText = messages
-        .filter((message) => message.type === 'content_block_delta')
-        .map((message) => {
-          const delta = message.delta as { text?: string } | undefined
-          return delta?.text ?? ''
-        })
-        .join('')
-      expect(streamedText).toBe('Hello world')
-      expect(messages.some((message) => message.type === 'content_block_stop')).toBe(true)
-
-      const usageEvent = messages.find((message) => {
-        if (message.type !== 'message_delta') return false
-        const usage = message.usage as { input_tokens?: number; output_tokens?: number } | undefined
-        return usage?.input_tokens === 13 && usage?.output_tokens === 34
-      })
-      expect(usageEvent).toBeDefined()
-
-      const replayMessages: Array<{
-        type: string
-        usage?: { inputTokens: number; outputTokens: number; costUsd: number }
-      }> = []
-      const replayWsUrl = server.baseUrl.replace('http://', 'ws://') +
-        '/api/agents/sessions/codex-stream-live/terminal?api_key=test-key'
-      const replayWs = new WebSocket(replayWsUrl)
-      replayWs.on('message', (data) => {
-        replayMessages.push(JSON.parse(data.toString()) as {
-          type: string
-          usage?: { inputTokens: number; outputTokens: number; costUsd: number }
-        })
-      })
-      await new Promise<void>((resolve, reject) => {
-        replayWs.on('open', () => resolve())
-        replayWs.on('error', reject)
-      })
-
-      await vi.waitFor(() => {
-        expect(replayMessages.some((message) => message.type === 'replay')).toBe(true)
-      })
-
-      const replay = replayMessages.find((message) => message.type === 'replay')
-      expect(replay).toBeDefined()
-      expect(replay?.usage).toEqual({
-        inputTokens: 13,
-        outputTokens: 34,
-        costUsd: 0,
-      })
-
-      ws.close()
-      replayWs.close()
-    } finally {
-      await server.close()
-      await codexSidecar.close()
-    }
-  }, 15000)
-
-  it('does not leave queued Codex /message sends stuck after a turn/start failure', async () => {
-    const codexSidecar = installMockCodexSidecar()
-    codexSidecar.queueTurnScript({ error: 'sidecar disconnected' })
-    codexSidecar.queueTurnScript({
-      notifications: [
-        {
-          method: 'turn/started',
-          params: { turn: { id: 'turn-2', status: 'inProgress', items: [] } },
-        },
-        {
-          method: 'turn/completed',
-          params: { turn: { id: 'turn-2', status: 'completed', items: [] } },
-        },
-      ],
-    })
-    const server = await startServer()
-
-    try {
-      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          name: 'codex-message-retry',
-          mode: 'default',
-          sessionType: 'stream',
-          agentType: 'codex',
-        }),
-      })
-      expect(createResponse.status).toBe(201)
-
-      const ws = await connectWs(server.baseUrl, 'codex-message-retry')
-      const messages: Array<Record<string, unknown>> = []
-      ws.on('message', (data) => {
-        messages.push(JSON.parse(data.toString()) as Record<string, unknown>)
-      })
-
-      const firstResponse = await fetch(`${server.baseUrl}/api/agents/sessions/codex-message-retry/message`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({ message: 'first try' }),
-      })
-      expect(firstResponse.status).toBe(202)
-
-      await vi.waitFor(() => {
-        expect(codexSidecar.turnStartInputs).toEqual(['first try'])
-      })
-      await vi.waitFor(() => {
-        expect(messages.some((message) => {
-          if (message.type !== 'system') return false
-          return typeof message.text === 'string' && message.text.includes('Codex request failed')
-        })).toBe(true)
-      })
-
-      const secondResponse = await fetch(`${server.baseUrl}/api/agents/sessions/codex-message-retry/message`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({ message: 'second try' }),
-      })
-      expect(secondResponse.status).toBe(202)
-
-      await vi.waitFor(() => {
-        expect(codexSidecar.turnStartInputs).toEqual(['first try', 'second try'])
-      })
-
-      ws.close()
-    } finally {
-      await server.close()
-      await codexSidecar.close()
-    }
-  })
-
-  it('routes HTTP /message directly to OpenClaw hook dispatch', async () => {
-    const originalFetch = globalThis.fetch.bind(globalThis)
-    const hookCalls: Array<{ url: string; body: { message?: string } }> = []
-    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(((input, init) => {
-      const url = typeof input === 'string'
-        ? input
-        : (input instanceof URL ? input.toString() : input.url)
-      if (url === 'http://localhost:18789/hooks/agent') {
-        const body = typeof init?.body === 'string' ? JSON.parse(init.body) as { message?: string } : {}
-        hookCalls.push({ url, body })
-        return Promise.resolve(new Response('{}', { status: 200 }))
-      }
-      return originalFetch(input, init)
-    }) as typeof fetch)
-
-    const server = await startServer()
-
-    try {
-      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          name: 'openclaw-http-message',
-          mode: 'dangerouslySkipPermissions',
-          sessionType: 'stream',
-          agentType: 'openclaw',
-        }),
-      })
-      expect(createResponse.status).toBe(201)
-
-      const messageResponse = await fetch(`${server.baseUrl}/api/agents/sessions/openclaw-http-message/message`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({ message: 'openclaw queued input' }),
-      })
-
-      expect(messageResponse.status).toBe(202)
-      expect(await messageResponse.json()).toEqual({ queued: true, queueDepth: 0 })
-
-      await vi.waitFor(() => {
-        expect(hookCalls).toHaveLength(1)
-      })
-      expect(hookCalls[0].body.message).toBe('openclaw queued input')
-    } finally {
-      fetchSpy.mockRestore()
-      await server.close()
-    }
-  })
-
-  it('pre-kill-debrief returns unsupported for OpenClaw; DELETE never blocks on debrief', async () => {
-    const originalFetch = globalThis.fetch.bind(globalThis)
-    const hookCalls: Array<{ url: string; body: { message?: string } }> = []
-    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(((input, init) => {
-      const url = typeof input === 'string'
-        ? input
-        : (input instanceof URL ? input.toString() : input.url)
-      if (url === 'http://localhost:18789/hooks/agent') {
-        const body = typeof init?.body === 'string' ? JSON.parse(init.body) as { message?: string } : {}
-        hookCalls.push({ url, body })
-        return Promise.resolve(new Response('{}', { status: 200 }))
-      }
-      return originalFetch(input, init)
-    }) as typeof fetch)
-
-    const server = await startServer()
-
-    try {
-      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          name: 'openclaw-kill-no-debrief',
-          mode: 'dangerouslySkipPermissions',
-          sessionType: 'stream',
-          agentType: 'openclaw',
-        }),
-      })
-      expect(createResponse.status).toBe(201)
-
-      const preResp = await fetch(`${server.baseUrl}/api/agents/sessions/openclaw-kill-no-debrief/pre-kill-debrief`, {
-        method: 'POST',
-        headers: AUTH_HEADERS,
-      })
-      expect(preResp.status).toBe(200)
-      expect(await preResp.json()).toMatchObject({
-        debriefed: false,
-        reason: 'unsupported-agent-type',
-      })
-      expect(hookCalls).toHaveLength(0)
-
-      const deleteResponse = await fetch(`${server.baseUrl}/api/agents/sessions/openclaw-kill-no-debrief`, {
-        method: 'DELETE',
-        headers: AUTH_HEADERS,
-      })
-      expect(deleteResponse.status).toBe(200)
-      expect(await deleteResponse.json()).toEqual({ killed: true })
-    } finally {
-      fetchSpy.mockRestore()
-      await server.close()
-    }
-  })
-
-  it('pre-kill-debrief returns pty-session for PTY sessions without attempting debrief', async () => {
-    const { spawner } = createMockPtySpawner()
-    const server = await startServer({ ptySpawner: spawner })
-
-    const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      method: 'POST',
-      headers: {
-        ...AUTH_HEADERS,
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        name: 'pty-no-debrief',
-        mode: 'default',
-        sessionType: 'pty',
-      }),
-    })
-    expect(createResponse.status).toBe(201)
-
-    const preResp = await fetch(`${server.baseUrl}/api/agents/sessions/pty-no-debrief/pre-kill-debrief`, {
-      method: 'POST',
-      headers: AUTH_HEADERS,
-    })
-    expect(preResp.status).toBe(200)
-    expect(await preResp.json()).toEqual({ debriefed: false, reason: 'pty-session' })
-
-    const statusResp = await fetch(`${server.baseUrl}/api/agents/sessions/pty-no-debrief/debrief-status`, {
-      headers: AUTH_HEADERS,
-    })
-    expect((await statusResp.json()).status).toBe('none')
-
-    await server.close()
-  })
-
   it('clears lastTurnCompleted immediately when WS input is received for completed session', async () => {
     const mock = installMockProcess()
     const server = await startServer()
@@ -4970,19 +4595,13 @@ describe('stream sessions', () => {
     mock.emitStdout('{"type":"result","subtype":"success","result":"done"}\n')
 
     await vi.waitFor(async () => {
-      const resp = await fetch(`${server.baseUrl}/api/agents/sessions/command-room-no-clear-test`, {
+      const resp = await fetch(`${server.baseUrl}/api/agents/world`, {
         headers: AUTH_HEADERS,
       })
-      const payload = await resp.json() as { completed: boolean; status?: string }
-      expect(payload.completed).toBe(true)
+      const payload = await resp.json() as Array<{ id: string; status: string }>
+      const entry = payload.find((e) => e.id === 'command-room-no-clear-test')
+      expect(entry?.status).toBe('completed')
     })
-
-    // Completed command-room sessions should be excluded from /world.
-    const worldResp = await fetch(`${server.baseUrl}/api/agents/world`, {
-      headers: AUTH_HEADERS,
-    })
-    const worldPayload = await worldResp.json() as Array<{ id: string }>
-    expect(worldPayload.find((e) => e.id === 'command-room-no-clear-test')).toBeUndefined()
 
     // Send input — command-room sessions should stay completed.
     const ws = await connectWs(server.baseUrl, 'command-room-no-clear-test')
@@ -4991,11 +4610,12 @@ describe('stream sessions', () => {
     // Wait briefly to let the WS message be processed.
     await new Promise((r) => setTimeout(r, 100))
 
-    const resp = await fetch(`${server.baseUrl}/api/agents/sessions/command-room-no-clear-test`, {
+    const resp = await fetch(`${server.baseUrl}/api/agents/world`, {
       headers: AUTH_HEADERS,
     })
-    const payload = await resp.json() as { completed: boolean; status?: string }
-    expect(payload.completed).toBe(true)
+    const payload = await resp.json() as Array<{ id: string; status: string }>
+    const entry = payload.find((e) => e.id === 'command-room-no-clear-test')
+    expect(entry?.status).toBe('completed')
 
     ws.close()
     await server.close()
@@ -5039,8 +4659,9 @@ describe('stream sessions', () => {
       const resp = await fetch(`${server.baseUrl}/api/agents/sessions`, {
         headers: AUTH_HEADERS,
       })
-      const sessions = await resp.json()
-      expect(sessions).toHaveLength(0)
+      const sessions = await resp.json() as Array<{ name: string; processAlive?: boolean }>
+      const exited = sessions.find((session) => session.name === 'stream-exit')
+      expect(exited?.processAlive).toBe(false)
     })
 
     await server.close()
@@ -5140,8 +4761,9 @@ describe('stream sessions', () => {
       const resp = await fetch(`${server.baseUrl}/api/agents/sessions`, {
         headers: AUTH_HEADERS,
       })
-      const sessions = await resp.json()
-      expect(sessions).toHaveLength(0)
+      const sessions = await resp.json() as Array<{ name: string; processAlive?: boolean }>
+      const exited = sessions.find((session) => session.name === 'stream-error')
+      expect(exited?.processAlive).toBe(false)
     })
 
     ws.close()
@@ -5217,59 +4839,6 @@ describe('stream sessions', () => {
     expect(mock.cp.kill).toHaveBeenCalledWith('SIGTERM')
 
     await server.close()
-  })
-
-  it('pre-kill-debrief returns immediately and debrief-status tracks completion for Claude stream session', async () => {
-    const mock = installMockProcess()
-    const server = await startServer()
-
-    try {
-      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          name: 'stream-kill-debrief',
-          mode: 'default',
-          sessionType: 'stream',
-        }),
-      })
-      expect(createResponse.status).toBe(201)
-
-      const preResp = await fetch(`${server.baseUrl}/api/agents/sessions/stream-kill-debrief/pre-kill-debrief`, {
-        method: 'POST',
-        headers: AUTH_HEADERS,
-      })
-      expect(preResp.status).toBe(200)
-      const preJson = await preResp.json()
-      expect(preJson).toMatchObject({ debriefStarted: true, timeoutMs: 60000 })
-
-      await vi.waitFor(() => {
-        expect(mock.getStdinWrites().some((write) => write.includes('/debrief hotwash'))).toBe(true)
-      })
-
-      mock.emitStdout('{"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":1,"is_error":false,"num_turns":1,"result":"done","session_id":"test-session"}\n')
-
-      await vi.waitFor(async () => {
-        const statusResp = await fetch(`${server.baseUrl}/api/agents/sessions/stream-kill-debrief/debrief-status`, {
-          headers: AUTH_HEADERS,
-        })
-        const { status } = await statusResp.json()
-        expect(status).toBe('completed')
-      })
-
-      const deleteResponse = await fetch(`${server.baseUrl}/api/agents/sessions/stream-kill-debrief`, {
-        method: 'DELETE',
-        headers: AUTH_HEADERS,
-      })
-      expect(deleteResponse.status).toBe(200)
-      expect(await deleteResponse.json()).toEqual({ killed: true })
-      expect(mock.cp.kill).toHaveBeenCalledWith('SIGTERM')
-    } finally {
-      await server.close()
-    }
   })
 
   it('tracks usage from message_delta events', async () => {
@@ -5781,8 +5350,9 @@ describe('stream sessions', () => {
     const resp = await fetch(`${server.baseUrl}/api/agents/sessions`, {
       headers: AUTH_HEADERS,
     })
-    const sessions = await resp.json()
-    expect(sessions).toHaveLength(0)
+    const sessions = await resp.json() as Array<{ name: string; processAlive?: boolean }>
+    const exited = sessions.find((session) => session.name === 'stream-race')
+    expect(exited?.processAlive).toBe(false)
 
     await server.close()
   })
@@ -5815,1128 +5385,5 @@ describe('stream sessions', () => {
     }).not.toThrow()
 
     await server.close()
-  })
-
-  it('marks factory session as completed on process exit without result', async () => {
-    const mock = installMockProcess()
-    const server = await startServer()
-
-    const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      method: 'POST',
-      headers: {
-        ...AUTH_HEADERS,
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        name: 'factory-feat-123-1234567890',
-        mode: 'default',
-        sessionType: 'stream',
-        task: 'implement feature',
-      }),
-    })
-    expect(createResponse.status).toBe(201)
-
-    // Factory worker exits without emitting result — exit handler should synthesize completion.
-    mock.emitExit(0)
-
-    await vi.waitFor(async () => {
-      const response = await fetch(`${server.baseUrl}/api/agents/sessions/factory-feat-123-1234567890`, {
-        headers: AUTH_HEADERS,
-      })
-      expect(response.status).toBe(200)
-      const payload = (await response.json()) as {
-        completed: boolean
-        status: string
-        result?: { status: string; finalComment: string }
-      }
-      expect(payload.completed).toBe(true)
-      expect(payload.status).toBe('success')
-      expect(payload.result?.finalComment).toContain('Process exited with code 0')
-    })
-
-    await server.close()
-  })
-
-  it('marks factory session as completed via POST /sessions/:name/complete', async () => {
-    const mock = installMockProcess()
-    const server = await startServer()
-
-    const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      method: 'POST',
-      headers: {
-        ...AUTH_HEADERS,
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        name: 'factory-fix-456-9876543210',
-        mode: 'default',
-        sessionType: 'stream',
-        task: 'fix bug',
-      }),
-    })
-    expect(createResponse.status).toBe(201)
-
-    // POST completion via the hook endpoint.
-    const completeResponse = await fetch(
-      `${server.baseUrl}/api/agents/sessions/factory-fix-456-9876543210/complete`,
-      {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({ status: 'success', comment: 'Stop hook fired' }),
-      },
-    )
-    expect(completeResponse.status).toBe(200)
-    const completePayload = (await completeResponse.json()) as { name: string; completed: boolean; status: string }
-    expect(completePayload.completed).toBe(true)
-    expect(completePayload.status).toBe('success')
-
-    expect(mock.cp.kill).toHaveBeenCalledWith('SIGTERM')
-
-    // GET should return completed.
-    const getResponse = await fetch(
-      `${server.baseUrl}/api/agents/sessions/factory-fix-456-9876543210`,
-      { headers: AUTH_HEADERS },
-    )
-    expect(getResponse.status).toBe(200)
-    const getPayload = (await getResponse.json()) as { completed: boolean; status: string }
-    expect(getPayload.completed).toBe(true)
-
-    await server.close()
-  })
-
-  it('POST /sessions/:name/complete is idempotent', async () => {
-    installMockProcess()
-    const server = await startServer()
-
-    await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      method: 'POST',
-      headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
-      body: JSON.stringify({
-        name: 'factory-idempotent-789',
-        mode: 'default',
-        sessionType: 'stream',
-        task: 'test',
-      }),
-    })
-
-    // First complete call.
-    const first = await fetch(
-      `${server.baseUrl}/api/agents/sessions/factory-idempotent-789/complete`,
-      {
-        method: 'POST',
-        headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
-        body: JSON.stringify({ status: 'success' }),
-      },
-    )
-    expect(first.status).toBe(200)
-
-    // Second complete call — should succeed without error.
-    const second = await fetch(
-      `${server.baseUrl}/api/agents/sessions/factory-idempotent-789/complete`,
-      {
-        method: 'POST',
-        headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
-        body: JSON.stringify({ status: 'success' }),
-      },
-    )
-    expect(second.status).toBe(200)
-    const payload = (await second.json()) as { completed: boolean }
-    expect(payload.completed).toBe(true)
-
-    await server.close()
-  })
-
-  it('POST /sessions/:name/reset rotates commander session with new process', async () => {
-    const processMocks: Array<ReturnType<typeof createMockChildProcess>> = []
-    mockedSpawn.mockImplementation(() => {
-      const mock = createMockChildProcess()
-      processMocks.push(mock)
-      return mock.cp as never
-    })
-
-    const workDir = await mkdtemp(join(tmpdir(), 'hammurabi-command-reset-http-'))
-    const commanderDataDir = join(workDir, 'commanders-data')
-    await seedCommanderSessionFixture({
-      commanderDataDir,
-      commanderId: 'reset-test',
-      workflowPrompt: 'HTTP reset workflow prompt from COMMANDER.md',
-      identityBody: 'HTTP reset identity body from identity.md.',
-    })
-    const server = await startServer({
-      commanderSessionStorePath: join(commanderDataDir, 'sessions.json'),
-    })
-
-    try {
-      await server.sessionsInterface.createCommanderSession({
-        name: 'commander-reset-test',
-        systemPrompt: 'Stale reset prompt',
-        agentType: 'claude',
-        cwd: '/tmp',
-        maxTurns: 9,
-      })
-      expect(processMocks).toHaveLength(1)
-
-      // Emit a result so the session is in a completed-turn state.
-      processMocks[0].emitStdout('{"type":"result","result":"done"}\n')
-      await waitForPersistedSessionFlush()
-
-      // Reset the session.
-      const resetResponse = await fetch(
-        `${server.baseUrl}/api/agents/sessions/commander-reset-test/reset`,
-        {
-          method: 'POST',
-          headers: AUTH_HEADERS,
-        },
-      )
-      expect(resetResponse.status).toBe(200)
-      const resetPayload = (await resetResponse.json()) as { reset: boolean; sessionName: string }
-      expect(resetPayload.reset).toBe(true)
-      expect(resetPayload.sessionName).toBe('commander-reset-test')
-
-      // A new process should have been spawned.
-      expect(processMocks).toHaveLength(2)
-
-      // Old process should have been killed.
-      expect(processMocks[0].cp.kill).toHaveBeenCalledWith('SIGTERM')
-
-      // New process should NOT have --resume flag.
-      const lastSpawnArgs = mockedSpawn.mock.calls[mockedSpawn.mock.calls.length - 1]
-      expect(lastSpawnArgs[1]).not.toContain('--resume')
-      expect(lastSpawnArgs[1]).not.toContain('--max-turns')
-      expect(lastSpawnArgs[1]).toContain('--system-prompt')
-      const promptIndex = lastSpawnArgs[1].indexOf('--system-prompt')
-      const resetPrompt = lastSpawnArgs[1][promptIndex + 1]
-      expect(resetPrompt).toContain('HTTP reset workflow prompt from COMMANDER.md')
-      expect(resetPrompt).toContain('HTTP reset identity body from identity.md.')
-      expect(resetPrompt).not.toBe('Stale reset prompt')
-
-      // Session should still exist in the session list.
-      const listResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-        headers: AUTH_HEADERS,
-      })
-      const sessions = (await listResponse.json()) as Array<{ name: string }>
-      expect(sessions.some((s) => s.name === 'commander-reset-test')).toBe(true)
-
-      await vi.waitFor(() => {
-        expect(processMocks[1].getStdinWrites().some((write) => (
-          write.includes('Session rotated. Continuing as commander.')
-        ))).toBe(true)
-      })
-    } finally {
-      await server.close()
-      await rm(workDir, { recursive: true, force: true })
-    }
-  })
-
-  it('POST /sessions/:name/reset rejects non-commander sessions', async () => {
-    const mock = installMockProcess()
-    const server = await startServer()
-
-    try {
-      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-        method: 'POST',
-        headers: {
-          ...AUTH_HEADERS,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          name: 'regular-session',
-          mode: 'default',
-          sessionType: 'stream',
-        }),
-      })
-      expect(createResponse.status).toBe(201)
-
-      mock.emitStdout('{"type":"result","result":"done"}\n')
-      await waitForPersistedSessionFlush()
-
-      const resetResponse = await fetch(
-        `${server.baseUrl}/api/agents/sessions/regular-session/reset`,
-        {
-          method: 'POST',
-          headers: AUTH_HEADERS,
-        },
-      )
-      expect(resetResponse.status).toBe(400)
-      const payload = (await resetResponse.json()) as { error: string }
-      expect(payload.error).toContain('commander')
-    } finally {
-      await server.close()
-    }
-  })
-
-  it('POST /sessions/:name/reset returns 404 for non-existent session', async () => {
-    const server = await startServer()
-
-    try {
-      const resetResponse = await fetch(
-        `${server.baseUrl}/api/agents/sessions/commander-nonexistent/reset`,
-        {
-          method: 'POST',
-          headers: AUTH_HEADERS,
-        },
-      )
-      expect(resetResponse.status).toBe(404)
-    } finally {
-      await server.close()
-    }
-  })
-
-  it('passes --system-prompt to spawn when commander session is created with systemPrompt', async () => {
-    const mock = installMockProcess()
-    const server = await startServer()
-
-    server.sessionsInterface.createCommanderSession({
-      name: 'commander-identity-test',
-      systemPrompt: 'You are Commander Alpha',
-      cwd: '/tmp',
-    })
-
-    expect(mockedSpawn).toHaveBeenCalledWith(
-      'claude',
-      expect.arrayContaining(['--system-prompt', 'You are Commander Alpha']),
-      expect.objectContaining({ stdio: ['pipe', 'pipe', 'pipe'] }),
-    )
-
-    // Clean up
-    mock.cp.kill()
-    server.sessionsInterface.deleteSession('commander-identity-test')
-    await server.close()
-  })
-
-  it('keeps websocket clients connected when commander session is replaced', async () => {
-    const firstMock = createMockChildProcess()
-    const secondMock = createMockChildProcess()
-    mockedSpawn.mockReturnValueOnce(firstMock.cp as never)
-    mockedSpawn.mockReturnValueOnce(secondMock.cp as never)
-
-    const server = await startServer()
-
-    await server.sessionsInterface.createCommanderSession({
-      name: 'commander-replace-test',
-      systemPrompt: 'You are Commander Gamma',
-      agentType: 'claude',
-      cwd: '/tmp',
-    })
-
-    const ws = await connectWs(server.baseUrl, 'commander-replace-test')
-    const closeSpy = vi.fn()
-    ws.on('close', closeSpy)
-
-    await server.sessionsInterface.createCommanderSession({
-      name: 'commander-replace-test',
-      systemPrompt: 'You are Commander Delta',
-      agentType: 'claude',
-      cwd: '/tmp',
-    })
-
-    await vi.waitFor(() => {
-      expect(firstMock.cp.kill).toHaveBeenCalledWith('SIGTERM')
-    })
-    await new Promise((resolve) => setTimeout(resolve, 50))
-
-    expect(ws.readyState).toBe(WebSocket.OPEN)
-    expect(closeSpy).not.toHaveBeenCalled()
-
-    ws.close()
-    await new Promise<void>((resolve) => {
-      ws.once('close', () => resolve())
-    })
-    server.sessionsInterface.deleteSession('commander-replace-test')
-    await server.close()
-  })
-
-  it('preserves systemPrompt on respawn when process exits and new message arrives via WS', async () => {
-    const mock1 = createMockChildProcess()
-    mockedSpawn.mockReturnValueOnce(mock1.cp as never)
-
-    const workDir = await mkdtemp(join(tmpdir(), 'hammurabi-respawn-seed-'))
-    const commanderDataDir = join(workDir, 'commanders-data')
-    await seedCommanderSessionFixture({
-      commanderDataDir,
-      commanderId: 'respawn-test',
-      workflowPrompt: 'Fresh respawn workflow prompt',
-      identityBody: 'Fresh respawn identity body.',
-    })
-
-    const server = await startServer({
-      commanderSessionStorePath: join(commanderDataDir, 'sessions.json'),
-    })
-
-    // Create a commander session with a system prompt
-    server.sessionsInterface.createCommanderSession({
-      name: 'commander-respawn-test',
-      systemPrompt: 'You are Commander Beta',
-      agentType: 'claude',
-      cwd: '/tmp',
-      maxTurns: 5,
-    })
-
-    // Verify first spawn includes system prompt
-    expect(mockedSpawn).toHaveBeenCalledTimes(1)
-    expect(mockedSpawn).toHaveBeenCalledWith(
-      'claude',
-      expect.arrayContaining(['--system-prompt', 'You are Commander Beta']),
-      expect.anything(),
-    )
-
-    // Simulate the init event so claudeSessionId gets set
-    mock1.emitStdout('{"type":"system","subtype":"init","session_id":"claude-session-abc"}\n')
-    await new Promise((r) => setTimeout(r, 50))
-
-    // Connect WS *before* making stdin non-writable (session must still
-    // be in the map; after process exit the session is deleted).
-    const ws = await connectWs(server.baseUrl, 'commander-respawn-test')
-
-    // Make stdin non-writable without triggering a full process exit —
-    // this simulates a process that has finished its turn but whose exit
-    // event has not yet fired.
-    Object.defineProperty(mock1.cp.stdin, 'writable', { value: false })
-    mock1.cp.stdin.write = vi.fn(() => false)
-
-    // Prepare a second mock for the respawn
-    const mock2 = createMockChildProcess()
-    mockedSpawn.mockReturnValueOnce(mock2.cp as never)
-
-    // Send a user message via WS — this triggers the respawn path
-    ws.send(JSON.stringify({ type: 'input', text: 'check quest board' }))
-
-    // Wait for the respawn to be triggered (it happens asynchronously via readMachineRegistry)
-    await vi.waitFor(() => {
-      expect(mockedSpawn).toHaveBeenCalledTimes(2)
-    }, { timeout: 2000 })
-
-    // The second spawn call (respawn) should include --system-prompt
-    const secondCall = mockedSpawn.mock.calls[1]
-    expect(secondCall[0]).toBe('claude')
-    const args = secondCall[1] as string[]
-    expect(args).toContain('--system-prompt')
-    const spIdx = args.indexOf('--system-prompt')
-    const respawnPrompt = args[spIdx + 1]
-    expect(respawnPrompt).toContain('Fresh respawn workflow prompt')
-    expect(respawnPrompt).toContain('Fresh respawn identity body.')
-    expect(respawnPrompt).not.toBe('You are Commander Beta')
-
-    // Also verify --max-turns is preserved
-    expect(args).toContain('--max-turns')
-    const mtIdx = args.indexOf('--max-turns')
-    expect(args[mtIdx + 1]).toBe('5')
-
-    // Also verify --resume is passed
-    expect(args).toContain('--resume')
-
-    ws.close()
-    server.sessionsInterface.deleteSession('commander-respawn-test')
-    await server.close()
-    await rm(workDir, { recursive: true, force: true })
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Unit tests for session-messages.ts
-// ---------------------------------------------------------------------------
-
-describe('extractMessages', () => {
-  it('extracts user and assistant messages from Claude envelope events', () => {
-    const events = [
-      { type: 'system', subtype: 'init', session_id: 'abc' },
-      { type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'Hello' }] } },
-      { type: 'message_start', message: { id: 'm1', role: 'assistant' } },
-      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Hi there!' }] } },
-      { type: 'message_delta', usage: { input_tokens: 10, output_tokens: 20 } },
-      { type: 'result', subtype: 'success', result: 'done' },
-    ]
-
-    const messages = extractMessages(events)
-    expect(messages).toHaveLength(2)
-    expect(messages[0]).toEqual({ role: 'user', content: 'Hello' })
-    expect(messages[1]).toEqual({ role: 'assistant', content: 'Hi there!' })
-  })
-
-  it('filters by role=assistant', () => {
-    const events = [
-      { type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'Q1' }] } },
-      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'A1' }] } },
-      { type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'Q2' }] } },
-      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'A2' }] } },
-    ]
-
-    const messages = extractMessages(events, 'assistant')
-    expect(messages).toHaveLength(2)
-    expect(messages[0].content).toBe('A1')
-    expect(messages[1].content).toBe('A2')
-  })
-
-  it('filters by role=user', () => {
-    const events = [
-      { type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'Q1' }] } },
-      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'A1' }] } },
-    ]
-
-    const messages = extractMessages(events, 'user')
-    expect(messages).toHaveLength(1)
-    expect(messages[0].content).toBe('Q1')
-  })
-
-  it('applies last=N to return only the last N messages', () => {
-    const events = [
-      { type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'Q1' }] } },
-      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'A1' }] } },
-      { type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'Q2' }] } },
-      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'A2' }] } },
-    ]
-
-    const messages = extractMessages(events, 'all', 2)
-    expect(messages).toHaveLength(2)
-    expect(messages[0].content).toBe('Q2')
-    expect(messages[1].content).toBe('A2')
-  })
-
-  it('marks assistant messages with tool_use content', () => {
-    const events = [
-      {
-        type: 'assistant',
-        message: {
-          role: 'assistant',
-          content: [
-            { type: 'text', text: 'Let me check' },
-            { type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } },
-          ],
-        },
-      },
-    ]
-
-    const messages = extractMessages(events)
-    expect(messages).toHaveLength(1)
-    expect(messages[0].toolUse).toBe(true)
-  })
-
-  it('returns empty array for events with no messages', () => {
-    const events = [
-      { type: 'system', subtype: 'init' },
-      { type: 'message_start', message: { id: 'm1', role: 'assistant' } },
-      { type: 'message_delta', usage: { input_tokens: 10 } },
-      { type: 'result', subtype: 'success' },
-    ]
-
-    const messages = extractMessages(events)
-    expect(messages).toEqual([])
-  })
-
-  it('preserves timestamp from events', () => {
-    const events = [
-      {
-        type: 'user',
-        timestamp: '2026-03-20T10:00:00Z',
-        message: { role: 'user', content: [{ type: 'text', text: 'Hello' }] },
-      },
-    ]
-
-    const messages = extractMessages(events)
-    expect(messages[0].timestamp).toBe('2026-03-20T10:00:00Z')
-  })
-
-  it('handles string content in message', () => {
-    const events = [
-      { type: 'user', message: { role: 'user', content: 'plain string content' } },
-    ]
-
-    const messages = extractMessages(events)
-    expect(messages).toHaveLength(1)
-    expect(messages[0].content).toBe('plain string content')
-  })
-
-  it('preserves tool-only assistant envelopes (P2-4)', () => {
-    const events = [
-      {
-        type: 'assistant',
-        message: {
-          role: 'assistant',
-          content: [
-            { type: 'tool_use', id: 't1', name: 'AskUserQuestion', input: { question: 'Continue?' } },
-          ],
-        },
-      },
-    ]
-
-    const messages = extractMessages(events)
-    expect(messages).toHaveLength(1)
-    expect(messages[0].role).toBe('assistant')
-    expect(messages[0].content).toBe('')
-    expect(messages[0].toolUse).toBe(true)
-  })
-})
-
-describe('readCommanderTranscript', () => {
-  let tmpDir: string
-
-  beforeEach(async () => {
-    tmpDir = await mkdtemp(join(tmpdir(), 'commander-transcript-'))
-  })
-
-  afterEach(async () => {
-    await rm(tmpDir, { recursive: true, force: true })
-  })
-
-  it('reads JSONL transcript file and returns events', async () => {
-    const commanderId = 'test-commander'
-    const transcriptId = 'session-abc'
-    const sessionsDir = join(tmpDir, commanderId, 'sessions')
-    await mkdir(sessionsDir, { recursive: true })
-
-    const events = [
-      { type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'Hello' }] } },
-      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Hi' }] } },
-    ]
-    await writeFile(
-      join(sessionsDir, `${transcriptId}.jsonl`),
-      events.map((e) => JSON.stringify(e)).join('\n') + '\n',
-    )
-
-    const result = await readCommanderTranscript(commanderId, transcriptId, tmpDir)
-    expect(result).not.toBeNull()
-    expect(result).toHaveLength(2)
-    expect(result![0].type).toBe('user')
-    expect(result![1].type).toBe('assistant')
-  })
-
-  it('returns null for nonexistent transcript', async () => {
-    const result = await readCommanderTranscript('no-commander', 'no-session', tmpDir)
-    expect(result).toBeNull()
-  })
-
-  it('rejects path traversal in commanderId', async () => {
-    const result = await readCommanderTranscript('../etc', 'passwd', tmpDir)
-    expect(result).toBeNull()
-  })
-
-  it('rejects path traversal in transcriptId', async () => {
-    const result = await readCommanderTranscript('valid-id', '../../etc/passwd', tmpDir)
-    expect(result).toBeNull()
-  })
-
-  it('skips malformed JSONL lines gracefully', async () => {
-    const commanderId = 'test-commander'
-    const transcriptId = 'session-bad'
-    const sessionsDir = join(tmpDir, commanderId, 'sessions')
-    await mkdir(sessionsDir, { recursive: true })
-
-    const content = [
-      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Good"}]}}',
-      'this is not json',
-      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"OK"}]}}',
-    ].join('\n')
-    await writeFile(join(sessionsDir, `${transcriptId}.jsonl`), content)
-
-    const result = await readCommanderTranscript(commanderId, transcriptId, tmpDir)
-    expect(result).not.toBeNull()
-    expect(result).toHaveLength(2)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Integration tests for GET /sessions/:name/messages endpoint
-// ---------------------------------------------------------------------------
-
-describe('session messages endpoint', () => {
-  function installMockProcess() {
-    const mock = createMockChildProcess()
-    mockedSpawn.mockReturnValue(mock.cp as never)
-    return mock
-  }
-
-  afterEach(() => {
-    mockedSpawn.mockRestore()
-  })
-
-  it('returns messages from an active stream session', async () => {
-    const mock = installMockProcess()
-    const server = await startServer()
-
-    // Create a stream session with an initial task — the server synthesizes
-    // a user event for the task at creation time. Stdout user events are
-    // skipped as echoes, so we rely on the synthesized user event.
-    await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      method: 'POST',
-      headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
-      body: JSON.stringify({ name: 'peek-test', mode: 'default', sessionType: 'stream', task: 'What is 2+2?' }),
-    })
-
-    // Emit assistant response via stdout
-    mock.emitStdout('{"type":"system","subtype":"init","session_id":"s1"}\n')
-    mock.emitStdout('{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"4"}]}}\n')
-
-    // Allow events to be processed
-    await new Promise((r) => setTimeout(r, 50))
-
-    const res = await fetch(`${server.baseUrl}/api/agents/sessions/peek-test/messages`, {
-      headers: AUTH_HEADERS,
-    })
-    expect(res.status).toBe(200)
-    const body = await res.json()
-    expect(body.session).toBe('peek-test')
-    expect(body.source).toBe('live')
-    expect(body.messages).toHaveLength(2)
-    expect(body.messages[0]).toEqual({ role: 'user', content: 'What is 2+2?' })
-    expect(body.messages[1]).toEqual({ role: 'assistant', content: '4' })
-
-    await server.close()
-  })
-
-  it('filters messages by role', async () => {
-    const mock = installMockProcess()
-    const server = await startServer()
-
-    await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      method: 'POST',
-      headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
-      body: JSON.stringify({ name: 'peek-role', mode: 'default', sessionType: 'stream' }),
-    })
-
-    mock.emitStdout('{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Q1"}]}}\n')
-    mock.emitStdout('{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"A1"}]}}\n')
-    mock.emitStdout('{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Q2"}]}}\n')
-    await new Promise((r) => setTimeout(r, 50))
-
-    const res = await fetch(
-      `${server.baseUrl}/api/agents/sessions/peek-role/messages?role=assistant`,
-      { headers: AUTH_HEADERS },
-    )
-    const body = await res.json()
-    expect(body.messages).toHaveLength(1)
-    expect(body.messages[0].content).toBe('A1')
-
-    await server.close()
-  })
-
-  it('respects the last query parameter', async () => {
-    const mock = installMockProcess()
-    const server = await startServer()
-
-    await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      method: 'POST',
-      headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
-      body: JSON.stringify({ name: 'peek-last', mode: 'default', sessionType: 'stream' }),
-    })
-
-    mock.emitStdout('{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Q1"}]}}\n')
-    mock.emitStdout('{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"A1"}]}}\n')
-    mock.emitStdout('{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Q2"}]}}\n')
-    mock.emitStdout('{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"A2"}]}}\n')
-    await new Promise((r) => setTimeout(r, 50))
-
-    const res = await fetch(
-      `${server.baseUrl}/api/agents/sessions/peek-last/messages?last=1`,
-      { headers: AUTH_HEADERS },
-    )
-    const body = await res.json()
-    expect(body.messages).toHaveLength(1)
-    expect(body.messages[0].content).toBe('A2')
-
-    await server.close()
-  })
-
-  it('returns 404 for nonexistent session', async () => {
-    const server = await startServer()
-
-    const res = await fetch(
-      `${server.baseUrl}/api/agents/sessions/does-not-exist/messages`,
-      { headers: AUTH_HEADERS },
-    )
-    expect(res.status).toBe(404)
-    expect(await res.json()).toEqual({ error: 'Session not found' })
-
-    await server.close()
-  })
-
-  it('returns 400 for invalid session name', async () => {
-    const server = await startServer()
-
-    const res = await fetch(
-      `${server.baseUrl}/api/agents/sessions/${encodeURIComponent('bad name!@#')}/messages`,
-      { headers: AUTH_HEADERS },
-    )
-    expect(res.status).toBe(400)
-
-    await server.close()
-  })
-
-  it('returns 400 for invalid last parameter', async () => {
-    const mock = installMockProcess()
-    const server = await startServer()
-
-    await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      method: 'POST',
-      headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
-      body: JSON.stringify({ name: 'peek-bad-last', mode: 'default', sessionType: 'stream' }),
-    })
-
-    const res = await fetch(
-      `${server.baseUrl}/api/agents/sessions/peek-bad-last/messages?last=-1`,
-      { headers: AUTH_HEADERS },
-    )
-    expect(res.status).toBe(400)
-    expect(await res.json()).toEqual({ error: 'Invalid last parameter: expected positive integer' })
-
-    await server.close()
-  })
-
-  it('returns 400 for invalid role parameter', async () => {
-    const mock = installMockProcess()
-    const server = await startServer()
-
-    await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      method: 'POST',
-      headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
-      body: JSON.stringify({ name: 'peek-bad-role', mode: 'default', sessionType: 'stream' }),
-    })
-
-    const res = await fetch(
-      `${server.baseUrl}/api/agents/sessions/peek-bad-role/messages?role=admin`,
-      { headers: AUTH_HEADERS },
-    )
-    expect(res.status).toBe(400)
-    expect(await res.json()).toEqual({ error: 'Invalid role parameter: expected user, assistant, or all' })
-
-    await server.close()
-  })
-
-  it('returns messages from commander transcript', async () => {
-    const tmpDir = await mkdtemp(join(tmpdir(), 'commander-peek-'))
-    const commanderId = 'cmdr-abc'
-    const sessionsDir = join(tmpDir, commanderId, 'sessions')
-    await mkdir(sessionsDir, { recursive: true })
-
-    // Write transcript JSONL
-    const events = [
-      { type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'Build the feature' }] } },
-      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'On it' }] } },
-    ]
-    const transcriptId = 'claude-session-123'
-    await writeFile(
-      join(sessionsDir, `${transcriptId}.jsonl`),
-      events.map((e) => JSON.stringify(e)).join('\n') + '\n',
-    )
-
-    // Mock commander session store to return this commander
-    const commanderSession: CommanderSession = {
-      id: commanderId,
-      host: 'test-host',
-      pid: 123,
-      state: 'running',
-      created: '2026-03-20T00:00:00Z',
-      claudeSessionId: transcriptId,
-      heartbeat: { lastSentAt: null, lastPayload: null },
-      lastHeartbeat: null,
-      taskSource: null,
-      currentTask: null,
-      completedTasks: 0,
-      totalCostUsd: 0,
-    }
-
-    vi.spyOn(CommanderSessionStore.prototype, 'get').mockResolvedValue(commanderSession)
-
-    try {
-      // Point commanderSessionStorePath inside tmpDir so commanderDataDir resolves correctly
-      const server = await startServer({
-        commanderSessionStorePath: join(tmpDir, 'sessions.json'),
-      })
-
-      const res = await fetch(
-        `${server.baseUrl}/api/agents/sessions/commander-${commanderId}/messages`,
-        { headers: AUTH_HEADERS },
-      )
-      expect(res.status).toBe(200)
-      const body = await res.json()
-      expect(body.session).toBe(`commander-${commanderId}`)
-      expect(body.source).toBe('transcript')
-      expect(body.messages).toHaveLength(2)
-      expect(body.messages[0].content).toBe('Build the feature')
-      expect(body.messages[1].content).toBe('On it')
-
-      await server.close()
-    } finally {
-      await rm(tmpDir, { recursive: true, force: true })
-    }
-  })
-
-  it('returns messages from Codex commander transcript via codexThreadId (P2-1)', async () => {
-    const tmpDir = await mkdtemp(join(tmpdir(), 'commander-codex-'))
-    const commanderId = 'cmdr-codex'
-    const sessionsDir = join(tmpDir, commanderId, 'sessions')
-    await mkdir(sessionsDir, { recursive: true })
-
-    const codexThreadId = 'codex-thread-xyz'
-    const events = [
-      { type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'Run tests' }] } },
-      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Tests passed' }] } },
-    ]
-    await writeFile(
-      join(sessionsDir, `${codexThreadId}.jsonl`),
-      events.map((e) => JSON.stringify(e)).join('\n') + '\n',
-    )
-
-    const commanderSession: CommanderSession = {
-      id: commanderId,
-      host: 'test-host',
-      pid: 123,
-      state: 'running',
-      created: '2026-03-20T00:00:00Z',
-      agentType: 'codex',
-      codexThreadId,
-      heartbeat: { lastSentAt: null, lastPayload: null },
-      lastHeartbeat: null,
-      taskSource: null,
-      currentTask: null,
-      completedTasks: 0,
-      totalCostUsd: 0,
-    }
-
-    vi.spyOn(CommanderSessionStore.prototype, 'get').mockResolvedValue(commanderSession)
-
-    try {
-      const server = await startServer({
-        commanderSessionStorePath: join(tmpDir, 'sessions.json'),
-      })
-
-      const res = await fetch(
-        `${server.baseUrl}/api/agents/sessions/commander-${commanderId}/messages`,
-        { headers: AUTH_HEADERS },
-      )
-      expect(res.status).toBe(200)
-      const body = await res.json()
-      expect(body.source).toBe('transcript')
-      expect(body.messages).toHaveLength(2)
-      expect(body.messages[0].content).toBe('Run tests')
-
-      await server.close()
-    } finally {
-      await rm(tmpDir, { recursive: true, force: true })
-    }
-  })
-
-  it('merges pre-init and post-init commander transcript files (P2-3)', async () => {
-    const tmpDir = await mkdtemp(join(tmpdir(), 'commander-merge-'))
-    const commanderId = 'cmdr-merge'
-    const sessionsDir = join(tmpDir, commanderId, 'sessions')
-    await mkdir(sessionsDir, { recursive: true })
-
-    const sessionName = `commander-${commanderId}`
-    const claudeSessionId = 'claude-session-456'
-
-    // Pre-init file: written under session name before init event
-    const preInitEvents = [
-      { type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'Initial task' }] } },
-    ]
-    await writeFile(
-      join(sessionsDir, `${sessionName}.jsonl`),
-      preInitEvents.map((e) => JSON.stringify(e)).join('\n') + '\n',
-    )
-
-    // Post-init file: written under claudeSessionId after init event
-    const postInitEvents = [
-      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Working on it' }] } },
-    ]
-    await writeFile(
-      join(sessionsDir, `${claudeSessionId}.jsonl`),
-      postInitEvents.map((e) => JSON.stringify(e)).join('\n') + '\n',
-    )
-
-    const commanderSession: CommanderSession = {
-      id: commanderId,
-      host: 'test-host',
-      pid: 123,
-      state: 'running',
-      created: '2026-03-20T00:00:00Z',
-      claudeSessionId,
-      heartbeat: { lastSentAt: null, lastPayload: null },
-      lastHeartbeat: null,
-      taskSource: null,
-      currentTask: null,
-      completedTasks: 0,
-      totalCostUsd: 0,
-    }
-
-    vi.spyOn(CommanderSessionStore.prototype, 'get').mockResolvedValue(commanderSession)
-
-    try {
-      const server = await startServer({
-        commanderSessionStorePath: join(tmpDir, 'sessions.json'),
-      })
-
-      const res = await fetch(
-        `${server.baseUrl}/api/agents/sessions/${sessionName}/messages`,
-        { headers: AUTH_HEADERS },
-      )
-      expect(res.status).toBe(200)
-      const body = await res.json()
-      expect(body.source).toBe('transcript')
-      // Both pre-init and post-init events should be merged
-      expect(body.messages).toHaveLength(2)
-      expect(body.messages[0].content).toBe('Initial task')
-      expect(body.messages[1].content).toBe('Working on it')
-
-      await server.close()
-    } finally {
-      await rm(tmpDir, { recursive: true, force: true })
-    }
-  })
-
-  it('serves messages for completed one-shot sessions (P2-5)', async () => {
-    const mock = installMockProcess()
-    const server = await startServer()
-
-    // Create a command-room session (one-shot)
-    await fetch(`${server.baseUrl}/api/agents/sessions`, {
-      method: 'POST',
-      headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
-      body: JSON.stringify({ name: 'command-room-p2-5', mode: 'default', sessionType: 'stream', task: 'Do something' }),
-    })
-
-    // Emit assistant response
-    mock.emitStdout('{"type":"system","subtype":"init","session_id":"s1"}\n')
-    mock.emitStdout('{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done"}]}}\n')
-    mock.emitStdout('{"type":"result","subtype":"success","result":"complete"}\n')
-    await new Promise((r) => setTimeout(r, 50))
-
-    // Simulate process exit so the session moves to completedSessions
-    mock.emitExit(0)
-    await new Promise((r) => setTimeout(r, 50))
-
-    // Session should now be completed but messages should still be available
-    const res = await fetch(
-      `${server.baseUrl}/api/agents/sessions/command-room-p2-5/messages`,
-      { headers: AUTH_HEADERS },
-    )
-    expect(res.status).toBe(200)
-    const body = await res.json()
-    expect(body.messages.length).toBeGreaterThan(0)
-    // Should contain the user task and assistant response
-    const userMsg = body.messages.find((m: { role: string }) => m.role === 'user')
-    const assistantMsg = body.messages.find((m: { role: string }) => m.role === 'assistant')
-    expect(userMsg?.content).toBe('Do something')
-    expect(assistantMsg?.content).toBe('Done')
-
-    await server.close()
-  })
-
-  it('requires authentication', async () => {
-    const server = await startServer()
-
-    const res = await fetch(
-      `${server.baseUrl}/api/agents/sessions/any-session/messages`,
-    )
-    expect(res.status).toBe(401)
-
-    await server.close()
-  })
-
-  it('allows read-only access', async () => {
-    const server = await startServer()
-
-    const res = await fetch(
-      `${server.baseUrl}/api/agents/sessions/no-session/messages`,
-      { headers: READ_ONLY_AUTH_HEADERS },
-    )
-    // 404 means auth passed, session just doesn't exist
-    expect(res.status).toBe(404)
-
-    await server.close()
-  })
-
-  it('serves workspace tree, preview, and save routes for local sessions', async () => {
-    const tempWorkspaceRoot = await mkdtemp(join(tmpdir(), 'agent-workspace-'))
-    const workspaceDir = join(tempWorkspaceRoot, 'workspace')
-    await mkdir(workspaceDir, { recursive: true })
-    await mkdir(join(workspaceDir, 'src'), { recursive: true })
-    await writeFile(join(workspaceDir, 'README.md'), '# workspace\n', 'utf8')
-
-    const { spawner } = createMockPtySpawner()
-    const server = await startServer({ ptySpawner: spawner })
-
-    try {
-      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
-        method: 'POST',
-        headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
-        body: JSON.stringify({
-          name: 'workspace-local',
-          mode: 'default',
-          cwd: workspaceDir,
-        }),
-      })
-      expect(createResponse.status).toBe(201)
-
-      const treeResponse = await fetch(
-        `${server.baseUrl}/api/agents/sessions/workspace-local/workspace/tree`,
-        { headers: AUTH_HEADERS },
-      )
-      expect(treeResponse.status).toBe(200)
-      const treeBody = await treeResponse.json()
-      expect(treeBody.nodes.map((node: { name: string }) => node.name)).toEqual(['src', 'README.md'])
-
-      const fileResponse = await fetch(
-        `${server.baseUrl}/api/agents/sessions/workspace-local/workspace/file?path=README.md`,
-        { headers: AUTH_HEADERS },
-      )
-      expect(fileResponse.status).toBe(200)
-      const fileBody = await fileResponse.json()
-      expect(fileBody.kind).toBe('text')
-      expect(fileBody.content).toContain('# workspace')
-
-      const saveResponse = await fetch(
-        `${server.baseUrl}/api/agents/sessions/workspace-local/workspace/file`,
-        {
-          method: 'PUT',
-          headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
-          body: JSON.stringify({
-            path: 'README.md',
-            content: '# updated\n',
-          }),
-        },
-      )
-      expect(saveResponse.status).toBe(200)
-      expect(await readFile(join(workspaceDir, 'README.md'), 'utf8')).toBe('# updated\n')
-    } finally {
-      await rm(tempWorkspaceRoot, { recursive: true, force: true })
-      await server.close()
-    }
-  })
-
-  it('rejects workspace traversal outside the resolved root', async () => {
-    const tempWorkspaceRoot = await mkdtemp(join(tmpdir(), 'agent-workspace-escape-'))
-    const workspaceDir = join(tempWorkspaceRoot, 'workspace-escape')
-    await mkdir(workspaceDir, { recursive: true })
-    await writeFile(join(workspaceDir, 'inside.txt'), 'ok\n', 'utf8')
-
-    const { spawner } = createMockPtySpawner()
-    const server = await startServer({ ptySpawner: spawner })
-
-    try {
-      await fetch(`${server.baseUrl}/api/agents/sessions`, {
-        method: 'POST',
-        headers: { ...AUTH_HEADERS, 'content-type': 'application/json' },
-        body: JSON.stringify({
-          name: 'workspace-escape',
-          mode: 'default',
-          cwd: workspaceDir,
-        }),
-      })
-
-      const response = await fetch(
-        `${server.baseUrl}/api/agents/sessions/workspace-escape/workspace/file?path=../outside.txt`,
-        { headers: AUTH_HEADERS },
-      )
-
-      expect(response.status).toBe(400)
-      expect(await response.json()).toEqual({
-        error: 'Workspace path cannot escape the workspace root',
-      })
-    } finally {
-      await rm(tempWorkspaceRoot, { recursive: true, force: true })
-      await server.close()
-    }
   })
 })

@@ -98,7 +98,7 @@ function UserMessage({
 }
 
 function ThinkingBlock({ text }: { text: string }) {
-  const [expanded, setExpanded] = useState(false)
+  const [expanded, setExpanded] = useState(true)
   return (
     <div className="rounded border border-violet-300/20 bg-violet-500/8">
       <button
@@ -127,14 +127,41 @@ function ThinkingBlock({ text }: { text: string }) {
   )
 }
 
-function AgentMessage({ text }: { text: string }) {
+function isAgentAccentColor(value: string): boolean {
+  const t = value.trim()
+  if (t.length > 80) {
+    return false
+  }
+  return /^#[0-9a-f]{3,8}$/i.test(t) || /^rgba?\(/i.test(t) || /^[a-z][a-z0-9-]*$/i.test(t)
+}
+
+function AgentMessage({
+  text,
+  avatarUrl,
+  accentColor,
+}: {
+  text: string
+  avatarUrl?: string | null
+  accentColor?: string | null
+}) {
   if (!text.trim()) return null
+  const safeAccent = accentColor && isAgentAccentColor(accentColor) ? accentColor.trim() : null
   return (
     <div className="flex items-start gap-2">
-      <div className="flex shrink-0 items-center justify-center w-6 h-6 rounded-md bg-sky-500/15 text-sky-400 mt-0.5">
-        <Bot size={13} />
+      <div className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center overflow-hidden rounded-md bg-sky-500/15 text-sky-400">
+        {avatarUrl ? (
+          <img src={avatarUrl} alt="" className="h-full w-full object-cover" />
+        ) : (
+          <Bot size={13} />
+        )}
       </div>
-      <div className="min-w-0 flex-1 rounded-r-lg rounded-bl-lg border border-white/[0.12] border-l-[3px] border-l-sky-400/70 bg-[#242424] p-3.5">
+      <div
+        className={cn(
+          'min-w-0 flex-1 rounded-r-lg rounded-bl-lg border border-white/[0.12] border-l-[3px] bg-[#242424] p-3.5',
+          !safeAccent && 'border-l-sky-400/70',
+        )}
+        style={safeAccent ? { borderLeftColor: safeAccent } : undefined}
+      >
         <div className="msg-agent-md prose prose-invert prose-sm max-w-none break-words text-zinc-100">
           <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
         </div>
@@ -472,12 +499,18 @@ export interface SessionMessageListProps {
   messages: MsgItem[]
   onAnswer: (toolId: string, answers: Record<string, string[]>) => void
   emptyLabel?: string
+  /** Commander (or other) avatar for agent message rail — e.g. `/api/commanders/{id}/avatar` */
+  agentAvatarUrl?: string | null
+  /** Left accent on agent bubbles (CSS color) */
+  agentAccentColor?: string | null
 }
 
 export function SessionMessageList({
   messages,
   onAnswer,
   emptyLabel = 'No messages yet.',
+  agentAvatarUrl,
+  agentAccentColor,
 }: SessionMessageListProps) {
   if (messages.length === 0) {
     return (
@@ -503,7 +536,14 @@ export function SessionMessageList({
           case 'thinking':
             return <ThinkingBlock key={msg.id} text={msg.text} />
           case 'agent':
-            return <AgentMessage key={msg.id} text={msg.text} />
+            return (
+              <AgentMessage
+                key={msg.id}
+                text={msg.text}
+                avatarUrl={agentAvatarUrl}
+                accentColor={agentAccentColor}
+              />
+            )
           case 'tool':
             return <ToolBlock key={msg.id} msg={msg} />
           case 'ask':

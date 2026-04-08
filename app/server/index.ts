@@ -8,7 +8,47 @@ import { OpenAITranscriptionKeyStore } from './api-keys/transcription-store.js'
 import { createModules } from './module-registry.js'
 import { isCorsOriginAllowed, parseAllowedCorsOrigins } from './cors.js'
 import { createApiKeysRouter } from './routes/api-keys.js'
-import { DIST_DIR } from './runtime-paths.js'
+
+const buildVersion = process.env.LAUNCH_COMMIT ?? 'dev'
+const startedAt = Date.now()
+
+const nowIso = (): string => new Date().toISOString()
+
+const logInfo = (message: string): void => {
+  console.log(`[INFO] ${nowIso()} ${message}`)
+}
+
+const logWarn = (message: string): void => {
+  console.warn(`[WARN] ${nowIso()} ${message}`)
+}
+
+const logError = (message: string): void => {
+  console.error(`[ERROR] ${nowIso()} ${message}`)
+}
+
+const formatError = (value: unknown): string => {
+  if (value instanceof Error) {
+    return value.stack ?? `${value.name}: ${value.message}`
+  }
+  if (typeof value === 'string') {
+    return value
+  }
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return String(value)
+  }
+}
+
+process.on('uncaughtException', (error) => {
+  logError(`Uncaught exception\n${formatError(error)}`)
+  process.exit(1)
+})
+
+process.on('unhandledRejection', (reason) => {
+  logError(`Unhandled rejection\n${formatError(reason)}`)
+  process.exit(1)
+})
 
 const app = express()
 const port = parseInt(process.env.PORT ?? '20001', 10)
@@ -21,8 +61,8 @@ const apiKeyStore = new ApiKeyJsonStore()
 const defaultKeyValue = process.env.HAMBROS_DEFAULT_KEY ?? 'HAMBROS!'
 apiKeyStore.seedDefaultKey(defaultKeyValue).then((seeded) => {
   if (seeded) {
-    console.log(`[api-keys] Seeded default master key. Use "${seeded}" to authenticate.`)
-    console.log('[api-keys] ⚠ Change this key in production: Settings → API Keys → Revoke & create new.')
+    logInfo(`[api-keys] Seeded default master key. Use "${seeded}" to authenticate.`)
+    logWarn('[api-keys] Change this key in production: Settings -> API Keys -> Revoke & create new.')
   }
 }).catch(() => { /* best-effort — server starts regardless */ })
 
@@ -57,7 +97,18 @@ app.use(express.json())
 
 // Health check
 app.get('/api/health', (_req, res) => {
-  res.json({ status: 'ok', modules: modules.map((m) => m.name) })
+  const memory = process.memoryUsage()
+  res.json({
+    status: 'ok',
+    uptime: Math.floor((Date.now() - startedAt) / 1000),
+    version: buildVersion,
+    modules: modules.map((m) => m.name),
+    memory: {
+      rss: memory.rss,
+      heapUsed: memory.heapUsed,
+      heapTotal: memory.heapTotal,
+    },
+  })
 })
 
 app.use(
@@ -73,14 +124,15 @@ for (const mod of modules) {
   app.use(mod.routePrefix, mod.router)
 }
 
-if (process.env.NODE_ENV === 'production' && existsSync(DIST_DIR)) {
-  app.use(express.static(DIST_DIR))
+const distDir = path.resolve(process.cwd(), 'dist')
+if (process.env.NODE_ENV === 'production' && existsSync(distDir)) {
+  app.use(express.static(distDir))
   app.get('*', (req, res, next) => {
     if (req.path.startsWith('/api/') || req.path.startsWith('/v1/')) {
       next()
       return
     }
-    res.sendFile(path.join(DIST_DIR, 'index.html'))
+    res.sendFile(path.join(distDir, 'index.html'))
   })
 }
 
@@ -96,9 +148,37 @@ server.on('upgrade', (req, socket, head) => {
   socket.destroy()
 })
 
+let isShuttingDown = false
+
 server.listen(port, () => {
-  console.log(`HamBros server listening on port ${port}`)
-  console.log(
-    `Modules loaded: ${modules.length === 0 ? 'none (UI-only mode)' : modules.map((m) => m.name).join(', ')}`,
-  )
+  for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+    process.on(signal, () => {
+      if (isShuttingDown) {
+        return
+      }
+      isShuttingDown = true
+      logInfo(`Received ${signal}, shutting down`)
+      server.close((error) => {
+        if (error) {
+          logError(`Error during shutdown\n${formatError(error)}`)
+          process.exit(1)
+        }
+        logInfo(`Shutdown complete (${signal})`)
+        process.exit(0)
+      })
+    })
+  }
+
+  const moduleNames = modules.length === 0
+    ? 'none (UI-only mode)'
+    : modules.map((m) => m.name).join(', ')
+  const memory = process.memoryUsage()
+  const rssMb = (memory.rss / 1024 / 1024).toFixed(0)
+  const heapUsedMb = (memory.heapUsed / 1024 / 1024).toFixed(0)
+  const heapTotalMb = (memory.heapTotal / 1024 / 1024).toFixed(0)
+
+  logInfo('Hammurabi server started')
+  logInfo(`Node ${process.version} | PID ${process.pid} | Port ${port}`)
+  logInfo(`Memory: RSS ${rssMb}MB | Heap ${heapUsedMb}/${heapTotalMb}MB`)
+  logInfo(`Build: ${buildVersion} | Modules: ${moduleNames}`)
 })

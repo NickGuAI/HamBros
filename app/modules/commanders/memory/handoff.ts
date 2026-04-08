@@ -1,4 +1,7 @@
-import { MemoryRecollection } from './recollection.js'
+import {
+  createCommanderMemoryRecollection,
+  type RecollectionOptions,
+} from './recollection.js'
 import type { JournalWriter } from './journal.js'
 import type { SalienceLevel } from './types.js'
 import type { GHIssue as RecollectionIssue } from './skill-matcher.js'
@@ -75,6 +78,10 @@ interface RepoRef {
   fullName: string | null
 }
 
+export interface SubagentHandoffOptions {
+  recollectionOptions?: RecollectionOptions
+}
+
 function compactText(value: string): string {
   return value.replace(/\s+/g, ' ').trim()
 }
@@ -86,14 +93,19 @@ function safeSnippet(value: string, maxLen: number = 220): string {
 }
 
 export class SubagentHandoff {
-  private readonly recollection: MemoryRecollection
+  private readonly recollection: ReturnType<typeof createCommanderMemoryRecollection>
   private readonly workingMemory: WorkingMemoryStore
 
   constructor(
     private readonly commanderId: string,
     basePath?: string,
+    options: SubagentHandoffOptions = {},
   ) {
-    this.recollection = new MemoryRecollection(commanderId, basePath)
+    this.recollection = createCommanderMemoryRecollection(
+      commanderId,
+      basePath,
+      options.recollectionOptions,
+    )
     this.workingMemory = new WorkingMemoryStore(commanderId, basePath)
   }
 
@@ -119,7 +131,7 @@ export class SubagentHandoff {
       .filter((hit) => hit.type !== 'skill')
       .slice(0, MAX_MEMORY_EXCERPTS)
       .map((hit) => {
-        const header = `[${hit.type}] ${hit.title}${hit.repo ? ` [${hit.repo}]` : ''}`
+        const header = `[${hit.attribution}] ${hit.title}${hit.repo ? ` [${hit.repo}]` : ''}`
         const stale = hit.stale && hit.staleReason ? ` | stale: ${hit.staleReason}` : ''
         return `- ${header}\n  - ${hit.excerpt}\n  - reason: ${hit.reason}${stale}`
       })

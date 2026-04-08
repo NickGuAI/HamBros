@@ -5,6 +5,7 @@ import { access, mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import cron from 'node-cron'
+import multer from 'multer'
 import { Router, type Request, type Response as ExpressResponse } from 'express'
 import type { AuthUser } from '@hambros/auth-providers'
 import type { ApiKeyStoreLike } from '../../server/api-keys/store.js'
@@ -18,15 +19,27 @@ import {
 import { CommanderAgent } from './agent.js'
 import { CommanderManager, type CommanderSubagentLifecycleEvent } from './manager.js'
 import {
+  CommanderEmailConfigStore,
+  CommanderEmailStateStore,
+  parseEmailSourceConfig,
+} from './email-config.js'
+import {
+  EmailPoller,
+  type CommanderEmailClient,
+} from './email-poller.js'
+import {
   EmergencyFlusher,
   JournalWriter,
   MemoryMdWriter,
-  MemoryRecollection,
   NightlyConsolidation,
   WorkingMemoryStore,
   type FlushContext,
   type JournalEntry,
 } from './memory/index.js'
+import {
+  createCommanderMemoryRecollection,
+  syncCommanderMemoryHybridIndex,
+} from './memory/recollection.js'
 import type { GHIssue } from './memory/skill-matcher.js'
 import {
   CommanderHeartbeatManager,
@@ -55,7 +68,16 @@ import {
   type CommanderSession,
   type HeartbeatContextConfig,
   type CommanderTaskSource,
+  isCommanderSessionRunning,
 } from './store.js'
+import {
+  mimeTypeForAvatarFile,
+  profileForApiResponse,
+  readCommanderUiProfile,
+  resolveCommanderAvatarPath,
+  writeCommanderUiProfile,
+  type CommanderUiProfile,
+} from './commander-profile.js'
 import {
   readCommanderIdentity,
   scaffoldCommanderIdentity,
@@ -75,6 +97,7 @@ import {
   CommandRoomTaskStore,
   defaultCommandRoomTaskStorePath,
   type CronTask as CommandRoomCronTask,
+  type CommandRoomTaskType,
   type CreateCronTaskInput,
 } from '../command-room/task-store.js'
 import {
@@ -82,6 +105,7 @@ import {
   defaultCommandRoomRunStorePath,
   type WorkflowRun,
 } from '../command-room/run-store.js'
+import { CommandRoomScheduler } from '../command-room/scheduler.js'
 import {
   listWorkspaceTree,
   readWorkspaceFilePreview,
@@ -148,6 +172,11 @@ const CHANNEL_PROVIDER_LABELS: Record<CommanderChannelMeta['provider'], string> 
   telegram: 'Telegram',
   discord: 'Discord',
 }
+const DEFAULT_COMMANDER_MEMORY_COMPACT_CRON = '0 2 * * *'
+const DEFAULT_COMMANDER_MEMORY_COMPACT_TIMEZONE = 'UTC'
+const COMMANDER_MEMORY_COMPACT_TASK_TYPE: CommandRoomTaskType = 'memory_compact'
+const COMMANDER_INSTRUCTION_TASK_TYPE: CommandRoomTaskType = 'instruction'
+const COMMANDER_MEMORY_COMPACT_INSTRUCTION = 'Run internal commander memory compaction maintenance.'
 
 type StreamEvent = Record<string, unknown>
 type CommanderMessageMode = 'collect' | 'followup'
@@ -176,6 +205,7 @@ interface CommanderRuntime {
   heartbeatCount: number
   lastKnownInputTokens: number
   forceNextFatHeartbeat: boolean
+  preCompactionFlushTriggeredForCycle: boolean
   pendingSpikeObservations: string[]
   pendingCollect: string[]
   collectTimer: ReturnType<typeof setTimeout> | null
@@ -183,12 +213,30 @@ interface CommanderRuntime {
   unsubscribeEvents?: () => void
 }
 
-type CommanderSessionResponse = Omit<CommanderSession, 'remoteOrigin'> & {
+type CommanderSessionStats = {
+  questCount: number
+  scheduleCount: number
+}
+
+type CommanderSessionResponseBase = Omit<CommanderSession, 'remoteOrigin'> & {
+  name: string
   remoteOrigin?: {
     machineId: string
     label: string
   }
 }
+
+type CommanderUiPublic = {
+  borderColor?: string
+  accentColor?: string
+  speakingTone?: string
+} | null
+
+type CommanderSessionResponse = CommanderSessionResponseBase &
+  CommanderSessionStats & {
+    ui?: CommanderUiPublic
+    avatarUrl?: string | null
+  }
 
 export interface CommanderChannelReplyDispatchInput {
   commanderId: string
@@ -206,6 +254,10 @@ export interface CommandersRouterOptions {
   sessionStorePath?: string
   questStore?: QuestStore
   questStoreDataDir?: string
+  emailConfigStore?: CommanderEmailConfigStore
+  emailStateStore?: CommanderEmailStateStore
+  emailClient?: CommanderEmailClient
+  emailPoller?: Pick<EmailPoller, 'sendReply'>
   ghTasksFactory?: (repo: string) => Pick<GhTasks, 'readTask'>
   heartbeatLog?: HeartbeatLog
   fetchImpl?: typeof fetch
@@ -1606,14 +1658,16 @@ function toHeartbeatLogTaskSnapshot(session: CommanderSession | null): {
 function toCommanderSessionResponse(
   session: CommanderSession,
   runtime?: CommanderRuntime | undefined,
+  stats: CommanderSessionStats = { questCount: 0, scheduleCount: 0 },
 ): CommanderSessionResponse & {
   contextConfig: { fatPinInterval: number }
   runtime: { heartbeatCount: number }
 } {
   const normalizedAgentType = resolveCommanderAgentType(session)
-  const base: CommanderSessionResponse = session.remoteOrigin
+  const base: CommanderSessionResponseBase = session.remoteOrigin
     ? {
         ...session,
+        name: session.host,
         agentType: normalizedAgentType,
         remoteOrigin: {
           machineId: session.remoteOrigin.machineId,
@@ -1622,11 +1676,15 @@ function toCommanderSessionResponse(
       }
     : {
         ...session,
+        name: session.host,
         agentType: normalizedAgentType,
       }
 
   return {
     ...base,
+    name: session.host,
+    questCount: stats.questCount,
+    scheduleCount: stats.scheduleCount,
     contextConfig: {
       fatPinInterval: resolveFatPinInterval(session.contextConfig?.fatPinInterval),
     },
@@ -1739,6 +1797,23 @@ function parseCronInstruction(rawInstruction: unknown): string | null {
   return instruction
 }
 
+function parseCronTaskType(rawTaskType: unknown): CommandRoomTaskType | null {
+  if (rawTaskType === undefined || rawTaskType === null) {
+    return COMMANDER_INSTRUCTION_TASK_TYPE
+  }
+  if (typeof rawTaskType !== 'string') {
+    return null
+  }
+  if (rawTaskType === COMMANDER_INSTRUCTION_TASK_TYPE || rawTaskType === COMMANDER_MEMORY_COMPACT_TASK_TYPE) {
+    return rawTaskType
+  }
+  return null
+}
+
+function buildCommanderMemoryCompactTaskName(commanderId: string): string {
+  return `commander-${commanderId}-memory-compact`
+}
+
 function parseOptionalEnabled(rawEnabled: unknown): boolean | undefined | null {
   if (rawEnabled === undefined) {
     return undefined
@@ -1774,12 +1849,16 @@ function parseTriggerInstruction(payload: unknown): string | null {
 function toCommanderCronTask(
   task: CommandRoomCronTask,
   fallbackCommanderId: string,
-  lastRunAt: string | null = null,
+  metadata: {
+    lastRun?: string | null
+    nextRun?: string | null
+  } = {},
 ): {
   id: string
   commanderId: string
   schedule: string
   instruction: string
+  taskType: CommandRoomTaskType
   enabled: boolean
   lastRun: string | null
   nextRun: string | null
@@ -1794,9 +1873,10 @@ function toCommanderCronTask(
     commanderId: task.commanderId ?? fallbackCommanderId,
     schedule: task.schedule,
     instruction: task.instruction,
+    taskType: task.taskType ?? COMMANDER_INSTRUCTION_TASK_TYPE,
     enabled: task.enabled,
-    lastRun: lastRunAt,
-    nextRun: null,
+    lastRun: metadata.lastRun ?? null,
+    nextRun: metadata.nextRun ?? null,
     agentType: task.agentType,
     ...(task.sessionType ? { sessionType: task.sessionType } : {}),
     ...(task.permissionMode ? { permissionMode: task.permissionMode } : {}),
@@ -1821,6 +1901,7 @@ interface CommanderCronScheduler {
     },
   ): Promise<CommandRoomCronTask | null>
   deleteTask(taskId: string): Promise<boolean>
+  getNextRun?(taskId: string): Date | null
 }
 
 interface CommanderCronTaskRecord {
@@ -1867,6 +1948,19 @@ function resolveCommanderCronStorePaths(
   }
 }
 
+const avatarUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const ALLOWED = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif'])
+    if (ALLOWED.has(file.mimetype)) {
+      cb(null, true)
+    } else {
+      cb(new Error('Only JPEG, PNG, WebP, and GIF images are allowed'))
+    }
+  },
+})
+
 export function createCommandersRouter(
   options: CommandersRouterOptions = {},
 ): CommandersRouterResult {
@@ -1885,6 +1979,9 @@ export function createCommandersRouter(
   const fetchImpl = options.fetchImpl ?? fetch
   const githubToken = resolveGitHubToken(options.githubToken)
   const sessionStore = options.sessionStore ?? new CommanderSessionStore(options.sessionStorePath)
+  const emailStoresDataDir = parseMessage(options.memoryBasePath)
+    ?? parseMessage(options.heartbeatBasePath)
+    ?? commanderDataDir
   const questStore = options.questStore ?? (
     options.questStoreDataDir
       ? new QuestStore(options.questStoreDataDir)
@@ -1892,6 +1989,8 @@ export function createCommandersRouter(
         ? new QuestStore(path.dirname(path.resolve(options.sessionStorePath)))
         : new QuestStore()
   )
+  const emailConfigStore = options.emailConfigStore ?? new CommanderEmailConfigStore(emailStoresDataDir)
+  const emailStateStore = options.emailStateStore ?? new CommanderEmailStateStore(emailStoresDataDir)
   const ghTasksFactory = options.ghTasksFactory ?? ((repo: string) => new GhTasks({ repo }))
   const sharedCommanderCronStores: CommanderCronStores | null = (
     options.commandRoomTaskStore || options.commandRoomRunStore
@@ -1919,6 +2018,17 @@ export function createCommandersRouter(
   function sendWorkspaceError(res: ExpressResponse, error: unknown): void {
     const workspaceError = toWorkspaceError(error)
     res.status(workspaceError.statusCode).json({ error: workspaceError.message })
+  }
+
+  async function refreshCommanderMemoryIndex(commanderId: string): Promise<void> {
+    try {
+      await syncCommanderMemoryHybridIndex(commanderId, commanderBasePath)
+    } catch (error) {
+      console.warn(
+        `[commanders] Failed to refresh commander memory index for "${commanderId}":`,
+        error,
+      )
+    }
   }
 
   async function resolveCommanderWorkspace(rawCommanderId: unknown) {
@@ -2002,6 +2112,18 @@ export function createCommandersRouter(
 
     return [...tasksById.values()]
   }
+  const getCommanderSessionStats = async (commanderId: string): Promise<CommanderSessionStats> => {
+    await commandRoomSchedulerInitialized
+    const [quests, cronTasks] = await Promise.all([
+      questStore.list(commanderId),
+      listCommanderCronTasksWithStores(commanderId),
+    ])
+
+    return {
+      questCount: quests.length,
+      scheduleCount: cronTasks.length,
+    }
+  }
   const findCommanderCronTaskWithStores = async (
     commanderId: string,
     taskId: string,
@@ -2027,6 +2149,62 @@ export function createCommandersRouter(
 
     return null
   }
+  const commanderMemoryCompactEnsureQueue = new Map<string, Promise<void>>()
+  const ensureCommanderMemoryCompactCronTask = (commanderId: string): Promise<void> => {
+    const previous = commanderMemoryCompactEnsureQueue.get(commanderId) ?? Promise.resolve()
+    const next = previous.then(async () => {
+      await commandRoomSchedulerInitialized
+      const taskRecords = await listCommanderCronTasksWithStores(commanderId)
+      const hasMemoryCompactTask = taskRecords.some(({ task }) => (
+        task.taskType === COMMANDER_MEMORY_COMPACT_TASK_TYPE ||
+        (
+          task.name === buildCommanderMemoryCompactTaskName(commanderId) &&
+          task.schedule === DEFAULT_COMMANDER_MEMORY_COMPACT_CRON &&
+          task.instruction === COMMANDER_MEMORY_COMPACT_INSTRUCTION
+        )
+      ))
+      if (hasMemoryCompactTask) {
+        return
+      }
+
+      const createInput: CreateCronTaskInput = {
+        name: buildCommanderMemoryCompactTaskName(commanderId),
+        commanderId,
+        schedule: DEFAULT_COMMANDER_MEMORY_COMPACT_CRON,
+        timezone: DEFAULT_COMMANDER_MEMORY_COMPACT_TIMEZONE,
+        machine: '',
+        workDir: '',
+        agentType: 'claude',
+        instruction: COMMANDER_MEMORY_COMPACT_INSTRUCTION,
+        taskType: COMMANDER_MEMORY_COMPACT_TASK_TYPE,
+        enabled: true,
+      }
+      if (commandRoomScheduler) {
+        await commandRoomScheduler.createTask(createInput)
+        return
+      }
+      await getCommanderCronStores(commanderId).taskStore.createTask(createInput)
+    })
+
+    const guarded = next.catch(() => {})
+    commanderMemoryCompactEnsureQueue.set(commanderId, guarded)
+    return next.finally(() => {
+      if (commanderMemoryCompactEnsureQueue.get(commanderId) === guarded) {
+        commanderMemoryCompactEnsureQueue.delete(commanderId)
+      }
+    })
+  }
+  void (async () => {
+    try {
+      await commandRoomSchedulerInitialized
+      const sessions = await sessionStore.list()
+      for (const session of sessions) {
+        await ensureCommanderMemoryCompactCronTask(session.id)
+      }
+    } catch (error) {
+      console.warn('[commanders] Failed to backfill memory compact cron tasks:', error)
+    }
+  })()
   const heartbeatDataDir = parseMessage(options.heartbeatBasePath) ?? parseMessage(commanderBasePath)
   const heartbeatLog = options.heartbeatLog ?? new HeartbeatLog(
     heartbeatDataDir ? { dataDir: heartbeatDataDir } : undefined,
@@ -2039,6 +2217,33 @@ export function createCommandersRouter(
   const runtimes = new Map<string, CommanderRuntime>()
   const ACTIVE_COMMANDER_SESSIONS = new Map<string, { sessionName: string; startedAt: string }>()
   const heartbeatFiredAtByCommander = new Map<string, string>()
+  const emailReplyService = options.emailPoller ?? (
+    sessionsInterface
+      ? new EmailPoller({
+          sessionStore,
+          configStore: emailConfigStore,
+          stateStore: emailStateStore,
+          sessionsInterface,
+          ...(options.emailClient ? { emailClient: options.emailClient } : {}),
+          now,
+        })
+      : null
+  )
+
+  async function buildCommanderCronTask(
+    task: CommandRoomCronTask,
+    fallbackCommanderId: string,
+  ): Promise<ReturnType<typeof toCommanderCronTask>> {
+    const runStores = listCommanderCronRunStores(fallbackCommanderId)
+    const latestByStore = await Promise.all(
+      runStores.map((runStore) => runStore.listLatestRunsByTaskIds([task.id])),
+    )
+    const latestRun = pickLatestWorkflowRun(latestByStore.map((runs) => runs.get(task.id)))
+    return toCommanderCronTask(task, fallbackCommanderId, {
+      lastRun: latestRun?.completedAt ?? latestRun?.startedAt ?? null,
+      nextRun: commandRoomScheduler?.getNextRun?.(task.id)?.toISOString() ?? null,
+    })
+  }
 
   const requireReadAccess = combinedAuth({
     apiKeyStore: options.apiKeyStore,
@@ -2106,6 +2311,7 @@ export function createCommandersRouter(
           `- Result: ${event.result?.trim() || '_no summary provided_'}`,
         ].join('\n'),
       })
+      await refreshCommanderMemoryIndex(commanderId)
     })().catch((error) => {
       console.error(
         `[commanders] Failed to persist sub-agent lifecycle memory for "${commanderId}":`,
@@ -2507,6 +2713,7 @@ export function createCommandersRouter(
           ].join('\n'),
         }),
       ])
+      await refreshCommanderMemoryIndex(input.commanderId)
     } catch (memoryError) {
       console.error(`[commanders] Failed to persist message memory for "${input.commanderId}":`, memoryError)
     }
@@ -2580,9 +2787,152 @@ export function createCommandersRouter(
     }
   }
 
+  async function attachCommanderPublicUi(
+    commanderId: string,
+    payload: CommanderSessionResponse & {
+      contextConfig: { fatPinInterval: number }
+      runtime: { heartbeatCount: number }
+    },
+  ): Promise<
+    CommanderSessionResponse & {
+      contextConfig: { fatPinInterval: number }
+      runtime: { heartbeatCount: number }
+    }
+  > {
+    const profile = await readCommanderUiProfile(commanderId, commanderBasePath)
+    const avatarPath = await resolveCommanderAvatarPath(commanderId, commanderBasePath, profile)
+    return {
+      ...payload,
+      ui: profileForApiResponse(profile),
+      avatarUrl: avatarPath ? `/api/commanders/${encodeURIComponent(commanderId)}/avatar` : null,
+    }
+  }
+
   router.get('/', requireReadAccess, async (_req, res) => {
     const sessions = await sessionStore.list()
-    res.json(sessions.map((session) => toCommanderSessionResponse(session)))
+    const response = await Promise.all(
+      sessions.map(async (session) => {
+        const stats = await getCommanderSessionStats(session.id)
+        const base = toCommanderSessionResponse(session, undefined, stats)
+        return attachCommanderPublicUi(session.id, base)
+      }),
+    )
+    res.json(response)
+  })
+
+  // No auth on avatar — <img src> cannot send bearer headers, and the URL
+  // is already keyed on a non-guessable UUID.
+  router.get('/:id/avatar', async (req, res) => {
+    const commanderId = parseSessionId(req.params.id)
+    if (!commanderId) {
+      res.status(400).json({ error: 'Invalid commander id' })
+      return
+    }
+
+    const session = await sessionStore.get(commanderId)
+    if (!session) {
+      res.status(404).json({ error: `Commander "${commanderId}" not found` })
+      return
+    }
+
+    const profile = await readCommanderUiProfile(commanderId, commanderBasePath)
+    const avatarPath = await resolveCommanderAvatarPath(commanderId, commanderBasePath, profile)
+    if (!avatarPath) {
+      res.status(404).json({ error: 'Avatar not configured' })
+      return
+    }
+
+    try {
+      const buf = await readFile(avatarPath)
+      res.setHeader('Content-Type', mimeTypeForAvatarFile(avatarPath))
+      res.setHeader('Cache-Control', 'private, max-age=300')
+      res.send(buf)
+    } catch {
+      res.status(404).json({ error: 'Avatar file missing' })
+    }
+  })
+
+  router.post('/:id/avatar', requireWriteAccess, avatarUpload.single('avatar'), async (req, res) => {
+    const commanderId = parseSessionId(req.params.id)
+    if (!commanderId) {
+      res.status(400).json({ error: 'Invalid commander id' })
+      return
+    }
+
+    const session = await sessionStore.get(commanderId)
+    if (!session) {
+      res.status(404).json({ error: `Commander "${commanderId}" not found` })
+      return
+    }
+
+    const file = req.file
+    if (!file) {
+      res.status(400).json({ error: 'No avatar file uploaded' })
+      return
+    }
+
+    const EXT_MAP: Record<string, string> = {
+      'image/jpeg': '.jpg',
+      'image/png': '.png',
+      'image/webp': '.webp',
+      'image/gif': '.gif',
+    }
+    const ext = EXT_MAP[file.mimetype] ?? '.bin'
+    const avatarFileName = `avatar${ext}`
+
+    const { commanderRoot } = resolveCommanderPaths(commanderId, commanderBasePath)
+    await mkdir(commanderRoot, { recursive: true })
+    await writeFile(path.join(commanderRoot, avatarFileName), file.buffer)
+
+    const existing = await readCommanderUiProfile(commanderId, commanderBasePath)
+    await writeCommanderUiProfile(commanderId, commanderBasePath, {
+      ...(existing ?? {}),
+      avatar: avatarFileName,
+    } satisfies CommanderUiProfile)
+
+    res.json({ avatarUrl: `/api/commanders/${encodeURIComponent(commanderId)}/avatar` })
+  })
+
+  router.patch('/:id/profile', requireWriteAccess, async (req, res) => {
+    const commanderId = parseSessionId(req.params.id)
+    if (!commanderId) {
+      res.status(400).json({ error: 'Invalid commander id' })
+      return
+    }
+
+    const session = await sessionStore.get(commanderId)
+    if (!session) {
+      res.status(404).json({ error: `Commander "${commanderId}" not found` })
+      return
+    }
+
+    const parseField = (v: unknown): string | undefined =>
+      typeof v === 'string' ? v.trim() || undefined : undefined
+
+    const persona = parseField(req.body?.persona)
+    const borderColor = parseField(req.body?.borderColor)
+    const accentColor = parseField(req.body?.accentColor)
+    const speakingTone = parseField(req.body?.speakingTone)
+
+    if (persona !== undefined && persona.length > MAX_PERSONA_LENGTH) {
+      res.status(400).json({ error: `persona must be a string up to ${MAX_PERSONA_LENGTH} characters` })
+      return
+    }
+
+    const existing = await readCommanderUiProfile(commanderId, commanderBasePath)
+    const merged: CommanderUiProfile = {
+      ...(existing ?? {}),
+      ...(req.body?.borderColor !== undefined ? { borderColor } : {}),
+      ...(req.body?.accentColor !== undefined ? { accentColor } : {}),
+      ...(req.body?.speakingTone !== undefined ? { speakingTone } : {}),
+    }
+    await writeCommanderUiProfile(commanderId, commanderBasePath, merged)
+
+    if (req.body?.persona !== undefined) {
+      await sessionStore.update(commanderId, (s) => ({ ...s, persona }))
+    }
+
+    res.json({ ok: true })
   })
 
   router.get('/:id', requireReadAccess, async (req, res) => {
@@ -2600,8 +2950,10 @@ export function createCommandersRouter(
 
     const runtime = runtimes.get(commanderId)
     const commanderMd = await readCommanderIdentity(commanderId, commanderBasePath)
+    const stats = await getCommanderSessionStats(commanderId)
+    const base = toCommanderSessionResponse(session, runtime, stats)
     res.json({
-      ...toCommanderSessionResponse(session, runtime),
+      ...(await attachCommanderPublicUi(commanderId, base)),
       subAgents: listSubAgentEntries(runtime),
       commanderMd,
     })
@@ -2766,6 +3118,7 @@ export function createCommandersRouter(
           {},
           commanderBasePath,
         )
+        await ensureCommanderMemoryCompactCronTask(created.id)
       } catch (scaffoldError) {
         await sessionStore.delete(created.id).catch(() => {})
         throw scaffoldError
@@ -2782,6 +3135,104 @@ export function createCommandersRouter(
     } catch (error) {
       res.status(500).json({
         error: error instanceof Error ? error.message : 'Failed to register remote commander',
+      })
+    }
+  })
+
+  router.get('/:id/email/config', requireReadAccess, async (req, res) => {
+    const commanderId = parseSessionId(req.params.id)
+    if (!commanderId) {
+      res.status(400).json({ error: 'Invalid commander id' })
+      return
+    }
+
+    if (!(await sessionStore.get(commanderId))) {
+      res.status(404).json({ error: `Commander "${commanderId}" not found` })
+      return
+    }
+
+    const config = await emailConfigStore.get(commanderId)
+    res.json({ config })
+  })
+
+  router.put('/:id/email/config', requireWriteAccess, async (req, res) => {
+    const commanderId = parseSessionId(req.params.id)
+    if (!commanderId) {
+      res.status(400).json({ error: 'Invalid commander id' })
+      return
+    }
+
+    if (!(await sessionStore.get(commanderId))) {
+      res.status(404).json({ error: `Commander "${commanderId}" not found` })
+      return
+    }
+
+    const parsedConfig = parseEmailSourceConfig(req.body)
+    if (!parsedConfig.ok) {
+      res.status(400).json({ error: parsedConfig.error })
+      return
+    }
+
+    const config = await emailConfigStore.set(commanderId, parsedConfig.value)
+    res.json({ config })
+  })
+
+  router.post('/:id/email/reply', requireWriteAccess, async (req, res) => {
+    const commanderId = parseSessionId(req.params.id)
+    if (!commanderId) {
+      res.status(400).json({ error: 'Invalid commander id' })
+      return
+    }
+
+    if (!(await sessionStore.get(commanderId))) {
+      res.status(404).json({ error: `Commander "${commanderId}" not found` })
+      return
+    }
+
+    const messageId = parseMessage(req.body?.messageId)
+    if (!messageId) {
+      res.status(400).json({ error: 'messageId must be a non-empty string' })
+      return
+    }
+
+    const body = parseMessage(req.body?.body)
+    if (!body) {
+      res.status(400).json({ error: 'body must be a non-empty string' })
+      return
+    }
+    const threadId = parseMessage(req.body?.threadId) ?? undefined
+
+    const config = await emailConfigStore.get(commanderId)
+    if (!config) {
+      res.status(409).json({ error: 'Commander email config is not set' })
+      return
+    }
+
+    if (!emailReplyService) {
+      res.status(500).json({ error: 'Commander email reply service not configured' })
+      return
+    }
+
+    try {
+      const reply = await emailReplyService.sendReply(
+        commanderId,
+        config,
+        {
+          messageId,
+          ...(threadId ? { threadId } : {}),
+          body,
+        },
+      )
+
+      res.json({
+        accepted: true,
+        account: reply.account,
+        threadId: reply.threadId,
+        messageId,
+      })
+    } catch (error) {
+      res.status(502).json({
+        error: error instanceof Error ? error.message : 'Failed to send email reply',
       })
     }
   })
@@ -2878,6 +3329,7 @@ export function createCommandersRouter(
             commanderBasePath,
           )
         }
+        await ensureCommanderMemoryCompactCronTask(created.id)
       } catch (scaffoldError) {
         // Rollback the persisted session so retries don't hit the host-conflict check.
         await sessionStore.delete(created.id).catch(() => {})
@@ -2917,6 +3369,7 @@ export function createCommandersRouter(
       )
 
       if (upserted.created) {
+        await ensureCommanderMemoryCompactCronTask(upserted.commander.id)
         try {
           await withNamesLock(commanderDataDir, (names) => {
             names[upserted.commander.id] = formatChannelCommanderDisplayName(parsed.value.channelMeta)
@@ -3037,6 +3490,41 @@ export function createCommandersRouter(
       return
     }
     const selectedAgentType = parsedAgentType ?? resolveCommanderAgentType(session)
+    const previousState = session.state
+    const previousPid = session.pid
+    const previousHeartbeatTickCount = session.heartbeatTickCount
+    const sessionName = toCommanderSessionName(commanderId)
+    let runtime: CommanderRuntime | null = null
+    let startStateUpdated = false
+
+    const rollbackCommanderStart = async () => {
+      heartbeatManager.stop(commanderId)
+      heartbeatFiredAtByCommander.delete(commanderId)
+
+      if (runtime?.collectTimer) {
+        clearTimeout(runtime.collectTimer)
+        runtime.collectTimer = null
+      }
+      if (runtime) {
+        runtime.pendingCollect = []
+        runtime.unsubscribeEvents?.()
+        runtimes.delete(commanderId)
+      }
+
+      ACTIVE_COMMANDER_SESSIONS.delete(commanderId)
+      sessionsInterface?.deleteSession(sessionName)
+
+      if (!startStateUpdated) {
+        return
+      }
+
+      await sessionStore.update(commanderId, (current) => ({
+        ...current,
+        state: previousState,
+        pid: previousPid,
+        heartbeatTickCount: previousHeartbeatTickCount,
+      }))
+    }
 
     try {
       await questStore.resetActiveToPending(commanderId)
@@ -3099,6 +3587,7 @@ export function createCommandersRouter(
         res.status(404).json({ error: `Commander "${commanderId}" not found` })
         return
       }
+      startStateUpdated = true
 
       warnInvalidWorkflowHeartbeatInterval(commanderId, workflow)
       const effectiveHeartbeat = resolveEffectiveHeartbeat(started.heartbeat, workflow.workflow)
@@ -3117,15 +3606,16 @@ export function createCommandersRouter(
         throw new Error('sessionsInterface not configured — agents router bridge missing')
       }
 
-      const sessionName = toCommanderSessionName(commanderId)
       sessionsInterface.deleteSession(sessionName)
       const commanderSessionParams: Parameters<CommanderSessionsInterface['createCommanderSession']>[0] = {
         name: sessionName,
         systemPrompt: built.systemPrompt,
         agentType: selectedAgentType,
         cwd: started.cwd ?? undefined,
-        resumeSessionId: selectedAgentType === 'claude' ? started.claudeSessionId : undefined,
-        resumeCodexThreadId: selectedAgentType === 'codex' ? started.codexThreadId : undefined,
+        // Never resume — always start fresh so COMMANDER.md is authoritative.
+        // Commander memory layer (MEMORY.md, journal, working memory) provides continuity.
+        // See: https://github.com/NickGuAI/monorepo-g/issues/727
+        resumeSessionId: undefined,
         maxTurns: built.maxTurns,
       }
       await sessionsInterface.createCommanderSession(commanderSessionParams)
@@ -3138,7 +3628,7 @@ export function createCommandersRouter(
         ? initialStreamSession.usage.inputTokens
         : 0
 
-      const runtime: CommanderRuntime = {
+      runtime = {
         manager,
         flusher,
         workingMemory,
@@ -3147,6 +3637,7 @@ export function createCommandersRouter(
         heartbeatCount: 0,
         lastKnownInputTokens: initialInputTokens,
         forceNextFatHeartbeat: false,
+        preCompactionFlushTriggeredForCycle: false,
         pendingSpikeObservations: [],
         pendingCollect: [],
         collectTimer: null,
@@ -3168,6 +3659,8 @@ export function createCommandersRouter(
           : 0
 
         if (
+          runtime &&
+          !runtime.preCompactionFlushTriggeredForCycle &&
           !contextPressureTriggeredForTurn &&
           (
             isLegacyContextPressureEvent(event) ||
@@ -3179,28 +3672,32 @@ export function createCommandersRouter(
           )
         ) {
           contextPressureTriggeredForTurn = true
+          runtime.preCompactionFlushTriggeredForCycle = true
           void contextPressureBridge.trigger()
         }
 
-        if (eventType === 'result') {
-          if (
+        if (eventType === 'result' && runtime) {
+          const observedPostCompactionBoundary = (
             runtime.lastKnownInputTokens > 0 &&
             sessionInputTokens > 0 &&
             sessionInputTokens < runtime.lastKnownInputTokens * 0.5
-          ) {
+          )
+
+          if (observedPostCompactionBoundary) {
             runtime.forceNextFatHeartbeat = true
+            runtime.preCompactionFlushTriggeredForCycle = false
           }
           runtime.lastKnownInputTokens = sessionInputTokens
           contextPressureTriggeredForTurn = false
         }
       })
 
-      runtime.unsubscribeEvents = unsubscribeEvents
+      runtime!.unsubscribeEvents = unsubscribeEvents
 
       manager.wirePreCompactionFlush(
         contextPressureBridge,
         flusher,
-        () => buildFlushContext(started, runtime),
+        () => buildFlushContext(started, runtime!),
       )
 
       runtimes.set(commanderId, runtime)
@@ -3242,6 +3739,7 @@ export function createCommandersRouter(
             ].join('\n'),
           }),
         ])
+        await refreshCommanderMemoryIndex(commanderId)
       } catch (memoryError) {
         console.error(`[commanders] Failed to persist startup memory for "${commanderId}":`, memoryError)
       }
@@ -3251,24 +3749,7 @@ export function createCommandersRouter(
         console.warn(
           `[commanders] Startup message failed for "${commanderId}" (${selectedAgentType}); resetting runtime state`,
         )
-
-        heartbeatManager.stop(commanderId)
-        heartbeatFiredAtByCommander.delete(commanderId)
-        if (runtime.collectTimer) {
-          clearTimeout(runtime.collectTimer)
-          runtime.collectTimer = null
-        }
-        runtime.pendingCollect = []
-        runtime.unsubscribeEvents?.()
-        runtimes.delete(commanderId)
-        ACTIVE_COMMANDER_SESSIONS.delete(commanderId)
-        sessionsInterface.deleteSession(sessionName)
-
-        await sessionStore.update(commanderId, (current) => ({
-          ...current,
-          state: 'idle',
-          pid: null,
-        }))
+        await rollbackCommanderStart()
 
         res.status(503).json({
           error: 'Commander startup message could not be delivered. Please retry start.',
@@ -3282,6 +3763,11 @@ export function createCommandersRouter(
         started: true,
       })
     } catch (error) {
+      try {
+        await rollbackCommanderStart()
+      } catch (rollbackError) {
+        console.error(`[commanders] Failed to roll back start for "${commanderId}":`, rollbackError)
+      }
       res.status(500).json({
         error: error instanceof Error ? error.message : 'Failed to start commander',
       })
@@ -3393,6 +3879,7 @@ export function createCommandersRouter(
             ].join('\n'),
           }),
         ])
+        await refreshCommanderMemoryIndex(commanderId)
       } catch (memoryError) {
         console.error(`[commanders] Failed to persist stop memory for "${commanderId}":`, memoryError)
       }
@@ -3634,30 +4121,33 @@ export function createCommandersRouter(
         const workingMemory = runtime?.workingMemory ?? new WorkingMemoryStore(commanderId, commanderBasePath)
         const journalWriter = runtime?.manager.journalWriter ?? new JournalWriter(commanderId, commanderBasePath)
 
-        await Promise.all([
-          workingMemory.update({
-            source: 'system',
-            summary,
-            issueNumber,
-            repo,
-            tags: ['quest', 'claimed', quest.source],
-          }),
-          journalWriter.append({
-            timestamp: now().toISOString(),
-            issueNumber,
-            repo,
-            outcome: 'Quest claimed',
-            durationMin: null,
-            salience: 'ROUTINE',
-            body: [
-              `- Quest ID: \`${quest.id}\``,
-              `- Source: ${quest.source}`,
-              `- Instruction: ${summarizeQuestInstruction(quest.instruction)}`,
-            ].join('\n'),
-          }),
-        ]).catch((error) => {
+        try {
+          await Promise.all([
+            workingMemory.update({
+              source: 'system',
+              summary,
+              issueNumber,
+              repo,
+              tags: ['quest', 'claimed', quest.source],
+            }),
+            journalWriter.append({
+              timestamp: now().toISOString(),
+              issueNumber,
+              repo,
+              outcome: 'Quest claimed',
+              durationMin: null,
+              salience: 'ROUTINE',
+              body: [
+                `- Quest ID: \`${quest.id}\``,
+                `- Source: ${quest.source}`,
+                `- Instruction: ${summarizeQuestInstruction(quest.instruction)}`,
+              ].join('\n'),
+            }),
+          ])
+          await refreshCommanderMemoryIndex(commanderId)
+        } catch (error) {
           console.error(`[commanders] Failed to persist quest claim activity for "${commanderId}":`, error)
-        })
+        }
       }
       res.json({ quest })
     } catch (error) {
@@ -3697,6 +4187,7 @@ export function createCommandersRouter(
       const writer = new JournalWriter(commanderId, commanderBasePath)
       await writer.scaffold()
       const result = await writer.appendBatch(date, entries)
+      await refreshCommanderMemoryIndex(commanderId)
       res.json(result)
     } catch (error) {
       res.status(500).json({
@@ -3840,6 +4331,10 @@ export function createCommandersRouter(
         } else {
           skillsSkipped += 1
         }
+      }
+
+      if (memoryUpdated) {
+        await refreshCommanderMemoryIndex(commanderId)
       }
 
       res.json({
@@ -4131,34 +4626,37 @@ export function createCommandersRouter(
         const workingMemory = runtime?.workingMemory ?? new WorkingMemoryStore(commanderId, commanderBasePath)
         const journalWriter = runtime?.manager.journalWriter ?? new JournalWriter(commanderId, commanderBasePath)
 
-        await Promise.all([
-          workingMemory.update({
-            source: 'system',
-            summary,
-            issueNumber,
-            repo,
-            tags: ['quest', update.status, updated.source],
-          }),
-          journalWriter.append({
-            timestamp: now().toISOString(),
-            issueNumber,
-            repo,
-            outcome: summaryPrefix,
-            durationMin: null,
-            salience: update.status === 'failed'
-              ? 'SPIKE'
-              : update.status === 'done'
-                ? 'NOTABLE'
-                : 'ROUTINE',
-            body: [
-              `- Quest ID: \`${updated.id}\``,
-              `- Status: ${existingQuest.status} -> ${update.status}`,
-              `- Instruction: ${summarizeQuestInstruction(updated.instruction)}`,
-            ].join('\n'),
-          }),
-        ]).catch((error) => {
+        try {
+          await Promise.all([
+            workingMemory.update({
+              source: 'system',
+              summary,
+              issueNumber,
+              repo,
+              tags: ['quest', update.status, updated.source],
+            }),
+            journalWriter.append({
+              timestamp: now().toISOString(),
+              issueNumber,
+              repo,
+              outcome: summaryPrefix,
+              durationMin: null,
+              salience: update.status === 'failed'
+                ? 'SPIKE'
+                : update.status === 'done'
+                  ? 'NOTABLE'
+                  : 'ROUTINE',
+              body: [
+                `- Quest ID: \`${updated.id}\``,
+                `- Status: ${existingQuest.status} -> ${update.status}`,
+                `- Instruction: ${summarizeQuestInstruction(updated.instruction)}`,
+              ].join('\n'),
+            }),
+          ])
+          await refreshCommanderMemoryIndex(commanderId)
+        } catch (error) {
           console.error(`[commanders] Failed to persist quest status activity for "${commanderId}":`, error)
-        })
+        }
       }
 
       res.json(updated)
@@ -4391,6 +4889,7 @@ export function createCommandersRouter(
     }
 
     try {
+      await commandRoomSchedulerInitialized
       const taskRecords = await listCommanderCronTasksWithStores(commanderId)
       const taskIds = taskRecords.map((record) => record.task.id)
       const latestByStore = await Promise.all(
@@ -4399,7 +4898,10 @@ export function createCommandersRouter(
       const response = taskRecords.map(({ task }) => {
         const latest = pickLatestWorkflowRun(latestByStore.map((runs) => runs.get(task.id)))
         const lastRunAt = latest?.completedAt ?? latest?.startedAt ?? null
-        return toCommanderCronTask(task, commanderId, lastRunAt)
+        return toCommanderCronTask(task, commanderId, {
+          lastRun: lastRunAt,
+          nextRun: commandRoomScheduler?.getNextRun?.(task.id)?.toISOString() ?? null,
+        })
       })
       res.json(response)
     } catch {
@@ -4420,8 +4922,16 @@ export function createCommandersRouter(
       return
     }
 
-    const instruction = parseCronInstruction(req.body?.instruction)
-    if (!instruction) {
+    const taskType = parseCronTaskType(req.body?.taskType)
+    if (!taskType) {
+      res.status(400).json({ error: 'taskType must be instruction or memory_compact when provided' })
+      return
+    }
+
+    const instruction = taskType === COMMANDER_MEMORY_COMPACT_TASK_TYPE
+      ? COMMANDER_MEMORY_COMPACT_INSTRUCTION
+      : parseCronInstruction(req.body?.instruction)
+    if (taskType === COMMANDER_INSTRUCTION_TASK_TYPE && !instruction) {
       res.status(400).json({ error: 'instruction is required' })
       return
     }
@@ -4439,7 +4949,9 @@ export function createCommandersRouter(
 
     const name = typeof req.body?.name === 'string' && req.body.name.trim()
       ? req.body.name.trim()
-      : `commander-${commanderId}-cron`
+      : taskType === COMMANDER_MEMORY_COMPACT_TASK_TYPE
+        ? buildCommanderMemoryCompactTaskName(commanderId)
+        : `commander-${commanderId}-cron`
     const agentType = req.body?.agentType === 'codex' ? 'codex' : 'claude'
     const sessionType = req.body?.sessionType === 'pty' ? 'pty' : req.body?.sessionType === 'stream' ? 'stream' : undefined
     const permissionMode = typeof req.body?.permissionMode === 'string' && req.body.permissionMode ? req.body.permissionMode as string : undefined
@@ -4459,7 +4971,8 @@ export function createCommandersRouter(
         machine,
         workDir,
         agentType,
-        instruction,
+        instruction: instruction ?? COMMANDER_MEMORY_COMPACT_INSTRUCTION,
+        taskType,
         enabled: enabled ?? true,
         sessionType,
         permissionMode,
@@ -4467,7 +4980,7 @@ export function createCommandersRouter(
       const created = commandRoomScheduler
         ? await commandRoomScheduler.createTask(createInput)
         : await getCommanderCronStores(commanderId).taskStore.createTask(createInput)
-      res.status(201).json(toCommanderCronTask(created, commanderId))
+      res.status(201).json(await buildCommanderCronTask(created, commanderId))
     } catch {
       res.status(500).json({ error: 'Failed to create cron task' })
     }
@@ -4548,7 +5061,7 @@ export function createCommandersRouter(
         return
       }
 
-      res.json(toCommanderCronTask(updated, commanderId))
+      res.json(await buildCommanderCronTask(updated, commanderId))
     } catch {
       res.status(500).json({ error: 'Failed to update cron task' })
     }
@@ -4590,7 +5103,6 @@ export function createCommandersRouter(
       await Promise.all(
         listCommanderCronRunStores(commanderId).map((runStore) => runStore.deleteRunsForTask(cronTaskId)),
       )
-
       res.status(204).send()
     } catch {
       res.status(500).json({ error: 'Failed to delete cron task' })
@@ -4637,8 +5149,54 @@ export function createCommandersRouter(
       return
     }
 
-    if (!(await sessionStore.get(commanderId))) {
+    const session = await sessionStore.get(commanderId)
+    if (!session) {
       res.status(404).json({ error: `Commander "${commanderId}" not found` })
+      return
+    }
+
+    const body = isObject(req.body) ? req.body : {}
+    const source = body.source === 'cron' ? 'cron' : 'manual'
+    const rawTargetDate = typeof body.targetDate === 'string' ? body.targetDate.trim() : ''
+    if (
+      Object.prototype.hasOwnProperty.call(body, 'targetDate') &&
+      (
+        typeof body.targetDate !== 'string' ||
+        (rawTargetDate.length > 0 && !ISO_DATE_KEY_PATTERN.test(rawTargetDate))
+      )
+    ) {
+      res.status(400).json({ error: 'targetDate must be YYYY-MM-DD when provided' })
+      return
+    }
+    const targetDate = rawTargetDate.length > 0 ? rawTargetDate : undefined
+
+    let lookbackDays: number | undefined
+    if (Object.prototype.hasOwnProperty.call(body, 'lookbackDays')) {
+      if (
+        typeof body.lookbackDays !== 'number' ||
+        !Number.isFinite(body.lookbackDays) ||
+        body.lookbackDays < 0
+      ) {
+        res.status(400).json({ error: 'lookbackDays must be a non-negative number when provided' })
+        return
+      }
+      lookbackDays = Math.floor(body.lookbackDays)
+    }
+
+    if (isCommanderSessionRunning(session)) {
+      if (source === 'cron') {
+        res.status(200).json({
+          skipped: true,
+          reason: 'commander_running',
+          commanderId,
+          ...(targetDate ? { targetDate } : {}),
+        })
+        return
+      }
+
+      res.status(409).json({
+        error: 'Commander is running. Pause or stop the session before compacting memory.',
+      })
       return
     }
 
@@ -4647,7 +5205,11 @@ export function createCommandersRouter(
         basePath: commanderBasePath,
         now,
       })
-      const report = await consolidation.run(commanderId)
+      const report = await consolidation.run(commanderId, {
+        targetDate,
+        lookbackDays,
+      })
+      await refreshCommanderMemoryIndex(commanderId)
       res.json(report)
     } catch (error) {
       res.status(500).json({
@@ -4678,7 +5240,7 @@ export function createCommandersRouter(
     const topK = typeof body.topK === 'number' && body.topK > 0 ? body.topK : undefined
 
     try {
-      const recollection = new MemoryRecollection(commanderId, commanderBasePath)
+      const recollection = createCommanderMemoryRecollection(commanderId, commanderBasePath)
       const result = await recollection.recall({ cue, topK })
       res.json(result)
     } catch (error) {
@@ -4747,6 +5309,7 @@ export function createCommandersRouter(
       await mkdir(commanderPaths.memoryRoot, { recursive: true })
       const writer = new MemoryMdWriter(commanderPaths.memoryRoot)
       const result = await writer.updateFacts(facts)
+      await refreshCommanderMemoryIndex(commanderId)
       res.json(result)
     } catch (error) {
       res.status(500).json({

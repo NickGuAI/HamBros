@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import path from 'node:path'
 import {
   resolveCommanderDataDir,
+  resolveCommanderEmailConfigPath,
+  resolveCommanderEmailSeenPath,
   resolveCommanderMachineId,
   resolveCommanderNamesPath,
   resolveCommanderPaths,
@@ -38,6 +40,12 @@ describe('commander paths', () => {
     )
     expect(resolveCommanderNamesPath('/tmp/cmdr-data')).toBe(
       path.resolve('/tmp/cmdr-data/names.json'),
+    )
+    expect(resolveCommanderEmailConfigPath('cmdr-1', '/tmp/cmdr-data')).toBe(
+      path.resolve('/tmp/cmdr-data/cmdr-1/email-config.json'),
+    )
+    expect(resolveCommanderEmailSeenPath('cmdr-1', '/tmp/cmdr-data')).toBe(
+      path.resolve('/tmp/cmdr-data/cmdr-1/email-seen.json'),
     )
   })
 

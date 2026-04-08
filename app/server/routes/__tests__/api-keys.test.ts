@@ -3,7 +3,7 @@ import express from 'express'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { ApiKeyJsonStore } from '../../api-keys/store'
+import { API_KEY_SCOPES, ApiKeyJsonStore } from '../../api-keys/store'
 import { OpenAITranscriptionKeyStore } from '../../api-keys/transcription-store'
 import { createApiKeysRouter } from '../api-keys'
 import { createTelemetryRouter } from '../../../modules/telemetry/routes'
@@ -50,15 +50,43 @@ async function startServer(): Promise<RunningServer> {
   })
   const telemetryStorePath = path.join(directory, 'telemetry.jsonl')
 
+  const auth0UsersByToken = new Map<string, {
+    id: string
+    email: string
+    metadata?: {
+      permissions?: string[]
+    }
+  }>([
+    ['valid-auth0-admin-token', {
+      id: 'auth0|admin',
+      email: 'admin@example.com',
+      metadata: {
+        permissions: [...API_KEY_SCOPES],
+      },
+    }],
+    ['valid-auth0-telemetry-write-token', {
+      id: 'auth0|telemetry-writer',
+      email: 'writer@example.com',
+      metadata: {
+        permissions: ['telemetry:write'],
+      },
+    }],
+    ['valid-auth0-telemetry-read-token', {
+      id: 'auth0|telemetry-reader',
+      email: 'reader@example.com',
+      metadata: {
+        permissions: ['telemetry:read'],
+      },
+    }],
+  ])
+
   const verifyAuth0Token = async (token: string) => {
-    if (token !== 'valid-auth0-token') {
+    const user = auth0UsersByToken.get(token)
+    if (!user) {
       throw new Error('invalid auth0 token')
     }
 
-    return {
-      id: 'auth0|user-1',
-      email: 'user@example.com',
-    }
+    return user
   }
 
   const app = express()
@@ -118,7 +146,7 @@ describe('api key auth routes', () => {
     const createResponse = await fetch(`${server.baseUrl}/api/auth/keys`, {
       method: 'POST',
       headers: {
-        authorization: 'Bearer valid-auth0-token',
+        authorization: 'Bearer valid-auth0-admin-token',
         'content-type': 'application/json',
       },
       body: JSON.stringify({
@@ -139,7 +167,7 @@ describe('api key auth routes', () => {
 
     const listResponse = await fetch(`${server.baseUrl}/api/auth/keys`, {
       headers: {
-        authorization: 'Bearer valid-auth0-token',
+        authorization: 'Bearer valid-auth0-admin-token',
       },
     })
     expect(listResponse.status).toBe(200)
@@ -173,7 +201,7 @@ describe('api key auth routes', () => {
     const ingestByAuth0 = await fetch(`${server.baseUrl}/api/telemetry/ingest`, {
       method: 'POST',
       headers: {
-        authorization: 'Bearer valid-auth0-token',
+        authorization: 'Bearer valid-auth0-admin-token',
         'content-type': 'application/json',
       },
       body: JSON.stringify({
@@ -192,7 +220,7 @@ describe('api key auth routes', () => {
       {
         method: 'DELETE',
         headers: {
-          authorization: 'Bearer valid-auth0-token',
+          authorization: 'Bearer valid-auth0-admin-token',
         },
       },
     )
@@ -224,7 +252,7 @@ describe('api key auth routes', () => {
     const response = await fetch(`${server.baseUrl}/api/auth/keys`, {
       method: 'POST',
       headers: {
-        authorization: 'Bearer valid-auth0-token',
+        authorization: 'Bearer valid-auth0-admin-token',
         'content-type': 'application/json',
       },
       body: JSON.stringify({
@@ -243,12 +271,72 @@ describe('api key auth routes', () => {
     await server.close()
   })
 
+  it('requires full admin permissions to manage API keys', async () => {
+    const server = await startServer()
+
+    const response = await fetch(`${server.baseUrl}/api/auth/keys`, {
+      headers: {
+        authorization: 'Bearer valid-auth0-telemetry-write-token',
+      },
+    })
+
+    expect(response.status).toBe(403)
+    expect(await response.json()).toEqual({
+      error: 'Insufficient permissions',
+    })
+
+    await server.close()
+  })
+
+  it('enforces telemetry write permission for Auth0 callers at the route level', async () => {
+    const server = await startServer()
+
+    const denied = await fetch(`${server.baseUrl}/api/telemetry/ingest`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer valid-auth0-telemetry-read-token',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        sessionId: 'session-with-read-only-auth0',
+        agentName: 'claude',
+        model: 'sonnet',
+        inputTokens: 1,
+        outputTokens: 1,
+        cost: 0.001,
+      }),
+    })
+    expect(denied.status).toBe(403)
+    expect(await denied.json()).toEqual({
+      error: 'Insufficient permissions',
+    })
+
+    const allowed = await fetch(`${server.baseUrl}/api/telemetry/ingest`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer valid-auth0-telemetry-write-token',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        sessionId: 'session-with-write-auth0',
+        agentName: 'claude',
+        model: 'sonnet',
+        inputTokens: 1,
+        outputTokens: 1,
+        cost: 0.001,
+      }),
+    })
+    expect(allowed.status).toBe(202)
+
+    await server.close()
+  })
+
   it('stores transcription OpenAI key without exposing plaintext on read', async () => {
     const server = await startServer()
 
     const initialStatus = await fetch(`${server.baseUrl}/api/auth/transcription/openai`, {
       headers: {
-        authorization: 'Bearer valid-auth0-token',
+        authorization: 'Bearer valid-auth0-admin-token',
       },
     })
     expect(initialStatus.status).toBe(200)
@@ -260,7 +348,7 @@ describe('api key auth routes', () => {
     const storeResponse = await fetch(`${server.baseUrl}/api/auth/transcription/openai`, {
       method: 'PUT',
       headers: {
-        authorization: 'Bearer valid-auth0-token',
+        authorization: 'Bearer valid-auth0-admin-token',
         'content-type': 'application/json',
       },
       body: JSON.stringify({ apiKey: 'sk-openai-transcription' }),
@@ -269,7 +357,7 @@ describe('api key auth routes', () => {
 
     const afterStoreStatus = await fetch(`${server.baseUrl}/api/auth/transcription/openai`, {
       headers: {
-        authorization: 'Bearer valid-auth0-token',
+        authorization: 'Bearer valid-auth0-admin-token',
       },
     })
     expect(afterStoreStatus.status).toBe(200)
@@ -285,14 +373,14 @@ describe('api key auth routes', () => {
     const clearResponse = await fetch(`${server.baseUrl}/api/auth/transcription/openai`, {
       method: 'DELETE',
       headers: {
-        authorization: 'Bearer valid-auth0-token',
+        authorization: 'Bearer valid-auth0-admin-token',
       },
     })
     expect(clearResponse.status).toBe(204)
 
     const afterClearStatus = await fetch(`${server.baseUrl}/api/auth/transcription/openai`, {
       headers: {
-        authorization: 'Bearer valid-auth0-token',
+        authorization: 'Bearer valid-auth0-admin-token',
       },
     })
     expect(afterClearStatus.status).toBe(200)

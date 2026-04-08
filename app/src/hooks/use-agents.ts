@@ -9,6 +9,8 @@ import type {
   WorldAgent,
 } from '@/types'
 
+const AGENT_SESSIONS_REFETCH_INTERVAL_MS = 1000
+
 export interface DirectoryListing {
   parent: string
   directories: string[]
@@ -38,7 +40,7 @@ export function useAgentSessions() {
   return useQuery({
     queryKey: ['agents', 'sessions'],
     queryFn: fetchSessions,
-    refetchInterval: 5000,
+    refetchInterval: AGENT_SESSIONS_REFETCH_INTERVAL_MS,
   })
 }
 
@@ -72,6 +74,14 @@ export async function createSession(
 export async function killSession(sessionName: string): Promise<{ killed: boolean }> {
   return fetchJson(`/api/agents/sessions/${encodeURIComponent(sessionName)}`, {
     method: 'DELETE',
+  })
+}
+
+export async function resumeSession(
+  sessionName: string,
+): Promise<{ name: string; resumedFrom: string }> {
+  return fetchJson(`/api/agents/sessions/${encodeURIComponent(sessionName)}/resume`, {
+    method: 'POST',
   })
 }
 

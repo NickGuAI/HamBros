@@ -76,6 +76,67 @@ function resolveAuth0Config(options: Auth0Options): ResolvedAuth0Config | null {
   }
 }
 
+function normalizePermissionEntries(values: Iterable<string>): string[] {
+  return [...new Set(
+    [...values]
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0),
+  )]
+}
+
+function permissionEntriesFromUnknown(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return normalizePermissionEntries(
+      value.filter((entry): entry is string => typeof entry === 'string'),
+    )
+  }
+
+  if (typeof value === 'string') {
+    return normalizePermissionEntries(value.split(/\s+/))
+  }
+
+  return []
+}
+
+export function auth0PermissionsFromClaims(
+  claims: Readonly<Record<string, unknown>>,
+): string[] {
+  const permissions = new Set<string>()
+  const addPermissions = (value: unknown): void => {
+    for (const permission of permissionEntriesFromUnknown(value)) {
+      permissions.add(permission)
+    }
+  }
+
+  addPermissions(claims.permissions)
+  addPermissions(claims.scope)
+
+  for (const [key, value] of Object.entries(claims)) {
+    if (key.endsWith('/permissions')) {
+      addPermissions(value)
+    }
+  }
+
+  return [...permissions]
+}
+
+export function auth0PermissionsFromUser(user: AuthUser): string[] {
+  return user.metadata ? auth0PermissionsFromClaims(user.metadata) : []
+}
+
+export function auth0UserHasRequiredPermissions(
+  user: AuthUser,
+  requiredPermissions: readonly string[] | undefined,
+): boolean {
+  const normalizedRequiredPermissions = permissionEntriesFromUnknown(requiredPermissions)
+  if (normalizedRequiredPermissions.length === 0) {
+    return true
+  }
+
+  const availablePermissions = new Set(auth0PermissionsFromUser(user))
+  return normalizedRequiredPermissions.every((permission) => availablePermissions.has(permission))
+}
+
 class Auth0JwksClient implements Auth0ClientLike {
   private readonly jwks
 
@@ -112,6 +173,13 @@ class Auth0JwksClient implements Auth0ClientLike {
       typeof verification.payload.email === 'string'
         ? verification.payload.email
         : `${subject}@auth0.local`
+    const permissions = auth0PermissionsFromClaims(
+      verification.payload as Readonly<Record<string, unknown>>,
+    )
+    const emailVerified =
+      typeof verification.payload.email_verified === 'boolean'
+        ? verification.payload.email_verified
+        : undefined
 
     return {
       id: subject,
@@ -119,6 +187,8 @@ class Auth0JwksClient implements Auth0ClientLike {
       metadata: {
         provider: 'auth0',
         aud: verification.payload.aud,
+        permissions,
+        ...(emailVerified === undefined ? {} : { emailVerified }),
       },
     }
   }
@@ -201,6 +271,7 @@ export async function authorizeAuth0Request(
 export function auth0Middleware(
   options: Auth0Options & {
     optional?: boolean
+    requiredPermissions?: readonly string[]
   } = {},
 ): RequestHandler {
   const verifyToken = createAuth0Verifier(options)
@@ -229,7 +300,18 @@ export function auth0Middleware(
     }
 
     try {
-      req.user = await verifyToken(token)
+      const user = await verifyToken(token)
+      if (!auth0UserHasRequiredPermissions(user, options.requiredPermissions)) {
+        if (options.optional) {
+          next()
+          return
+        }
+
+        res.status(403).json({ error: 'Insufficient permissions' })
+        return
+      }
+
+      req.user = user
       req.authMode = 'auth0'
       next()
     } catch {

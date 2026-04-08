@@ -1,16 +1,18 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { FolderOpen, GitBranch, GitCommitHorizontal, Loader2, Search, X } from 'lucide-react'
+import { Check, FolderOpen, GitBranch, GitCommitHorizontal, Loader2, Plus, Search, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import type { WorkspaceTreeNode } from '../../workspace/types'
+import type { WorkspaceFilePreview as WorkspaceFilePreviewData, WorkspaceTreeNode } from '../../workspace/types'
 import {
   fetchWorkspaceExpandedTree,
   fetchWorkspaceTree,
   getWorkspaceSourceKey,
+  useWorkspaceFilePreview,
   useWorkspaceGitLog,
   useWorkspaceGitStatus,
   type WorkspaceSource,
 } from '../../workspace/use-workspace'
+import { WorkspaceFilePreview } from '../../workspace/components/WorkspaceFilePreview'
 import { WorkspaceTree } from '../../workspace/components/WorkspaceTree'
 
 interface WorkspaceOverlayProps {
@@ -21,6 +23,149 @@ interface WorkspaceOverlayProps {
 }
 
 type OverlayTab = 'files' | 'changes' | 'log'
+
+function findNodeByPath(
+  nodesByParent: Record<string, WorkspaceTreeNode[]>,
+  path: string | null,
+): WorkspaceTreeNode | null {
+  if (!path) {
+    return null
+  }
+
+  for (const nodes of Object.values(nodesByParent)) {
+    const match = nodes.find((node) => node.path === path)
+    if (match) {
+      return match
+    }
+  }
+
+  return null
+}
+
+interface PreviewPopupProps {
+  open: boolean
+  selectedPath: string | null
+  preview: WorkspaceFilePreviewData | null
+  draftContent: string
+  loading: boolean
+  error: string | null
+  onClose: () => void
+}
+
+function PreviewPopup({
+  open,
+  selectedPath,
+  preview,
+  draftContent,
+  loading,
+  error,
+  onClose,
+}: PreviewPopupProps) {
+  const desktopPanelRef = useRef<HTMLDivElement>(null)
+  const mobilePanelRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!open) {
+      return
+    }
+
+    function handlePointerDown(event: MouseEvent | TouchEvent) {
+      const target = event.target
+      if (!(target instanceof Node)) {
+        return
+      }
+      if (
+        desktopPanelRef.current?.contains(target) ||
+        mobilePanelRef.current?.contains(target)
+      ) {
+        return
+      }
+      onClose()
+    }
+
+    document.addEventListener('mousedown', handlePointerDown)
+    document.addEventListener('touchstart', handlePointerDown)
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown)
+      document.removeEventListener('touchstart', handlePointerDown)
+    }
+  }, [open, onClose])
+
+  if (!open || !selectedPath) {
+    return null
+  }
+
+  return createPortal(
+    <div className="fixed inset-0 z-[10000] md:pointer-events-none">
+      <div className="absolute inset-0 bg-sumi-black/30 md:bg-sumi-black/15" />
+
+      <div className="hidden md:flex absolute inset-0 items-center justify-center p-5">
+        <div
+          ref={desktopPanelRef}
+          role="dialog"
+          aria-modal="true"
+          aria-label="Workspace file preview"
+          className="pointer-events-auto flex h-[90vh] w-full max-w-5xl flex-col overflow-hidden rounded-xl border border-ink-border bg-washi-white shadow-2xl"
+        >
+          <div className="flex items-center justify-between border-b border-ink-border px-3 py-2">
+            <span className="font-mono text-xs text-sumi-gray">Preview</span>
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-md p-1.5 text-sumi-diluted hover:bg-ink-wash transition-colors"
+              aria-label="Close preview"
+            >
+              <X size={14} />
+            </button>
+          </div>
+          <div className="min-h-0 flex-1 p-3">
+            <WorkspaceFilePreview
+              selectedPath={selectedPath}
+              preview={preview}
+              draftContent={draftContent}
+              loading={loading}
+              error={error}
+              readOnly
+            />
+          </div>
+        </div>
+      </div>
+
+      <div className="md:hidden absolute inset-x-0 bottom-0 px-2 pb-2 pt-8">
+        <div
+          ref={mobilePanelRef}
+          role="dialog"
+          aria-modal="true"
+          aria-label="Workspace file preview"
+          className="flex max-h-[90dvh] min-h-[50dvh] flex-col overflow-hidden rounded-2xl border border-ink-border bg-washi-white shadow-2xl"
+        >
+          <div className="flex items-center justify-between border-b border-ink-border px-3 py-2">
+            <span className="font-mono text-xs text-sumi-gray">Preview</span>
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-md p-1.5 text-sumi-diluted hover:bg-ink-wash transition-colors"
+              aria-label="Close preview"
+            >
+              <X size={14} />
+            </button>
+          </div>
+          <div className="min-h-0 flex-1 p-2">
+            <WorkspaceFilePreview
+              selectedPath={selectedPath}
+              preview={preview}
+              draftContent={draftContent}
+              loading={loading}
+              error={error}
+              readOnly
+            />
+          </div>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  )
+}
 
 export function WorkspaceOverlay({
   open,
@@ -34,11 +179,29 @@ export function WorkspaceOverlay({
   const [nodesByParent, setNodesByParent] = useState<Record<string, WorkspaceTreeNode[]>>({})
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set())
   const [loadingPaths, setLoadingPaths] = useState<Set<string>>(new Set())
+  const [addedPaths, setAddedPaths] = useState<Set<string>>(new Set())
   const [selectedPath, setSelectedPath] = useState<string | null>(null)
+  const addFeedbackTimersRef = useRef<number[]>([])
   const searchRef = useRef<HTMLInputElement>(null)
+  const selectedNode = useMemo(
+    () => findNodeByPath(nodesByParent, selectedPath),
+    [nodesByParent, selectedPath],
+  )
 
+  const previewQuery = useWorkspaceFilePreview(
+    source,
+    selectedNode?.type === 'file' ? selectedNode.path : null,
+    open && activeTab === 'files',
+  )
   const gitStatusQuery = useWorkspaceGitStatus(source, open && activeTab === 'changes')
   const gitLogQuery = useWorkspaceGitLog(source, open && activeTab === 'log')
+
+  const clearAddFeedbackTimers = useCallback(() => {
+    for (const timerId of addFeedbackTimersRef.current) {
+      window.clearTimeout(timerId)
+    }
+    addFeedbackTimersRef.current = []
+  }, [])
 
   // Auto-focus search on open
   useEffect(() => {
@@ -47,17 +210,23 @@ export function WorkspaceOverlay({
     } else {
       setQuery('')
       setSelectedPath(null)
+      setAddedPaths(new Set())
+      clearAddFeedbackTimers()
     }
-  }, [open])
+  }, [open, clearAddFeedbackTimers])
 
   // Reset tree when source changes
   useEffect(() => {
     setNodesByParent({})
     setExpandedPaths(new Set())
     setLoadingPaths(new Set())
+    setAddedPaths(new Set())
     setSelectedPath(null)
     setActiveTab('files')
-  }, [sourceKey])
+    clearAddFeedbackTimers()
+  }, [sourceKey, clearAddFeedbackTimers])
+
+  useEffect(() => () => clearAddFeedbackTimers(), [clearAddFeedbackTimers])
 
   // Load root directory on open
   useEffect(() => {
@@ -105,19 +274,24 @@ export function WorkspaceOverlay({
     }
   }
 
-  function handleSelectPath(path: string) {
+  function handlePreviewPath(path: string) {
     setSelectedPath(path)
-    // Check if this is a directory so we can suffix with '/'
-    let isDir = false
-    for (const nodes of Object.values(nodesByParent)) {
-      const node = nodes.find((n) => n.path === path)
-      if (node) {
-        isDir = node.type === 'directory'
-        break
-      }
-    }
-    onSelectFile(isDir ? `${path}/` : path)
-    onClose()
+  }
+
+  function handleAddPath(path: string, knownType?: WorkspaceTreeNode['type']) {
+    const nodeType = knownType ?? findNodeByPath(nodesByParent, path)?.type
+    const isDirectory = nodeType === 'directory'
+    onSelectFile(isDirectory ? `${path}/` : path)
+    setAddedPaths((prev) => new Set(prev).add(path))
+
+    const timerId = window.setTimeout(() => {
+      setAddedPaths((prev) => {
+        const next = new Set(prev)
+        next.delete(path)
+        return next
+      })
+    }, 1200)
+    addFeedbackTimersRef.current.push(timerId)
   }
 
   // Filter file nodes by search query
@@ -150,6 +324,12 @@ export function WorkspaceOverlay({
     return result
   }, [nodesByParent, query])
 
+  const selectedPreviewPath =
+    activeTab === 'files' && selectedNode?.type === 'file' ? selectedPath : null
+  const closePreview = useCallback(() => {
+    setSelectedPath(null)
+  }, [])
+
   // Escape to close
   useEffect(() => {
     if (!open) {
@@ -159,13 +339,17 @@ export function WorkspaceOverlay({
     function handleKeyDown(e: KeyboardEvent) {
       if (e.key === 'Escape') {
         e.preventDefault()
+        if (selectedPreviewPath) {
+          closePreview()
+          return
+        }
         onClose()
       }
     }
 
     document.addEventListener('keydown', handleKeyDown)
     return () => document.removeEventListener('keydown', handleKeyDown)
-  }, [open, onClose])
+  }, [open, onClose, selectedPreviewPath, closePreview])
 
   if (!open) {
     return null
@@ -252,18 +436,23 @@ export function WorkspaceOverlay({
           {/* Content */}
           <div className="flex-1 min-h-0 overflow-y-auto p-3">
             {activeTab === 'files' && (
-              <div className="min-h-[200px]">
+              <div className="flex h-full min-h-[200px] flex-col gap-3 overflow-y-auto">
                 {filteredNodesByParent[''] ? (
-                  <WorkspaceTree
-                    nodesByParent={filteredNodesByParent}
-                    expandedPaths={expandedPaths}
-                    loadingPaths={loadingPaths}
-                    selectedPath={selectedPath}
-                    onSelectPath={handleSelectPath}
-                    onToggleDirectory={(path) => void handleToggleDirectory(path)}
-                  />
+                  <div className="min-h-0 flex-1 overflow-auto rounded-lg border border-ink-border bg-washi-white p-2">
+                    <WorkspaceTree
+                      nodesByParent={filteredNodesByParent}
+                      expandedPaths={expandedPaths}
+                      loadingPaths={loadingPaths}
+                      addedPaths={addedPaths}
+                      selectedPath={selectedPath}
+                      onSelectPath={handlePreviewPath}
+                      onToggleDirectory={(path) => void handleToggleDirectory(path)}
+                      onAddPath={handleAddPath}
+                      selectDirectoriesOnClick={false}
+                    />
+                  </div>
                 ) : (
-                  <div className="flex items-center justify-center py-8 text-sm text-sumi-diluted">
+                  <div className="flex flex-1 items-center justify-center py-8 text-sm text-sumi-diluted">
                     <Loader2 size={16} className="mr-2 animate-spin" />
                     Loading workspace...
                   </div>
@@ -272,7 +461,7 @@ export function WorkspaceOverlay({
             )}
 
             {activeTab === 'changes' && (
-              <div className="min-h-[200px]">
+              <div className="h-full min-h-[200px] overflow-y-auto">
                 {gitStatusQuery.isLoading || gitStatusQuery.isFetching ? (
                   <div className="flex items-center justify-center py-8 text-sm text-sumi-diluted">
                     <Loader2 size={16} className="mr-2 animate-spin" />
@@ -306,14 +495,12 @@ export function WorkspaceOverlay({
                     ) : (
                       <div className="space-y-1">
                         {gitStatus.entries.map((entry) => (
-                          <button
+                          <div
                             key={entry.path}
-                            type="button"
-                            className="w-full flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs hover:bg-ink-wash transition-colors"
-                            onClick={() => {
-                              onSelectFile(entry.path)
-                              onClose()
-                            }}
+                            className={cn(
+                              'w-full flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors',
+                              addedPaths.has(entry.path) ? 'bg-emerald-50' : 'hover:bg-ink-wash',
+                            )}
                           >
                             <span className={cn(
                               'font-mono text-[10px] w-5 shrink-0 text-center',
@@ -327,7 +514,21 @@ export function WorkspaceOverlay({
                             <span className="font-mono text-sumi-gray truncate">
                               {entry.path}
                             </span>
-                          </button>
+                            <button
+                              type="button"
+                              className={cn(
+                                'ml-auto inline-flex items-center gap-1 rounded-md px-2 py-1 text-[10px] font-medium transition-colors',
+                                addedPaths.has(entry.path)
+                                  ? 'text-emerald-700 bg-emerald-100 hover:bg-emerald-200'
+                                  : 'text-sumi-diluted hover:bg-ink-wash',
+                              )}
+                              onClick={() => handleAddPath(entry.path, 'file')}
+                              aria-label={addedPaths.has(entry.path) ? `Added ${entry.path}` : `Add ${entry.path} to context`}
+                            >
+                              {addedPaths.has(entry.path) ? <Check size={11} /> : <Plus size={11} />}
+                              {addedPaths.has(entry.path) ? 'Added' : 'Add'}
+                            </button>
+                          </div>
                         ))}
                       </div>
                     )}
@@ -337,7 +538,7 @@ export function WorkspaceOverlay({
             )}
 
             {activeTab === 'log' && (
-              <div className="min-h-[200px]">
+              <div className="h-full min-h-[200px] overflow-y-auto">
                 {gitLogQuery.isLoading || gitLogQuery.isFetching ? (
                   <div className="flex items-center justify-center py-8 text-sm text-sumi-diluted">
                     <Loader2 size={16} className="mr-2 animate-spin" />
@@ -381,6 +582,16 @@ export function WorkspaceOverlay({
           </div>
         </div>
       </div>
+
+      <PreviewPopup
+        open={activeTab === 'files' && Boolean(selectedPreviewPath)}
+        selectedPath={selectedPreviewPath}
+        preview={previewQuery.data ?? null}
+        draftContent={previewQuery.data?.kind === 'text' ? previewQuery.data.content ?? '' : ''}
+        loading={previewQuery.isLoading || previewQuery.isFetching}
+        error={previewQuery.error instanceof Error ? previewQuery.error.message : null}
+        onClose={closePreview}
+      />
     </>,
     document.body,
   )

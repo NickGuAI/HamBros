@@ -146,4 +146,23 @@ describe('CommandRoomTaskStore', () => {
     expect(commanderPayload.tasks?.map((task) => task.id)).toEqual([commanderTask.id])
     expect(legacyPayload.tasks?.map((task) => task.id)).toEqual([sharedTask.id])
   })
+
+  it('persists memory_compact task types for commander maintenance tasks', async () => {
+    const created = await store.createTask({
+      name: 'Commander memory compact',
+      schedule: '0 2 * * *',
+      machine: '',
+      workDir: '',
+      agentType: 'claude',
+      instruction: 'Run internal commander memory compaction maintenance.',
+      taskType: 'memory_compact',
+      enabled: true,
+      commanderId: 'cmdr-maintenance',
+    })
+
+    expect(created.taskType).toBe('memory_compact')
+    const listed = await store.listTasks({ commanderId: 'cmdr-maintenance' })
+    expect(listed).toHaveLength(1)
+    expect(listed[0]?.taskType).toBe('memory_compact')
+  })
 })

@@ -38,7 +38,7 @@ export interface AgentCallSettings {
 
 /** Normalized event emitted by agentCall */
 export interface AgentEvent {
-  type: 'text' | 'tool_use' | 'tool_result' | 'usage' | 'session' | 'done' | 'error'
+  type: 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'usage' | 'session' | 'done' | 'error'
   /** Text content (for type=text, type=error) */
   content?: string
   /** Tool name (for type=tool_use) */

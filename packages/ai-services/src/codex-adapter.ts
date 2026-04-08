@@ -64,6 +64,15 @@ export async function* runCodex(
               raw: event,
             }
           }
+        } else if (item.type === 'reasoning') {
+          const text = (item.text ?? '') as string
+          if (text) {
+            yield {
+              type: 'thinking',
+              content: text,
+              raw: event,
+            }
+          }
         } else if (item.type === 'file_change') {
           yield {
             type: 'tool_use',

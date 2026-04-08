@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process'
 import { readFile, readdir } from 'node:fs/promises'
 import path from 'node:path'
 import { promisify } from 'node:util'
+import type { EmailPoller } from './email-poller.js'
 import {
   NightlyConsolidation,
   type CronEngine,
@@ -14,10 +15,15 @@ import { WorkingMemoryStore } from './memory/working-memory.js'
 import { CommanderSessionStore } from './store.js'
 import { HeartbeatLog, type HeartbeatLogEntry } from './heartbeat-log.js'
 import { QuestStore, type CommanderQuest } from './quest-store.js'
+import {
+  maintainCommanderTranscriptIndex,
+} from './transcript-index.js'
 
 export const NIGHTLY_CONSOLIDATION_CRON = '0 2 * * *'
+export const COMMANDER_TRANSCRIPT_MAINTENANCE_CRON = '20 2 * * *'
 export const COMMANDER_MEMORY_ONLY_SYNC_CRON = '*/5 * * * *'
 export const COMMANDER_FULL_SYNC_CRON = '30 * * * *'
+export const COMMANDER_EMAIL_POLL_CRON = '*/5 * * * *'
 export const MORNING_BRIEFING_CRON = '50 8 * * *'
 export const MICRO_RESET_CRON = '15 9 * * *'
 
@@ -50,13 +56,20 @@ interface TranscriptActivitySignals {
 
 type CommanderSyncMode = 'memory' | 'full'
 type CommanderMemorySyncRunner = (mode: CommanderSyncMode) => Promise<void>
+type CommanderTranscriptMaintenanceRunner = (commanderId: string) => Promise<void>
 
 interface CommanderCronOptions extends NightlyConsolidationOptions {
   commanderSessionStorePath?: string
+  enableNightlyConsolidation?: boolean
   enableS3Sync?: boolean
+  enableEmailPoll?: boolean
   memoryOnlySyncCron?: string
   fullSyncCron?: string
+  emailPollCron?: string
   memorySyncRunner?: CommanderMemorySyncRunner
+  transcriptMaintenanceCron?: string
+  transcriptMaintenanceRunner?: CommanderTranscriptMaintenanceRunner
+  emailPoller?: Pick<EmailPoller, 'pollAll'>
 }
 
 const execFileAsync = promisify(execFile)
@@ -363,6 +376,13 @@ async function defaultCommanderMemorySyncRunner(
   })
 }
 
+async function defaultCommanderTranscriptMaintenanceRunner(
+  commanderId: string,
+  basePath?: string,
+): Promise<void> {
+  await maintainCommanderTranscriptIndex(commanderId, { basePath })
+}
+
 function scheduleCommanderMemorySync(
   cronEngine: CronEngine,
   expression: string,
@@ -387,6 +407,7 @@ function scheduleCommanderMemorySync(
 /**
  * Registers Commander cron jobs:
  * - nightly memory consolidation at 02:00
+ * - optional email polling every 5 min
  * - optional S3 durability syncs (memory-only every 5 min + full hourly)
  * - activity-driven observer/reflector journal synthesis
  */
@@ -413,12 +434,38 @@ export function registerCommanderCron(
       : undefined
 
   const consolidation = new NightlyConsolidation(resolvedOptions)
-  consolidation.register(cronEngine)
+  if (options.enableNightlyConsolidation ?? false) {
+    consolidation.register(cronEngine)
+  }
 
   const questStore = commanderDataPath ? new QuestStore(commanderDataPath) : new QuestStore()
   const heartbeatLog = commanderDataPath
     ? new HeartbeatLog({ dataDir: commanderDataPath })
     : new HeartbeatLog()
+  if (options.enableEmailPoll && options.emailPoller) {
+    const emailPoller = options.emailPoller
+    let emailPollInFlight: Promise<void> | null = null
+    cronEngine.schedule(
+      options.emailPollCron ?? COMMANDER_EMAIL_POLL_CRON,
+      () => {
+        if (emailPollInFlight) {
+          return
+        }
+        emailPollInFlight = emailPoller.pollAll()
+          .catch((error) => {
+            console.error('[commanders] Failed commander email poll:', error)
+          })
+          .finally(() => {
+            emailPollInFlight = null
+          })
+      },
+      { name: 'commander-email-poll' },
+    )
+  }
+
+  const transcriptMaintenanceRunner = options.transcriptMaintenanceRunner ?? ((commanderId: string) => (
+    defaultCommanderTranscriptMaintenanceRunner(commanderId, resolvedOptions.basePath)
+  ))
 
   const resolveCommanderIdsForCron = async (): Promise<string[]> => {
     const source = resolvedOptions.commanderIdsForCronResolver
@@ -554,6 +601,19 @@ export function registerCommanderCron(
       syncRunner,
     )
   }
+
+  cronEngine.schedule(
+    options.transcriptMaintenanceCron ?? COMMANDER_TRANSCRIPT_MAINTENANCE_CRON,
+    async () => {
+      const commanderIds = await resolveCommanderIdsForCron()
+      for (const commanderId of commanderIds) {
+        await transcriptMaintenanceRunner(commanderId).catch((error) => {
+          console.error(`[commanders] Failed transcript maintenance for ${commanderId}:`, error)
+        })
+      }
+    },
+    { name: 'commander-transcript-maintenance' },
+  )
 
   cronEngine.schedule(
     MORNING_BRIEFING_CRON,

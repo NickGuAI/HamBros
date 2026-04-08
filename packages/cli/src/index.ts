@@ -1,40 +1,21 @@
+import { runCli as runOnboardCli } from './onboard.js'
+import { runMachinesCli } from './machines.js'
+import { runQuestsCli } from './quests.js'
+import { runWorkersCli } from './workers.js'
 import { runCommanderCli } from './commander.js'
 import { runCronCli } from './cron.js'
-import { runInitCli } from './init.js'
 import { runMemoryCli } from './memory.js'
-import { runCli as runOnboardCli } from './onboard.js'
-import { runQuestsCli } from './quests.js'
-import { runStartCli } from './start.js'
-import { runWorkersCli } from './workers.js'
-
-function printUsage(): void {
-  process.stdout.write('Usage:\n')
-  process.stdout.write('  hambros init\n')
-  process.stdout.write('  hambros start\n')
-  process.stdout.write('  hambros onboard\n')
-  process.stdout.write('  hambros quests <command>\n')
-  process.stdout.write('  hambros workers <command>\n')
-  process.stdout.write('  hambros cron <command>\n')
-  process.stdout.write('  hambros commander <command>\n')
-  process.stdout.write('  hambros memory <command>\n')
-}
+import { runSessionCli } from './session.js'
+import { runSentinelCli } from './sentinel.js'
 
 export async function runCli(args: readonly string[]): Promise<number> {
   const command = args[0]
 
-  if (!command || command === 'help' || command === '--help' || command === '-h') {
-    printUsage()
-    return 0
+  if (!command || command === 'onboard') {
+    return runOnboardCli(command ? args : [])
   }
-
-  if (command === 'init') {
-    return runInitCli(args.slice(1))
-  }
-  if (command === 'start') {
-    return runStartCli(args.slice(1))
-  }
-  if (command === 'onboard') {
-    return runOnboardCli(args.slice(1))
+  if (command === 'machine') {
+    return runMachinesCli(args.slice(1))
   }
   if (command === 'quests') {
     return runQuestsCli(args.slice(1))
@@ -51,7 +32,31 @@ export async function runCli(args: readonly string[]): Promise<number> {
   if (command === 'memory') {
     return runMemoryCli(args.slice(1))
   }
+  if (command === 'session') {
+    return runSessionCli(args.slice(1))
+  }
+  if (command === 'sentinel') {
+    return runSentinelCli(args.slice(1))
+  }
 
-  printUsage()
+  process.stdout.write('Usage:\n')
+  process.stdout.write('  hammurabi onboard\n')
+  process.stdout.write('  hammurabi machine <command>\n')
+  process.stdout.write('  hammurabi quests <command>\n')
+  process.stdout.write('  hammurabi workers <command>\n')
+  process.stdout.write('  hammurabi cron <command>\n')
+  process.stdout.write('  hammurabi commander <command>\n')
+  process.stdout.write('  hammurabi memory <command>\n')
+  process.stdout.write('  hammurabi session <command>\n')
+  process.stdout.write('  hammurabi sentinel <command>\n')
   return 1
 }
+
+export { runMachinesCli } from './machines.js'
+export { runQuestsCli } from './quests.js'
+export { runWorkersCli } from './workers.js'
+export { runCommanderCli } from './commander.js'
+export { runCronCli } from './cron.js'
+export { runMemoryCli } from './memory.js'
+export { runSessionCli } from './session.js'
+export { runSentinelCli } from './sentinel.js'

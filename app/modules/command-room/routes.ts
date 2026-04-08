@@ -3,9 +3,14 @@ import type { AuthUser } from '@hambros/auth-providers'
 import type { ApiKeyStoreLike } from '../../server/api-keys/store.js'
 import { combinedAuth } from '../../server/middleware/combined-auth.js'
 import { CommandRoomExecutor, type CommandRoomExecutorOptions } from './executor.js'
-import { CommandRoomRunStore } from './run-store.js'
+import { CommandRoomRunStore, type WorkflowRun } from './run-store.js'
 import { CommandRoomScheduler, InvalidCronExpressionError } from './scheduler.js'
-import { CommandRoomTaskStore, type CommandRoomAgentType, type UpdateCronTaskInput } from './task-store.js'
+import {
+  CommandRoomTaskStore,
+  type CommandRoomAgentType,
+  type CronTask,
+  type UpdateCronTaskInput,
+} from './task-store.js'
 
 const TASK_ID_PATTERN = /^[a-zA-Z0-9_-]+$/
 const COMMANDER_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/i
@@ -68,6 +73,27 @@ function parseOptionalString(raw: unknown): string | null | undefined {
   }
   const trimmed = raw.trim()
   return trimmed.length > 0 ? trimmed : undefined
+}
+
+function parseOptionalModel(
+  raw: unknown,
+  options: { allowClear: boolean },
+): string | null | undefined {
+  if (raw === undefined) {
+    return undefined
+  }
+  if (raw === null) {
+    return options.allowClear ? undefined : null
+  }
+  if (typeof raw !== 'string') {
+    return null
+  }
+
+  const trimmed = raw.trim()
+  if (trimmed.length === 0) {
+    return options.allowClear ? undefined : null
+  }
+  return trimmed
 }
 
 function parseAgentType(raw: unknown): CommandRoomAgentType | null {
@@ -142,7 +168,37 @@ export interface CommandRoomRouterOptions extends Pick<CommandRoomExecutorOption
   internalToken?: string
 }
 
-export function createCommandRoomRouter(options: CommandRoomRouterOptions = {}): Router {
+export interface CommandRoomRouterResult {
+  router: Router
+  scheduler: CommandRoomScheduler
+  taskStore: CommandRoomTaskStore
+  runStore: CommandRoomRunStore
+  ready: Promise<void>
+}
+
+function toIsoString(value: Date | null | undefined): string | null {
+  if (!(value instanceof Date) || Number.isNaN(value.getTime())) {
+    return null
+  }
+  return value.toISOString()
+}
+
+function toTaskResponse(
+  task: CronTask,
+  latestRun: WorkflowRun | null,
+  scheduler: CommandRoomScheduler,
+) {
+  return {
+    ...task,
+    nextRun: toIsoString(scheduler.getNextRun(task.id)),
+    lastRunStatus: latestRun?.status ?? null,
+    lastRunAt: latestRun?.completedAt ?? latestRun?.startedAt ?? null,
+  }
+}
+
+export function createCommandRoomRouter(
+  options: CommandRoomRouterOptions = {},
+): CommandRoomRouterResult {
   const router = Router()
   const taskStore = options.taskStore ?? new CommandRoomTaskStore()
   const runStore = options.runStore ?? new CommandRoomRunStore({ taskStore })
@@ -199,11 +255,7 @@ export function createCommandRoomRouter(options: CommandRoomRouterOptions = {}):
       res.json(
         tasks.map((task) => {
           const latest = latestByTask.get(task.id) ?? null
-          return {
-            ...task,
-            lastRunStatus: latest?.status ?? null,
-            lastRunAt: latest?.completedAt ?? latest?.startedAt ?? null,
-          }
+          return toTaskResponse(task, latest, scheduler)
         }),
       )
     } catch {
@@ -266,6 +318,11 @@ export function createCommandRoomRouter(options: CommandRoomRouterOptions = {}):
       res.status(400).json({ error: 'description must be a string when provided' })
       return
     }
+    const model = parseOptionalModel(req.body?.model, { allowClear: false })
+    if (model === null) {
+      res.status(400).json({ error: 'model must be a non-empty string when provided' })
+      return
+    }
     const permissionMode = typeof req.body?.permissionMode === 'string' && req.body.permissionMode ? req.body.permissionMode as string : undefined
     const sessionType = req.body?.sessionType === 'pty' ? 'pty' : req.body?.sessionType === 'stream' ? 'stream' : undefined
 
@@ -282,10 +339,11 @@ export function createCommandRoomRouter(options: CommandRoomRouterOptions = {}):
         instruction,
         enabled: enabled ?? true,
         commanderId,
+        model,
         permissionMode,
         sessionType,
       })
-      res.status(201).json(created)
+      res.status(201).json(toTaskResponse(created, null, scheduler))
     } catch (error) {
       if (isInvalidCronError(error)) {
         res.status(400).json({ error: 'Invalid cron expression' })
@@ -369,6 +427,15 @@ export function createCommandRoomRouter(options: CommandRoomRouterOptions = {}):
       update.instruction = instruction
     }
 
+    if ('model' in body) {
+      const model = parseOptionalModel(body.model, { allowClear: true })
+      if (model === null) {
+        res.status(400).json({ error: 'model must be a non-empty string when provided' })
+        return
+      }
+      update.model = model
+    }
+
     if ('enabled' in body) {
       const enabled = parseOptionalEnabled(body.enabled)
       if (enabled === null || enabled === undefined) {
@@ -420,7 +487,8 @@ export function createCommandRoomRouter(options: CommandRoomRouterOptions = {}):
         return
       }
 
-      res.json(updated)
+      const latestRun = (await runStore.listLatestRunsByTaskIds([updated.id])).get(updated.id) ?? null
+      res.json(toTaskResponse(updated, latestRun, scheduler))
     } catch (error) {
       if (isInvalidCronError(error)) {
         res.status(400).json({ error: 'Invalid cron expression' })
@@ -496,5 +564,11 @@ export function createCommandRoomRouter(options: CommandRoomRouterOptions = {}):
     }
   })
 
-  return router
+  return {
+    router,
+    scheduler,
+    taskStore,
+    runStore,
+    ready: initialized,
+  }
 }

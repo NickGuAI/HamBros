@@ -10,10 +10,10 @@ interface WorkspaceFilePreviewProps {
   loading?: boolean
   readOnly?: boolean
   saving?: boolean
-  onDraftChange: (value: string) => void
-  onSave: () => void
-  onRename: () => void
-  onDelete: () => void
+  onDraftChange?: (value: string) => void
+  onSave?: () => void
+  onRename?: () => void
+  onDelete?: () => void
   onInsertPath?: (path: string) => void
   variant?: 'light' | 'dark'
 }
@@ -26,10 +26,10 @@ export function WorkspaceFilePreview({
   loading = false,
   readOnly = false,
   saving = false,
-  onDraftChange,
-  onSave,
-  onRename,
-  onDelete,
+  onDraftChange = () => undefined,
+  onSave = () => undefined,
+  onRename = () => undefined,
+  onDelete = () => undefined,
   onInsertPath,
   variant = 'light',
 }: WorkspaceFilePreviewProps) {

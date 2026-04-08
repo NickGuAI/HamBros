@@ -42,12 +42,12 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 function printUsage(stdout: Writable): void {
   stdout.write('Usage:\n')
-  stdout.write('  hambros memory compact --commander <id>\n')
-  stdout.write('  hambros memory find --commander <id> "<query>" [--top <k>] [--semantic]\n')
-  stdout.write('  hambros memory save --commander <id> "<fact>" [--fact "<another>"]\n')
-  stdout.write('  hambros memory export --commander <id>\n')
+  stdout.write('  hammurabi memory compact --commander <id>\n')
+  stdout.write('  hammurabi memory find --commander <id> "<query>" [--top <k>] [--semantic]\n')
+  stdout.write('  hammurabi memory save --commander <id> "<fact>" [--fact "<another>"]\n')
+  stdout.write('  hammurabi memory export --commander <id>\n')
   stdout.write(
-    '  hambros memory journal --commander <id> --body "<text>" [--timestamp <iso>] [--outcome "<text>"] [--salience SPIKE|NOTABLE|ROUTINE] [--issue-number <n>] [--repo <name>] [--duration-min <n>]\n',
+    '  hammurabi memory journal --commander <id> --body "<text>" [--timestamp <iso>] [--outcome "<text>"] [--salience SPIKE|NOTABLE|ROUTINE] [--issue-number <n>] [--repo <name>] [--duration-min <n>]\n',
   )
 }
 
@@ -601,6 +601,7 @@ async function runCompact(
 
 interface RecollectionHit {
   type: string
+  attribution?: string
   score: number
   title: string
   excerpt: string
@@ -621,13 +622,14 @@ function writeLexicalHits(
 
     const h: RecollectionHit = {
       type: typeof hit.type === 'string' ? hit.type : 'unknown',
+      attribution: typeof hit.attribution === 'string' ? hit.attribution : undefined,
       score: typeof hit.score === 'number' ? hit.score : 0,
       title: typeof hit.title === 'string' ? hit.title : '(untitled)',
       excerpt: typeof hit.excerpt === 'string' ? hit.excerpt : '',
       reason: typeof hit.reason === 'string' ? hit.reason : '',
     }
 
-    const paddedType = `[${h.type}]`.padEnd(10)
+    const paddedType = `[${h.attribution ?? h.type}]`.padEnd(28)
     stdout.write(`${i + 1}. ${paddedType} ${h.score.toFixed(3)} — ${h.title}\n`)
     if (h.excerpt) {
       stdout.write(`   excerpt: "${h.excerpt}"\n`)
@@ -840,7 +842,7 @@ export async function runMemoryCli(
 
   const config = await readConfig()
   if (!config) {
-    stderr.write('HamBros config not found. Run `hambros init` first.\n')
+    stderr.write('Hammurabi config not found. Run `hammurabi onboard` first.\n')
     return 1
   }
 

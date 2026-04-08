@@ -17,6 +17,25 @@ const SS_MAX_BUFFER = 2 * 1024 * 1024
 const HEALTH_TIMEOUT_MS = 1_500
 const SERVICE_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*$/i
 const DEFAULT_HEALTH_PATHS = ['/health', '/api/health']
+const HERMETIC_LAUNCH_ENV_ALLOWLIST = [
+  'HOME',
+  'PATH',
+  'USER',
+  'LOGNAME',
+  'SHELL',
+  'TERM',
+  'LANG',
+  'TZ',
+  'TMPDIR',
+  'TMP',
+  'TEMP',
+  'PWD',
+  'SHLVL',
+  'XDG_RUNTIME_DIR',
+  'SSH_AUTH_SOCK',
+  'NVM_DIR',
+  'PNPM_HOME',
+] as const
 const VERCEL_API_BASE = 'https://api.vercel.com'
 const VERCEL_CONFIG_ERROR =
   'Vercel integration not configured. Set VERCEL_GEHIRN_MASTER_TOKEN and VERCEL_GEHIRN_TEAM_ID.'
@@ -165,6 +184,26 @@ function runCommand(command: string, args: string[]): Promise<string> {
       },
     )
   })
+}
+
+function buildHermeticLaunchEnv(sourceEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const sanitized: NodeJS.ProcessEnv = {}
+
+  for (const key of HERMETIC_LAUNCH_ENV_ALLOWLIST) {
+    const value = sourceEnv[key]
+    if (typeof value === 'string') {
+      sanitized[key] = value
+    }
+  }
+
+  for (const [key, value] of Object.entries(sourceEnv)) {
+    if (key.startsWith('LC_') && typeof value === 'string') {
+      sanitized[key] = value
+    }
+  }
+
+  sanitized.LAUNCH_HERMETIC_ENV = '1'
+  return sanitized
 }
 
 function sanitizeHealthPath(rawPath: string): string {
@@ -703,6 +742,7 @@ export function createServicesRouter(options: ServicesRouterOptions = {}): Servi
     spawnChild('bash', [scriptPath], {
       stdio: 'ignore',
       detached: true,
+      env: buildHermeticLaunchEnv(env),
     }).unref()
   })
   const serviceStopper: ServiceStopper = options.stopService ?? (async (service: DiscoveredService) => {

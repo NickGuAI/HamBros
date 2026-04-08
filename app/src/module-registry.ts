@@ -38,6 +38,20 @@ export const modules: FrontendModule[] = [
     component: () => import('@modules/commanders/page'),
   },
   {
+    name: 'quests',
+    label: 'Quests',
+    icon: 'ClipboardCheck',
+    path: '/quests',
+    component: () => import('@modules/quests/page'),
+  },
+  {
+    name: 'sentinels',
+    label: 'Sentinels',
+    icon: 'Clock3',
+    path: '/sentinels',
+    component: () => import('@modules/sentinels/page'),
+  },
+  {
     name: 'command-room',
     label: 'Command Room',
     icon: 'CalendarClock',

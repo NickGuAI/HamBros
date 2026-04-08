@@ -25,6 +25,11 @@ function listIanaTimezones(): string[] {
 }
 
 const TIMEZONE_OPTIONS = listIanaTimezones()
+const MODEL_OPTIONS = [
+  'claude-opus-4-6',
+  'claude-sonnet-4-6',
+  'claude-haiku-3-5',
+] as const
 
 function prependSkillInvocation(instruction: string, skillName: string): string {
   const command = `/${skillName}`
@@ -58,6 +63,7 @@ export function CreateTaskForm({ onCreate, onClose, machines, createPending }: C
   const [timezone, setTimezone] = useState(() => detectBrowserTimezone())
   const [agentType, setAgentType] = useState<AgentType>('claude')
   const [sessionType, setSessionType] = useState<SessionType>('stream')
+  const [model, setModel] = useState('')
   const [selectedHost, setSelectedHost] = useState('')
   const [selectedSkill, setSelectedSkill] = useState('')
   const [createError, setCreateError] = useState<string | null>(null)
@@ -77,6 +83,7 @@ export function CreateTaskForm({ onCreate, onClose, machines, createPending }: C
         workDir: cwd.trim(),
         agentType: agentType as CommandRoomAgentType,
         instruction: task.trim(),
+        ...(model ? { model } : {}),
         enabled: true,
         permissionMode: mode,
         sessionType,
@@ -91,6 +98,7 @@ export function CreateTaskForm({ onCreate, onClose, machines, createPending }: C
       setTask('')
       setAgentType('claude')
       setSessionType('stream')
+      setModel('')
       setSelectedHost('')
       setSelectedSkill('')
       onClose()
@@ -187,6 +195,21 @@ export function CreateTaskForm({ onCreate, onClose, machines, createPending }: C
                 )}
               </div>
             ) : null}
+            <div>
+              <label className="section-title block mb-2">Model</label>
+              <select
+                value={model}
+                onChange={(event) => setModel(event.target.value)}
+                className="w-full px-3 py-2 rounded-lg border border-ink-border bg-washi-aged text-[16px] md:text-sm focus:outline-none focus:border-ink-border-hover"
+              >
+                <option value="">— Default —</option>
+                {MODEL_OPTIONS.map((option) => (
+                  <option key={option} value={option}>
+                    {option}
+                  </option>
+                ))}
+              </select>
+            </div>
           </div>
         }
       />

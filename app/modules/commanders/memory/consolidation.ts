@@ -12,6 +12,7 @@ const HIGH_ACTIVITY_ENTRY_THRESHOLD = 20
 const HIGH_ACTIVITY_SPIKE_THRESHOLD = 4
 const MAX_LONG_TERM_JOURNAL_ENTRIES = 6
 const MAX_LONG_TERM_WORKING_NOTES = 8
+const DATE_KEY_PATTERN = /^\d{4}-\d{2}-\d{2}$/
 const SYNTHETIC_JOURNAL_OUTCOMES = new Set([
   'Daily observations',
   'Work pulse reflection',
@@ -42,6 +43,11 @@ export interface ConsolidationIssueClient {
   postConsolidationComment?(commanderId: string, commentBody: string): Promise<void>
 }
 
+export interface ConsolidationRunOptions {
+  targetDate?: string
+  lookbackDays?: number
+}
+
 export interface SkillDistillerLike {
   run(input: { journalEntries: JournalEntry[]; parsedDebriefs: ParsedDebrief[] }): Promise<void>
 }
@@ -58,6 +64,22 @@ export interface NightlyConsolidationOptions {
 
 function dateKey(date: Date): string {
   return date.toISOString().slice(0, 10)
+}
+
+function resolveTargetDate(now: () => Date, explicit?: string): string {
+  const candidate = explicit?.trim()
+  if (candidate && DATE_KEY_PATTERN.test(candidate)) {
+    return candidate
+  }
+  return dateKey(now())
+}
+
+function resolveLookbackDays(explicit?: number): number {
+  if (!Number.isFinite(explicit)) {
+    return 1
+  }
+  const normalized = Math.floor(explicit as number)
+  return Math.max(0, normalized)
 }
 
 function daysBetween(fromDate: string, toDate: string): number {
@@ -220,8 +242,9 @@ export class NightlyConsolidation {
   }
 
   // Run consolidation for a given commander (callable manually for testing)
-  async run(commanderId: string): Promise<ConsolidationReport> {
-    const today = dateKey(this.now())
+  async run(commanderId: string, options: ConsolidationRunOptions = {}): Promise<ConsolidationReport> {
+    const targetDate = resolveTargetDate(this.now, options.targetDate)
+    const lookbackDays = resolveLookbackDays(options.lookbackDays)
     const writer = new JournalWriter(commanderId, this.options.basePath)
     await writer.scaffold()
     const memoryRoot = writer.memoryRootPath
@@ -230,15 +253,15 @@ export class NightlyConsolidation {
     await mkdir(archiveJournalDir, { recursive: true })
 
     // Phase 1: Gather inputs
-    const [todayEntries, debriefs, closedIssues] = await Promise.all([
-      writer.readDate(today),
-      this.parser.parseForDate(today, this.debriefDir),
-      this.options.issueClient?.fetchClosedIssuesForDate?.(commanderId, today) ?? Promise.resolve([]),
+    const [targetEntries, debriefs, closedIssues] = await Promise.all([
+      writer.readDate(targetDate),
+      this.parser.parseForDate(targetDate, this.debriefDir),
+      this.options.issueClient?.fetchClosedIssuesForDate?.(commanderId, targetDate) ?? Promise.resolve([]),
     ])
-    const idleDay = todayEntries.length === 0 && debriefs.length === 0
-    const spikeCount = todayEntries.filter((entry) => entry.salience === 'SPIKE').length
+    const idleDay = targetEntries.length === 0 && debriefs.length === 0
+    const spikeCount = targetEntries.filter((entry) => entry.salience === 'SPIKE').length
     const incrementalRefreshTriggered =
-      todayEntries.length >= HIGH_ACTIVITY_ENTRY_THRESHOLD || spikeCount >= HIGH_ACTIVITY_SPIKE_THRESHOLD
+      targetEntries.length >= HIGH_ACTIVITY_ENTRY_THRESHOLD || spikeCount >= HIGH_ACTIVITY_SPIKE_THRESHOLD
 
     // Phase 2: Extract durable facts -> MEMORY.md
     const factCandidates: string[] = []
@@ -250,14 +273,14 @@ export class NightlyConsolidation {
         factCandidates.push(`Avoid: ${cause}`)
       }
     }
-    for (const entry of todayEntries) {
+    for (const entry of targetEntries) {
       if (entry.salience !== 'SPIKE') continue
       factCandidates.push(summarizeSpike(entry))
     }
 
     const memoryWriter = new MemoryMdWriter(memoryRoot, { now: this.now })
     const memoryResult = await memoryWriter.updateFacts(factCandidates)
-    await this.distillLongTermMemory(commanderId, memoryRoot, today, todayEntries)
+    await this.distillLongTermMemory(commanderId, memoryRoot, targetDate, targetEntries)
 
     // Phase 3: Compress episodic traces
     const files = await readdir(journalDir)
@@ -270,7 +293,7 @@ export class NightlyConsolidation {
 
     for (const fileName of dailyJournalFiles) {
       const date = fileName.replace(/\.md$/, '')
-      const ageInDays = daysBetween(date, today)
+      const ageInDays = daysBetween(date, targetDate)
       if (ageInDays <= 7) continue
 
       const filePath = path.join(journalDir, fileName)
@@ -329,8 +352,8 @@ export class NightlyConsolidation {
     // Phase 4: Downstream hooks (interfaces only).
     if (this.options.skillDistiller && !idleDay) {
       const distillerJournalEntries = incrementalRefreshTriggered
-        ? await this.readJournalWindow(writer, today, 1, todayEntries)
-        : todayEntries
+        ? await this.readJournalWindow(writer, targetDate, lookbackDays, targetEntries)
+        : targetEntries
       await this.options.skillDistiller.run({
         journalEntries: distillerJournalEntries,
         parsedDebriefs: debriefs,
@@ -347,7 +370,7 @@ export class NightlyConsolidation {
       idleDay,
       incrementalRefreshTriggered,
     }
-    const commentBody = buildCommentBody(commanderId, today, report, closedIssues)
+    const commentBody = buildCommentBody(commanderId, targetDate, report, closedIssues)
     const logPath = path.join(memoryRoot, 'consolidation-log.md')
     let log = '# Consolidation Log\n\n'
     try {
@@ -355,7 +378,7 @@ export class NightlyConsolidation {
     } catch {
       // Keep default header.
     }
-    const logBlock = [`## ${today}`, '', commentBody, ''].join('\n')
+    const logBlock = [`## ${targetDate}`, '', commentBody, ''].join('\n')
     await writeFile(logPath, `${log.trimEnd()}\n\n${logBlock}`, 'utf-8')
     await this.options.issueClient?.postConsolidationComment?.(commanderId, commentBody)
 

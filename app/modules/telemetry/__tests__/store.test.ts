@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -92,18 +92,18 @@ describe('TelemetryJsonlStore', () => {
 
 describe('TelemetryJsonlStore.compact()', () => {
   it('removes entries older than retentionDays', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-03-04T00:00:00.000Z'))
+
     const filePath = await createTempStoreFilePath()
     const store = new TelemetryJsonlStore(filePath)
-    const oldDate = new Date()
-    oldDate.setUTCDate(oldDate.getUTCDate() - 60)
-    const oldIso = oldDate.toISOString()
-    const recentDate = new Date()
-    recentDate.setUTCDate(recentDate.getUTCDate() - 7)
-    const recentIso = recentDate.toISOString()
+    const now = Date.now()
+    const oldRecordedAt = new Date(now - (30 * 24 * 60 * 60 * 1000)).toISOString()
+    const recentRecordedAt = new Date(now - (24 * 60 * 60 * 1000)).toISOString()
 
     const old: TelemetryStoreEntry = {
       type: 'ingest',
-      recordedAt: oldIso,
+      recordedAt: oldRecordedAt,
       payload: {
         id: 'old-1',
         sessionId: 's1',
@@ -115,12 +115,12 @@ describe('TelemetryJsonlStore.compact()', () => {
         cost: 0.01,
         durationMs: 100,
         currentTask: 'old task',
-        timestamp: oldIso,
+        timestamp: oldRecordedAt,
       },
     }
     const recent: TelemetryStoreEntry = {
       type: 'ingest',
-      recordedAt: recentIso,
+      recordedAt: recentRecordedAt,
       payload: {
         id: 'new-1',
         sessionId: 's2',
@@ -132,7 +132,7 @@ describe('TelemetryJsonlStore.compact()', () => {
         cost: 0.05,
         durationMs: 200,
         currentTask: 'new task',
-        timestamp: recentIso,
+        timestamp: recentRecordedAt,
       },
     }
 

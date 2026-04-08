@@ -42,11 +42,11 @@ describe('runMemoryCli', () => {
 
     expect(exitCode).toBe(1)
     expect(stdout.read()).toContain('Usage:')
-    expect(stdout.read()).toContain('hambros memory compact')
-    expect(stdout.read()).toContain('hambros memory find')
-    expect(stdout.read()).toContain('hambros memory save')
-    expect(stdout.read()).toContain('hambros memory export')
-    expect(stdout.read()).toContain('hambros memory journal')
+    expect(stdout.read()).toContain('hammurabi memory compact')
+    expect(stdout.read()).toContain('hammurabi memory find')
+    expect(stdout.read()).toContain('hammurabi memory save')
+    expect(stdout.read()).toContain('hammurabi memory export')
+    expect(stdout.read()).toContain('hammurabi memory journal')
   })
 
   it('prints usage for unknown subcommand', async () => {
@@ -161,6 +161,7 @@ describe('runMemoryCli', () => {
             hits: [
               {
                 type: 'journal',
+                attribution: 'journal',
                 score: 0.923,
                 title: 'Fixed Prisma migration drift on gfinance',
                 excerpt: 'Applied manual SQL to realign...',
@@ -168,6 +169,7 @@ describe('runMemoryCli', () => {
               },
               {
                 type: 'memory',
+                attribution: 'memory',
                 score: 0.81,
                 title: 'Prisma UserUpdateInput for String[] Fields',
                 excerpt: 'For String[] fields, use { set: string[] }...',
@@ -198,10 +200,12 @@ describe('runMemoryCli', () => {
       expect(exitCode).toBe(0)
       expect(stderr.read()).toBe('')
       expect(stdout.read()).toContain('Hits (2 found, query terms: prisma, migration, schema)')
-      expect(stdout.read()).toContain('1. [journal]  0.923')
+      expect(stdout.read()).toContain('1. [journal]')
+      expect(stdout.read()).toContain('0.923')
       expect(stdout.read()).toContain('Fixed Prisma migration drift')
       expect(stdout.read()).toContain('excerpt: "Applied manual SQL')
-      expect(stdout.read()).toContain('2. [memory]   0.810')
+      expect(stdout.read()).toContain('2. [memory]')
+      expect(stdout.read()).toContain('0.810')
 
       expect(fetchImpl).toHaveBeenCalledWith(
         'https://hammurabi.gehirn.ai/api/commanders/cmdr-1/memory/recall',
@@ -218,6 +222,47 @@ describe('runMemoryCli', () => {
         (fetchImpl.mock.calls[0]?.[1] as RequestInit)?.body as string,
       )
       expect(sentBody).toEqual({ cue: 'prisma migration schema' })
+    })
+
+    it('prints transcript attribution from recall results', async () => {
+      const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            hits: [
+              {
+                type: 'transcript',
+                attribution: 'transcript: 2026-03-28 turn 142',
+                score: 0.904,
+                title: 'Investigated retry collapse in stream restore',
+                excerpt: 'The restore path was replaying stale session metadata...',
+                reason: 'semantic 0.904',
+              },
+            ],
+            queryTerms: ['restore', 'retry'],
+          }),
+          {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          },
+        ),
+      )
+      const stdout = createBufferWriter()
+      const stderr = createBufferWriter()
+
+      const exitCode = await runMemoryCli(
+        ['find', '--commander', 'cmdr-1', 'restore retry'],
+        {
+          fetchImpl,
+          readConfig: async () => config,
+          stdout: stdout.writer,
+          stderr: stderr.writer,
+        },
+      )
+
+      expect(exitCode).toBe(0)
+      expect(stderr.read()).toBe('')
+      expect(stdout.read()).toContain('[transcript: 2026-03-28 turn 142]')
+      expect(stdout.read()).toContain('Investigated retry collapse in stream restore')
     })
 
     it('passes --top option as topK', async () => {
@@ -586,6 +631,6 @@ describe('runMemoryCli', () => {
     })
 
     expect(exitCode).toBe(1)
-    expect(stderr.read()).toContain('HamBros config not found')
+    expect(stderr.read()).toContain('Hammurabi config not found')
   })
 })

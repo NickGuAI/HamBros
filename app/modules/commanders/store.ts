@@ -88,6 +88,12 @@ export interface CommanderSession {
   remoteOrigin?: CommanderRemoteOrigin
 }
 
+export function isCommanderSessionRunning(
+  session: Pick<CommanderSession, 'state'> | null | undefined,
+): boolean {
+  return session?.state === 'running'
+}
+
 interface PersistedCommanderSessions {
   sessions: CommanderSession[]
 }

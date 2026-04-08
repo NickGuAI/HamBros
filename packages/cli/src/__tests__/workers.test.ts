@@ -84,10 +84,8 @@ describe('runWorkersCli', () => {
     const exitCode = await runWorkersCli(
       [
         'dispatch',
-        '--session',
-        'commander-main',
-        '--issue',
-        'https://github.com/NickGuAI/monorepo-g/issues/123',
+        '--branch',
+        'feat-123',
         '--task',
         'Handle edge cases',
         '--machine',
@@ -115,12 +113,6 @@ describe('runWorkersCli', () => {
           authorization: 'Bearer hmrb_test_key',
           'content-type': 'application/json',
         }),
-        body: JSON.stringify({
-          parentSession: 'commander-main',
-          issueUrl: 'https://github.com/NickGuAI/monorepo-g/issues/123',
-          task: 'Handle edge cases',
-          machine: 'gpu-1',
-        }),
       }),
     )
 
@@ -131,7 +123,11 @@ describe('runWorkersCli', () => {
         ? dispatchInit.body
         : undefined
     const payload = typeof dispatchBody === 'string' ? (JSON.parse(dispatchBody) as Record<string, unknown>) : {}
+    expect(payload.branch).toBe('feat-123')
+    expect(payload.task).toBe('Handle edge cases')
+    expect(payload.machine).toBe('gpu-1')
     expect(payload.agentType).toBeUndefined()
+    expect(payload.parentSession).toBeUndefined()
   })
 
   it('includes agentType when dispatching with --agent claude', async () => {
@@ -260,19 +256,12 @@ describe('runWorkersCli', () => {
     expect(fetchImpl).not.toHaveBeenCalled()
   })
 
-  it('requires --session and --issue or --branch for dispatch', async () => {
+  it('requires --issue or --branch for factory dispatch', async () => {
     const fetchImpl = vi.fn<typeof fetch>()
     const stdout = createBufferWriter()
 
-    const missingSessionExit = await runWorkersCli(['dispatch', '--issue', 'https://github.com/a/b/issues/1'], {
-      fetchImpl,
-      readConfig: async () => config,
-      stdout: stdout.writer,
-    })
-    expect(missingSessionExit).toBe(1)
-
     const missingIssueAndBranchExit = await runWorkersCli(
-      ['dispatch', '--session', 'commander-main'],
+      ['dispatch'],
       {
         fetchImpl,
         readConfig: async () => config,
@@ -281,6 +270,44 @@ describe('runWorkersCli', () => {
     )
     expect(missingIssueAndBranchExit).toBe(1)
     expect(fetchImpl).not.toHaveBeenCalled()
+  })
+
+  it('times out long-running dispatch requests', async () => {
+    vi.useFakeTimers()
+    try {
+      const fetchImpl = vi.fn<typeof fetch>().mockImplementation((_url, init) => (
+        new Promise((_resolve, reject) => {
+          const signal = init?.signal as AbortSignal | undefined
+          signal?.addEventListener(
+            'abort',
+            () => {
+              reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+            },
+            { once: true },
+          )
+        })
+      ))
+      const stdout = createBufferWriter()
+      const stderr = createBufferWriter()
+
+      const exitCodePromise = runWorkersCli(
+        ['dispatch', '--branch', 'feat-timeout'],
+        {
+          fetchImpl,
+          readConfig: async () => config,
+          stdout: stdout.writer,
+          stderr: stderr.writer,
+        },
+      )
+
+      await vi.advanceTimersByTimeAsync(300_000)
+      const exitCode = await exitCodePromise
+
+      expect(exitCode).toBe(1)
+      expect(stderr.read()).toContain('Dispatch request timed out after 300s.')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('kills a session via DELETE', async () => {
@@ -393,7 +420,7 @@ describe('runWorkersCli', () => {
     })
 
     expect(exitCode).toBe(1)
-    expect(stderr.read()).toContain('HamBros config not found.')
+    expect(stderr.read()).toContain('Hammurabi config not found.')
     expect(fetchImpl).not.toHaveBeenCalled()
   })
 })

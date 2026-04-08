@@ -9,6 +9,7 @@ import {
 } from '../associations.js'
 import { MemoryRecollection } from '../recollection.js'
 import type { JournalEntry } from '../types.js'
+import type { TranscriptSearchHit } from '../../transcript-index.js'
 
 function journalBlock(input: {
   time: string
@@ -225,5 +226,117 @@ describe('MemoryRecollection', () => {
     const associativeHit = result.hits.find((hit) => hit.issueNumber === 900)
     expect(associativeHit).toBeDefined()
     expect(associativeHit?.reason).toContain('associative')
+  })
+
+  it('includes transcript hits with transcript attribution', async () => {
+    const transcriptHits: TranscriptSearchHit[] = [{
+      score: 0.887,
+      text: 'Investigated websocket retry collapse and fixed the scheduler jitter window.',
+      sourceFile: join(commanderRoot, 'sessions', '2026-03-08.jsonl'),
+      transcriptId: '2026-03-08',
+      timestamp: '2026-03-08T15:42:00.000Z',
+      role: 'assistant',
+      turnNumber: 142,
+      messageIndex: 1,
+    }]
+
+    const recollection = new MemoryRecollection(commanderId, tmpDir, {
+      now: () => nowValue,
+      transcriptSearch: async () => transcriptHits,
+    })
+
+    const result = await recollection.recall({
+      cue: 'retry scheduler jitter',
+      topK: 5,
+    })
+
+    const transcriptHit = result.hits.find((hit) => hit.type === 'transcript')
+    expect(transcriptHit).toBeDefined()
+    expect(transcriptHit?.attribution).toBe('transcript: 2026-03-08 turn 142')
+    expect(transcriptHit?.excerpt).toContain('scheduler jitter window')
+    expect(transcriptHit?.reason).toContain('semantic 0.887')
+  })
+
+  it('recalls memory through hybrid semantic score without literal overlap', async () => {
+    await writeFile(
+      join(memoryRoot, 'MEMORY.md'),
+      [
+        '# Commander Memory',
+        '- Middleware sequencing corrected the silent renewal failure in production.',
+      ].join('\n'),
+      'utf-8',
+    )
+
+    const recollection = new MemoryRecollection(commanderId, tmpDir, {
+      now: () => nowValue,
+      hybridSearch: async ({ candidates }) => {
+        const semanticCandidate = candidates.find((candidate) =>
+          candidate.path?.endsWith('MEMORY.md'))
+        if (!semanticCandidate) {
+          return new Map()
+        }
+        return new Map([
+          [semanticCandidate.id, {
+            id: semanticCandidate.id,
+            vectorScore: 0.92,
+            bm25Score: 0,
+            hybridScore: 0.644,
+          }],
+        ])
+      },
+    })
+
+    const result = await recollection.recall({
+      cue: 'Investigate token renewal regression',
+      topK: 5,
+    })
+
+    const memoryHit = result.hits.find((hit) => hit.type === 'memory')
+    expect(memoryHit).toBeDefined()
+    expect(memoryHit?.reason).toContain('hybrid')
+    expect(memoryHit?.excerpt).toContain('Middleware sequencing corrected')
+  })
+
+  it('indexes and returns LONG_TERM_MEM.md narrative candidates', async () => {
+    await writeFile(
+      join(memoryRoot, 'LONG_TERM_MEM.md'),
+      [
+        '# Commander Long-term Memory',
+        '',
+        'During the auth incident retrospective we established staged token rollouts.',
+      ].join('\n'),
+      'utf-8',
+    )
+
+    let sawLongTermCandidate = false
+    const recollection = new MemoryRecollection(commanderId, tmpDir, {
+      now: () => nowValue,
+      hybridSearch: async ({ candidates }) => {
+        const longTermCandidate = candidates.find((candidate) =>
+          candidate.path?.endsWith('LONG_TERM_MEM.md'))
+        sawLongTermCandidate = Boolean(longTermCandidate)
+        if (!longTermCandidate) {
+          return new Map()
+        }
+        return new Map([
+          [longTermCandidate.id, {
+            id: longTermCandidate.id,
+            vectorScore: 0.81,
+            bm25Score: 0.42,
+            hybridScore: 0.693,
+          }],
+        ])
+      },
+    })
+
+    const result = await recollection.recall({
+      cue: 'Need staged token rollout notes',
+      topK: 5,
+    })
+
+    expect(sawLongTermCandidate).toBe(true)
+    const longTermHit = result.hits.find((hit) => hit.path?.endsWith('LONG_TERM_MEM.md'))
+    expect(longTermHit).toBeDefined()
+    expect(longTermHit?.excerpt).toContain('staged token rollouts')
   })
 })

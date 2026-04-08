@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
+  COMMANDER_EMAIL_POLL_CRON,
   COMMANDER_FULL_SYNC_CRON,
   COMMANDER_MEMORY_ONLY_SYNC_CRON,
+  COMMANDER_TRANSCRIPT_MAINTENANCE_CRON,
   MORNING_BRIEFING_CRON,
   MICRO_RESET_CRON,
   NIGHTLY_CONSOLIDATION_CRON,
@@ -10,16 +12,17 @@ import {
 import { CommanderSessionStore } from '../store.js'
 
 describe('registerCommanderCron()', () => {
-  it('registers only commander nightly consolidation at 02:00', () => {
+  it('does not register hidden nightly consolidation by default', () => {
     const schedule = vi.fn()
     const consolidation = registerCommanderCron(
       { schedule },
       { commanderIdsForCron: ['commander-1'] },
     )
-    // nightly consolidation + morning briefing + micro reset
+    // transcript maintenance + morning briefing + micro reset
     expect(schedule).toHaveBeenCalledTimes(3)
     const expressions = schedule.mock.calls.map((call) => call[0])
-    expect(expressions).toContain(NIGHTLY_CONSOLIDATION_CRON)
+    expect(expressions).not.toContain(NIGHTLY_CONSOLIDATION_CRON)
+    expect(expressions).toContain(COMMANDER_TRANSCRIPT_MAINTENANCE_CRON)
     expect(typeof schedule.mock.calls[0][1]).toBe('function')
     expect(consolidation).toBeDefined()
   })
@@ -35,7 +38,10 @@ describe('registerCommanderCron()', () => {
     const commanderIdsForCron = ['commander-initial']
     const consolidation = registerCommanderCron(
       { schedule },
-      { commanderIdsForCron },
+      {
+        commanderIdsForCron,
+        enableNightlyConsolidation: true,
+      },
     )
 
     const runSpy = vi.spyOn(consolidation, 'run').mockResolvedValue({
@@ -81,7 +87,11 @@ describe('registerCommanderCron()', () => {
         { id: 'commander-201' } as never,
       ])
 
-    const consolidation = registerCommanderCron({ schedule })
+    const consolidation = registerCommanderCron({
+      schedule,
+    }, {
+      enableNightlyConsolidation: true,
+    })
     const runSpy = vi.spyOn(consolidation, 'run').mockResolvedValue({
       factsExtracted: 0,
       memoryMdLineCount: 0,
@@ -119,15 +129,15 @@ describe('registerCommanderCron()', () => {
       },
     )
 
-    // nightly consolidation + memory-only sync + full sync + morning briefing + micro reset
+    // memory-only sync + full sync + transcript maintenance + morning briefing + micro reset
     expect(schedule).toHaveBeenCalledTimes(5)
 
     const expressions = schedule.mock.calls.map((call) => call[0])
     expect(expressions).toEqual(
       expect.arrayContaining([
-        NIGHTLY_CONSOLIDATION_CRON,
         COMMANDER_MEMORY_ONLY_SYNC_CRON,
         COMMANDER_FULL_SYNC_CRON,
+        COMMANDER_TRANSCRIPT_MAINTENANCE_CRON,
         MORNING_BRIEFING_CRON,
         MICRO_RESET_CRON,
       ]),
@@ -148,5 +158,102 @@ describe('registerCommanderCron()', () => {
 
     expect(syncRunner).toHaveBeenNthCalledWith(1, 'memory')
     expect(syncRunner).toHaveBeenNthCalledWith(2, 'full')
+  })
+
+  it('runs transcript maintenance for each commander at the maintenance cron', async () => {
+    let transcriptJob: (() => Promise<void> | void) | null = null
+    const schedule = vi.fn((expression: string, task: () => Promise<void> | void) => {
+      if (expression === COMMANDER_TRANSCRIPT_MAINTENANCE_CRON) {
+        transcriptJob = task
+      }
+    })
+    const transcriptMaintenanceRunner = vi.fn(async () => {})
+
+    registerCommanderCron(
+      { schedule },
+      {
+        commanderIdsForCron: ['commander-a', 'commander-b'],
+        transcriptMaintenanceRunner,
+      },
+    )
+
+    if (!transcriptJob) {
+      throw new Error('transcript maintenance job was not registered')
+    }
+
+    await transcriptJob()
+
+    expect(transcriptMaintenanceRunner).toHaveBeenCalledTimes(2)
+    expect(transcriptMaintenanceRunner).toHaveBeenNthCalledWith(1, 'commander-a')
+    expect(transcriptMaintenanceRunner).toHaveBeenNthCalledWith(2, 'commander-b')
+  })
+
+  it('registers commander email polling when enabled', async () => {
+    const schedule = vi.fn()
+    const emailPoller = {
+      pollAll: vi.fn(async () => undefined),
+    }
+
+    registerCommanderCron(
+      { schedule },
+      {
+        commanderIdsForCron: ['commander-1'],
+        enableEmailPoll: true,
+        emailPoller,
+      },
+    )
+
+    const pollJob = schedule.mock.calls.find(
+      (call) => call[0] === COMMANDER_EMAIL_POLL_CRON,
+    )?.[1]
+    expect(typeof pollJob).toBe('function')
+
+    if (!pollJob) {
+      throw new Error('email poll job was not registered')
+    }
+
+    await pollJob()
+    expect(emailPoller.pollAll).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not start overlapping commander email polls', async () => {
+    const schedule = vi.fn()
+    let resolveFirstPoll: (() => void) | null = null
+    const firstPoll = new Promise<void>((resolve) => {
+      resolveFirstPoll = resolve
+    })
+    const emailPoller = {
+      pollAll: vi.fn(() => firstPoll),
+    }
+
+    registerCommanderCron(
+      { schedule },
+      {
+        commanderIdsForCron: ['commander-1'],
+        enableEmailPoll: true,
+        emailPoller,
+      },
+    )
+
+    const pollJob = schedule.mock.calls.find(
+      (call) => call[0] === COMMANDER_EMAIL_POLL_CRON,
+    )?.[1]
+    if (!pollJob) {
+      throw new Error('email poll job was not registered')
+    }
+
+    pollJob()
+    pollJob()
+    expect(emailPoller.pollAll).toHaveBeenCalledTimes(1)
+
+    if (!resolveFirstPoll) {
+      throw new Error('first poll promise was not created')
+    }
+    resolveFirstPoll()
+    await firstPoll
+    await Promise.resolve()
+
+    pollJob()
+    expect(emailPoller.pollAll).toHaveBeenCalledTimes(2)
   })
 })

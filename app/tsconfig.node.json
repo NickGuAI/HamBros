@@ -7,7 +7,7 @@
       "@server/*": ["./server/*"],
       "@modules/*": ["./modules/*"]
     },
-    "lib": ["ES2021"],
+    "lib": ["ES2022"],
     "module": "ESNext",
     "moduleResolution": "bundler",
     "outDir": "./dist-server",

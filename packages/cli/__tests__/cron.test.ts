@@ -30,29 +30,27 @@ const config = createHammurabiConfig({
 })
 
 describe('runCronCli', () => {
-  it('lists cron tasks in a table', async () => {
+  it('lists command-room cron tasks', async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response(
-        JSON.stringify([
-          {
-            id: 'cron-1',
-            schedule: '*/5 * * * *',
-            enabled: true,
-            agentType: 'claude',
-            sessionType: 'stream',
-            nextRun: '2026-03-09T20:00:00.000Z',
-          },
-        ]),
+      new Response(JSON.stringify([
         {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
+          id: 'task-1',
+          name: 'daily-briefing',
+          schedule: '27 6 * * *',
+          enabled: true,
+          agentType: 'claude',
+          sessionType: 'stream',
+          model: 'claude-opus-4-6',
         },
-      ),
+      ]), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
     )
     const stdout = createBufferWriter()
     const stderr = createBufferWriter()
 
-    const exitCode = await runCronCli(['list', '--commander', 'cmdr-1'], {
+    const exitCode = await runCronCli(['list'], {
       fetchImpl,
       readConfig: async () => config,
       stdout: stdout.writer,
@@ -61,35 +59,19 @@ describe('runCronCli', () => {
 
     expect(exitCode).toBe(0)
     expect(stderr.read()).toBe('')
-    expect(stdout.read()).toContain('| ID')
-    expect(stdout.read()).toContain('cron-1')
-    expect(stdout.read()).toContain('*/5 * * * *')
+    expect(stdout.read()).toContain('daily-briefing')
     expect(fetchImpl).toHaveBeenCalledWith(
-      'https://hammurabi.gehirn.ai/api/commanders/cmdr-1/crons',
-      expect.objectContaining({
-        method: 'GET',
-        headers: expect.objectContaining({
-          authorization: 'Bearer hmrb_test_key',
-        }),
-      }),
+      'https://hammurabi.gehirn.ai/api/command-room/tasks',
+      expect.objectContaining({ method: 'GET' }),
     )
   })
 
-  it('adds a cron task and prints created id', async () => {
+  it('adds a command-room cron task and prints created id', async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response(
-        JSON.stringify({
-          id: 'cron-42',
-          commanderId: 'cmdr-1',
-          schedule: '0 * * * *',
-          instruction: 'Hourly health check',
-          enabled: false,
-        }),
-        {
-          status: 201,
-          headers: { 'content-type': 'application/json' },
-        },
-      ),
+      new Response(JSON.stringify({ id: 'task-1' }), {
+        status: 201,
+        headers: { 'content-type': 'application/json' },
+      }),
     )
     const stdout = createBufferWriter()
     const stderr = createBufferWriter()
@@ -97,25 +79,24 @@ describe('runCronCli', () => {
     const exitCode = await runCronCli(
       [
         'add',
-        '--commander',
-        'cmdr-1',
-        '--schedule',
-        '0 * * * *',
-        '--instruction',
-        'Hourly health check',
         '--name',
-        'hourly-health',
+        'daily-briefing',
+        '--schedule',
+        '27 6 * * *',
+        '--timezone',
+        'America/New_York',
+        '--instruction',
+        '/daily-briefing',
+        '--model',
+        'claude-opus-4-6',
         '--agent',
-        'codex',
-        '--session-type',
-        'pty',
-        '--permission-mode',
-        'bypassPermissions',
+        'claude',
         '--work-dir',
-        '/tmp/worktrees/hourly-health',
-        '--machine',
-        'ops-1',
-        '--disabled',
+        '/home/ec2-user/App',
+        '--permission-mode',
+        'dangerouslySkipPermissions',
+        '--session-type',
+        'stream',
       ],
       {
         fetchImpl,
@@ -127,37 +108,37 @@ describe('runCronCli', () => {
 
     expect(exitCode).toBe(0)
     expect(stderr.read()).toBe('')
-    expect(stdout.read()).toContain('Created cron task ID: cron-42')
-    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    expect(stdout.read()).toContain('Created cron task ID: task-1')
 
     const call = fetchImpl.mock.calls[0]
-    expect(call?.[0]).toBe('https://hammurabi.gehirn.ai/api/commanders/cmdr-1/crons')
-    expect(call?.[1]).toMatchObject({
-      method: 'POST',
-      headers: expect.objectContaining({
-        authorization: 'Bearer hmrb_test_key',
-        'content-type': 'application/json',
-      }),
-    })
+    expect(call?.[0]).toBe('https://hammurabi.gehirn.ai/api/command-room/tasks')
+    expect(call?.[1]).toMatchObject({ method: 'POST' })
     expect(JSON.parse((call?.[1]?.body as string) ?? '{}')).toEqual({
-      schedule: '0 * * * *',
-      instruction: 'Hourly health check',
-      enabled: false,
-      name: 'hourly-health',
-      agentType: 'codex',
-      sessionType: 'pty',
-      permissionMode: 'bypassPermissions',
-      workDir: '/tmp/worktrees/hourly-health',
-      machine: 'ops-1',
+      name: 'daily-briefing',
+      schedule: '27 6 * * *',
+      timezone: 'America/New_York',
+      instruction: '/daily-briefing',
+      model: 'claude-opus-4-6',
+      enabled: true,
+      agentType: 'claude',
+      machine: '',
+      workDir: '/home/ec2-user/App',
+      permissionMode: 'dangerouslySkipPermissions',
+      sessionType: 'stream',
     })
   })
 
-  it('deletes a cron task and prints confirmation', async () => {
-    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 204 }))
+  it('deletes a task', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ deleted: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
     const stdout = createBufferWriter()
     const stderr = createBufferWriter()
 
-    const exitCode = await runCronCli(['delete', '--commander', 'cmdr-1', 'cron-9'], {
+    const exitCode = await runCronCli(['delete', 'task-1'], {
       fetchImpl,
       readConfig: async () => config,
       stdout: stdout.writer,
@@ -166,19 +147,10 @@ describe('runCronCli', () => {
 
     expect(exitCode).toBe(0)
     expect(stderr.read()).toBe('')
-    expect(stdout.read()).toContain('Deleted cron task cron-9.')
-    expect(fetchImpl).toHaveBeenCalledWith(
-      'https://hammurabi.gehirn.ai/api/commanders/cmdr-1/crons/cron-9',
-      expect.objectContaining({
-        method: 'DELETE',
-        headers: expect.objectContaining({
-          authorization: 'Bearer hmrb_test_key',
-        }),
-      }),
-    )
+    expect(stdout.read()).toContain('Deleted cron task task-1.')
   })
 
-  it('returns non-zero when cron list API request fails', async () => {
+  it('returns non-zero when list API request fails', async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
       new Response(JSON.stringify({ error: 'Bad commander id' }), {
         status: 400,
@@ -187,7 +159,7 @@ describe('runCronCli', () => {
     )
     const stderr = createBufferWriter()
 
-    const exitCode = await runCronCli(['list', '--commander', 'bad-id'], {
+    const exitCode = await runCronCli(['list'], {
       fetchImpl,
       readConfig: async () => config,
       stderr: stderr.writer,
@@ -197,7 +169,7 @@ describe('runCronCli', () => {
     expect(stderr.read()).toContain('Request failed (400): Bad commander id')
   })
 
-  it('returns non-zero when cron add API request fails', async () => {
+  it('returns non-zero when add API request fails', async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
       new Response(JSON.stringify({ error: 'Invalid cron expression' }), {
         status: 400,
@@ -209,8 +181,8 @@ describe('runCronCli', () => {
     const exitCode = await runCronCli(
       [
         'add',
-        '--commander',
-        'cmdr-1',
+        '--name',
+        'daily-briefing',
         '--schedule',
         'bad cron',
         '--instruction',
@@ -227,7 +199,7 @@ describe('runCronCli', () => {
     expect(stderr.read()).toContain('Request failed (400): Invalid cron expression')
   })
 
-  it('returns non-zero when cron delete API request fails', async () => {
+  it('returns non-zero when delete API request fails', async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
       new Response(JSON.stringify({ error: 'Cron task not found' }), {
         status: 404,
@@ -236,7 +208,7 @@ describe('runCronCli', () => {
     )
     const stderr = createBufferWriter()
 
-    const exitCode = await runCronCli(['delete', '--commander', 'cmdr-1', 'missing'], {
+    const exitCode = await runCronCli(['delete', 'missing'], {
       fetchImpl,
       readConfig: async () => config,
       stderr: stderr.writer,

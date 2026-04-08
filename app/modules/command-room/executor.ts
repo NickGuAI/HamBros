@@ -5,7 +5,7 @@ import {
   type AgentSessionMonitorOptions,
 } from '../commanders/tools/agent-session.js'
 import { CommandRoomRunStore, type WorkflowRun, type WorkflowRunStatus } from './run-store.js'
-import { CommandRoomTaskStore } from './task-store.js'
+import { CommandRoomTaskStore, type CronTask } from './task-store.js'
 
 export type WorkflowTriggerSource = 'cron' | 'manual'
 
@@ -24,6 +24,7 @@ export interface CommandRoomExecutorOptions {
   now?: () => Date
   monitorOptions?: AgentSessionMonitorOptions
   agentSessionFactory?: () => AgentSessionClientLike
+  fetchImpl?: typeof fetch
   internalToken?: string
 }
 
@@ -104,6 +105,69 @@ function resolveApiKey(): string | undefined {
   return apiKey || undefined
 }
 
+function toDateKey(date: Date): string {
+  return date.toISOString().slice(0, 10)
+}
+
+function resolvePreviousCompletedUtcDate(now: Date): string {
+  const cursor = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()))
+  cursor.setUTCDate(cursor.getUTCDate() - 1)
+  return toDateKey(cursor)
+}
+
+async function readResponseError(response: Response): Promise<string> {
+  try {
+    const payload = await response.json() as unknown
+    if (isObject(payload)) {
+      const error = payload.error
+      if (typeof error === 'string' && error.trim()) {
+        return error.trim()
+      }
+      const message = payload.message
+      if (typeof message === 'string' && message.trim()) {
+        return message.trim()
+      }
+    }
+  } catch {
+    // Fall through.
+  }
+
+  try {
+    const text = await response.text()
+    if (text.trim()) {
+      return text.trim()
+    }
+  } catch {
+    // Fall through.
+  }
+
+  return response.statusText || 'Request failed'
+}
+
+function toMemoryCompactReport(task: CronTask, targetDate: string, payload: unknown): string {
+  if (!isObject(payload)) {
+    return `Memory compaction completed for ${task.commanderId ?? '(unknown)'} (target ${targetDate}).`
+  }
+
+  if (payload.skipped === true) {
+    const reason = typeof payload.reason === 'string' && payload.reason.trim()
+      ? payload.reason.trim()
+      : 'unspecified'
+    return `Memory compaction skipped for ${task.commanderId ?? '(unknown)'} (target ${targetDate}): ${reason}.`
+  }
+
+  const factsExtracted = asNumber(payload.factsExtracted) ?? 0
+  const memoryMdLineCount = asNumber(payload.memoryMdLineCount) ?? 0
+  const debriefsProcessed = asNumber(payload.debrifsProcessed) ?? asNumber(payload.debriefsProcessed) ?? 0
+  return [
+    `Memory compaction completed for ${task.commanderId ?? '(unknown)'}.`,
+    `targetDate=${targetDate}`,
+    `factsExtracted=${factsExtracted}`,
+    `memoryMdLineCount=${memoryMdLineCount}`,
+    `debriefsProcessed=${debriefsProcessed}`,
+  ].join(' ')
+}
+
 function defaultAgentSessionFactory(internalToken?: string): () => AgentSessionClientLike {
   if (!resolveApiKey() && !internalToken) {
     console.warn('[command-room] WARNING: No internal token or HAMBROS_INTERNAL_API_KEY set - cron triggers may fail')
@@ -137,6 +201,7 @@ export class CommandRoomExecutor {
   private readonly now: () => Date
   private readonly monitorOptions?: AgentSessionMonitorOptions
   private readonly agentSessionFactory: () => AgentSessionClientLike
+  private readonly fetchImpl: typeof fetch
   private readonly internalToken?: string
   private readonly inFlightByTaskId = new Map<string, Promise<WorkflowRun | null>>()
 
@@ -146,6 +211,7 @@ export class CommandRoomExecutor {
     this.runStore = options.runStore ?? new CommandRoomRunStore({ taskStore })
     this.now = options.now ?? (() => new Date())
     this.monitorOptions = options.monitorOptions
+    this.fetchImpl = options.fetchImpl ?? fetch
     this.internalToken = options.internalToken
     this.agentSessionFactory = options.agentSessionFactory ?? defaultAgentSessionFactory(options.internalToken)
   }
@@ -192,6 +258,10 @@ export class CommandRoomExecutor {
       sessionId: '',
     })
 
+    if (task.taskType === 'memory_compact') {
+      return this.executeMemoryCompactTask(task, run, source, authToken)
+    }
+
     let sessionId = ''
     let client: AgentSessionClientLike | null = null
     let sessionKilled = false
@@ -218,6 +288,7 @@ export class CommandRoomExecutor {
         host: task.machine,
         mode: (task.permissionMode as 'default' | 'acceptEdits' | 'dangerouslySkipPermissions' | undefined) ?? 'acceptEdits',
         sessionType: task.sessionType ?? 'stream',
+        model: task.model,
       })
       sessionId = created.sessionId
       await this.runStore.updateRun(run.id, { sessionId })
@@ -271,5 +342,84 @@ export class CommandRoomExecutor {
     } finally {
       await killSessionSafely()
     }
+  }
+
+  private async executeMemoryCompactTask(
+    task: CronTask,
+    run: WorkflowRun,
+    source: WorkflowTriggerSource,
+    authToken?: string,
+  ): Promise<WorkflowRun> {
+    const commanderId = task.commanderId?.trim()
+    if (!commanderId) {
+      throw new Error('memory_compact task requires commanderId')
+    }
+
+    const targetDate = resolvePreviousCompletedUtcDate(this.now())
+    const url = `${resolveBaseUrl()}/api/commanders/${encodeURIComponent(commanderId)}/memory/compact`
+    const finalize = async (report: string): Promise<WorkflowRun> => {
+      const completedAt = this.now().toISOString()
+      const updated = await this.runStore.updateRun(run.id, {
+        status: 'complete',
+        completedAt,
+        report,
+        costUsd: 0,
+        sessionId: '',
+      })
+
+      if (updated) {
+        return updated
+      }
+
+      return {
+        ...run,
+        status: 'complete',
+        completedAt,
+        report,
+        costUsd: 0,
+        sessionId: '',
+      }
+    }
+
+    const headers: Record<string, string> = {
+      'content-type': 'application/json',
+    }
+    if (authToken) {
+      headers.authorization = `Bearer ${authToken}`
+    } else if (this.internalToken) {
+      headers['x-hammurabi-internal-token'] = this.internalToken
+    } else {
+      const apiKey = resolveApiKey()
+      if (apiKey) {
+        headers.authorization = `Bearer ${apiKey}`
+      }
+    }
+
+    const response = await this.fetchImpl(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        source,
+        targetDate,
+      }),
+    })
+
+    if (!response.ok) {
+      if (response.status === 409 && source === 'cron') {
+        return finalize(`Memory compaction skipped for ${commanderId} (target ${targetDate}): commander_running.`)
+      }
+      const detail = await readResponseError(response)
+      throw new Error(`memory compact request failed (${response.status}): ${detail}`)
+    }
+
+    let payload: unknown = null
+    try {
+      payload = await response.json() as unknown
+    } catch {
+      payload = null
+    }
+
+    const report = toMemoryCompactReport(task, targetDate, payload)
+    return finalize(report)
   }
 }

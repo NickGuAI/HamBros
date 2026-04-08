@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock('@/hooks/use-agents', () => ({
   createSession: vi.fn(),
   killSession: vi.fn(),
+  resumeSession: vi.fn(),
   useAgentSessions: mocks.useAgentSessions,
   useMachines: mocks.useMachines,
 }))
@@ -159,5 +160,36 @@ describe('AgentsPage default session tab', () => {
     expect(html).toContain('commander-completed-workers')
     expect(html).toContain('✓ 2 done')
     expect(html).toContain('>Kill<')
+  })
+
+  it('shows Resume for stale resumable Codex sessions even while the wrapper is still alive', () => {
+    const sessions = [
+      {
+        name: 'commander-codex-watchdog-stale',
+        created: '2026-03-09T00:00:00.000Z',
+        pid: 333,
+        processAlive: true,
+        sessionType: 'stream',
+        agentType: 'codex',
+        status: 'stale',
+        resumeAvailable: true,
+      },
+    ] as AgentSession[]
+
+    mocks.useAgentSessions.mockReturnValue({
+      data: sessions,
+      isLoading: false,
+    })
+    mocks.useMachines.mockReturnValue({
+      data: [],
+      isLoading: false,
+    })
+
+    const html = renderAgentsPageHtml()
+
+    expect(html).toContain('commander-codex-watchdog-stale')
+    expect(html).toContain('>Resume<')
+    expect(html).toContain('>Kill<')
+    expect(html).toContain('>stale<')
   })
 })

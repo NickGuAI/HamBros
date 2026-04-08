@@ -5,7 +5,7 @@ interface Writable {
 }
 
 interface DispatchOptions {
-  parentSession: string
+  parentSession?: string
   issueUrl?: string
   task?: string
   branch?: string
@@ -39,19 +39,21 @@ export interface WorkersCliDependencies {
   stderr?: Writable
 }
 
+const DISPATCH_TIMEOUT_MS = 300_000
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
 }
 
 function printUsage(stdout: Writable): void {
   stdout.write('Usage:\n')
-  stdout.write('  hambros workers list\n')
+  stdout.write('  hammurabi workers list\n')
   stdout.write(
-    '  hambros workers dispatch --session <name> [--type factory|agent] [--issue <url>] [--task <text>] [--branch <name>] [--machine <id>] [--agent claude|codex]\n',
+    '  hammurabi workers dispatch [--session <name>] [--type factory|agent] [--issue <url>] [--task <text>] [--branch <name>] [--machine <id>] [--agent claude|codex]\n',
   )
-  stdout.write('  hambros workers kill <name>\n')
-  stdout.write('  hambros workers status <session-name>\n')
-  stdout.write('  hambros workers send <session-name> "<text>"\n')
+  stdout.write('  hammurabi workers kill <name>\n')
+  stdout.write('  hammurabi workers status <session-name>\n')
+  stdout.write('  hammurabi workers send <session-name> "<text>"\n')
 }
 
 function buildApiUrl(endpoint: string, apiPath: string): string {
@@ -123,6 +125,10 @@ async function readErrorDetail(response: Response): Promise<string | null> {
   } catch {
     return null
   }
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'AbortError'
 }
 
 function parseSessionName(value: string | undefined): string | null {
@@ -213,11 +219,12 @@ function parseDispatchOptions(args: readonly string[]): DispatchOptions | null {
     index += 1
   }
 
-  if (!parentSession) {
+  const resolvedWorkerType = workerType ?? 'factory'
+  if (resolvedWorkerType === 'agent' && !parentSession) {
     return null
   }
 
-  if ((workerType ?? 'factory') !== 'agent' && !issueUrl && !branch) {
+  if (resolvedWorkerType === 'factory' && !issueUrl && !branch) {
     return null
   }
 
@@ -360,8 +367,9 @@ async function runDispatch(
   stderr: Writable,
 ): Promise<number> {
   const url = buildApiUrl(config.endpoint, '/api/agents/sessions/dispatch-worker')
-  const body: Record<string, string> = {
-    parentSession: options.parentSession,
+  const body: Record<string, string> = {}
+  if (options.parentSession) {
+    body.parentSession = options.parentSession
   }
   if (options.issueUrl) {
     body.issueUrl = options.issueUrl
@@ -382,11 +390,29 @@ async function runDispatch(
     body.workerType = options.workerType
   }
 
-  const result = await fetchJson(fetchImpl, url, {
-    method: 'POST',
-    headers: buildAuthHeaders(config, true),
-    body: JSON.stringify(body),
-  })
+  const timeoutController = new AbortController()
+  const timeout = setTimeout(() => timeoutController.abort(), DISPATCH_TIMEOUT_MS)
+  let result: Awaited<ReturnType<typeof fetchJson>>
+
+  try {
+    result = await fetchJson(fetchImpl, url, {
+      method: 'POST',
+      headers: buildAuthHeaders(config, true),
+      body: JSON.stringify(body),
+      signal: timeoutController.signal,
+    })
+  } catch (error) {
+    if (isAbortError(error)) {
+      stderr.write(`Dispatch request timed out after ${DISPATCH_TIMEOUT_MS / 1000}s.\n`)
+      return 1
+    }
+
+    const message = error instanceof Error ? error.message : 'Unknown error'
+    stderr.write(`Dispatch request failed: ${message}\n`)
+    return 1
+  } finally {
+    clearTimeout(timeout)
+  }
 
   if (!result.ok) {
     const detail = await readErrorDetail(result.response)
@@ -515,7 +541,7 @@ export async function runWorkersCli(
 
   const config = await readConfig()
   if (!config) {
-    stderr.write('HamBros config not found. Run `hambros init` first.\n')
+    stderr.write('Hammurabi config not found. Run `hammurabi onboard` first.\n')
     return 1
   }
 

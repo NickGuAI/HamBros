@@ -1,8 +1,7 @@
-import { Router, type Response } from 'express'
+import { Router } from 'express'
 import { WebSocketServer, WebSocket, type RawData } from 'ws'
 import type { IncomingMessage } from 'node:http'
 import type { Duplex } from 'node:stream'
-import { EventEmitter } from 'node:events'
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import * as path from 'node:path'
 import { appendFile, mkdir, readdir, readFile, realpath, stat, writeFile } from 'node:fs/promises'
@@ -14,73 +13,61 @@ import type { ApiKeyStoreLike } from '../../server/api-keys/store.js'
 import { combinedAuth } from '../../server/middleware/combined-auth.js'
 import { createAuth0Verifier } from '../../server/middleware/auth0.js'
 import { bootstrapFactoryWorktree } from '../factory/worktree.js'
-import { resolveCommanderDataDir, resolveCommanderNamesPath } from '../commanders/paths.js'
-import { buildCommanderSessionSeed } from '../commanders/routes.js'
+import { resolveCommanderNamesPath } from '../commanders/paths.js'
+import type { QuestStore } from '../commanders/quest-store.js'
 import { CommanderSessionStore, type CommanderSession } from '../commanders/store.js'
 import {
-  extractMessages,
-  readCommanderTranscript,
-  type MessageRoleFilter,
-  type SessionMessagesResponse,
-} from './session-messages.js'
-import { JournalWriter, EmergencyFlusher } from '../commanders/memory/index.js'
-import { KeyedAsyncQueue } from './message-queue.js'
-import { QuestStore } from '../commanders/quest-store.js'
-import {
-  createWorkspaceFile,
-  createWorkspaceFolder,
-  createWorkspaceUploadMiddleware,
-  deleteWorkspaceEntry,
-  initWorkspaceGit,
   listWorkspaceTree,
   readWorkspaceFilePreview,
   readWorkspaceGitLog,
   readWorkspaceGitStatus,
-  renameWorkspaceEntry,
-  resolveWorkspacePath,
   resolveWorkspaceRoot,
-  resolveWorkspaceUploadDestination,
-  saveWorkspaceTextFile,
   toWorkspaceError,
   WorkspaceError,
 } from '../workspace/index.js'
+import { normalizeCodexEvent } from './normalize-codex-event.js'
 
 const DEFAULT_MAX_SESSIONS = 10
 const DEFAULT_TASK_DELAY_MS = 3000
 const DEFAULT_WS_KEEPALIVE_INTERVAL_MS = 30000
-const DEFAULT_AUTO_ROTATE_ENTRY_THRESHOLD = 500
+const DEFAULT_CODEX_TURN_WATCHDOG_TIMEOUT_MS = 60_000
 const MAX_BUFFER_BYTES = 256 * 1024
 const MAX_STREAM_EVENTS = 1000
-const MAX_PENDING_SESSION_MESSAGES = 50
-const HOTWASH_DEBRIEF_TIMEOUT_MS = 60_000
-const AAR_DEBRIEF_TIMEOUT_MS = 180_000
-const CODEX_TURN_COMPLETION_TIMEOUT_MS = 60_000
-const LONG_SESSION_USER_TURN_THRESHOLD = 10
-const LONG_SESSION_EVENT_THRESHOLD = 120
-const LONG_SESSION_DURATION_MS = 45 * 60 * 1000
-const PTY_DEBRIEF_POLL_INTERVAL_MS = 250
-const PTY_DEBRIEF_COMPLETION_PATTERN = /\/clear\b/i
 const SESSION_NAME_PATTERN = /^[\w-]+$/
 const FILE_NAME_PATTERN = /^[a-zA-Z0-9._\- ]+$/
 const DEFAULT_COLS = 120
 const DEFAULT_ROWS = 40
 const DEFAULT_SESSION_STORE_PATH = 'data/agents/stream-sessions.json'
 const COMMAND_ROOM_SESSION_PREFIX = 'command-room-'
-const FACTORY_SESSION_PREFIX = 'factory-'
-const AGENT_SESSION_PREFIX = 'agent-'
 const COMMANDER_SESSION_NAME_PREFIX = 'commander-'
-const COMMANDER_ROTATION_CONTINUATION_PROMPT = 'Session rotated. Continuing as commander.'
 const COMMANDER_PATH_SEGMENT_PATTERN = /^[a-zA-Z0-9._-]+$/
-const COMMAND_ROOM_STALE_SESSION_TTL_MS = 15 * 60 * 1000
 const COMMAND_ROOM_COMPLETED_SESSION_TTL_MS = 24 * 60 * 60 * 1000
-const DONE_WORKER_TTL_MS = 30 * 60 * 1000 // 30 minutes
 const FACTORY_BRANCH_PATTERN = /^[\w-]+$/
 const GITHUB_ISSUE_URL_PATTERN = /^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+?)(?:\.git)?\/issues\/(\d+)(?:[/?#].*)?$/
 const GITHUB_REMOTE_URL_PATTERN = /^(?:https:\/\/github\.com\/|git@github\.com:)([\w.-]+)\/([\w.-]+?)(?:\.git)?$/
-const DEFAULT_COMPLETED_SESSIONS_STORE_PATH = 'data/agents/completed-sessions.json'
 const DEFAULT_OPENCLAW_GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL?.trim() || 'http://localhost:18789'
 
 const execFileAsync = promisify(execFile)
+const CODEX_SIDECAR_LOG_TAIL_LIMIT = 20
+const CODEX_SIDECAR_LOG_TEXT_LIMIT = 500
+
+function truncateLogText(value: string, maxChars = CODEX_SIDECAR_LOG_TEXT_LIMIT): string {
+  const normalized = value.replace(/\s+/g, ' ').trim()
+  if (normalized.length <= maxChars) {
+    return normalized
+  }
+  return `${normalized.slice(0, Math.max(0, maxChars - 3))}...`
+}
+
+function rawDataToText(data: RawData): string {
+  if (Array.isArray(data)) {
+    return Buffer.concat(data).toString('utf8')
+  }
+  if (Buffer.isBuffer(data)) {
+    return data.toString('utf8')
+  }
+  return Buffer.from(data).toString('utf8')
+}
 
 type ClaudePermissionMode = 'default' | 'acceptEdits' | 'dangerouslySkipPermissions'
 
@@ -109,24 +96,28 @@ export interface AgentSession {
   label?: string
   created: string
   pid: number
-  processAlive?: boolean
-  sessionType?: 'pty' | 'stream'
+  sessionType?: 'pty' | 'stream' | 'external'
   agentType?: AgentType
   cwd?: string
   host?: string
   parentSession?: string
   spawnedWorkers?: string[]
   workerSummary?: WorkerSummary
+  processAlive?: boolean
+  hadResult?: boolean
+  resumedFrom?: string
+  status?: 'active' | 'idle' | 'stale' | 'completed' | 'exited'
+  resumeAvailable?: boolean
 }
 
 type WorldAgentStatus = 'active' | 'idle' | 'stale' | 'completed'
-type WorldAgentPhase = 'idle' | 'thinking' | 'tool_use' | 'blocked' | 'completed'
+type WorldAgentPhase = 'idle' | 'thinking' | 'tool_use' | 'blocked' | 'stale' | 'completed'
 type WorldAgentRole = 'commander' | 'worker'
 
 export interface WorldAgent {
   id: string
   agentType: AgentType
-  sessionType: 'pty' | 'stream'
+  sessionType: 'pty' | 'stream' | 'external'
   status: WorldAgentStatus
   usage: { inputTokens: number; outputTokens: number; costUsd: number }
   task: string
@@ -134,11 +125,6 @@ export interface WorldAgent {
   lastToolUse: string | null
   lastUpdatedAt: string
   role: WorldAgentRole
-  channelMeta?: {
-    provider: 'whatsapp' | 'telegram' | 'discord'
-    displayName: string
-    chatType: 'direct' | 'group' | 'channel' | 'forum-topic'
-  }
 }
 
 export interface PtyHandle {
@@ -173,7 +159,6 @@ interface PtySession {
   task?: string
   pty: PtyHandle
   buffer: string
-  bufferBytesDropped: number
   clients: Set<WebSocket>
   createdAt: string
   lastEventAt: string
@@ -205,17 +190,14 @@ interface StreamSession {
   stdinDraining: boolean
   lastTurnCompleted: boolean
   completedTurnAt?: string
-  systemPrompt?: string
-  maxTurns?: number
-  messageQueue: KeyedAsyncQueue
-  pendingMessageCount: number
-  /** Normalized append-only entry metric (completed turns). */
-  conversationEntryCount: number
-  autoRotatePending: boolean
-  turnCompletedEmitter: EventEmitter
   claudeSessionId?: string
   codexThreadId?: string
+  resumedFrom?: string
   finalResultEvent?: StreamJsonEvent
+  conversationEntryCount: number
+  codexTurnWatchdogTimer?: NodeJS.Timeout
+  codexTurnStaleAt?: string
+  codexNotificationCleanup?: () => void
   /** True when this session was spawned during restore with no new task.
    * Used to skip the persist-write on exit so the file is not overwritten
    * with an empty list just because the idle resume process exited. */
@@ -237,10 +219,27 @@ interface OpenClawSession {
   clients: Set<WebSocket>
   createdAt: string
   lastEventAt: string
-  pendingHookDispatches: number
-  pendingTurnCount: number
   claudeSessionId?: string
 }
+
+interface ExternalSession {
+  kind: 'external'
+  name: string
+  agentType: AgentType
+  machine: string
+  cwd: string
+  host?: string
+  task?: string
+  status: 'connected' | 'stale'
+  lastHeartbeat: number
+  events: StreamJsonEvent[]
+  clients: Set<WebSocket>
+  createdAt: string
+  lastEventAt: string
+  metadata?: Record<string, unknown>
+}
+
+const EXTERNAL_SESSION_STALE_MS = 60_000
 
 interface CompletedSession {
   name: string
@@ -270,7 +269,18 @@ interface WorkerSummary {
 interface ExitedStreamSessionState {
   phase: 'exited'
   hadResult: boolean
-  exitedAt: number // Date.now() at exit — used for done-worker TTL
+  agentType: AgentType
+  mode: ClaudePermissionMode
+  cwd: string
+  host?: string
+  parentSession?: string
+  spawnedWorkers: string[]
+  createdAt: string
+  claudeSessionId?: string
+  codexThreadId?: string
+  resumedFrom?: string
+  conversationEntryCount: number
+  events: StreamJsonEvent[]
 }
 
 interface StreamSessionCreateOptions {
@@ -280,44 +290,26 @@ interface StreamSessionCreateOptions {
   createdAt?: string
   parentSession?: string
   spawnedWorkers?: string[]
+  resumedFrom?: string
 }
 
 interface CodexSessionCreateOptions {
+  resumeSessionId?: string
   createdAt?: string
   parentSession?: string
   spawnedWorkers?: string[]
   systemPrompt?: string
-  maxTurns?: number
+  resumedFrom?: string
 }
 
-type AnySession = PtySession | StreamSession | OpenClawSession
-type SessionLength = 'short' | 'long'
-type DebriefMode = 'hotwash' | 'aar'
-
-interface PreKillDebriefResult {
-  attempted: boolean
-  debriefed: boolean
-  mode: DebriefMode
-  sessionLength: SessionLength
-  timeoutMs: number
-  timedOut: boolean
-  reason?: string
-}
-
-type DebriefStatus = 'pending' | 'completed' | 'timed-out' | 'none'
-
-interface DebriefState {
-  status: DebriefStatus
-  startedAt: string
-  timeoutMs: number
-}
+type AnySession = PtySession | StreamSession | OpenClawSession | ExternalSession
 
 export interface AgentsRouterOptions {
   ptySpawner?: PtySpawner
   maxSessions?: number
   taskDelayMs?: number
   wsKeepAliveIntervalMs?: number
-  autoRotateEntryThreshold?: number
+  codexTurnWatchdogTimeoutMs?: number
   sessionStorePath?: string
   autoResumeSessions?: boolean
   machinesFilePath?: string
@@ -328,7 +320,6 @@ export interface AgentsRouterOptions {
   verifyAuth0Token?: (token: string) => Promise<AuthUser>
   internalToken?: string
   commanderSessionStorePath?: string
-  completedSessionsStorePath?: string
   questStore?: QuestStore
 }
 
@@ -367,15 +358,12 @@ function parseSessionName(rawSessionName: unknown): string | null {
   return sessionName
 }
 
-function parseQueryBoolean(rawValue: unknown): boolean {
-  if (typeof rawValue === 'string') {
-    const normalized = rawValue.trim().toLowerCase()
-    return normalized === 'true' || normalized === '1' || normalized === 'yes'
+function parseOptionalSessionName(rawSessionName: unknown): string | null | undefined {
+  if (rawSessionName === undefined || rawSessionName === null || rawSessionName === '') {
+    return undefined
   }
-  if (Array.isArray(rawValue)) {
-    return rawValue.some((value) => parseQueryBoolean(value))
-  }
-  return false
+
+  return parseSessionName(rawSessionName)
 }
 
 function parseClaudePermissionMode(rawMode: unknown): ClaudePermissionMode | null {
@@ -404,6 +392,23 @@ function parseOptionalTask(rawTask: unknown): string | null {
   }
 
   return rawTask.trim()
+}
+
+function parseWorkerDispatchType(rawWorkerType: unknown): 'factory' | 'agent' | null {
+  if (rawWorkerType === undefined || rawWorkerType === null || rawWorkerType === '') {
+    return 'factory'
+  }
+
+  if (typeof rawWorkerType !== 'string') {
+    return null
+  }
+
+  const normalized = rawWorkerType.trim()
+  if (normalized === 'factory' || normalized === 'agent') {
+    return normalized
+  }
+
+  return null
 }
 
 function parseCwd(rawCwd: unknown): string | null | undefined {
@@ -449,23 +454,6 @@ function parseFactoryBranch(rawBranch: unknown): string | null | undefined {
   }
 
   return normalized
-}
-
-function parseDispatchWorkerType(rawWorkerType: unknown): 'factory' | 'agent' | null {
-  if (rawWorkerType === undefined || rawWorkerType === null || rawWorkerType === '') {
-    return 'factory'
-  }
-
-  if (typeof rawWorkerType !== 'string') {
-    return null
-  }
-
-  const normalized = rawWorkerType.trim()
-  if (normalized === 'factory' || normalized === 'agent') {
-    return normalized
-  }
-
-  return null
 }
 
 function parseGitHubIssueUrl(
@@ -521,6 +509,26 @@ export interface MachineConfig {
   cwd?: string
 }
 
+const MACHINE_TOOL_KEYS = ['claude', 'codex', 'git', 'node'] as const
+
+type MachineToolKey = (typeof MACHINE_TOOL_KEYS)[number]
+
+interface MachineToolStatus {
+  ok: boolean
+  version: string | null
+  raw: string
+}
+
+interface MachineHealthReport {
+  machineId: string
+  mode: 'local' | 'ssh'
+  ssh: {
+    ok: boolean
+    destination?: string
+  }
+  tools: Record<MachineToolKey, MachineToolStatus>
+}
+
 interface PersistedStreamSession {
   name: string
   agentType: AgentType
@@ -528,18 +536,24 @@ interface PersistedStreamSession {
   cwd: string
   host?: string
   createdAt: string
-  systemPrompt?: string
-  maxTurns?: number
   claudeSessionId?: string
   codexThreadId?: string
-  parentSession?: string
-  spawnedWorkers?: string[]
   conversationEntryCount?: number
   events?: StreamJsonEvent[]
+  parentSession?: string
+  spawnedWorkers?: string[]
+  resumedFrom?: string
+  sessionState?: 'active' | 'exited'
+  hadResult?: boolean
 }
 
 interface PersistedSessionsState {
   sessions: PersistedStreamSession[]
+}
+
+interface ResolvedResumableSessionSource {
+  source: PersistedStreamSession
+  liveSession?: StreamSession
 }
 
 function parseOptionalHost(rawHost: unknown): string | null | undefined {
@@ -559,6 +573,69 @@ function parseOptionalHost(rawHost: unknown): string | null | undefined {
   return trimmed
 }
 
+function validateMachineConfig(
+  rawMachine: unknown,
+  options: { requireHost?: boolean } = {},
+): MachineConfig {
+  if (!rawMachine || typeof rawMachine !== 'object') {
+    throw new Error('Invalid machines config: machine entry must be an object')
+  }
+
+  const id = (rawMachine as { id?: unknown }).id
+  const label = (rawMachine as { label?: unknown }).label
+  const host = (rawMachine as { host?: unknown }).host
+  const user = (rawMachine as { user?: unknown }).user
+  const port = (rawMachine as { port?: unknown }).port
+  const cwd = (rawMachine as { cwd?: unknown }).cwd
+
+  if (typeof id !== 'string' || !SESSION_NAME_PATTERN.test(id)) {
+    throw new Error('Invalid machines config: machine id must match [a-zA-Z0-9_-]+')
+  }
+
+  if (typeof label !== 'string' || label.trim().length === 0) {
+    throw new Error(`Invalid machines config: machine "${id}" must include a label`)
+  }
+
+  if (host !== null && typeof host !== 'string') {
+    throw new Error(`Invalid machines config: machine "${id}" host must be string or null`)
+  }
+
+  const normalizedHost = typeof host === 'string' && host.trim().length > 0 ? host.trim() : null
+  if (options.requireHost && normalizedHost === null) {
+    throw new Error(`Invalid machines config: machine "${id}" host must be string`)
+  }
+
+  if (typeof user !== 'undefined' && typeof user !== 'string') {
+    throw new Error(`Invalid machines config: machine "${id}" user must be string`)
+  }
+
+  if (typeof port !== 'undefined') {
+    if (
+      typeof port !== 'number' ||
+      !Number.isInteger(port) ||
+      port <= 0 ||
+      port > 65535
+    ) {
+      throw new Error(`Invalid machines config: machine "${id}" port must be 1-65535`)
+    }
+  }
+
+  if (typeof cwd !== 'undefined') {
+    if (typeof cwd !== 'string' || !cwd.startsWith('/')) {
+      throw new Error(`Invalid machines config: machine "${id}" cwd must be absolute`)
+    }
+  }
+
+  return {
+    id,
+    label: label.trim(),
+    host: normalizedHost,
+    user: typeof user === 'string' && user.trim().length > 0 ? user.trim() : undefined,
+    port,
+    cwd: typeof cwd === 'string' && cwd.trim().length > 0 ? cwd.trim() : undefined,
+  }
+}
+
 function parseMachineRegistry(raw: unknown): MachineConfig[] {
   if (!raw || typeof raw !== 'object') {
     throw new Error('Invalid machines config: expected an object')
@@ -572,58 +649,13 @@ function parseMachineRegistry(raw: unknown): MachineConfig[] {
   const seenIds = new Set<string>()
   const parsed: MachineConfig[] = []
   for (const machine of machines) {
-    if (!machine || typeof machine !== 'object') {
-      throw new Error('Invalid machines config: machine entry must be an object')
-    }
-
-    const id = (machine as { id?: unknown }).id
-    const label = (machine as { label?: unknown }).label
-    const host = (machine as { host?: unknown }).host
-    const user = (machine as { user?: unknown }).user
-    const port = (machine as { port?: unknown }).port
-    const cwd = (machine as { cwd?: unknown }).cwd
-
-    if (typeof id !== 'string' || !SESSION_NAME_PATTERN.test(id)) {
-      throw new Error('Invalid machines config: machine id must match [a-zA-Z0-9_-]+')
-    }
+    const parsedMachine = validateMachineConfig(machine)
+    const id = parsedMachine.id
     if (seenIds.has(id)) {
       throw new Error(`Invalid machines config: duplicate machine id "${id}"`)
     }
     seenIds.add(id)
-
-    if (typeof label !== 'string' || label.trim().length === 0) {
-      throw new Error(`Invalid machines config: machine "${id}" must include a label`)
-    }
-    if (host !== null && typeof host !== 'string') {
-      throw new Error(`Invalid machines config: machine "${id}" host must be string or null`)
-    }
-    if (typeof user !== 'undefined' && typeof user !== 'string') {
-      throw new Error(`Invalid machines config: machine "${id}" user must be string`)
-    }
-    if (typeof port !== 'undefined') {
-      if (
-        typeof port !== 'number' ||
-        !Number.isInteger(port) ||
-        port <= 0 ||
-        port > 65535
-      ) {
-        throw new Error(`Invalid machines config: machine "${id}" port must be 1-65535`)
-      }
-    }
-    if (typeof cwd !== 'undefined') {
-      if (typeof cwd !== 'string' || !cwd.startsWith('/')) {
-        throw new Error(`Invalid machines config: machine "${id}" cwd must be absolute`)
-      }
-    }
-
-    parsed.push({
-      id,
-      label: label.trim(),
-      host: typeof host === 'string' && host.trim().length > 0 ? host.trim() : null,
-      user: typeof user === 'string' && user.trim().length > 0 ? user.trim() : undefined,
-      port,
-      cwd,
-    })
+    parsed.push(parsedMachine)
   }
 
   return parsed
@@ -635,6 +667,13 @@ function isRemoteMachine(machine: MachineConfig | undefined): machine is Machine
 
 function shellEscape(arg: string): string {
   return `'${arg.replace(/'/g, `'\"'\"'`)}'`
+}
+
+function buildLoginShellCommand(script: string, cwd?: string): string {
+  if (cwd) {
+    return `cd ${shellEscape(cwd)} && exec /bin/bash -lc ${shellEscape(script)}`
+  }
+  return `exec /bin/bash -lc ${shellEscape(script)}`
 }
 
 function buildRemoteCommand(command: string, args: string[], cwd?: string): string {
@@ -668,6 +707,157 @@ function buildSshArgs(
   return args
 }
 
+function createMissingToolStatus(): MachineToolStatus {
+  return {
+    ok: false,
+    version: null,
+    raw: 'missing',
+  }
+}
+
+function buildMachineProbeScript(): string {
+  return [
+    "printf 'ssh:ok\\n'",
+    'probe() {',
+    '  label="$1"',
+    '  cmd="$2"',
+    '  if command -v "$cmd" >/dev/null 2>&1; then',
+    '    out="$("$cmd" --version 2>/dev/null | head -n 1 || true)"',
+    '    if [ -n "$out" ]; then',
+    '      printf "%s:%s\\n" "$label" "$out"',
+    '    else',
+    '      printf "%s:missing\\n" "$label"',
+    '    fi',
+    '  else',
+    '    printf "%s:missing\\n" "$label"',
+    '  fi',
+    '}',
+    'probe claude claude',
+    'probe codex codex',
+    'probe git git',
+    'probe node node',
+  ].join('\n')
+}
+
+function parseMachineHealthOutput(
+  machine: MachineConfig,
+  stdout: string,
+): MachineHealthReport {
+  const tools = Object.fromEntries(
+    MACHINE_TOOL_KEYS.map((tool) => [tool, createMissingToolStatus()]),
+  ) as Record<MachineToolKey, MachineToolStatus>
+
+  let sshOk = machine.host === null
+  for (const rawLine of stdout.split(/\r?\n/u)) {
+    const line = rawLine.trim()
+    if (!line) continue
+
+    if (line === 'ssh:ok') {
+      sshOk = true
+      continue
+    }
+
+    const separatorIndex = line.indexOf(':')
+    if (separatorIndex <= 0) {
+      continue
+    }
+
+    const key = line.slice(0, separatorIndex) as MachineToolKey
+    if (!MACHINE_TOOL_KEYS.includes(key)) {
+      continue
+    }
+
+    const rawValue = line.slice(separatorIndex + 1).trim()
+    if (!rawValue || rawValue === 'missing') {
+      tools[key] = createMissingToolStatus()
+      continue
+    }
+
+    tools[key] = {
+      ok: true,
+      version: rawValue,
+      raw: rawValue,
+    }
+  }
+
+  return {
+    machineId: machine.id,
+    mode: machine.host === null ? 'local' : 'ssh',
+    ssh: {
+      ok: sshOk,
+      destination: isRemoteMachine(machine) ? buildSshDestination(machine) : undefined,
+    },
+    tools,
+  }
+}
+
+interface CapturedCommandResult {
+  stdout: string
+  stderr: string
+  code: number
+  signal: string | null
+  timedOut: boolean
+}
+
+function runCapturedCommand(
+  command: string,
+  args: string[],
+  options: { cwd?: string; timeoutMs?: number } = {},
+): Promise<CapturedCommandResult> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(command, args, {
+      cwd: options.cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    let timedOut = false
+    let signal: string | null = null
+
+    const finish = (result: CapturedCommandResult): void => {
+      if (settled) {
+        return
+      }
+      settled = true
+      if (timer) {
+        clearTimeout(timer)
+      }
+      resolve(result)
+    }
+
+    proc.stdout?.on('data', (chunk: Buffer) => {
+      stdout += chunk.toString()
+    })
+    proc.stderr?.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString()
+    })
+    proc.on('error', (error) => {
+      if (timer) {
+        clearTimeout(timer)
+      }
+      reject(error)
+    })
+    proc.on('close', (code, closeSignal) => {
+      signal = closeSignal
+      finish({
+        stdout,
+        stderr,
+        code: code ?? 1,
+        signal,
+        timedOut,
+      })
+    })
+
+    const timer = options.timeoutMs
+      ? setTimeout(() => {
+        timedOut = true
+        proc.kill('SIGTERM')
+      }, options.timeoutMs)
+      : null
+  })
+}
+
 type SessionType = 'pty' | 'stream'
 
 function parseSessionType(raw: unknown): SessionType {
@@ -699,10 +889,10 @@ function parseWsKeepAliveIntervalMs(rawValue: unknown): number {
   return parsed
 }
 
-function parseAutoRotateEntryThreshold(rawValue: unknown): number {
+function parseCodexTurnWatchdogTimeoutMs(rawValue: unknown): number {
   const parsed = Number.parseInt(String(rawValue ?? ''), 10)
   if (!Number.isFinite(parsed) || parsed <= 0) {
-    return DEFAULT_AUTO_ROTATE_ENTRY_THRESHOLD
+    return DEFAULT_CODEX_TURN_WATCHDOG_TIMEOUT_MS
   }
   return parsed
 }
@@ -724,16 +914,6 @@ function summarizeWorkerStates(workers: WorkerState[]): WorkerSummary {
   }
 
   return summary
-}
-
-function isWorkerOrchestrationComplete(summary: WorkerSummary): boolean {
-  return (
-    summary.total > 0
-    && summary.done === summary.total
-    && summary.running === 0
-    && summary.starting === 0
-    && summary.down === 0
-  )
 }
 
 function parseFrontmatter(content: string): Record<string, string | boolean> {
@@ -788,22 +968,14 @@ function parsePersistedStreamSessionEntry(value: unknown): PersistedStreamSessio
   const codexThreadId = typeof raw.codexThreadId === 'string' && raw.codexThreadId.trim().length > 0
     ? raw.codexThreadId.trim()
     : undefined
-  const systemPrompt = typeof raw.systemPrompt === 'string' && raw.systemPrompt.length > 0
-    ? raw.systemPrompt
+  const parentSession = typeof raw.parentSession === 'string' && raw.parentSession.trim().length > 0
+    ? raw.parentSession.trim()
     : undefined
-  const maxTurns = typeof raw.maxTurns === 'number' && raw.maxTurns > 0
-    ? raw.maxTurns
+  const resumedFrom = typeof raw.resumedFrom === 'string' && raw.resumedFrom.trim().length > 0
+    ? raw.resumedFrom.trim()
     : undefined
-  const parentSession = parseSessionName(raw.parentSession) ?? undefined
-  const spawnedWorkers = Array.isArray(raw.spawnedWorkers)
-    ? Array.from(
-      new Set(
-        raw.spawnedWorkers
-          .map((workerName) => parseSessionName(workerName))
-          .filter((workerName): workerName is string => workerName !== null),
-      ),
-    )
-    : undefined
+  const sessionState = raw.sessionState === 'exited' ? 'exited' : 'active'
+  const hadResult = typeof raw.hadResult === 'boolean' ? raw.hadResult : undefined
   const parsedConversationEntryCount = Number.parseInt(String(raw.conversationEntryCount ?? ''), 10)
   const conversationEntryCount = Number.isFinite(parsedConversationEntryCount) && parsedConversationEntryCount >= 0
     ? parsedConversationEntryCount
@@ -821,9 +993,20 @@ function parsePersistedStreamSessionEntry(value: unknown): PersistedStreamSessio
   if (!cwd.startsWith('/')) {
     return null
   }
+  if (parentSession && !SESSION_NAME_PATTERN.test(parentSession)) {
+    return null
+  }
+  if (resumedFrom && !SESSION_NAME_PATTERN.test(resumedFrom)) {
+    return null
+  }
 
   const parsedEvents = Array.isArray(raw.events)
     ? (raw.events as unknown[]).filter((e): e is StreamJsonEvent => !!asObject(e))
+    : []
+  const parsedSpawnedWorkers = Array.isArray(raw.spawnedWorkers)
+    ? (raw.spawnedWorkers as unknown[])
+      .filter((entry): entry is string => typeof entry === 'string' && SESSION_NAME_PATTERN.test(entry.trim()))
+      .map((entry) => entry.trim())
     : []
 
   return {
@@ -833,12 +1016,13 @@ function parsePersistedStreamSessionEntry(value: unknown): PersistedStreamSessio
     cwd: path.resolve(cwd),
     host,
     createdAt,
-    systemPrompt,
-    maxTurns,
     claudeSessionId,
     codexThreadId,
     parentSession,
-    spawnedWorkers,
+    spawnedWorkers: parsedSpawnedWorkers,
+    resumedFrom,
+    sessionState,
+    hadResult,
     conversationEntryCount: conversationEntryCount ?? countCompletedTurnEntries(parsedEvents),
     events: parsedEvents,
   }
@@ -853,21 +1037,21 @@ function parsePersistedSessionsState(value: unknown): PersistedSessionsState {
   return { sessions }
 }
 
-async function getCommanderNames(commanderDataDir: string): Promise<Record<string, string>> {
-  try {
-    const namesPath = resolveCommanderNamesPath(commanderDataDir)
-    const raw = await readFile(namesPath, 'utf8')
-    return JSON.parse(raw) as Record<string, string>
-  } catch {
-    return {}
-  }
-}
-
 async function getCommanderLabels(
-  commanderDataDir: string,
   commanderSessionStorePath?: string,
 ): Promise<Record<string, string>> {
-  const labels = await getCommanderNames(commanderDataDir)
+  const dataDir = commanderSessionStorePath
+    ? path.dirname(path.resolve(commanderSessionStorePath))
+    : undefined
+
+  let labels: Record<string, string> = {}
+  try {
+    const namesPath = resolveCommanderNamesPath(dataDir)
+    const raw = await readFile(namesPath, 'utf8')
+    labels = JSON.parse(raw) as Record<string, string>
+  } catch {
+    labels = {}
+  }
 
   try {
     const commanderStore = commanderSessionStorePath !== undefined
@@ -875,12 +1059,13 @@ async function getCommanderLabels(
       : new CommanderSessionStore()
     const commanderSessions = await commanderStore.list()
     for (const commanderSession of commanderSessions) {
-      if (commanderSession.host.trim().length > 0) {
-        labels[commanderSession.id] = commanderSession.host
+      const host = commanderSession.host.trim()
+      if (host.length > 0) {
+        labels[commanderSession.id] = host
       }
     }
   } catch {
-    // Fall back to names.json when the commander session store is unavailable.
+    // Fall back to names.json when the commander store is unavailable.
   }
 
   return labels
@@ -917,7 +1102,7 @@ function getCommanderWorldAgentPhase(session: CommanderSession): WorldAgentPhase
 function toCommanderWorldAgent(session: CommanderSession): WorldAgent {
   return {
     id: getCommanderWorldAgentId(session.id),
-    agentType: session.agentType === 'codex' ? 'codex' : 'claude',
+    agentType: session.agentType ?? 'claude',
     sessionType: 'stream',
     status: getCommanderWorldAgentStatus(session),
     usage: {
@@ -930,15 +1115,6 @@ function toCommanderWorldAgent(session: CommanderSession): WorldAgent {
     lastToolUse: null,
     lastUpdatedAt: session.lastHeartbeat ?? session.created,
     role: 'commander',
-    ...(session.channelMeta
-      ? {
-          channelMeta: {
-            provider: session.channelMeta.provider,
-            displayName: session.channelMeta.displayName,
-            chatType: session.channelMeta.chatType,
-          },
-        }
-      : {}),
   }
 }
 
@@ -949,7 +1125,7 @@ function buildClaudeStreamArgs(
   maxTurns?: number,
 ): string[] {
   // Claude CLI requires --verbose when using --print (-p) with stream-json output.
-  const args = ['-p', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json', '--model', 'claude-opus-4-6']
+  const args = ['-p', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json']
   if (mode === 'acceptEdits') {
     args.push('--permission-mode', 'acceptEdits')
   } else if (mode === 'dangerouslySkipPermissions') {
@@ -979,33 +1155,6 @@ function extractClaudeSessionId(event: StreamJsonEvent): string | undefined {
 
 function isCommandRoomSessionName(name: string): boolean {
   return name.startsWith(COMMAND_ROOM_SESSION_PREFIX)
-}
-
-function isFactorySessionName(name: string): boolean {
-  return name.startsWith(FACTORY_SESSION_PREFIX)
-}
-
-function isAgentWorkerSessionName(name: string): boolean {
-  return name.startsWith(AGENT_SESSION_PREFIX)
-}
-
-function isWorkerSessionName(name: string): boolean {
-  return isFactorySessionName(name) || isAgentWorkerSessionName(name)
-}
-
-function isOneShotStreamSessionName(name: string): boolean {
-  return isCommandRoomSessionName(name) || isFactorySessionName(name) || isAgentWorkerSessionName(name)
-}
-
-/** Check if a PID is still alive via kill(0). */
-function isPidAlive(pid: number): boolean {
-  if (!pid || pid <= 0) return false
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch {
-    return false
-  }
 }
 
 function toCompletedSession(sessionName: string, completedAt: string, event: StreamJsonEvent, costUsd: number): CompletedSession {
@@ -1048,17 +1197,13 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
   const router = Router()
   const sessions = new Map<string, AnySession>()
   const sessionEventHandlers = new Map<string, Set<(event: StreamJsonEvent) => void>>()
-  const debriefStateBySessionName = new Map<string, DebriefState>()
   const completedSessions = new Map<string, CompletedSession>()
-  const completedSessionEvents = new Map<string, StreamJsonEvent[]>()
   const exitedStreamSessions = new Map<string, ExitedStreamSessionState>()
   const wss = new WebSocketServer({ noServer: true })
   const maxSessions = parseMaxSessions(options.maxSessions)
   const taskDelayMs = parseTaskDelayMs(options.taskDelayMs)
   const wsKeepAliveIntervalMs = parseWsKeepAliveIntervalMs(options.wsKeepAliveIntervalMs)
-  const autoRotateEntryThreshold = parseAutoRotateEntryThreshold(
-    options.autoRotateEntryThreshold ?? process.env.AGENTS_AUTO_ROTATE_ENTRY_THRESHOLD,
-  )
+  const codexTurnWatchdogTimeoutMs = parseCodexTurnWatchdogTimeoutMs(options.codexTurnWatchdogTimeoutMs)
   const autoResumeSessions = options.autoResumeSessions ?? true
   const sessionStorePath = options.sessionStorePath
     ? path.resolve(options.sessionStorePath)
@@ -1066,21 +1211,21 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
   const machinesFilePath = options.machinesFilePath
     ? path.resolve(options.machinesFilePath)
     : path.resolve(process.cwd(), 'data/machines.json')
-  const completedSessionsStorePath = options.completedSessionsStorePath
-    ? path.resolve(options.completedSessionsStorePath)
-    : path.resolve(process.cwd(), DEFAULT_COMPLETED_SESSIONS_STORE_PATH)
-  const commanderDataDir = options.commanderSessionStorePath !== undefined
-    ? path.dirname(path.resolve(options.commanderSessionStorePath))
-    : resolveCommanderDataDir()
-  const questStore = options.questStore ?? null
+  const restorePersistedSessionsReady = autoResumeSessions
+    ? restorePersistedSessions().catch(() => undefined)
+    : Promise.resolve()
+
+  router.use((_req, _res, next) => {
+    restorePersistedSessionsReady.then(() => next(), next)
+  })
 
   let spawner: PtySpawner | null = options.ptySpawner ?? null
   let cachedMachines: MachineConfig[] | null = null
   let cachedMachinesMtimeMs = -1
+  let cachedMachinesSize = -1
+  let machineRegistryWriteQueue = Promise.resolve()
   let persistSessionStateQueue = Promise.resolve()
-  let persistCompletedSessionsQueue = Promise.resolve()
   const commanderTranscriptWriteQueues = new Map<string, Promise<void>>()
-  const autoRotationQueues = new Map<string, Promise<StreamSession | null>>()
 
   function sanitizeTranscriptFileKey(raw: string): string {
     return raw
@@ -1100,7 +1245,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       return
     }
 
-    const rawTranscriptId = session.claudeSessionId ?? session.codexThreadId ?? extractClaudeSessionId(event) ?? session.name
+    const rawTranscriptId = session.claudeSessionId ?? extractClaudeSessionId(event) ?? session.name
     const transcriptId = sanitizeTranscriptFileKey(rawTranscriptId)
     if (!transcriptId) {
       return
@@ -1114,7 +1259,9 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     }
 
     const transcriptPath = path.resolve(
-      commanderDataDir,
+      process.cwd(),
+      'data',
+      'commanders',
       commanderId,
       'sessions',
       `${transcriptId}.jsonl`,
@@ -1143,7 +1290,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
   function resolveWorkerState(workerSessionName: string): WorkerState {
     const active = sessions.get(workerSessionName)
     if (active?.kind === 'stream') {
-      if (completedSessions.has(workerSessionName) || active.lastTurnCompleted) {
+      if (active.lastTurnCompleted) {
         return {
           name: workerSessionName,
           status: 'done',
@@ -1160,24 +1307,14 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
 
     const exited = exitedStreamSessions.get(workerSessionName)
     if (exited) {
-      const status = exited.hadResult ? 'done' : 'down'
-      // Auto-evict done workers after TTL
-      if (status === 'done' && Date.now() - exited.exitedAt > DONE_WORKER_TTL_MS) {
-        return { name: workerSessionName, status: 'down', phase: 'exited' }
-      }
       return {
         name: workerSessionName,
-        status,
+        status: exited.hadResult ? 'done' : 'down',
         phase: exited.phase,
       }
     }
 
     if (completedSessions.has(workerSessionName)) {
-      const completed = completedSessions.get(workerSessionName)!
-      const completedAtMs = Date.parse(completed.completedAt)
-      if (Number.isFinite(completedAtMs) && Date.now() - completedAtMs > DONE_WORKER_TTL_MS) {
-        return { name: workerSessionName, status: 'down', phase: 'exited' }
-      }
       return {
         name: workerSessionName,
         status: 'done',
@@ -1253,36 +1390,115 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     return machines
   }
 
+  function invalidateMachineRegistryCache(): void {
+    cachedMachines = null
+    cachedMachinesMtimeMs = -1
+  }
+
+  function sendWorkspaceError(res: import('express').Response, error: unknown): void {
+    const workspaceError = toWorkspaceError(error)
+    res.status(workspaceError.statusCode).json({ error: workspaceError.message })
+  }
+
+  async function resolveAgentSessionWorkspace(rawSessionName: unknown) {
+    const sessionName = parseSessionName(rawSessionName)
+    if (!sessionName) {
+      throw new WorkspaceError(400, 'Invalid session name')
+    }
+
+    const session = sessions.get(sessionName)
+    if (!session) {
+      throw new WorkspaceError(404, `Session "${sessionName}" not found`)
+    }
+
+    return resolveWorkspaceRoot({
+      rootPath: session.cwd,
+      source: {
+        kind: 'agent-session',
+        id: sessionName,
+        label: sessionName,
+        host: session.host ?? (session.kind === 'external' ? session.machine : undefined),
+      },
+    })
+  }
+
+  async function writeMachineRegistry(machines: readonly MachineConfig[]): Promise<MachineConfig[]> {
+    const validated = parseMachineRegistry({ machines })
+    await mkdir(path.dirname(machinesFilePath), { recursive: true })
+    await writeFile(
+      machinesFilePath,
+      `${JSON.stringify({ machines: validated }, null, 2)}\n`,
+      'utf8',
+    )
+    invalidateMachineRegistryCache()
+    return validated
+  }
+
+  async function withMachineRegistryWriteLock<T>(operation: () => Promise<T>): Promise<T> {
+    const next = machineRegistryWriteQueue.then(operation, operation)
+    machineRegistryWriteQueue = next.then(
+      () => undefined,
+      () => undefined,
+    )
+    return next
+  }
+
   function serializePersistedSessionsState(): PersistedSessionsState {
-    const restoredSessions: PersistedStreamSession[] = []
+    const sessionsByName = new Map<string, PersistedStreamSession>()
     for (const session of sessions.values()) {
       if (session.kind !== 'stream') continue
 
-      // One-shot sessions (command-room, factory/agent workers) should not be
-      // restored after a completed turn because they are terminal jobs.
-      if (isOneShotStreamSessionName(session.name) && session.lastTurnCompleted && session.finalResultEvent) continue
+      // Command-room sessions are one-shot jobs. Once a turn is complete, keep
+      // them out of persisted auto-resume state so they do not clutter agents.
+      if (isCommandRoomSessionName(session.name) && session.lastTurnCompleted && session.finalResultEvent) continue
 
       if (session.agentType === 'claude' && (!session.claudeSessionId || !session.lastTurnCompleted)) continue
       if (session.agentType === 'codex' && !session.codexThreadId) continue
 
-      restoredSessions.push({
+      sessionsByName.set(session.name, {
         name: session.name,
         agentType: session.agentType,
         mode: session.mode,
         cwd: session.cwd,
         host: session.host,
         createdAt: session.createdAt,
-        systemPrompt: session.systemPrompt,
-        maxTurns: session.maxTurns,
         claudeSessionId: session.claudeSessionId,
         codexThreadId: session.codexThreadId,
         parentSession: session.parentSession,
-        spawnedWorkers: session.spawnedWorkers.length > 0 ? [...session.spawnedWorkers] : undefined,
+        spawnedWorkers: session.spawnedWorkers,
+        resumedFrom: session.resumedFrom,
+        sessionState: 'active',
+        hadResult: Boolean(session.finalResultEvent),
         conversationEntryCount: session.conversationEntryCount,
         events: session.events,
       })
     }
 
+    for (const [sessionName, exited] of exitedStreamSessions) {
+      if (isCommandRoomSessionName(sessionName)) continue
+      if (exited.agentType === 'claude' && !exited.claudeSessionId) continue
+      if (exited.agentType === 'codex' && !exited.codexThreadId) continue
+
+      sessionsByName.set(sessionName, {
+        name: sessionName,
+        agentType: exited.agentType,
+        mode: exited.mode,
+        cwd: exited.cwd,
+        host: exited.host,
+        createdAt: exited.createdAt,
+        claudeSessionId: exited.claudeSessionId,
+        codexThreadId: exited.codexThreadId,
+        parentSession: exited.parentSession,
+        spawnedWorkers: exited.spawnedWorkers,
+        resumedFrom: exited.resumedFrom,
+        sessionState: 'exited',
+        hadResult: exited.hadResult,
+        conversationEntryCount: exited.conversationEntryCount,
+        events: exited.events,
+      })
+    }
+
+    const restoredSessions = [...sessionsByName.values()]
     restoredSessions.sort((left, right) => left.name.localeCompare(right.name))
     return { sessions: restoredSessions }
   }
@@ -1300,62 +1516,6 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
         await writePersistedSessionsState()
       })
   }
-
-  // ── Completed sessions persistence ──────────────────────────────
-  async function writeCompletedSessionsState(): Promise<void> {
-    const entries = [...completedSessions.values()]
-    await mkdir(path.dirname(completedSessionsStorePath), { recursive: true })
-    await writeFile(completedSessionsStorePath, JSON.stringify(entries, null, 2), 'utf8')
-  }
-
-  function scheduleCompletedSessionsWrite(): void {
-    persistCompletedSessionsQueue = persistCompletedSessionsQueue
-      .catch(() => undefined)
-      .then(async () => {
-        await writeCompletedSessionsState()
-      })
-  }
-
-  async function loadCompletedSessionsState(): Promise<void> {
-    let raw: string
-    try {
-      raw = await readFile(completedSessionsStorePath, 'utf8')
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        return
-      }
-      return
-    }
-
-    let parsed: unknown
-    try {
-      parsed = JSON.parse(raw) as unknown
-    } catch {
-      return
-    }
-
-    if (!Array.isArray(parsed)) {
-      return
-    }
-
-    for (const entry of parsed) {
-      if (
-        typeof entry === 'object' && entry !== null &&
-        typeof (entry as Record<string, unknown>).name === 'string' &&
-        typeof (entry as Record<string, unknown>).completedAt === 'string'
-      ) {
-        const record = entry as CompletedSession
-        if (!completedSessions.has(record.name)) {
-          completedSessions.set(record.name, record)
-        }
-      }
-    }
-  }
-
-  // Load completed sessions from disk on startup.
-  loadCompletedSessionsState().catch(() => {
-    // Ignore load failures — the map starts empty and will be populated as sessions complete.
-  })
 
   async function readPersistedSessionsState(): Promise<PersistedSessionsState> {
     let raw: string
@@ -1384,39 +1544,12 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     for (const [sessionName, session] of sessions) {
       if (session.kind !== 'stream') continue
       if (!isCommandRoomSessionName(sessionName)) continue
-      const completionReferenceAt = session.lastTurnCompleted
-        ? (session.completedTurnAt ?? session.createdAt)
-        : session.createdAt
-      const completionReferenceMs = Date.parse(completionReferenceAt)
-      if (!Number.isFinite(completionReferenceMs)) continue
-      if (nowMs - completionReferenceMs <= COMMAND_ROOM_STALE_SESSION_TTL_MS) continue
+      if (!session.lastTurnCompleted || !session.finalResultEvent) continue
 
-      // Defense-in-depth: command-room stream sessions are one-shot jobs.
-      // Reap them after stale TTL whether or not they emitted a terminal
-      // result event, and persist a completion record first.
-      if (!completedSessions.has(sessionName)) {
-        if (session.finalResultEvent) {
-          completedSessions.set(
-            sessionName,
-            toCompletedSession(
-              sessionName,
-              session.completedTurnAt ?? new Date().toISOString(),
-              session.finalResultEvent,
-              session.usage.costUsd,
-            ),
-          )
-        } else {
-          const staleEvent: StreamJsonEvent = {
-            type: 'exit',
-            exitCode: -1,
-            text: 'Command-room session exceeded stale-session TTL before emitting a final result event',
-          }
-          completedSessions.set(
-            sessionName,
-            toExitBasedCompletedSession(sessionName, staleEvent, session.usage.costUsd),
-          )
-        }
-      }
+      const completedAtMs = Date.parse(session.completedTurnAt ?? session.createdAt)
+      if (!Number.isFinite(completedAtMs)) continue
+      if (nowMs - completedAtMs <= COMMAND_ROOM_COMPLETED_SESSION_TTL_MS) continue
+
       for (const client of session.clients) {
         client.close(1000, 'Session ended')
       }
@@ -1433,9 +1566,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
   function appendToBuffer(session: PtySession, data: string): void {
     session.buffer += data
     if (session.buffer.length > MAX_BUFFER_BYTES) {
-      const dropped = session.buffer.length - MAX_BUFFER_BYTES
       session.buffer = session.buffer.slice(-MAX_BUFFER_BYTES)
-      session.bufferBytesDropped += dropped
     }
   }
 
@@ -1455,30 +1586,19 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     return session.createdAt
   }
 
-  function isCompletedOneShotStreamSession(session: StreamSession): boolean {
-    return isOneShotStreamSessionName(session.name) && (
-      completedSessions.has(session.name)
-      || (session.lastTurnCompleted && Boolean(session.finalResultEvent))
-    )
-  }
-
-  function countTrackedSessions(): number {
-    let count = 0
-    for (const session of sessions.values()) {
-      if (session.kind === 'stream' && isCompletedOneShotStreamSession(session)) {
-        continue
-      }
-      count += 1
-    }
-    return count
-  }
-
   function getWorldAgentStatus(session: AnySession, nowMs: number): WorldAgentStatus {
     if (session.kind === 'stream' && session.lastTurnCompleted && session.completedTurnAt) {
-      // Commanders are long-lived; turn completion ≠ session completion
-      if (!session.name.startsWith(COMMANDER_SESSION_NAME_PREFIX)) {
-        return 'completed'
-      }
+      return 'completed'
+    }
+
+    if (session.kind === 'stream' && !session.lastTurnCompleted && session.codexTurnStaleAt) {
+      return 'stale'
+    }
+
+    if (session.kind === 'external') {
+      const heartbeatAge = nowMs - session.lastHeartbeat
+      if (heartbeatAge > EXTERNAL_SESSION_STALE_MS) return 'stale'
+      return 'active'
     }
 
     const lastUpdatedAt = resolveLastUpdatedAt(session)
@@ -1559,7 +1679,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     return ids
   }
 
-  function getLastToolUse(session: StreamSession | OpenClawSession): string | null {
+  function getLastToolUse(session: StreamSession | OpenClawSession | ExternalSession): string | null {
     for (let i = session.events.length - 1; i >= 0; i -= 1) {
       const toolUses = getToolUses(session.events[i])
       for (let j = toolUses.length - 1; j >= 0; j -= 1) {
@@ -1569,7 +1689,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     return null
   }
 
-  function hasPendingAskUserQuestion(session: StreamSession | OpenClawSession): boolean {
+  function hasPendingAskUserQuestion(session: StreamSession | OpenClawSession | ExternalSession): boolean {
     const answeredToolIds = new Set<string>()
     for (let i = session.events.length - 1; i >= 0; i -= 1) {
       const event = session.events[i]
@@ -1594,14 +1714,15 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     return false
   }
 
-  function getWorldAgentPhase(session: AnySession): WorldAgentPhase {
+  function getWorldAgentPhase(session: AnySession, nowMs: number): WorldAgentPhase {
     if (session.kind === 'pty') return 'idle'
 
     if (session.kind === 'stream' && session.lastTurnCompleted && session.completedTurnAt) {
-      // Commanders are long-lived; turn completion ≠ session completion
-      if (!session.name.startsWith(COMMANDER_SESSION_NAME_PREFIX)) {
-        return 'completed'
-      }
+      return 'completed'
+    }
+
+    if (session.kind === 'stream' && getWorldAgentStatus(session, nowMs) === 'stale') {
+      return 'stale'
     }
 
     if (hasPendingAskUserQuestion(session)) {
@@ -1657,11 +1778,11 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     return {
       id: session.name,
       agentType: session.agentType,
-      sessionType: session.kind === 'pty' ? 'pty' : 'stream',
+      sessionType: session.kind === 'external' ? 'external' : (session.kind === 'pty' ? 'pty' : 'stream'),
       status: getWorldAgentStatus(session, nowMs),
       usage: getWorldAgentUsage(session),
       task: getWorldAgentTask(session),
-      phase: getWorldAgentPhase(session),
+      phase: getWorldAgentPhase(session, nowMs),
       lastToolUse: session.kind === 'pty' ? null : getLastToolUse(session),
       lastUpdatedAt: resolveLastUpdatedAt(session),
       role: getWorldAgentRole(session.name),
@@ -1745,38 +1866,6 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     verifyToken: options.verifyAuth0Token,
     internalToken: options.internalToken,
   })
-
-  function sendWorkspaceError(
-    res: Response,
-    error: unknown,
-  ): void {
-    const workspaceError = toWorkspaceError(error)
-    res.status(workspaceError.statusCode).json({ error: workspaceError.message })
-  }
-
-  async function resolveAgentWorkspace(
-    rawSessionName: unknown,
-  ) {
-    const sessionName = parseSessionName(rawSessionName)
-    if (!sessionName) {
-      throw new WorkspaceError(400, 'Invalid session name')
-    }
-
-    const session = sessions.get(sessionName)
-    if (!session) {
-      throw new WorkspaceError(404, `Session "${sessionName}" not found`)
-    }
-
-    return resolveWorkspaceRoot({
-      rootPath: session.cwd,
-      source: {
-        kind: 'agent-session',
-        id: session.name,
-        label: session.name,
-        host: session.host,
-      },
-    })
-  }
 
   router.get('/directories', requireReadAccess, async (req, res) => {
     const rawPath = req.query.path
@@ -1923,34 +2012,6 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     }
   })
 
-  router.get('/openclaw/gateway-info', requireReadAccess, async (_req, res) => {
-    const url = DEFAULT_OPENCLAW_GATEWAY_URL
-    const token = process.env.OPENCLAW_GATEWAY_TOKEN?.trim()
-    const authEnabled = Boolean(token)
-    const headers: Record<string, string> = {}
-    if (token) {
-      headers.Authorization = `Bearer ${token}`
-    }
-
-    let reachable = false
-    const controller = new AbortController()
-    const timeoutHandle = setTimeout(() => controller.abort(), 2000)
-
-    try {
-      const response = await fetch(`${url}/agents`, {
-        headers,
-        signal: controller.signal,
-      })
-      reachable = response.ok || response.status === 401
-    } catch {
-      reachable = false
-    } finally {
-      clearTimeout(timeoutHandle)
-    }
-
-    res.json({ url, authEnabled, reachable })
-  })
-
   router.get('/files', requireReadAccess, async (req, res) => {
     const rawPath = req.query.path
     const homeBase = homedir()
@@ -2034,188 +2095,6 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     })
   })
 
-  router.get('/sessions/:name/workspace/tree', requireReadAccess, async (req, res) => {
-    try {
-      const workspace = await resolveAgentWorkspace(req.params.name)
-      const tree = await listWorkspaceTree(
-        workspace,
-        typeof req.query.path === 'string' ? req.query.path : '',
-      )
-      res.json(tree)
-    } catch (error) {
-      sendWorkspaceError(res, error)
-    }
-  })
-
-  router.get('/sessions/:name/workspace/expand', requireReadAccess, async (req, res) => {
-    try {
-      const workspace = await resolveAgentWorkspace(req.params.name)
-      const tree = await listWorkspaceTree(
-        workspace,
-        typeof req.query.path === 'string' ? req.query.path : '',
-      )
-      res.json(tree)
-    } catch (error) {
-      sendWorkspaceError(res, error)
-    }
-  })
-
-  router.get('/sessions/:name/workspace/file', requireReadAccess, async (req, res) => {
-    try {
-      const workspace = await resolveAgentWorkspace(req.params.name)
-      if (typeof req.query.path !== 'string' || !req.query.path.trim()) {
-        throw new WorkspaceError(400, 'path query parameter is required')
-      }
-      const preview = await readWorkspaceFilePreview(workspace, req.query.path)
-      res.json(preview)
-    } catch (error) {
-      sendWorkspaceError(res, error)
-    }
-  })
-
-  router.put('/sessions/:name/workspace/file', requireWriteAccess, async (req, res) => {
-    try {
-      if (typeof req.body?.path !== 'string' || !req.body.path.trim()) {
-        throw new WorkspaceError(400, 'path is required')
-      }
-      if (typeof req.body?.content !== 'string') {
-        throw new WorkspaceError(400, 'content must be a string')
-      }
-      const workspace = await resolveAgentWorkspace(req.params.name)
-      const result = await saveWorkspaceTextFile(workspace, req.body.path, req.body.content)
-      res.json(result)
-    } catch (error) {
-      sendWorkspaceError(res, error)
-    }
-  })
-
-  router.get('/sessions/:name/workspace/download', requireReadAccess, async (req, res) => {
-    try {
-      const workspace = await resolveAgentWorkspace(req.params.name)
-      if (typeof req.query.path !== 'string' || !req.query.path.trim()) {
-        throw new WorkspaceError(400, 'path query parameter is required')
-      }
-      const { absolutePath } = await resolveWorkspacePath(workspace, req.query.path, {
-        expectFile: true,
-      })
-      res.download(absolutePath)
-    } catch (error) {
-      sendWorkspaceError(res, error)
-    }
-  })
-
-  router.post('/sessions/:name/workspace/upload', requireWriteAccess, async (req, res) => {
-    try {
-      const workspace = await resolveAgentWorkspace(req.params.name)
-      const destination = await resolveWorkspaceUploadDestination(
-        workspace,
-        typeof req.query.path === 'string' ? req.query.path : '',
-      )
-      const upload = createWorkspaceUploadMiddleware(destination.absolutePath)
-      upload.array('files', 5)(req, res, (error) => {
-        if (error) {
-          sendWorkspaceError(res, error)
-          return
-        }
-
-        const uploaded = (req.files as Express.Multer.File[] | undefined)?.map((file) => file.filename) ?? []
-        res.json({
-          workspace,
-          path: destination.relativePath,
-          uploaded,
-        })
-      })
-    } catch (error) {
-      sendWorkspaceError(res, error)
-    }
-  })
-
-  router.post('/sessions/:name/workspace/new-file', requireWriteAccess, async (req, res) => {
-    try {
-      if (typeof req.body?.path !== 'string' || !req.body.path.trim()) {
-        throw new WorkspaceError(400, 'path is required')
-      }
-      const workspace = await resolveAgentWorkspace(req.params.name)
-      const result = await createWorkspaceFile(workspace, req.body.path)
-      res.status(201).json(result)
-    } catch (error) {
-      sendWorkspaceError(res, error)
-    }
-  })
-
-  router.post('/sessions/:name/workspace/new-folder', requireWriteAccess, async (req, res) => {
-    try {
-      if (typeof req.body?.path !== 'string' || !req.body.path.trim()) {
-        throw new WorkspaceError(400, 'path is required')
-      }
-      const workspace = await resolveAgentWorkspace(req.params.name)
-      const result = await createWorkspaceFolder(workspace, req.body.path)
-      res.status(201).json(result)
-    } catch (error) {
-      sendWorkspaceError(res, error)
-    }
-  })
-
-  router.post('/sessions/:name/workspace/rename', requireWriteAccess, async (req, res) => {
-    try {
-      if (typeof req.body?.fromPath !== 'string' || !req.body.fromPath.trim()) {
-        throw new WorkspaceError(400, 'fromPath is required')
-      }
-      if (typeof req.body?.toPath !== 'string' || !req.body.toPath.trim()) {
-        throw new WorkspaceError(400, 'toPath is required')
-      }
-      const workspace = await resolveAgentWorkspace(req.params.name)
-      const result = await renameWorkspaceEntry(workspace, req.body.fromPath, req.body.toPath)
-      res.json(result)
-    } catch (error) {
-      sendWorkspaceError(res, error)
-    }
-  })
-
-  router.delete('/sessions/:name/workspace/path', requireWriteAccess, async (req, res) => {
-    try {
-      if (typeof req.query.path !== 'string' || !req.query.path.trim()) {
-        throw new WorkspaceError(400, 'path query parameter is required')
-      }
-      const workspace = await resolveAgentWorkspace(req.params.name)
-      const result = await deleteWorkspaceEntry(workspace, req.query.path)
-      res.json(result)
-    } catch (error) {
-      sendWorkspaceError(res, error)
-    }
-  })
-
-  router.get('/sessions/:name/workspace/git/status', requireReadAccess, async (req, res) => {
-    try {
-      const workspace = await resolveAgentWorkspace(req.params.name)
-      const status = await readWorkspaceGitStatus(workspace)
-      res.json(status)
-    } catch (error) {
-      sendWorkspaceError(res, error)
-    }
-  })
-
-  router.get('/sessions/:name/workspace/git/log', requireReadAccess, async (req, res) => {
-    try {
-      const workspace = await resolveAgentWorkspace(req.params.name)
-      const limit = typeof req.query.limit === 'string' ? Number.parseInt(req.query.limit, 10) : 15
-      const log = await readWorkspaceGitLog(workspace, Number.isFinite(limit) ? limit : 15)
-      res.json(log)
-    } catch (error) {
-      sendWorkspaceError(res, error)
-    }
-  })
-
-  router.post('/sessions/:name/workspace/git/init', requireWriteAccess, async (req, res) => {
-    try {
-      const workspace = await resolveAgentWorkspace(req.params.name)
-      const output = await initWorkspaceGit(workspace)
-      res.status(201).json({ workspace, output })
-    } catch (error) {
-      sendWorkspaceError(res, error)
-    }
-  })
-
   router.get('/machines', requireReadAccess, async (_req, res) => {
     try {
       const machines = await readMachineRegistry()
@@ -2226,15 +2105,146 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     }
   })
 
+  router.post('/machines', requireWriteAccess, async (req, res) => {
+    let machine: MachineConfig
+    try {
+      machine = validateMachineConfig(req.body, { requireHost: true })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Invalid machine payload'
+      res.status(400).json({ error: message })
+      return
+    }
+
+    try {
+      const created = await withMachineRegistryWriteLock(async () => {
+        const current = await readMachineRegistry()
+        if (current.some((entry) => entry.id === machine.id)) {
+          throw new Error(`Machine "${machine.id}" already exists`)
+        }
+
+        const next = await writeMachineRegistry([...current, machine])
+        return next.find((entry) => entry.id === machine.id) ?? machine
+      })
+      res.status(201).json(created)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to update machines registry'
+      if (message.includes('already exists')) {
+        res.status(409).json({ error: message })
+        return
+      }
+      res.status(500).json({ error: message })
+    }
+  })
+
+  router.delete('/machines/:id', requireWriteAccess, async (req, res) => {
+    const machineId = parseSessionName(req.params.id)
+    if (!machineId) {
+      res.status(400).json({ error: 'Invalid machine ID' })
+      return
+    }
+
+    try {
+      await withMachineRegistryWriteLock(async () => {
+        const current = await readMachineRegistry()
+        const target = current.find((entry) => entry.id === machineId)
+        if (!target) {
+          throw new Error(`Machine "${machineId}" not found`)
+        }
+        if (target.host === null) {
+          throw new Error(`Machine "${machineId}" is the local machine and cannot be removed`)
+        }
+
+        await writeMachineRegistry(current.filter((entry) => entry.id !== machineId))
+      })
+      res.status(204).end()
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to update machines registry'
+      if (message.includes('cannot be removed')) {
+        res.status(400).json({ error: message })
+        return
+      }
+      if (message.includes('not found')) {
+        res.status(404).json({ error: message })
+        return
+      }
+      res.status(500).json({ error: message })
+    }
+  })
+
+  router.get('/machines/:id/health', requireReadAccess, async (req, res) => {
+    const machineId = parseSessionName(req.params.id)
+    if (!machineId) {
+      res.status(400).json({ error: 'Invalid machine ID' })
+      return
+    }
+
+    let machine: MachineConfig | undefined
+    try {
+      const machines = await readMachineRegistry()
+      machine = machines.find((entry) => entry.id === machineId)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to read machines registry'
+      res.status(500).json({ error: message })
+      return
+    }
+
+    if (!machine) {
+      res.status(404).json({ error: `Machine "${machineId}" not found` })
+      return
+    }
+
+    const probeScript = buildMachineProbeScript()
+
+    try {
+      const result = isRemoteMachine(machine)
+        ? await runCapturedCommand(
+          'ssh',
+          [
+            '-o',
+            'BatchMode=yes',
+            '-o',
+            'ConnectTimeout=10',
+            ...buildSshArgs(machine, buildLoginShellCommand(probeScript, machine.cwd), false),
+          ],
+          { timeoutMs: 12_000 },
+        )
+        : await runCapturedCommand(
+          '/bin/bash',
+          ['-lc', probeScript],
+          { cwd: machine.cwd, timeoutMs: 12_000 },
+        )
+
+      if (result.code !== 0) {
+        const detail = result.stderr.trim() || (result.timedOut ? 'Command timed out' : '')
+        res.status(502).json({
+          error: isRemoteMachine(machine)
+            ? `Machine "${machine.id}" health check failed over SSH`
+            : `Machine "${machine.id}" local health check failed`,
+          detail: detail || undefined,
+          exitCode: result.code,
+          signal: result.signal ?? undefined,
+        })
+        return
+      }
+
+      res.json(parseMachineHealthOutput(machine, result.stdout))
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Health check failed'
+      res.status(502).json({
+        error: isRemoteMachine(machine)
+          ? `Machine "${machine.id}" health check failed over SSH`
+          : `Machine "${machine.id}" local health check failed`,
+        detail: message,
+      })
+    }
+  })
+
   router.get('/world', requireReadAccess, async (_req, res) => {
     pruneStaleCommandRoomSessions()
 
     const nowMs = Date.now()
     const worldAgentsById = new Map<string, WorldAgent>()
     for (const session of sessions.values()) {
-      if (session.kind === 'stream' && isCompletedOneShotStreamSession(session)) {
-        continue
-      }
       const worldAgent = toWorldAgent(session, nowMs)
       worldAgentsById.set(worldAgent.id, worldAgent)
     }
@@ -2261,22 +2271,23 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
   })
 
   router.post('/sessions/dispatch-worker', requireDispatchWorkerAccess, async (req, res) => {
-    const parentSessionName = parseSessionName(req.body?.parentSession)
-    if (!parentSessionName) {
+    const rawParentSession = req.body?.parentSession
+    const hasParentSessionValue =
+      rawParentSession !== undefined && rawParentSession !== null && rawParentSession !== ''
+    const parentSessionName = hasParentSessionValue ? parseSessionName(rawParentSession) : undefined
+    if (hasParentSessionValue && !parentSessionName) {
       res.status(400).json({ error: 'Invalid parentSession' })
       return
     }
 
-    const parentSession = sessions.get(parentSessionName)
-    if (!parentSession || parentSession.kind !== 'stream') {
-      res.status(404).json({ error: `Stream parent session "${parentSessionName}" not found` })
-      return
-    }
-
-    const workerType = parseDispatchWorkerType(req.body?.workerType)
-    if (workerType === null) {
-      res.status(400).json({ error: 'Invalid workerType. Expected "factory" or "agent"' })
-      return
+    let parentSession: StreamSession | undefined
+    if (parentSessionName) {
+      const candidate = sessions.get(parentSessionName)
+      if (!candidate || candidate.kind !== 'stream') {
+        res.status(404).json({ error: `Stream parent session "${parentSessionName}" not found` })
+        return
+      }
+      parentSession = candidate
     }
 
     const requestedMachine = parseOptionalHost(req.body?.machine)
@@ -2285,12 +2296,30 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       return
     }
 
-    if (countTrackedSessions() >= maxSessions) {
+    if (sessions.size >= maxSessions) {
       res.status(429).json({ error: `Session limit reached (${maxSessions})` })
       return
     }
 
-    const targetMachineId = requestedMachine ?? parentSession.host
+    const workerType = parseWorkerDispatchType(req.body?.workerType)
+    if (workerType === null) {
+      res.status(400).json({ error: 'workerType must be either "factory" or "agent"' })
+      return
+    }
+    if (workerType === 'agent' && !parentSessionName) {
+      res.status(400).json({ error: 'Provide parentSession for agent workers' })
+      return
+    }
+
+    const hasRequestedAgentType =
+      typeof req.body?.agentType === 'string' && req.body.agentType.trim().length > 0
+    const parsedAgentType = parseAgentType(req.body?.agentType)
+    const workerAgentType: 'claude' | 'codex' = hasRequestedAgentType
+      ? (parsedAgentType === 'codex' ? 'codex' : 'claude')
+      : (parentSession?.agentType === 'codex' ? 'codex' : 'claude')
+    const workerMode: ClaudePermissionMode = parentSession?.mode ?? 'default'
+
+    const targetMachineId = requestedMachine ?? parentSession?.host
     let targetMachine: MachineConfig | undefined
     if (targetMachineId !== undefined) {
       try {
@@ -2328,16 +2357,6 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       res.status(400).json({ error: 'Invalid cwd: must be an absolute path' })
       return
     }
-    const sourceCwd = requestedCwd
-      ?? (targetMachine ? targetMachine.cwd : undefined)
-      ?? parentSession.cwd
-    const branch = workerType === 'factory'
-      ? (parsedBranch ?? (parsedIssueUrl ? `feat-${parsedIssueUrl.issueNumber}` : undefined))
-      : undefined
-    if (workerType === 'factory' && !branch) {
-      res.status(400).json({ error: 'Provide branch or issueUrl' })
-      return
-    }
 
     let resolvedTask = rawTask
     if (prefab === 'legion-implement' && parsedIssueUrl) {
@@ -2346,167 +2365,118 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     }
 
     const timestamp = Date.now()
-    const sessionNameBase = workerType === 'agent'
-      ? `${AGENT_SESSION_PREFIX}${timestamp}`
-      : `${FACTORY_SESSION_PREFIX}${branch}-${timestamp}`
-    let workerSessionName = sessionNameBase
+    let workerSessionName = `${workerType}-${timestamp}`
     let suffix = 1
+    while (sessions.has(workerSessionName)) {
+      workerSessionName = `${workerType}-${timestamp}-${suffix}`
+      suffix += 1
+    }
+
+    if (workerType === 'agent') {
+      const workerCwd = requestedCwd ?? parentSession?.cwd
+      const workerParentOptions = parentSessionName ? { parentSession: parentSessionName } : {}
+      try {
+        const workerSession = workerAgentType === 'codex'
+          ? await createCodexAppServerSession(
+            workerSessionName,
+            workerMode,
+            resolvedTask,
+            workerCwd,
+            workerParentOptions,
+          )
+          : createStreamSession(
+            workerSessionName,
+            workerMode,
+            resolvedTask,
+            workerCwd,
+            targetMachine,
+            workerAgentType,
+            workerParentOptions,
+          )
+
+        sessions.set(workerSessionName, workerSession)
+        if (parentSession && !parentSession.spawnedWorkers.includes(workerSessionName)) {
+          parentSession.spawnedWorkers.push(workerSessionName)
+        }
+        schedulePersistedSessionsWrite()
+
+        res.status(202).json({
+          name: workerSessionName,
+          workerType,
+          cwd: workerSession.cwd,
+        })
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Failed to dispatch worker'
+        res.status(500).json({ error: message })
+      }
+      return
+    }
+
+    const branch = parsedBranch ?? (parsedIssueUrl ? `feat-${parsedIssueUrl.issueNumber}` : undefined)
+    if (!branch) {
+      res.status(400).json({ error: 'Provide branch or issueUrl' })
+      return
+    }
+
+    const repoFromIssue = parsedIssueUrl
+      ? { owner: parsedIssueUrl.owner, repo: parsedIssueUrl.repo }
+      : null
+    const sourceCwd = requestedCwd ?? parentSession?.cwd ?? process.cwd()
+    const repo = repoFromIssue ?? await resolveGitHubRepoFromCwd(sourceCwd)
+    if (!repo) {
+      res.status(400).json({
+        error: 'Unable to resolve GitHub owner/repo. Provide issueUrl or use a git repo cwd.',
+      })
+      return
+    }
+
+    const sessionNameBase = `${workerType}-${branch}-${timestamp}`
+    workerSessionName = sessionNameBase
+    suffix = 1
     while (sessions.has(workerSessionName)) {
       workerSessionName = `${sessionNameBase}-${suffix}`
       suffix += 1
     }
 
     try {
-      const requestedAgentType = req.body?.agentType
-      const workerAgentType: 'claude' | 'codex' = requestedAgentType === 'codex'
-        ? 'codex'
-        : requestedAgentType === 'claude'
-          ? 'claude'
-          : parentSession.agentType === 'codex'
-            ? 'codex'
-            : 'claude'
+      const worktree = await bootstrapFactoryWorktree({
+        owner: repo.owner,
+        repo: repo.repo,
+        feature: branch,
+        machine: targetMachine,
+      })
 
-      let workerSession: StreamSession
-      const responsePayload: {
-        name: string
-        branch?: string
-        worktree?: string
-        cwd?: string
-        workerType: 'factory' | 'agent'
-      } = {
-        name: workerSessionName,
-        workerType,
-      }
-
-      if (workerType === 'agent') {
-        workerSession = workerAgentType === 'codex'
-          ? await createCodexAppServerSession(
-            workerSessionName,
-            parentSession.mode,
-            resolvedTask,
-            sourceCwd,
-            { parentSession: parentSessionName },
-          )
-          : createStreamSession(
-            workerSessionName,
-            parentSession.mode,
-            resolvedTask,
-            sourceCwd,
-            targetMachine,
-            workerAgentType,
-            { parentSession: parentSessionName },
-          )
-        responsePayload.cwd = sourceCwd
-      } else {
-        const factoryBranch = branch
-        if (!factoryBranch) {
-          res.status(400).json({ error: 'Provide branch or issueUrl' })
-          return
-        }
-
-        const repoFromIssue = parsedIssueUrl
-          ? { owner: parsedIssueUrl.owner, repo: parsedIssueUrl.repo }
-          : null
-        const repo = repoFromIssue ?? await resolveGitHubRepoFromCwd(sourceCwd)
-        if (!repo) {
-          res.status(400).json({
-            error: 'Unable to resolve GitHub owner/repo. Provide issueUrl or use a git repo cwd.',
-          })
-          return
-        }
-
-        const worktree = await bootstrapFactoryWorktree({
-          owner: repo.owner,
-          repo: repo.repo,
-          feature: factoryBranch,
-          machine: targetMachine,
-        })
-
-        // Write a Claude Code Stop hook into the worktree so that when the
-        // agent finishes, it POSTs to the hammurabi API to mark the session
-        // as completed.  This is the primary completion signal.
-        try {
-          const hookApiBase = process.env.HAMBROS_API_URL?.trim() || `http://127.0.0.1:${process.env.PORT || '4200'}`
-          const hookApiKey = process.env.HAMBROS_INTERNAL_TOKEN?.trim() || ''
-          const hookUrl = `${hookApiBase}/api/agents/sessions/${encodeURIComponent(workerSessionName)}/complete`
-          const curlCmd = [
-            'curl -s -X POST',
-            `-H "Content-Type: application/json"`,
-            hookApiKey ? `-H "x-hammurabi-api-key: ${hookApiKey}"` : '',
-            `-d '{"status":"success","comment":"Stop hook fired"}'`,
-            `"${hookUrl}"`,
-          ].filter(Boolean).join(' ')
-          const hookSettings = {
-            hooks: {
-              Stop: [
-                {
-                  matcher: '',
-                  hooks: [
-                    {
-                      type: 'command',
-                      command: `bash -c '${curlCmd.replace(/'/g, `'\\''`)}'`,
-                    },
-                  ],
-                },
-              ],
-            },
-          }
-          const claudeDir = path.join(worktree.path, '.claude')
-          await mkdir(claudeDir, { recursive: true })
-          await writeFile(
-            path.join(claudeDir, 'settings.local.json'),
-            JSON.stringify(hookSettings, null, 2),
-            'utf8',
-          )
-        } catch {
-          // Non-fatal — PID liveness and exit handler are fallbacks.
-        }
-
-        workerSession = workerAgentType === 'codex'
-          ? await createCodexAppServerSession(
-            workerSessionName,
-            parentSession.mode,
-            resolvedTask,
-            worktree.path,
-            { parentSession: parentSessionName },
-          )
-          : createStreamSession(
-            workerSessionName,
-            parentSession.mode,
-            resolvedTask,
-            worktree.path,
-            targetMachine,
-            workerAgentType,
-            { parentSession: parentSessionName },
-          )
-        responsePayload.branch = worktree.branch
-        responsePayload.worktree = worktree.path
-      }
+      const workerParentOptions = parentSessionName ? { parentSession: parentSessionName } : {}
+      const workerSession = workerAgentType === 'codex'
+        ? await createCodexAppServerSession(
+          workerSessionName,
+          workerMode,
+          resolvedTask,
+          worktree.path,
+          workerParentOptions,
+        )
+        : createStreamSession(
+          workerSessionName,
+          workerMode,
+          resolvedTask,
+          worktree.path,
+          targetMachine,
+          workerAgentType,
+          workerParentOptions,
+        )
 
       sessions.set(workerSessionName, workerSession)
-      if (!parentSession.spawnedWorkers.includes(workerSessionName)) {
+      if (parentSession && !parentSession.spawnedWorkers.includes(workerSessionName)) {
         parentSession.spawnedWorkers.push(workerSessionName)
       }
       schedulePersistedSessionsWrite()
 
-      // Transition matching quests from pending → active when a worker is dispatched.
-      if (questStore && parsedIssueUrl && parentSessionName.startsWith(COMMANDER_SESSION_NAME_PREFIX)) {
-        const commanderId = parentSessionName.slice(COMMANDER_SESSION_NAME_PREFIX.length)
-        const issueUrl = `https://github.com/${parsedIssueUrl.owner}/${parsedIssueUrl.repo}/issues/${parsedIssueUrl.issueNumber}`
-        questStore.list(commanderId).then((quests) => {
-          for (const quest of quests) {
-            if (quest.status === 'pending' && quest.githubIssueUrl === issueUrl) {
-              questStore.update(commanderId, quest.id, { status: 'active' }).catch(() => {
-                // Non-fatal — quest status is a UX improvement, not a hard requirement.
-              })
-            }
-          }
-        }).catch(() => {
-          // Non-fatal — quest store may not be available.
-        })
-      }
-
-      res.status(202).json(responsePayload)
+      res.status(202).json({
+        name: workerSessionName,
+        workerType,
+        worktree: worktree.path,
+        branch: worktree.branch,
+      })
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to dispatch worker'
       if (message.includes('already exists')) {
@@ -2533,102 +2503,64 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     res.json(getWorkerStates(sessionName))
   })
 
-  // ── Factory worker completion hook endpoint ─────────────────────
-  // Called by Claude Code Stop hook (or externally) to mark a factory
-  // worker session as completed.
-  router.post('/sessions/:name/complete', requireWriteAccess, (req, res) => {
-    const name = parseSessionName(req.params.name)
-    if (!name) {
-      res.status(400).json({ error: 'Invalid session name' })
-      return
+  router.get('/sessions/:name/workspace/tree', requireReadAccess, async (req, res) => {
+    try {
+      const workspace = await resolveAgentSessionWorkspace(req.params.name)
+      const tree = await listWorkspaceTree(
+        workspace,
+        typeof req.query.path === 'string' ? req.query.path : '',
+      )
+      res.json(tree)
+    } catch (error) {
+      sendWorkspaceError(res, error)
     }
-
-    // Already completed — idempotent success.
-    if (completedSessions.has(name)) {
-      res.json({ name, completed: true, status: completedSessions.get(name)!.subtype })
-      return
-    }
-
-    const rawStatus = typeof req.body?.status === 'string' ? req.body.status.trim() : 'success'
-    const rawComment = typeof req.body?.comment === 'string' ? req.body.comment.trim() : ''
-    const rawCostUsd = typeof req.body?.costUsd === 'number' ? req.body.costUsd : 0
-
-    const active = sessions.get(name)
-    if (active && active.kind === 'stream') {
-      const completed: CompletedSession = {
-        name,
-        completedAt: new Date().toISOString(),
-        subtype: rawStatus || 'success',
-        finalComment: rawComment,
-        costUsd: rawCostUsd || active.usage.costUsd,
-      }
-      completedSessions.set(name, completed)
-      scheduleCompletedSessionsWrite()
-      exitedStreamSessions.set(name, { phase: 'exited', hadResult: true, exitedAt: Date.now() })
-
-      // Kill the process if still alive so exit handler fires cleanup.
-      const pid = active.process.pid ?? 0
-      if (pid > 0 && isPidAlive(pid)) {
-        active.process.kill('SIGTERM')
-      }
-
-      res.json({ name, completed: true, status: completed.subtype })
-      return
-    }
-
-    // Session not in active map — create completion entry from request body.
-    const completed: CompletedSession = {
-      name,
-      completedAt: new Date().toISOString(),
-      subtype: rawStatus || 'success',
-      finalComment: rawComment,
-      costUsd: rawCostUsd,
-    }
-    completedSessions.set(name, completed)
-    scheduleCompletedSessionsWrite()
-    exitedStreamSessions.set(name, { phase: 'exited', hadResult: true, exitedAt: Date.now() })
-    res.json({ name, completed: true, status: completed.subtype })
   })
 
-  router.delete('/sessions/:name/workers/done', requireWriteAccess, (req, res) => {
-    const sessionName = parseSessionName(req.params.name)
-    if (!sessionName) {
-      res.status(400).json({ error: 'Invalid session name' })
-      return
+  router.get('/sessions/:name/workspace/expand', requireReadAccess, async (req, res) => {
+    try {
+      const workspace = await resolveAgentSessionWorkspace(req.params.name)
+      const tree = await listWorkspaceTree(
+        workspace,
+        typeof req.query.path === 'string' ? req.query.path : '',
+      )
+      res.json(tree)
+    } catch (error) {
+      sendWorkspaceError(res, error)
     }
+  })
 
-    const parentSession = sessions.get(sessionName)
-    if (!parentSession || parentSession.kind !== 'stream') {
-      res.status(404).json({ error: `Stream session "${sessionName}" not found` })
-      return
-    }
-
-    // Identify done workers and remove them
-    const doneWorkers: string[] = []
-    for (const workerName of parentSession.spawnedWorkers) {
-      const state = resolveWorkerState(workerName)
-      if (state.status === 'done' || state.status === 'down') {
-        doneWorkers.push(workerName)
+  router.get('/sessions/:name/workspace/file', requireReadAccess, async (req, res) => {
+    try {
+      if (typeof req.query.path !== 'string' || !req.query.path.trim()) {
+        throw new WorkspaceError(400, 'path query parameter is required')
       }
+      const workspace = await resolveAgentSessionWorkspace(req.params.name)
+      const preview = await readWorkspaceFilePreview(workspace, req.query.path)
+      res.json(preview)
+    } catch (error) {
+      sendWorkspaceError(res, error)
     }
+  })
 
-    parentSession.spawnedWorkers = parentSession.spawnedWorkers.filter(
-      (name) => !doneWorkers.includes(name),
-    )
-    for (const workerName of doneWorkers) {
-      sessions.delete(workerName)
-      completedSessions.delete(workerName)
-      exitedStreamSessions.delete(workerName)
+  router.get('/sessions/:name/workspace/git/status', requireReadAccess, async (req, res) => {
+    try {
+      const workspace = await resolveAgentSessionWorkspace(req.params.name)
+      const status = await readWorkspaceGitStatus(workspace)
+      res.json(status)
+    } catch (error) {
+      sendWorkspaceError(res, error)
     }
+  })
 
-    if (doneWorkers.length > 0) {
-      schedulePersistedSessionsWrite()
+  router.get('/sessions/:name/workspace/git/log', requireReadAccess, async (req, res) => {
+    try {
+      const workspace = await resolveAgentSessionWorkspace(req.params.name)
+      const limit = typeof req.query.limit === 'string' ? Number.parseInt(req.query.limit, 10) : 15
+      const log = await readWorkspaceGitLog(workspace, Number.isFinite(limit) ? limit : 15)
+      res.json(log)
+    } catch (error) {
+      sendWorkspaceError(res, error)
     }
-
-    res.json({
-      cleared: doneWorkers.length,
-      workers: getWorkerStates(sessionName),
-    })
   })
 
   router.get('/sessions/:name', requireReadAccess, (req, res) => {
@@ -2644,12 +2576,14 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     if (active) {
       if (
         active.kind === 'stream' &&
-        isCompletedOneShotStreamSession(active)
+        (isCommandRoomSessionName(name) || active.parentSession) &&
+        active.lastTurnCompleted &&
+        active.finalResultEvent
       ) {
-        const completed = completedSessions.get(name) ?? toCompletedSession(
+        const completed = toCompletedSession(
           name,
           active.completedTurnAt ?? new Date().toISOString(),
-          active.finalResultEvent!,
+          active.finalResultEvent,
           active.usage.costUsd,
         )
         completedSessions.set(name, completed)
@@ -2667,35 +2601,6 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
         return
       }
 
-      // PID liveness fallback: if a worker's PID is dead but the process
-      // exit handler hasn't fired yet, synthesize completion now.
-      if (active.kind === 'stream' && isWorkerSessionName(name)) {
-        const workerPid = active.process.pid ?? 0
-        if (workerPid > 0 && !isPidAlive(workerPid)) {
-          const exitEvent: StreamJsonEvent = { type: 'exit', exitCode: -1, text: 'Process not found (PID liveness check)' }
-          const completed = active.finalResultEvent
-            ? toCompletedSession(name, active.completedTurnAt ?? new Date().toISOString(), active.finalResultEvent, active.usage.costUsd)
-            : toExitBasedCompletedSession(name, exitEvent, active.usage.costUsd)
-          completedSessions.set(name, completed)
-          scheduleCompletedSessionsWrite()
-          exitedStreamSessions.set(name, { phase: 'exited', hadResult: Boolean(active.finalResultEvent), exitedAt: Date.now() })
-          sessions.delete(name)
-          schedulePersistedSessionsWrite()
-          res.json({
-            name,
-            completed: true,
-            status: completed.subtype,
-            result: {
-              status: completed.subtype,
-              finalComment: completed.finalComment,
-              costUsd: completed.costUsd,
-              completedAt: completed.completedAt,
-            },
-          })
-          return
-        }
-      }
-
       const pid = active.kind === 'pty'
         ? active.pty.pid
         : (active.kind === 'stream' ? (active.process.pid ?? 0) : 0)
@@ -2703,15 +2608,16 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       res.json({
         name,
         completed: false,
-        status: 'running',
+        status: active.kind === 'external' ? active.status : 'running',
         pid,
-        sessionType: active.kind === 'pty' ? 'pty' : 'stream',
+        sessionType: active.kind === 'external' ? 'external' : (active.kind === 'pty' ? 'pty' : 'stream'),
         agentType: active.agentType,
         cwd: active.cwd,
-        host: active.host,
+        host: active.host ?? (active.kind === 'external' ? active.machine : undefined),
         parentSession: active.kind === 'stream' ? active.parentSession : undefined,
         spawnedWorkers: active.kind === 'stream' ? [...active.spawnedWorkers] : undefined,
         workerSummary: active.kind === 'stream' ? summarizeWorkerStates(workerStates) : undefined,
+        ...(active.kind === 'external' ? { machine: active.machine, metadata: active.metadata } : {}),
       })
       return
     }
@@ -2735,175 +2641,18 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     res.status(404).json({ error: 'Session not found' })
   })
 
-  // -----------------------------------------------------------------------
-  // GET /sessions/:name/messages — peek at normalized messages
-  // -----------------------------------------------------------------------
-
-  router.get('/sessions/:name/messages', requireReadAccess, async (req, res) => {
-    const name = parseSessionName(req.params.name)
-    if (!name) {
-      res.status(400).json({ error: 'Invalid session name' })
-      return
-    }
-
-    // Parse query params
-    const rawLast = req.query.last
-    let last: number | undefined
-    if (rawLast !== undefined) {
-      const parsed = Number(rawLast)
-      if (!Number.isFinite(parsed) || parsed < 1 || !Number.isInteger(parsed)) {
-        res.status(400).json({ error: 'Invalid last parameter: expected positive integer' })
-        return
-      }
-      last = parsed
-    }
-
-    const rawRole = req.query.role
-    let roleFilter: MessageRoleFilter = 'all'
-    if (rawRole !== undefined) {
-      if (rawRole !== 'user' && rawRole !== 'assistant' && rawRole !== 'all') {
-        res.status(400).json({ error: 'Invalid role parameter: expected user, assistant, or all' })
-        return
-      }
-      roleFilter = rawRole as MessageRoleFilter
-    }
-
-    // 1) Check active in-memory sessions (stream + openclaw have events[])
-    const active = sessions.get(name)
-    if (active) {
-      const events = (active.kind === 'stream' || active.kind === 'openclaw')
-        ? active.events
-        : []
-
-      const messages = extractMessages(events, roleFilter, last)
-      const response: SessionMessagesResponse = {
-        session: name,
-        messages,
-        source: 'live',
-        totalEvents: events.length,
-      }
-      res.json(response)
-      return
-    }
-
-    // 2) Check commander sessions — resolve transcript JSONL
-    if (name.startsWith(COMMANDER_SESSION_NAME_PREFIX)) {
-      const commanderId = name.slice(COMMANDER_SESSION_NAME_PREFIX.length).trim()
-      const dataDir = commanderDataDir
-
-      try {
-        const commanderStore = options.commanderSessionStorePath !== undefined
-          ? new CommanderSessionStore(options.commanderSessionStorePath)
-          : new CommanderSessionStore()
-        const commanderSession = await commanderStore.get(commanderId)
-
-        if (commanderSession) {
-          // Resolve the primary transcript ID — prefer claudeSessionId, then
-          // codexThreadId (P2-1), then fall back to the bare commander ID.
-          const primaryId = sanitizeTranscriptFileKey(
-            commanderSession.claudeSessionId ?? commanderSession.codexThreadId ?? commanderId,
-          )
-
-          // Pre-init events may be written under the session name before the
-          // init event sets claudeSessionId/codexThreadId (P2-3).  Build a
-          // de-duplicated list of transcript IDs to read & merge.
-          const preInitId = sanitizeTranscriptFileKey(name)
-          const transcriptIds = primaryId
-            ? (preInitId && preInitId !== primaryId ? [preInitId, primaryId] : [primaryId])
-            : (preInitId ? [preInitId] : [])
-
-          let allEvents: StreamJsonEvent[] = []
-          for (const tid of transcriptIds) {
-            const events = await readCommanderTranscript(commanderId, tid, dataDir)
-            if (events) {
-              allEvents = allEvents.concat(events)
-            }
-          }
-
-          if (allEvents.length > 0) {
-            const messages = extractMessages(allEvents, roleFilter, last)
-            const response: SessionMessagesResponse = {
-              session: name,
-              messages,
-              source: 'transcript',
-              totalEvents: allEvents.length,
-            }
-            res.json(response)
-            return
-          }
-        }
-      } catch {
-        // Fall through to 404 if commander store is unavailable
-      }
-    }
-
-    // 3) Check completed sessions — serve snapshotted events when available (P2-5)
-    const completed = completedSessions.get(name)
-    if (completed) {
-      const snapshotEvents = completedSessionEvents.get(name) ?? []
-      const messages = extractMessages(snapshotEvents, roleFilter, last)
-      const response: SessionMessagesResponse = {
-        session: name,
-        messages,
-        source: 'live',
-        totalEvents: snapshotEvents.length,
-      }
-      res.json(response)
-      return
-    }
-
-    res.status(404).json({ error: 'Session not found' })
-  })
-
-  /** Prune stream sessions whose PID is no longer alive. */
-  function pruneDeadStreamSessions(): void {
-    let removedCount = 0
-    let completedChanged = false
-    for (const [sessionName, session] of sessions) {
-      if (session.kind !== 'stream') continue
-      const pid = session.process.pid ?? 0
-      if (pid <= 0 || isPidAlive(pid)) continue
-
-      const alreadyMarkedExited = exitedStreamSessions.has(sessionName)
-      if (!alreadyMarkedExited) {
-        exitedStreamSessions.set(sessionName, { phase: 'exited', hadResult: Boolean(session.finalResultEvent), exitedAt: Date.now() })
-      }
-      if (isOneShotStreamSessionName(sessionName)) {
-        const exitEvent: StreamJsonEvent = { type: 'exit', exitCode: -1, text: 'Process not found (PID liveness check)' }
-        const completed = session.finalResultEvent
-          ? toCompletedSession(sessionName, session.completedTurnAt ?? new Date().toISOString(), session.finalResultEvent, session.usage.costUsd)
-          : toExitBasedCompletedSession(sessionName, exitEvent, session.usage.costUsd)
-        completedSessions.set(sessionName, completed)
-        if (session.events.length > 0) {
-          completedSessionEvents.set(sessionName, session.events.slice())
-        }
-        completedChanged = true
-        sessions.delete(sessionName)
-        removedCount += 1
-        continue
-      }
-
-      // Keep non-one-shot sessions in the map so resumable session state is not discarded.
-      // We only mark them exited for worker-state resolution and UI processAlive rendering.
-    }
-
-    if (completedChanged) scheduleCompletedSessionsWrite()
-    if (removedCount > 0) schedulePersistedSessionsWrite()
-  }
-
   router.get('/sessions', requireReadAccess, async (_req, res) => {
     pruneStaleCommandRoomSessions()
-    pruneDeadStreamSessions()
 
     const result: AgentSession[] = []
-    const commanderLabels = await getCommanderLabels(
-      commanderDataDir,
-      options.commanderSessionStorePath,
-    )
+    const nowMs = Date.now()
+    const commanderLabels = await getCommanderLabels(options.commanderSessionStorePath)
     for (const [name, session] of sessions) {
       if (
         session.kind === 'stream' &&
-        isCompletedOneShotStreamSession(session)
+        isCommandRoomSessionName(name) &&
+        session.lastTurnCompleted &&
+        session.finalResultEvent
       ) {
         continue
       }
@@ -2912,12 +2661,6 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
         ? session.pty.pid
         : (session.kind === 'stream' ? (session.process.pid ?? 0) : 0)
       const workerStates = session.kind === 'stream' ? getWorkerStates(name) : []
-      const workerSummary = session.kind === 'stream' ? summarizeWorkerStates(workerStates) : undefined
-      const processAlive = isPidAlive(pid)
-
-      if (session.kind === 'stream' && workerSummary && isWorkerOrchestrationComplete(workerSummary) && !processAlive) {
-        continue
-      }
 
       let label: string | undefined
       if (name.startsWith(COMMANDER_SESSION_NAME_PREFIX)) {
@@ -2925,270 +2668,124 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
         label = commanderLabels[commanderId]
       }
 
+      const status = getWorldAgentStatus(session, nowMs)
+
       result.push({
         name,
         label,
         created: session.createdAt,
         pid,
-        processAlive,
-        sessionType: session.kind === 'pty' ? 'pty' : 'stream',
+        sessionType: session.kind === 'external' ? 'external' : (session.kind === 'pty' ? 'pty' : 'stream'),
         agentType: session.agentType,
         cwd: session.cwd,
-        host: session.host,
+        host: session.host ?? (session.kind === 'external' ? session.machine : undefined),
         parentSession: session.kind === 'stream' ? session.parentSession : undefined,
         spawnedWorkers: session.kind === 'stream' ? [...session.spawnedWorkers] : undefined,
-        workerSummary,
+        workerSummary: session.kind === 'stream' ? summarizeWorkerStates(workerStates) : undefined,
+        processAlive: true,
+        hadResult: session.kind === 'stream' ? Boolean(session.finalResultEvent) : undefined,
+        resumedFrom: session.kind === 'stream' ? session.resumedFrom : undefined,
+        status,
+        resumeAvailable: session.kind === 'stream' ? canResumeLiveStreamSession(session) : false,
+      })
+    }
+
+    for (const [name, exited] of exitedStreamSessions) {
+      if (sessions.has(name)) {
+        continue
+      }
+      if (isCommandRoomSessionName(name)) {
+        continue
+      }
+
+      const persistedEntry = buildPersistedEntryFromExitedSession(name, exited)
+      const resumeAvailable = await isExitedSessionResumeAvailable(persistedEntry)
+      result.push({
+        name,
+        created: exited.createdAt,
+        pid: 0,
+        sessionType: 'stream',
+        agentType: exited.agentType,
+        cwd: exited.cwd,
+        host: exited.host,
+        parentSession: exited.parentSession,
+        spawnedWorkers: [...exited.spawnedWorkers],
+        processAlive: false,
+        hadResult: exited.hadResult,
+        resumedFrom: exited.resumedFrom,
+        status: 'exited',
+        resumeAvailable,
       })
     }
     res.json(result)
   })
 
   // ── Stream session helpers ──────────────────────────────────────
-  function supportsAutoRotation(sessionName: string, session: StreamSession): boolean {
-    if (isOneShotStreamSessionName(sessionName)) {
-      return false
+  function readFiniteNumber(value: unknown): number | undefined {
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      return undefined
     }
-    return session.agentType === 'claude' || session.agentType === 'codex'
+    return value
   }
 
-  function createAutoRotationEvent(
-    session: StreamSession,
-    fromBackingId: string | undefined,
-    toBackingId: string | undefined,
-  ): StreamJsonEvent {
-    const backingLabel = session.agentType === 'codex' ? 'thread' : 'session'
-    const from = fromBackingId ?? null
-    const to = toBackingId ?? null
-    return {
-      type: 'system',
-      subtype: 'session_rotated',
-      reason: 'auto-entry-threshold',
-      entryCount: session.conversationEntryCount,
-      threshold: autoRotateEntryThreshold,
-      fromBackingId: from,
-      toBackingId: to,
-      text: `Session auto-rotated after ${session.conversationEntryCount} entries (${backingLabel}: ${from ?? 'unknown'} -> ${to ?? 'pending'}).`,
-    }
-  }
-
-  async function buildSeededSystemPrompt(
-    sessionName: string,
-    session: Pick<StreamSession, 'cwd' | 'systemPrompt'>,
-  ): Promise<string | undefined> {
-    if (!sessionName.startsWith(COMMANDER_SESSION_NAME_PREFIX)) {
-      return session.systemPrompt
-    }
-
-    const commanderId = sessionName.slice(COMMANDER_SESSION_NAME_PREFIX.length).trim()
-    if (!commanderId) {
-      return session.systemPrompt
-    }
-
-    try {
-      const commanderStore = options.commanderSessionStorePath !== undefined
-        ? new CommanderSessionStore(options.commanderSessionStorePath)
-        : new CommanderSessionStore()
-      const commanderSession = await commanderStore.get(commanderId)
-      const built = await buildCommanderSessionSeed({
-        commanderId,
-        cwd: commanderSession?.cwd ?? session.cwd,
-        currentTask: commanderSession?.currentTask ?? null,
-        taskSource: commanderSession?.taskSource ?? null,
-        memoryBasePath: commanderDataDir,
-      })
-      return built.systemPrompt
-    } catch {
-      return session.systemPrompt
-    }
-  }
-
-  async function sendTextToStreamSession(session: StreamSession, text: string): Promise<boolean> {
-    if (session.agentType === 'codex') {
-      if (!session.codexThreadId) {
-        return false
-      }
-      const completed = await waitForTurnCompletionWithTimeout(
-        session,
-        CODEX_TURN_COMPLETION_TIMEOUT_MS,
-      )
-      if (!completed) {
-        return false
-      }
-      return startCodexTurn(session, text)
-    }
-
-    const userMsg = JSON.stringify({ type: 'user', message: { role: 'user', content: text } })
-    const sent = writeToStdin(session, userMsg + '\n')
-    if (sent) {
-      const userEvent: StreamJsonEvent = {
-        type: 'user',
-        message: { role: 'user', content: text },
-      } as unknown as StreamJsonEvent
-      appendStreamEvent(session, userEvent)
-      broadcastStreamEvent(session, userEvent)
-    }
-    return sent
-  }
-
-  async function createReplacementStreamSession(
-    sessionName: string,
-    session: StreamSession,
-    options: { preserveMaxTurns?: boolean; resumeSessionId?: string } = {},
-  ): Promise<StreamSession> {
-    const systemPrompt = await buildSeededSystemPrompt(sessionName, session)
-    const commonOptions = {
-      createdAt: session.createdAt,
-      parentSession: session.parentSession,
-      spawnedWorkers: session.spawnedWorkers,
-      systemPrompt,
-      maxTurns: options.preserveMaxTurns ? session.maxTurns : undefined,
-    }
-
-    if (session.agentType === 'codex') {
-      return createCodexAppServerSession(
-        sessionName,
-        session.mode,
-        systemPrompt ?? '',
-        session.cwd,
-        commonOptions,
-      )
-    }
-
-    let machine: MachineConfig | undefined
-    if (session.host) {
-      const machines = await readMachineRegistry()
-      machine = machines.find((entry) => entry.id === session.host)
-      if (!machine) {
-        throw new Error(`Host machine "${session.host}" is unavailable for session replacement`)
+  function readUsageNumber(usage: Record<string, unknown>, keys: string[]): number | undefined {
+    for (const key of keys) {
+      const value = readFiniteNumber(usage[key])
+      if (value !== undefined) {
+        return value
       }
     }
-
-    return createStreamSession(
-      sessionName,
-      session.mode,
-      '',
-      session.cwd,
-      machine,
-      'claude',
-      {
-        ...commonOptions,
-        resumeSessionId: options.resumeSessionId,
-      },
-    )
+    return undefined
   }
 
-  async function createRotatedStreamSession(sessionName: string, session: StreamSession): Promise<StreamSession> {
-    return createReplacementStreamSession(sessionName, session)
-  }
-
-  async function rotateStreamSessionIfNeeded(
-    sessionName: string,
-    options: { allowPendingCount?: number } = {},
-  ): Promise<StreamSession | null> {
-    const allowPendingCount = options.allowPendingCount ?? 0
-    const current = sessions.get(sessionName)
-    if (!current || current.kind !== 'stream') {
-      return null
-    }
-    if (!current.autoRotatePending) {
-      return current
-    }
-    if (!supportsAutoRotation(sessionName, current)) {
-      current.autoRotatePending = false
-      return current
-    }
-    if (current.pendingMessageCount > allowPendingCount) {
-      return current
-    }
-
-    await waitForTurnCompletion(current)
-
-    const live = sessions.get(sessionName)
-    if (!live || live.kind !== 'stream') {
-      return null
-    }
-    if (!live.autoRotatePending) {
-      return live
-    }
-    if (!supportsAutoRotation(sessionName, live)) {
-      live.autoRotatePending = false
-      return live
-    }
-    if (live.pendingMessageCount > allowPendingCount || !live.lastTurnCompleted) {
-      return live
-    }
-
-    try {
-      const rotated = await createRotatedStreamSession(sessionName, live)
-      const fromBackingId = live.agentType === 'codex' ? live.codexThreadId : live.claudeSessionId
-      const toBackingId = rotated.agentType === 'codex' ? rotated.codexThreadId : rotated.claudeSessionId
-      const rotationEvent = createAutoRotationEvent(live, fromBackingId, toBackingId)
-
-      appendStreamEvent(live, rotationEvent)
-      broadcastStreamEvent(live, rotationEvent)
-
-      rotated.events = live.events.slice()
-      rotated.usage = { ...live.usage }
-      rotated.lastEventAt = live.lastEventAt
-      rotated.pendingMessageCount = live.pendingMessageCount
-      rotated.conversationEntryCount = 0
-      rotated.autoRotatePending = false
-
-      for (const client of live.clients) {
-        rotated.clients.add(client)
+  function applyStreamUsageEvent(session: StreamSession, event: StreamJsonEvent): void {
+    const evtType = event.type as string
+    if (evtType === 'message_delta' && event.usage) {
+      const usage = asObject(event.usage)
+      if (!usage) {
+        return
       }
-      live.clients.clear()
-
-      sessions.set(sessionName, rotated)
-      cleanupStreamMessageQueue(live)
-      live.process.kill('SIGTERM')
-      if (sessionName.startsWith(COMMANDER_SESSION_NAME_PREFIX)) {
-        await sendTextToStreamSession(rotated, COMMANDER_ROTATION_CONTINUATION_PROMPT)
+      const usageIsTotal = event.usage_is_total === true
+      const inputTokens = readUsageNumber(usage, ['input_tokens', 'inputTokens', 'input'])
+      const outputTokens = readUsageNumber(usage, ['output_tokens', 'outputTokens', 'output'])
+      if (usageIsTotal) {
+        if (inputTokens !== undefined) session.usage.inputTokens = inputTokens
+        if (outputTokens !== undefined) session.usage.outputTokens = outputTokens
+      } else {
+        if (inputTokens !== undefined) session.usage.inputTokens += inputTokens
+        if (outputTokens !== undefined) session.usage.outputTokens += outputTokens
       }
-      schedulePersistedSessionsWrite()
-      return rotated
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      const failureEvent: StreamJsonEvent = {
-        type: 'system',
-        subtype: 'session_rotation_failed',
-        reason: 'auto-entry-threshold',
-        text: `Session auto-rotation failed: ${message}`,
-      }
-      appendStreamEvent(live, failureEvent)
-      broadcastStreamEvent(live, failureEvent)
-      schedulePersistedSessionsWrite()
-      return live
-    }
-  }
 
-  function scheduleAutoRotationIfNeeded(sessionName: string): void {
-    const existing = autoRotationQueues.get(sessionName)
-    if (existing) {
-      void existing.finally(() => {
-        const live = sessions.get(sessionName)
-        if (
-          live &&
-          live.kind === 'stream' &&
-          live.autoRotatePending &&
-          live.pendingMessageCount === 0 &&
-          !autoRotationQueues.has(sessionName)
-        ) {
-          scheduleAutoRotationIfNeeded(sessionName)
-        }
-      })
+      const totalCost = readFiniteNumber(event.total_cost_usd)
+      const cost = readFiniteNumber(event.cost_usd)
+      if (totalCost !== undefined) {
+        session.usage.costUsd = totalCost
+      } else if (cost !== undefined) {
+        session.usage.costUsd = cost
+      }
       return
     }
 
-    const task = rotateStreamSessionIfNeeded(sessionName)
-      .catch(() => null)
-      .finally(() => {
-        if (autoRotationQueues.get(sessionName) === task) {
-          autoRotationQueues.delete(sessionName)
-        }
-      })
+    if (evtType === 'result') {
+      const totalCost = readFiniteNumber(event.total_cost_usd)
+      const cost = readFiniteNumber(event.cost_usd)
+      if (totalCost !== undefined) {
+        session.usage.costUsd = totalCost
+      } else if (cost !== undefined) {
+        session.usage.costUsd = cost
+      }
 
-    autoRotationQueues.set(sessionName, task)
+      if (event.usage) {
+        const usage = asObject(event.usage)
+        if (!usage) {
+          return
+        }
+        const inputTokens = readUsageNumber(usage, ['input_tokens', 'inputTokens', 'input'])
+        const outputTokens = readUsageNumber(usage, ['output_tokens', 'outputTokens', 'output'])
+        session.usage.inputTokens = inputTokens ?? session.usage.inputTokens
+        session.usage.outputTokens = outputTokens ?? session.usage.outputTokens
+      }
+    }
   }
 
   function appendStreamEvent(session: StreamSession, event: StreamJsonEvent): void {
@@ -3207,14 +2804,12 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     const evtType = event.type as string
     if (evtType === 'message_start') {
       const wasCompleted = session.lastTurnCompleted
-      // One-shot sessions are terminal jobs. Once a `result` event has been
-      // stored, a subsequent `message_start` from stdout (for example, newer
-      // Claude envelope ordering) must not clear the completed state.
-      if (!isCompletedOneShotStreamSession(session)) {
-        session.lastTurnCompleted = false
-        session.completedTurnAt = undefined
-        session.finalResultEvent = undefined
-        session.restoredIdle = false
+      session.lastTurnCompleted = false
+      session.completedTurnAt = undefined
+      session.finalResultEvent = undefined
+      session.restoredIdle = false
+      if (session.agentType === 'codex') {
+        scheduleCodexTurnWatchdog(session)
       }
       if (wasCompleted && session.agentType === 'claude') {
         schedulePersistedSessionsWrite()
@@ -3228,46 +2823,19 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       if (!wasCompleted) {
         session.conversationEntryCount += 1
       }
-      session.turnCompletedEmitter.emit('done')
       if (!wasCompleted && session.agentType === 'claude') {
         schedulePersistedSessionsWrite()
       }
-      if (!wasCompleted && session.agentType === 'codex') {
-        schedulePersistedSessionsWrite()
-      }
-      if (
-        supportsAutoRotation(session.name, session) &&
-        session.conversationEntryCount >= autoRotateEntryThreshold
-      ) {
-        session.autoRotatePending = true
-        scheduleAutoRotationIfNeeded(session.name)
+      if (session.agentType === 'codex') {
+        clearCodexTurnWatchdog(session)
+        markCodexTurnHealthy(session)
       }
     }
-    if (evtType === 'message_delta' && event.usage) {
-      const u = event.usage as { input_tokens?: number; output_tokens?: number }
-      if (codexUsageIsTotal(event)) {
-        if (u.input_tokens !== undefined) session.usage.inputTokens = u.input_tokens
-        if (u.output_tokens !== undefined) session.usage.outputTokens = u.output_tokens
-      } else {
-        if (u.input_tokens !== undefined) session.usage.inputTokens += u.input_tokens
-        if (u.output_tokens !== undefined) session.usage.outputTokens += u.output_tokens
-      }
+    if (evtType === 'exit' && session.agentType === 'codex') {
+      clearCodexTurnWatchdog(session)
+      markCodexTurnHealthy(session)
     }
-    if (evtType === 'result') {
-      const totalCost = event.total_cost_usd as number | undefined
-      const cost = event.cost_usd as number | undefined
-      if (typeof totalCost === 'number') {
-        session.usage.costUsd = totalCost
-      } else if (typeof cost === 'number') {
-        session.usage.costUsd = cost
-      }
-    }
-    if (evtType === 'result' && event.usage) {
-      // result.usage is session-level cumulative — override accumulated totals
-      const u = event.usage as { input_tokens?: number; output_tokens?: number }
-      session.usage.inputTokens = u.input_tokens ?? session.usage.inputTokens
-      session.usage.outputTokens = u.output_tokens ?? session.usage.outputTokens
-    }
+    applyStreamUsageEvent(session, event)
 
     if (session.agentType === 'claude') {
       const sessionId = extractClaudeSessionId(event)
@@ -3280,7 +2848,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     appendCommanderTranscriptEvent(session, event)
   }
 
-  function broadcastStreamEvent(session: StreamSession | OpenClawSession, event: StreamJsonEvent): void {
+  function broadcastStreamEvent(session: StreamSession | OpenClawSession | ExternalSession, event: StreamJsonEvent): void {
     const payload = JSON.stringify(event)
     for (const client of session.clients) {
       if (client.readyState === WebSocket.OPEN) {
@@ -3349,51 +2917,25 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     }
   }
 
-  async function dispatchOpenClawHook(session: OpenClawSession, message: string, signal?: AbortSignal): Promise<boolean> {
+  async function dispatchOpenClawHook(session: OpenClawSession, message: string): Promise<boolean> {
     const text = message.trim()
     if (text.length === 0) return false
 
-    session.pendingHookDispatches += 1
     try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-      }
-      const token = process.env.OPENCLAW_GATEWAY_TOKEN?.trim()
-      if (token) {
-        headers.Authorization = `Bearer ${token}`
-      }
-
       const response = await fetch(`${session.gatewayUrl}/hooks/agent`, {
         method: 'POST',
-        headers,
+        headers: {
+          'Content-Type': 'application/json',
+        },
         body: JSON.stringify({
           message: text,
           sessionKey: session.sessionKey,
           agentId: session.agentId,
         }),
-        signal,
       })
-      if (response.status === 401) {
-        const unauthorizedEvent: StreamJsonEvent = {
-          type: 'system',
-          text: 'OpenClaw gateway returned 401 — check OPENCLAW_GATEWAY_TOKEN env var on the server',
-        }
-        session.lastEventAt = new Date().toISOString()
-        session.events.push(unauthorizedEvent)
-        if (session.events.length > MAX_STREAM_EVENTS) {
-          session.events = session.events.slice(-MAX_STREAM_EVENTS)
-        }
-        broadcastStreamEvent(session, unauthorizedEvent)
-        return false
-      }
-      if (response.ok) {
-        session.pendingTurnCount += 1
-      }
       return response.ok
     } catch {
       return false
-    } finally {
-      session.pendingHookDispatches = Math.max(0, session.pendingHookDispatches - 1)
     }
   }
 
@@ -3425,8 +2967,6 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       clients: new Set(),
       createdAt: initializedAt,
       lastEventAt: initializedAt,
-      pendingHookDispatches: 0,
-      pendingTurnCount: 0,
     }
 
     ws.on('open', () => {
@@ -3464,9 +3004,6 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
 
       const normalized = normalizeOpenClawEvent(parsed)
       if (!normalized) return
-      if (normalized.type === 'result' && session.pendingTurnCount > 0) {
-        session.pendingTurnCount -= 1
-      }
       // Save event to replay buffer (openclaw sessions don't use usage tracking).
       session.lastEventAt = new Date().toISOString()
       session.events.push(normalized)
@@ -3518,496 +3055,14 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     }
   }
 
-  function cleanupStreamMessageQueue(session: StreamSession): void {
-    session.turnCompletedEmitter.emit('done')
-    session.turnCompletedEmitter.removeAllListeners('done')
-    session.messageQueue.clear(session.name)
-    session.pendingMessageCount = 0
-  }
-
-  function stopSessionRuntime(
-    session: PtySession | StreamSession | OpenClawSession,
-    options: { closeClients?: boolean; closeReason?: string } = {},
-  ): void {
-    const shouldCloseClients = options.closeClients !== false
-    if (shouldCloseClients) {
-      for (const client of session.clients) {
-        client.close(1000, options.closeReason ?? 'Session ended')
-      }
-      session.clients.clear()
-    }
-
-    if (session.kind === 'stream') {
-      cleanupStreamMessageQueue(session)
-      session.process.kill('SIGTERM')
-      return
-    }
-
-    if (session.kind === 'openclaw') {
-      session.gatewayWs?.close()
-      session.gatewayWs = null
-      return
-    }
-
-    session.pty.kill()
-  }
-
-  function waitForTurnCompletion(session: StreamSession): Promise<void> {
-    if (session.lastTurnCompleted) {
-      return Promise.resolve()
-    }
-    return new Promise((resolve) => {
-      const onDone = () => {
-        if (!session.lastTurnCompleted) {
-          return
-        }
-        session.turnCompletedEmitter.off('done', onDone)
-        resolve()
-      }
-      session.turnCompletedEmitter.on('done', onDone)
-      if (session.lastTurnCompleted) {
-        session.turnCompletedEmitter.off('done', onDone)
-        resolve()
-      }
-    })
-  }
-
-  function toTimestampMs(value: string): number | null {
-    const parsed = Date.parse(value)
-    return Number.isFinite(parsed) ? parsed : null
-  }
-
-  function countUserTurnEvents(events: StreamJsonEvent[]): number {
-    let count = 0
-    for (const event of events) {
-      if (event.type === 'user' || event.type === 'human') {
-        count += 1
-        continue
-      }
-      const message = asObject(event.message)
-      if (message?.role === 'user') {
-        count += 1
-      }
-    }
-    return count
-  }
-
-  function estimateSessionLengthFromStats(
-    createdAt: string,
-    lastEventAt: string,
-    userTurns: number,
-    eventCount: number,
-  ): SessionLength {
-    const createdAtMs = toTimestampMs(createdAt)
-    const lastEventAtMs = toTimestampMs(lastEventAt)
-    const sessionSpanMs = (createdAtMs !== null && lastEventAtMs !== null)
-      ? Math.max(0, lastEventAtMs - createdAtMs)
-      : 0
-
-    if (
-      userTurns >= LONG_SESSION_USER_TURN_THRESHOLD ||
-      eventCount >= LONG_SESSION_EVENT_THRESHOLD ||
-      sessionSpanMs >= LONG_SESSION_DURATION_MS
-    ) {
-      return 'long'
-    }
-    return 'short'
-  }
-
-  function estimateSessionLength(session: AnySession): SessionLength {
-    if (session.kind === 'stream' || session.kind === 'openclaw') {
-      const events = session.events
-      const userTurns = countUserTurnEvents(events)
-      return estimateSessionLengthFromStats(
-        session.createdAt,
-        session.lastEventAt,
-        userTurns,
-        events.length,
-      )
-    }
-    return estimateSessionLengthFromStats(session.createdAt, session.lastEventAt, 0, 0)
-  }
-
-  function getDebriefModeForSessionLength(sessionLength: SessionLength): DebriefMode {
-    return sessionLength === 'long' ? 'aar' : 'hotwash'
-  }
-
-  function getDebriefTimeoutMs(mode: DebriefMode): number {
-    return mode === 'aar' ? AAR_DEBRIEF_TIMEOUT_MS : HOTWASH_DEBRIEF_TIMEOUT_MS
-  }
-
-  function supportsPreKillDebrief(session: AnySession): session is PtySession | StreamSession {
-    return session.kind !== 'openclaw'
-  }
-
-  function waitForTurnCompletionWithTimeout(session: StreamSession, timeoutMs: number): Promise<boolean> {
-    if (timeoutMs <= 0) {
-      return Promise.resolve(false)
-    }
-    if (session.lastTurnCompleted) {
-      return Promise.resolve(true)
-    }
-
-    return new Promise((resolve) => {
-      let settled = false
-      const onDone = () => {
-        if (settled || !session.lastTurnCompleted) {
-          return
-        }
-        settled = true
-        clearTimeout(timeoutHandle)
-        session.turnCompletedEmitter.off('done', onDone)
-        resolve(true)
-      }
-
-      const timeoutHandle = setTimeout(() => {
-        if (settled) return
-        settled = true
-        session.turnCompletedEmitter.off('done', onDone)
-        resolve(false)
-      }, timeoutMs)
-
-      session.turnCompletedEmitter.on('done', onDone)
-      if (session.lastTurnCompleted) {
-        onDone()
-      }
-    })
-  }
-
-  function waitForPromiseWithTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<{ timedOut: boolean; value?: T }> {
-    return new Promise((resolve) => {
-      let settled = false
-      const timeoutHandle = setTimeout(() => {
-        if (settled) return
-        settled = true
-        resolve({ timedOut: true })
-      }, timeoutMs)
-
-      promise
-        .then((value) => {
-          if (settled) return
-          settled = true
-          clearTimeout(timeoutHandle)
-          resolve({ timedOut: false, value })
-        })
-        .catch(() => {
-          if (settled) return
-          settled = true
-          clearTimeout(timeoutHandle)
-          resolve({ timedOut: false })
-        })
-    })
-  }
-
-  function waitForResultEventWithTimeout(
-    sessionName: string,
-    fromEventIndex: number,
-    timeoutMs: number,
-  ): Promise<boolean> {
-    if (timeoutMs <= 0) {
-      return Promise.resolve(false)
-    }
-
-    const hasResultSince = (candidate: AnySession): boolean => {
-      if (candidate.kind === 'pty') {
-        return false
-      }
-      for (let idx = Math.max(0, fromEventIndex); idx < candidate.events.length; idx += 1) {
-        if (candidate.events[idx]?.type === 'result') {
-          return true
-        }
-      }
-      return false
-    }
-
-    const initial = sessions.get(sessionName)
-    if (!initial || initial.kind === 'pty') {
-      return Promise.resolve(false)
-    }
-    if (hasResultSince(initial)) {
-      return Promise.resolve(true)
-    }
-
-    return new Promise((resolve) => {
-      let settled = false
-      const cleanup = () => {
-        clearTimeout(timeoutHandle)
-        const handlers = sessionEventHandlers.get(sessionName)
-        if (!handlers) {
-          return
-        }
-        handlers.delete(onEvent)
-        if (handlers.size === 0) {
-          sessionEventHandlers.delete(sessionName)
-        }
-      }
-
-      const onEvent = (event: StreamJsonEvent) => {
-        if (settled || event.type !== 'result') {
-          return
-        }
-        settled = true
-        cleanup()
-        resolve(true)
-      }
-
-      let handlers = sessionEventHandlers.get(sessionName)
-      if (!handlers) {
-        handlers = new Set()
-        sessionEventHandlers.set(sessionName, handlers)
-      }
-      handlers.add(onEvent)
-
-      const timeoutHandle = setTimeout(() => {
-        if (settled) {
-          return
-        }
-        settled = true
-        cleanup()
-        resolve(false)
-      }, timeoutMs)
-
-      const liveSession = sessions.get(sessionName)
-      if (!liveSession || liveSession.kind === 'pty') {
-        settled = true
-        cleanup()
-        resolve(false)
-        return
-      }
-      if (hasResultSince(liveSession)) {
-        settled = true
-        cleanup()
-        resolve(true)
-      }
-    })
-  }
-
-  async function waitForPtyDebriefCompletion(
-    sessionName: string,
-    session: PtySession,
-    fromBufferLength: number,
-    timeoutMs: number,
-  ): Promise<boolean> {
-    if (timeoutMs <= 0) {
-      return false
-    }
-
-    const deadlineMs = Date.now() + timeoutMs
-    let offset = Math.max(0, fromBufferLength)
-    let lastSeenDropped = session.bufferBytesDropped
-    let rollingOutput = ''
-    while (Date.now() < deadlineMs) {
-      if (sessions.get(sessionName) !== session) {
-        return false
-      }
-
-      const currentBuffer = session.buffer
-      const droppedNow = session.bufferBytesDropped
-      let appended = ''
-      if (droppedNow !== lastSeenDropped || currentBuffer.length < offset) {
-        // Buffer was capped since last poll; re-scan what remains.
-        appended = currentBuffer
-        offset = currentBuffer.length
-        lastSeenDropped = droppedNow
-      } else if (currentBuffer.length > offset) {
-        appended = currentBuffer.slice(offset)
-        offset = currentBuffer.length
-      }
-
-      if (appended.length > 0) {
-        rollingOutput = (rollingOutput + appended).slice(-512)
-        if (PTY_DEBRIEF_COMPLETION_PATTERN.test(rollingOutput)) {
-          return true
-        }
-      }
-
-      const remainingMs = Math.max(0, deadlineMs - Date.now())
-      if (remainingMs <= 0) {
-        break
-      }
-      await new Promise((resolve) => setTimeout(resolve, Math.min(PTY_DEBRIEF_POLL_INTERVAL_MS, remainingMs)))
-    }
-
-    return false
-  }
-
-  async function triggerPreKillDebriefForStreamSession(
-    sessionName: string,
-    session: StreamSession,
-    mode: DebriefMode,
-    timeoutMs: number,
-    sessionLength: SessionLength,
-  ): Promise<PreKillDebriefResult> {
-    const command = session.agentType === 'codex'
-      ? `$debrief ${mode}`
-      : `/debrief ${mode}`
-    const deadlineMs = Date.now() + timeoutMs
-
-    const debriefTask = session.messageQueue.enqueue(session.name, async () => {
-      if (sessions.get(sessionName) !== session) {
-        return false
-      }
-
-      const readyForDebrief = await waitForTurnCompletionWithTimeout(
-        session,
-        Math.max(0, deadlineMs - Date.now()),
-      )
-      if (!readyForDebrief) {
-        return false
-      }
-      if (sessions.get(sessionName) !== session) {
-        return false
-      }
-
-      const previousLastTurnCompleted = session.lastTurnCompleted
-      const previousCompletedTurnAt = session.completedTurnAt
+  function resetActiveTurnState(session: StreamSession): void {
+    if (session.lastTurnCompleted && !isCommandRoomSessionName(session.name)) {
       session.lastTurnCompleted = false
       session.completedTurnAt = undefined
-
-      let sent = false
-      if (session.agentType === 'codex' && session.codexThreadId) {
-        sent = await startCodexTurn(session, command, { reportFailure: false })
-      } else {
-        const userMsg = JSON.stringify({
-          type: 'user',
-          message: { role: 'user', content: command },
-        })
-        sent = writeToStdin(session, userMsg + '\n')
-      }
-
-      if (!sent) {
-        session.lastTurnCompleted = previousLastTurnCompleted
-        session.completedTurnAt = previousCompletedTurnAt
-        return false
-      }
-
-      return waitForTurnCompletionWithTimeout(
-        session,
-        Math.max(0, deadlineMs - Date.now()),
-      )
-    })
-
-    const settled = await waitForPromiseWithTimeout(debriefTask, timeoutMs)
-    if (settled.timedOut) {
-      return {
-        attempted: true,
-        debriefed: false,
-        mode,
-        sessionLength,
-        timeoutMs,
-        timedOut: true,
-        reason: 'timeout',
-      }
+      session.finalResultEvent = undefined
     }
-
-    if (settled.value === true) {
-      return {
-        attempted: true,
-        debriefed: true,
-        mode,
-        sessionLength,
-        timeoutMs,
-        timedOut: false,
-      }
-    }
-
-    return {
-      attempted: true,
-      debriefed: false,
-      mode,
-      sessionLength,
-      timeoutMs,
-      timedOut: false,
-      reason: 'not-completed',
-    }
-  }
-
-  async function triggerPreKillDebriefForPtySession(
-    sessionName: string,
-    session: PtySession,
-    mode: DebriefMode,
-    timeoutMs: number,
-    sessionLength: SessionLength,
-  ): Promise<PreKillDebriefResult> {
-    const command = session.agentType === 'codex'
-      ? `$debrief ${mode}`
-      : `/debrief ${mode}`
-    const baselineBufferLength = session.buffer.length
-
-    try {
-      session.pty.write(command + '\r')
-    } catch {
-      return {
-        attempted: true,
-        debriefed: false,
-        mode,
-        sessionLength,
-        timeoutMs,
-        timedOut: false,
-        reason: 'not-sent',
-      }
-    }
-
-    const debriefed = await waitForPtyDebriefCompletion(
-      sessionName,
-      session,
-      baselineBufferLength,
-      timeoutMs,
-    )
-    if (debriefed) {
-      return {
-        attempted: true,
-        debriefed: true,
-        mode,
-        sessionLength,
-        timeoutMs,
-        timedOut: false,
-      }
-    }
-
-    return {
-      attempted: true,
-      debriefed: false,
-      mode,
-      sessionLength,
-      timeoutMs,
-      timedOut: true,
-      reason: 'timeout',
-    }
-  }
-
-  async function triggerPreKillDebrief(sessionName: string, session: AnySession): Promise<PreKillDebriefResult> {
-    const sessionLength = estimateSessionLength(session)
-    const mode = getDebriefModeForSessionLength(sessionLength)
-    const timeoutMs = getDebriefTimeoutMs(mode)
-
-    if (!supportsPreKillDebrief(session)) {
-      return {
-        attempted: false,
-        debriefed: false,
-        mode,
-        sessionLength,
-        timeoutMs,
-        timedOut: false,
-        reason: 'unsupported-agent-type',
-      }
-    }
-
-    if (session.kind === 'stream') {
-      return triggerPreKillDebriefForStreamSession(sessionName, session, mode, timeoutMs, sessionLength)
-    }
-
-    if (session.kind === 'pty') {
-      return triggerPreKillDebriefForPtySession(sessionName, session, mode, timeoutMs, sessionLength)
-    }
-    return {
-      attempted: false,
-      debriefed: false,
-      mode,
-      sessionLength,
-      timeoutMs,
-      timedOut: false,
-      reason: 'unsupported-session-type',
+    if (session.agentType === 'codex') {
+      markCodexTurnHealthy(session)
     }
   }
 
@@ -4064,16 +3119,11 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       lastEventAt: initializedAt,
       usage: { inputTokens: 0, outputTokens: 0, costUsd: 0 },
       stdoutBuffer: '',
-      systemPrompt: options.systemPrompt,
-      maxTurns: options.maxTurns,
       stdinDraining: false,
       lastTurnCompleted: true,
-      messageQueue: new KeyedAsyncQueue(),
-      pendingMessageCount: 0,
       conversationEntryCount: 0,
-      autoRotatePending: false,
-      turnCompletedEmitter: new EventEmitter(),
       claudeSessionId: options.resumeSessionId,
+      resumedFrom: options.resumedFrom,
       restoredIdle: Boolean(options.resumeSessionId) && task.length === 0,
     }
 
@@ -4097,38 +3147,12 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
         if (!trimmed) continue
         try {
           const event = JSON.parse(trimmed) as StreamJsonEvent
-          // Skip plain user echoes from Claude's stdout — the server already
-          // synthesizes user events when input is received and at session
-          // creation. Keep tool_result envelopes so AskUserQuestion answers
-          // still unblock phase/status tracking.
-          if (event.type === 'user' && getToolResultIds(event).length === 0) continue
           appendStreamEvent(session, event)
           broadcastStreamEvent(session, event)
         } catch {
           // Skip unparseable lines
         }
       }
-    })
-
-    // Flush any remaining buffered data when stdout closes.  NDJSON lines
-    // should always end with '\n', but if the process exits without a
-    // trailing newline the last event (e.g. `result`) would stay in the
-    // buffer.  Draining here ensures the `result` event is processed before
-    // the 'exit' handler runs so `finalResultEvent` is set correctly.
-    childProcess.stdout?.on('end', () => {
-      const remaining = session.stdoutBuffer.trim()
-      if (remaining) {
-        try {
-          const event = JSON.parse(remaining) as StreamJsonEvent
-          if (event.type !== 'user' || getToolResultIds(event).length > 0) {
-            appendStreamEvent(session, event)
-            broadcastStreamEvent(session, event)
-          }
-        } catch {
-          // Ignore unparseable trailing data
-        }
-      }
-      session.stdoutBuffer = ''
     })
 
     // Capture stderr and relay as system events so auth failures, config
@@ -4201,31 +3225,17 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
             session.usage.costUsd,
           ),
         )
-        scheduleCompletedSessionsWrite()
-      } else if (isCommandRoomSessionName(sessionName) || isWorkerSessionName(sessionName)) {
-        // Command-room and worker sessions: process may exit
-        // without emitting a result event. Synthesize completion so status
-        // queries detect the session as finished.
+      } else if (isCommandRoomSessionName(sessionName)) {
+        // Cron-triggered sessions: process may exit without emitting result
+        // (e.g. AskUserQuestion block, crash, or Codex format). Synthesize
+        // completion so the executor can detect it and update the run.
         completedSessions.set(
           sessionName,
           toExitBasedCompletedSession(sessionName, exitEvent, session.usage.costUsd),
         )
-        scheduleCompletedSessionsWrite()
       }
 
-      exitedStreamSessions.set(sessionName, {
-        phase: 'exited',
-        hadResult: Boolean(session.finalResultEvent),
-        exitedAt: Date.now(),
-      })
-
-      // Snapshot events before removing the session so the messages endpoint
-      // can still serve conversation history for completed one-shot sessions (P2-5).
-      if (session.events.length > 0 && (isCommandRoomSessionName(sessionName) || isWorkerSessionName(sessionName))) {
-        completedSessionEvents.set(sessionName, session.events.slice())
-      }
-
-      cleanupStreamMessageQueue(session)
+      exitedStreamSessions.set(sessionName, snapshotExitedStreamSession(session))
       sessions.delete(sessionName)
 
       // If this was an idle restore process that exited cleanly without doing
@@ -4255,38 +3265,25 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       // On spawn failure (e.g. ENOENT), 'error' may fire without a
       // subsequent 'exit' event.  Clean up the session to prevent zombie
       // entries that never auto-clean.
-      if ((isCommandRoomSessionName(sessionName) || isWorkerSessionName(sessionName)) && !session.finalResultEvent) {
+      if (isCommandRoomSessionName(sessionName) && !session.finalResultEvent) {
         completedSessions.set(
           sessionName,
           toExitBasedCompletedSession(sessionName, errorEvent, session.usage.costUsd),
         )
-        scheduleCompletedSessionsWrite()
       }
       for (const client of session.clients) {
         client.close(1000, 'Session ended')
       }
 
-      exitedStreamSessions.set(sessionName, {
-        phase: 'exited',
-        hadResult: Boolean(session.finalResultEvent),
-        exitedAt: Date.now(),
-      })
-      cleanupStreamMessageQueue(session)
+      exitedStreamSessions.set(sessionName, snapshotExitedStreamSession(session))
       sessions.delete(sessionName)
       schedulePersistedSessionsWrite()
     })
 
-    // Send initial task as the first user message via stdin and persist
-    // the user event for replay (stdout 'user' events are filtered out).
+    // Send initial task as the first user message via stdin.
     if (task.length > 0) {
-      const userEvent: StreamJsonEvent = {
-        type: 'user',
-        message: { role: 'user', content: task },
-      } as unknown as StreamJsonEvent
       const userMsg = JSON.stringify({ type: 'user', message: { role: 'user', content: task } })
-      if (writeToStdin(session, userMsg + '\n')) {
-        appendStreamEvent(session, userEvent)
-      }
+      writeToStdin(session, userMsg + '\n')
     }
 
     return session
@@ -4297,22 +3294,421 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     process: ChildProcess | null
     port: number
     ws: WebSocket | null
+    stopKeepAlive: (() => void) | null
     requestId: number
     pendingRequests: Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>
     notificationListeners: Map<string, Set<(method: string, params: unknown) => void>>
+    stdoutTail: string[]
+    stderrTail: string[]
   }
 
   const codexSidecar: CodexSidecar = {
     process: null,
     port: 0,
     ws: null,
+    stopKeepAlive: null,
     requestId: 0,
     pendingRequests: new Map(),
     notificationListeners: new Map(),
+    stdoutTail: [],
+    stderrTail: [],
+  }
+
+  function codexFailureMessage(reason: string): string {
+    return `Codex transport failure: ${reason}`
+  }
+
+  function listActiveCodexSessionNames(): string[] {
+    return [...sessions.entries()]
+      .filter(([, candidate]) => candidate.kind === 'stream' && candidate.agentType === 'codex')
+      .map(([sessionName]) => sessionName)
+  }
+
+  function appendCodexSidecarTail(tail: string[], lines: string[]): void {
+    for (const line of lines) {
+      tail.push(line)
+    }
+    if (tail.length > CODEX_SIDECAR_LOG_TAIL_LIMIT) {
+      tail.splice(0, tail.length - CODEX_SIDECAR_LOG_TAIL_LIMIT)
+    }
+  }
+
+  function logCodexSidecar(
+    level: 'info' | 'warn' | 'error',
+    message: string,
+    extra: Record<string, unknown> = {},
+  ): void {
+    const payload = JSON.stringify({
+      pid: codexSidecar.process?.pid ?? null,
+      port: codexSidecar.port || null,
+      activeSessions: listActiveCodexSessionNames(),
+      pendingRequests: codexSidecar.pendingRequests.size,
+      listenerThreads: codexSidecar.notificationListeners.size,
+      ...(codexSidecar.stderrTail.length > 0 ? { stderrTail: codexSidecar.stderrTail } : {}),
+      ...(codexSidecar.stdoutTail.length > 0 ? { stdoutTail: codexSidecar.stdoutTail } : {}),
+      ...extra,
+    })
+    const line = `[agents][codex-sidecar] ${message} ${payload}`
+    if (level === 'error') {
+      console.error(line)
+      return
+    }
+    if (level === 'warn') {
+      console.warn(line)
+      return
+    }
+    console.info(line)
+  }
+
+  function recordCodexSidecarOutput(stream: 'stdout' | 'stderr', chunk: Buffer): void {
+    const lines = chunk.toString()
+      .split(/\r?\n/g)
+      .map((line) => truncateLogText(line))
+      .filter((line) => line.length > 0)
+    if (lines.length === 0) {
+      return
+    }
+
+    const tail = stream === 'stderr' ? codexSidecar.stderrTail : codexSidecar.stdoutTail
+    appendCodexSidecarTail(tail, lines)
+
+    if (stream === 'stderr') {
+      console.warn(`[agents][codex-sidecar][stderr] ${truncateLogText(lines.join(' | '), 800)}`)
+    }
+  }
+
+  function getCodexApprovalRequestDetails(params: unknown): {
+    itemId?: string
+    turnId?: string
+    reason?: string
+    risk?: string
+  } {
+    const payload = asObject(params)
+    if (!payload) {
+      return {}
+    }
+
+    const itemId = typeof payload.itemId === 'string' && payload.itemId.trim().length > 0
+      ? payload.itemId.trim()
+      : undefined
+    const turnId = typeof payload.turnId === 'string' && payload.turnId.trim().length > 0
+      ? payload.turnId.trim()
+      : undefined
+    const reason = typeof payload.reason === 'string' && payload.reason.trim().length > 0
+      ? truncateLogText(payload.reason.trim(), 300)
+      : undefined
+    const risk = typeof payload.risk === 'string' && payload.risk.trim().length > 0
+      ? truncateLogText(payload.risk.trim(), 300)
+      : undefined
+
+    return { itemId, turnId, reason, risk }
+  }
+
+  function buildCodexApprovalRequestSystemEvent(method: string, params: unknown): StreamJsonEvent | null {
+    const approvalTarget = method === 'item/commandExecution/requestApproval'
+      ? 'command execution'
+      : (method === 'item/fileChange/requestApproval' ? 'file change' : null)
+    if (!approvalTarget) {
+      return null
+    }
+
+    const { reason, risk } = getCodexApprovalRequestDetails(params)
+    const extras = [reason ? `Reason: ${reason}` : null, risk ? `Risk: ${risk}` : null]
+      .filter((value): value is string => value !== null)
+      .join(' ')
+
+    return {
+      type: 'system',
+      text: `Codex is waiting for ${approvalTarget} approval, but Hammurabi does not yet handle Codex approval prompts. This turn may appear stalled until it is approved externally or rerun in an auto-approve mode.${extras ? ` ${extras}` : ''}`,
+    }
+  }
+
+  function rejectPendingCodexRequests(error: Error): void {
+    for (const pending of codexSidecar.pendingRequests.values()) {
+      pending.reject(error)
+    }
+    codexSidecar.pendingRequests.clear()
+  }
+
+  function clearCodexTurnWatchdog(session: StreamSession): void {
+    if (session.codexTurnWatchdogTimer) {
+      clearTimeout(session.codexTurnWatchdogTimer)
+      session.codexTurnWatchdogTimer = undefined
+    }
+  }
+
+  function markCodexTurnHealthy(session: StreamSession): void {
+    session.codexTurnStaleAt = undefined
+  }
+
+  function extractCodexUsageTotals(payload: unknown): {
+    usage?: { input_tokens?: number; output_tokens?: number }
+    totalCostUsd?: number
+  } {
+    const usagePayload = asObject(payload)
+    if (!usagePayload) {
+      return {}
+    }
+    const inputTokens = readUsageNumber(usagePayload, ['input_tokens', 'inputTokens', 'input'])
+    const outputTokens = readUsageNumber(usagePayload, ['output_tokens', 'outputTokens', 'output'])
+    const totalCostUsd = readUsageNumber(usagePayload, ['total_cost_usd', 'totalCostUsd', 'cost_usd', 'costUsd'])
+    return {
+      usage: (inputTokens !== undefined || outputTokens !== undefined)
+        ? {
+            ...(inputTokens !== undefined ? { input_tokens: inputTokens } : {}),
+            ...(outputTokens !== undefined ? { output_tokens: outputTokens } : {}),
+          }
+        : undefined,
+      totalCostUsd,
+    }
+  }
+
+  function buildCodexResultFromThreadSnapshot(
+    status: string,
+    turn: Record<string, unknown>,
+    thread: Record<string, unknown>,
+  ): StreamJsonEvent {
+    const turnUsage = extractCodexUsageTotals(asObject(turn.tokenUsage) ?? asObject(turn.usage))
+    const threadUsage = extractCodexUsageTotals(asObject(thread.tokenUsage) ?? asObject(thread.usage))
+    const usage = turnUsage.usage ?? threadUsage.usage
+    const totalCostUsd = turnUsage.totalCostUsd ?? threadUsage.totalCostUsd
+
+    if (status === 'failed') {
+      const error = asObject(turn.error)
+      const message = typeof error?.message === 'string' && error.message.trim().length > 0
+        ? error.message.trim()
+        : 'Codex turn failed'
+      return {
+        type: 'result',
+        subtype: 'failed',
+        is_error: true,
+        result: message,
+        ...(usage ? { usage } : {}),
+        ...(totalCostUsd !== undefined ? { total_cost_usd: totalCostUsd } : {}),
+      }
+    }
+
+    if (status === 'interrupted') {
+      return {
+        type: 'result',
+        subtype: 'interrupted',
+        is_error: false,
+        result: 'Turn interrupted',
+        ...(usage ? { usage } : {}),
+        ...(totalCostUsd !== undefined ? { total_cost_usd: totalCostUsd } : {}),
+      }
+    }
+
+    return {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: 'Turn completed',
+      ...(usage ? { usage } : {}),
+      ...(totalCostUsd !== undefined ? { total_cost_usd: totalCostUsd } : {}),
+    }
+  }
+
+  async function handleCodexTurnWatchdogTimeout(session: StreamSession): Promise<void> {
+    if (sessions.get(session.name) !== session) {
+      return
+    }
+    if (session.lastTurnCompleted || !session.codexThreadId) {
+      clearCodexTurnWatchdog(session)
+      markCodexTurnHealthy(session)
+      return
+    }
+
+    clearCodexTurnWatchdog(session)
+
+    let resolved = false
+    try {
+      const readResult = await sendCodexRequest('thread/read', {
+        threadId: session.codexThreadId,
+        includeTurns: true,
+      })
+
+      if (sessions.get(session.name) !== session || session.lastTurnCompleted) {
+        return
+      }
+
+      const resultObj = asObject(readResult)
+      const thread = asObject(resultObj?.thread)
+      const turns = Array.isArray(thread?.turns) ? thread.turns : []
+      let latestTurn: Record<string, unknown> | null = null
+      for (let i = turns.length - 1; i >= 0; i -= 1) {
+        const turn = asObject(turns[i])
+        if (turn) {
+          latestTurn = turn
+          break
+        }
+      }
+
+      const status = typeof latestTurn?.status === 'string'
+        ? latestTurn.status.trim().toLowerCase()
+        : ''
+
+      if (latestTurn && thread && (status === 'completed' || status === 'failed' || status === 'interrupted')) {
+        const syntheticResult = buildCodexResultFromThreadSnapshot(status, latestTurn, thread)
+        appendStreamEvent(session, syntheticResult)
+        broadcastStreamEvent(session, syntheticResult)
+        schedulePersistedSessionsWrite()
+        resolved = true
+      }
+    } catch (error) {
+      logCodexSidecar('warn', 'Codex watchdog thread/read reconciliation failed', {
+        sessionName: session.name,
+        threadId: session.codexThreadId,
+        error: truncateLogText(error instanceof Error ? error.message : String(error)),
+      })
+    }
+
+    if (resolved || sessions.get(session.name) !== session || session.lastTurnCompleted) {
+      return
+    }
+
+    const timeoutSeconds = Math.max(1, Math.round(codexTurnWatchdogTimeoutMs / 1000))
+    session.codexTurnStaleAt = new Date().toISOString()
+    const staleEvent: StreamJsonEvent = {
+      type: 'system',
+      text: `Codex turn is stale (no sidecar events for ${timeoutSeconds}s). Session remains recoverable via resume.`,
+    }
+    appendStreamEvent(session, staleEvent)
+    broadcastStreamEvent(session, staleEvent)
+    schedulePersistedSessionsWrite()
+    logCodexSidecar('warn', 'Codex turn marked stale after watchdog timeout', {
+      sessionName: session.name,
+      threadId: session.codexThreadId,
+      timeoutSeconds,
+    })
+  }
+
+  function scheduleCodexTurnWatchdog(session: StreamSession): void {
+    if (session.agentType !== 'codex' || session.lastTurnCompleted) {
+      clearCodexTurnWatchdog(session)
+      return
+    }
+    clearCodexTurnWatchdog(session)
+    markCodexTurnHealthy(session)
+    session.codexTurnWatchdogTimer = setTimeout(() => {
+      void handleCodexTurnWatchdogTimeout(session)
+    }, codexTurnWatchdogTimeoutMs)
+  }
+
+  function detachCodexSidecarKeepAlive(): void {
+    codexSidecar.stopKeepAlive?.()
+    codexSidecar.stopKeepAlive = null
+  }
+
+  function handleCodexSidecarDisconnect(ws: WebSocket, detail: string): void {
+    if (codexSidecar.ws !== ws) {
+      return
+    }
+    logCodexSidecar('warn', 'Codex sidecar disconnected', {
+      detail: truncateLogText(detail),
+      readyState: ws.readyState,
+    })
+    detachCodexSidecarKeepAlive()
+    codexSidecar.ws = null
+    rejectPendingCodexRequests(new Error(detail))
+    failAllCodexSessions(detail)
+  }
+
+  function failCodexSession(
+    sessionName: string,
+    session: StreamSession,
+    reason: string,
+    exitCode = 1,
+    signal?: string,
+  ): void {
+    if (sessions.get(sessionName) !== session) {
+      return
+    }
+
+    clearCodexTurnWatchdog(session)
+    markCodexTurnHealthy(session)
+
+    const message = codexFailureMessage(reason)
+    const systemEvent: StreamJsonEvent = {
+      type: 'system',
+      text: message,
+    }
+    appendStreamEvent(session, systemEvent)
+    broadcastStreamEvent(session, systemEvent)
+
+    const resultEvent: StreamJsonEvent = {
+      type: 'result',
+      subtype: 'failed',
+      is_error: true,
+      result: message,
+    }
+    appendStreamEvent(session, resultEvent)
+    broadcastStreamEvent(session, resultEvent)
+
+    const exitEvent: StreamJsonEvent = {
+      type: 'exit',
+      exitCode,
+      signal,
+      text: message,
+    }
+    appendStreamEvent(session, exitEvent)
+    broadcastStreamEvent(session, exitEvent)
+
+    completedSessions.set(
+      sessionName,
+      toCompletedSession(
+        sessionName,
+        session.completedTurnAt ?? new Date().toISOString(),
+        resultEvent,
+        session.usage.costUsd,
+      ),
+    )
+    exitedStreamSessions.set(sessionName, snapshotExitedStreamSession(session))
+
+    // Keep failure cleanup on the existing kill/archive contract for Codex sessions.
+    try {
+      session.process.kill('SIGTERM')
+    } catch {
+      // Best-effort cleanup; continue with session teardown.
+    }
+
+    for (const client of session.clients) {
+      client.close(1000, 'Session ended')
+    }
+    sessions.delete(sessionName)
+    sessionEventHandlers.delete(sessionName)
+  }
+
+  function failAllCodexSessions(reason: string, exitCode = 1, signal?: string): void {
+    const codexSessions = [...sessions.entries()].filter(([, candidate]) =>
+      candidate.kind === 'stream' && candidate.agentType === 'codex'
+    ) as Array<[string, StreamSession]>
+
+    if (codexSessions.length === 0) {
+      codexSidecar.notificationListeners.clear()
+      return
+    }
+
+    logCodexSidecar('warn', 'Failing Codex sessions after transport failure', {
+      reason: truncateLogText(reason),
+      exitCode,
+      signal: signal ?? null,
+      affectedSessions: codexSessions.map(([sessionName]) => sessionName),
+    })
+    for (const [sessionName, session] of codexSessions) {
+      failCodexSession(sessionName, session, reason, exitCode, signal)
+    }
+    codexSidecar.notificationListeners.clear()
+    schedulePersistedSessionsWrite()
   }
 
   async function ensureCodexSidecar(): Promise<void> {
     if (codexSidecar.ws?.readyState === WebSocket.OPEN) return
+
+    if (codexSidecar.ws) {
+      detachCodexSidecarKeepAlive()
+      codexSidecar.ws = null
+    }
 
     if (!codexSidecar.process) {
       // Pick a free port
@@ -4328,38 +3724,65 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
         serverEmitter.on('error', reject)
       })
       codexSidecar.port = port
+      codexSidecar.stdoutTail = []
+      codexSidecar.stderrTail = []
 
       const cp = spawn('codex', ['app-server', '--listen', `ws://127.0.0.1:${port}`], {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env },
       })
       codexSidecar.process = cp
+      cp.stdout?.on('data', (chunk: Buffer) => {
+        recordCodexSidecarOutput('stdout', chunk)
+      })
+      cp.stderr?.on('data', (chunk: Buffer) => {
+        recordCodexSidecarOutput('stderr', chunk)
+      })
+      logCodexSidecar('info', 'Spawned Codex sidecar process')
 
       const cpEmitter = cp as unknown as NodeJS.EventEmitter
-      cpEmitter.on('exit', () => {
+      cpEmitter.on('exit', (code: number | null, signal: string | null) => {
+        const detail = signal
+          ? `Codex sidecar exited with signal ${signal}`
+          : `Codex sidecar exited with code ${code ?? -1}`
+        logCodexSidecar('error', 'Codex sidecar process exited', {
+          detail,
+          exitCode: code ?? -1,
+          signal: signal ?? null,
+        })
         codexSidecar.process = null
+        detachCodexSidecarKeepAlive()
+        if (codexSidecar.ws && codexSidecar.ws.readyState === WebSocket.OPEN) {
+          codexSidecar.ws.terminate()
+        }
         codexSidecar.ws = null
+        rejectPendingCodexRequests(new Error(detail))
+        failAllCodexSessions(detail, typeof code === 'number' ? code : 1, signal ?? undefined)
       })
-      cpEmitter.on('error', () => {
+      cpEmitter.on('error', (err: Error) => {
+        logCodexSidecar('error', 'Codex sidecar process error', {
+          error: truncateLogText(err.message),
+        })
         codexSidecar.process = null
+        detachCodexSidecarKeepAlive()
+        if (codexSidecar.ws && codexSidecar.ws.readyState === WebSocket.OPEN) {
+          codexSidecar.ws.terminate()
+        }
         codexSidecar.ws = null
+        rejectPendingCodexRequests(err)
+        failAllCodexSessions(`Codex sidecar process error: ${err.message}`)
       })
 
-      // Wait for sidecar to be ready (give it a moment to bind)
-      await new Promise(resolve => setTimeout(resolve, 1500))
     }
 
-    // Connect WebSocket
-    const ws = new WebSocket(`ws://127.0.0.1:${codexSidecar.port}`)
-    await new Promise<void>((resolve, reject) => {
-      ws.on('open', () => resolve())
-      ws.on('error', (err) => reject(err))
-      setTimeout(() => reject(new Error('Codex sidecar connection timeout')), 5000)
-    })
+    // Connect as soon as the sidecar binds instead of sleeping through a fixed delay.
+    const ws = await connectCodexSidecarSocket(codexSidecar.port)
+    logCodexSidecar('info', 'Connected to Codex sidecar WebSocket')
 
-    ws.on('message', (data) => {
+    ws.on('message', (data: RawData) => {
+      const payloadText = rawDataToText(data)
       try {
-        const msg = JSON.parse(data.toString()) as { id?: number; method?: string; params?: unknown; result?: unknown; error?: unknown }
+        const msg = JSON.parse(payloadText) as { id?: number; method?: string; params?: unknown; result?: unknown; error?: unknown }
         if (msg.id !== undefined && codexSidecar.pendingRequests.has(msg.id)) {
           const pending = codexSidecar.pendingRequests.get(msg.id)!
           codexSidecar.pendingRequests.delete(msg.id)
@@ -4380,16 +3803,37 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
             }
           }
         }
-      } catch {
-        // ignore parse errors
+      } catch (error) {
+        logCodexSidecar('warn', 'Failed to parse Codex sidecar WebSocket payload', {
+          error: truncateLogText(error instanceof Error ? error.message : String(error)),
+          payloadSnippet: truncateLogText(payloadText, 800),
+        })
       }
     })
 
-    ws.on('close', () => {
-      codexSidecar.ws = null
+    ws.on('close', (code, reasonBuffer) => {
+      const reason = reasonBuffer.toString().trim()
+      const detail = reason
+        ? `Codex sidecar connection closed (code ${code}): ${reason}`
+        : `Codex sidecar connection closed (code ${code})`
+      handleCodexSidecarDisconnect(ws, detail)
+    })
+
+    ws.on('error', (error) => {
+      const detail = error instanceof Error
+        ? `Codex sidecar connection error: ${error.message}`
+        : 'Codex sidecar connection error'
+      handleCodexSidecarDisconnect(ws, detail)
     })
 
     codexSidecar.ws = ws
+    codexSidecar.stopKeepAlive = attachWebSocketKeepAlive(ws, () => {
+      const detail = 'Codex sidecar keepalive timeout'
+      logCodexSidecar('warn', 'Codex sidecar keepalive timeout', {
+        readyState: ws.readyState,
+      })
+      handleCodexSidecarDisconnect(ws, detail)
+    })
 
     // Send initialize, then the required initialized notification
     await sendCodexRequest('initialize', {
@@ -4406,10 +3850,21 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       }
       const id = ++codexSidecar.requestId
       codexSidecar.pendingRequests.set(id, { resolve, reject })
-      codexSidecar.ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }))
+      try {
+        codexSidecar.ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }))
+      } catch (error) {
+        codexSidecar.pendingRequests.delete(id)
+        reject(error instanceof Error ? error : new Error(String(error)))
+        return
+      }
       setTimeout(() => {
         if (codexSidecar.pendingRequests.has(id)) {
           codexSidecar.pendingRequests.delete(id)
+          logCodexSidecar('warn', 'Codex request timed out', {
+            id,
+            method,
+            timeoutMs: 30000,
+          })
           reject(new Error(`Codex request ${method} timed out`))
         }
       }, 30000)
@@ -4430,185 +3885,153 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     }
   }
 
-  function codexUsageIsTotal(event: StreamJsonEvent): boolean {
-    return (event as StreamJsonEvent & { usage_is_total?: boolean }).usage_is_total === true
+  async function openCodexSidecarSocket(
+    port: number,
+    timeoutMs: number,
+  ): Promise<WebSocket> {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}`)
+
+    return new Promise<WebSocket>((resolve, reject) => {
+      let settled = false
+
+      const cleanup = () => {
+        clearTimeout(timeout)
+        ws.off('open', onOpen)
+        ws.off('error', onError)
+      }
+
+      const rejectOnce = (error: Error) => {
+        if (settled) {
+          return
+        }
+        settled = true
+        cleanup()
+        try {
+          ws.terminate()
+        } catch {
+          // Best-effort cleanup only.
+        }
+        reject(error)
+      }
+
+      const onOpen = () => {
+        if (settled) {
+          return
+        }
+        settled = true
+        cleanup()
+        resolve(ws)
+      }
+
+      const onError = (error: Error) => {
+        rejectOnce(error)
+      }
+
+      const timeout = setTimeout(() => {
+        rejectOnce(new Error('Codex sidecar connection timeout'))
+      }, timeoutMs)
+
+      ws.once('open', onOpen)
+      ws.once('error', onError)
+    })
   }
 
-  async function startCodexTurn(
-    session: StreamSession,
-    text: string,
-    options: { reportFailure?: boolean } = {},
-  ): Promise<boolean> {
-    if (!session.codexThreadId) {
-      return false
+  async function connectCodexSidecarSocket(
+    port: number,
+    options: { totalTimeoutMs?: number; attemptTimeoutMs?: number; retryDelayMs?: number } = {},
+  ): Promise<WebSocket> {
+    const totalTimeoutMs = options.totalTimeoutMs ?? 5000
+    const attemptTimeoutMs = options.attemptTimeoutMs ?? 500
+    const retryDelayMs = options.retryDelayMs ?? 50
+    const startedAt = Date.now()
+    let lastError: Error | null = null
+
+    while (Date.now() - startedAt < totalTimeoutMs) {
+      const remainingMs = totalTimeoutMs - (Date.now() - startedAt)
+      const timeoutMs = Math.max(50, Math.min(attemptTimeoutMs, remainingMs))
+
+      try {
+        return await openCodexSidecarSocket(port, timeoutMs)
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error))
+      }
+
+      if (!codexSidecar.process) {
+        break
+      }
+
+      const delayMs = Math.min(retryDelayMs, Math.max(0, totalTimeoutMs - (Date.now() - startedAt)))
+      if (delayMs <= 0) {
+        break
+      }
+      await new Promise((resolve) => setTimeout(resolve, delayMs))
     }
 
-    const previousLastTurnCompleted = session.lastTurnCompleted
-    const previousCompletedTurnAt = session.completedTurnAt
-    if (session.lastTurnCompleted) {
-      session.lastTurnCompleted = false
-      session.completedTurnAt = undefined
-    }
+    logCodexSidecar('error', 'Unable to connect to Codex sidecar WebSocket', {
+      totalTimeoutMs,
+      attemptTimeoutMs,
+      retryDelayMs,
+      lastError: truncateLogText((lastError ?? new Error('Codex sidecar connection timeout')).message),
+    })
+    throw lastError ?? new Error('Codex sidecar connection timeout')
+  }
 
-    try {
-      await ensureCodexSidecar()
-      await sendCodexRequest('turn/start', {
-        threadId: session.codexThreadId,
-        input: [{ type: 'text', text }],
-      })
+  async function startCodexTurn(session: StreamSession, text: string): Promise<void> {
+    const codexThreadId = session.codexThreadId
+    if (!codexThreadId) {
+      throw new Error('Codex session is missing a thread id')
+    }
+    await ensureCodexSidecar()
+    await sendCodexRequest('turn/start', {
+      threadId: codexThreadId,
+      input: [{ type: 'text', text }],
+    })
+  }
+
+  async function sendTextToStreamSession(session: StreamSession, text: string): Promise<boolean> {
+    if (session.agentType === 'codex' && session.codexThreadId) {
+      try {
+        await startCodexTurn(session, text)
+      } catch (error) {
+        if (sessions.get(session.name) !== session) {
+          return false
+        }
+
+        const detail = error instanceof Error ? error.message : String(error)
+        console.warn(`[agents] Codex input delivery failed for ${session.name}: ${detail}`)
+        failCodexSession(session.name, session, detail)
+        schedulePersistedSessionsWrite()
+        return false
+      }
+
+      resetActiveTurnState(session)
+      scheduleCodexTurnWatchdog(session)
+      const userEvent: StreamJsonEvent = {
+        type: 'user',
+        message: { role: 'user', content: text },
+      } as unknown as StreamJsonEvent
+      appendStreamEvent(session, userEvent)
+      broadcastStreamEvent(session, userEvent)
       return true
-    } catch (error) {
-      session.lastTurnCompleted = previousLastTurnCompleted
-      session.completedTurnAt = previousCompletedTurnAt
+    }
 
-      if (options.reportFailure !== false) {
-        const message = error instanceof Error ? error.message : String(error)
-        const event: StreamJsonEvent = {
-          type: 'system',
-          text: `Codex request failed: ${message}`,
-        } as unknown as StreamJsonEvent
-        appendStreamEvent(session, event)
-        broadcastStreamEvent(session, event)
-      }
-
+    const userMsg = JSON.stringify({ type: 'user', message: { role: 'user', content: text } })
+    const sent = writeToStdin(session, userMsg + '\n')
+    if (!sent) {
       return false
     }
+
+    resetActiveTurnState(session)
+    const userEvent: StreamJsonEvent = {
+      type: 'user',
+      message: { role: 'user', content: text },
+    } as unknown as StreamJsonEvent
+    appendStreamEvent(session, userEvent)
+    broadcastStreamEvent(session, userEvent)
+    return true
   }
 
-  function normalizeCodexEvent(method: string, params: unknown): StreamJsonEvent | StreamJsonEvent[] | null {
-    const p = params as Record<string, unknown>
-
-    switch (method) {
-      case 'thread/started':
-        return { type: 'system', text: 'Codex session started' }
-      case 'thread/tokenUsage/updated': {
-        const tokenUsage = p.tokenUsage as {
-          total?: { inputTokens?: number; outputTokens?: number }
-        } | undefined
-        const total = tokenUsage?.total
-        if (!total) return null
-        return {
-          type: 'message_delta',
-          usage: {
-            input_tokens: total.inputTokens,
-            output_tokens: total.outputTokens,
-          },
-          usage_is_total: true,
-        } as unknown as StreamJsonEvent
-      }
-      case 'turn/started':
-        return { type: 'message_start', message: { id: (p.turn as Record<string, unknown>)?.id as string ?? '', role: 'assistant' } }
-      case 'turn/completed': {
-        const turn = p.turn as Record<string, unknown> | undefined
-        const status = turn?.status as string | undefined
-        return {
-          type: 'result',
-          result: status === 'completed' ? 'Turn completed' : `Turn ${status ?? 'ended'}`,
-          is_error: status === 'failed',
-        }
-      }
-      case 'item/agentMessage/delta': {
-        const text = (p.delta ?? p.text) as string | undefined
-        if (!text) return null
-        return { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } } as unknown as StreamJsonEvent
-      }
-      case 'item/reasoning/summaryTextDelta':
-      case 'item/reasoning/textDelta': {
-        const text = (p as Record<string, unknown>).text as string | undefined
-        if (!text) return null
-        return { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: text } } as unknown as StreamJsonEvent
-      }
-      case 'item/started': {
-        const item = p.item as Record<string, unknown>
-        if (!item) return null
-        const itemType = item.type as string
-        if (itemType === 'userMessage') {
-          // User messages are already synthesized when input is sent from the UI.
-          // Re-emitting them from Codex notifications duplicates the prompt.
-          return null
-        }
-        if (itemType === 'agentMessage') {
-          return {
-            type: 'content_block_start',
-            index: 0,
-            content_block: { type: 'text', text: '' },
-          } as unknown as StreamJsonEvent
-        }
-        if (itemType === 'reasoning') {
-          return { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } } as unknown as StreamJsonEvent
-        }
-        return null
-      }
-      case 'item/completed': {
-        const item = p.item as Record<string, unknown>
-        if (!item) return null
-        const itemType = item.type as string
-        const itemId = item.id as string ?? ''
-        if (itemType === 'agentMessage') {
-          return { type: 'content_block_stop', index: 0 } as unknown as StreamJsonEvent
-        }
-        if (itemType === 'reasoning') {
-          return { type: 'content_block_stop', index: 0 } as unknown as StreamJsonEvent
-        }
-        if (itemType === 'commandExecution') {
-          const events: StreamJsonEvent[] = []
-          events.push({
-            type: 'assistant',
-            message: {
-              id: itemId,
-              role: 'assistant',
-              content: [{
-                type: 'tool_use',
-                id: itemId,
-                name: 'Bash',
-                input: { command: (item.command ?? item.input) as string ?? '' },
-              }],
-            },
-          } as unknown as StreamJsonEvent)
-          events.push({
-            type: 'user',
-            message: {
-              role: 'user',
-              content: [{
-                type: 'tool_result',
-                tool_use_id: itemId,
-                content: (item.output ?? '') as string,
-                is_error: (item.exitCode as number | undefined) !== 0,
-              }],
-            },
-          } as unknown as StreamJsonEvent)
-          return events
-        }
-        if (itemType === 'fileChange') {
-          const events: StreamJsonEvent[] = []
-          events.push({
-            type: 'assistant',
-            message: {
-              id: itemId,
-              role: 'assistant',
-              content: [{
-                type: 'tool_use',
-                id: itemId,
-                name: 'Edit',
-                input: { file_path: (item.filePath ?? item.file) as string ?? '', old_string: '', new_string: (item.content ?? item.patch ?? '') as string },
-              }],
-            },
-          } as unknown as StreamJsonEvent)
-          events.push({
-            type: 'user',
-            message: {
-              role: 'user',
-              content: [{ type: 'tool_result', tool_use_id: itemId, content: 'Applied' }],
-            },
-          } as unknown as StreamJsonEvent)
-          return events
-        }
-        return null
-      }
-      default:
-        return null
-    }
-  }
+  // normalizeCodexEvent is imported from ./normalize-codex-event.ts
 
   async function createCodexSessionFromThread(
     sessionName: string,
@@ -4621,10 +4044,11 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     exitedStreamSessions.delete(sessionName)
 
     const initializedAt = new Date().toISOString()
+    const loggedCodexApprovalRequests = new Set<string>()
     // Create a virtual StreamSession backed by the codex sidecar.
     // We use a fake ChildProcess-like object since we're proxying through the sidecar.
     const fakeProcess = new (await import('node:events')).EventEmitter() as unknown as ChildProcess
-    let removeListener = () => {}
+    let notificationCleanup = () => {}
     Object.assign(fakeProcess, {
       pid: codexSidecar.process?.pid ?? 0,
       stdin: null,
@@ -4633,7 +4057,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       kill: () => {
         // Archive the thread
         void sendCodexRequest('thread/archive', { threadId }).catch(() => {})
-        removeListener()
+        notificationCleanup()
         return true
       },
     })
@@ -4654,21 +4078,45 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       lastEventAt: initializedAt,
       usage: { inputTokens: 0, outputTokens: 0, costUsd: 0 },
       stdoutBuffer: '',
-      systemPrompt: options.systemPrompt,
-      maxTurns: options.maxTurns,
       stdinDraining: false,
       lastTurnCompleted: true,
-      messageQueue: new KeyedAsyncQueue(),
-      pendingMessageCount: 0,
       conversationEntryCount: 0,
-      autoRotatePending: false,
-      turnCompletedEmitter: new EventEmitter(),
       codexThreadId: threadId,
+      resumedFrom: options.resumedFrom,
+      codexNotificationCleanup: undefined,
       restoredIdle: false,
     }
 
     // Listen for codex notifications on this thread.
-    removeListener = addCodexNotificationListener(threadId, (method, params) => {
+    notificationCleanup = addCodexNotificationListener(threadId, (method, params) => {
+      if (!session.lastTurnCompleted) {
+        scheduleCodexTurnWatchdog(session)
+      }
+
+      const approvalEvent = buildCodexApprovalRequestSystemEvent(method, params)
+      if (approvalEvent) {
+        const approvalDetails = getCodexApprovalRequestDetails(params)
+        const approvalKey = [
+          method,
+          approvalDetails.turnId ?? '',
+          approvalDetails.itemId ?? '',
+        ].join(':')
+
+        if (!loggedCodexApprovalRequests.has(approvalKey)) {
+          loggedCodexApprovalRequests.add(approvalKey)
+          logCodexSidecar('warn', 'Unsupported Codex approval request', {
+            sessionName: session.name,
+            threadId,
+            method,
+            ...approvalDetails,
+          })
+          appendStreamEvent(session, approvalEvent)
+          broadcastStreamEvent(session, approvalEvent)
+          schedulePersistedSessionsWrite()
+        }
+        return
+      }
+
       const normalized = normalizeCodexEvent(method, params)
       if (!normalized) return
       const events = Array.isArray(normalized) ? normalized : [normalized]
@@ -4677,17 +4125,25 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
         broadcastStreamEvent(session, event)
       }
     })
+    session.codexNotificationCleanup = notificationCleanup
 
-    // Send initial task and persist the user message for replay.
     if (task.length > 0) {
+      try {
+        await startCodexTurn(session, task)
+      } catch (error) {
+        notificationCleanup()
+        session.codexNotificationCleanup = undefined
+        throw error
+      }
+
+      resetActiveTurnState(session)
+      scheduleCodexTurnWatchdog(session)
       const userEvent: StreamJsonEvent = {
         type: 'user',
         message: { role: 'user', content: task },
       } as unknown as StreamJsonEvent
       appendStreamEvent(session, userEvent)
       broadcastStreamEvent(session, userEvent)
-
-      void startCodexTurn(session, task)
     }
 
     return session
@@ -4718,20 +4174,56 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       approvalPolicy = 'on-failure'
     }
 
-    const threadResult = await sendCodexRequest('thread/start', {
+    const hasSystemPrompt = typeof options.systemPrompt === 'string' && options.systemPrompt.length > 0
+    const initialTask = hasSystemPrompt ? '' : task
+
+    const threadStartParams: {
+      cwd: string
+      sandbox: string
+      approvalPolicy: string
+      developerInstructions?: string
+    } = {
       cwd: sessionCwd,
       sandbox,
       approvalPolicy,
-    }) as { thread: { id: string } }
+    }
+    if (hasSystemPrompt) {
+      threadStartParams.developerInstructions = options.systemPrompt
+    }
+
+    let threadId: string
+    if (options.resumeSessionId) {
+      threadId = options.resumeSessionId
+      await sendCodexRequest('thread/resume', { threadId })
+    } else {
+      const threadResult = await sendCodexRequest('thread/start', threadStartParams) as { thread: { id: string } }
+      threadId = threadResult.thread.id
+    }
 
     return createCodexSessionFromThread(
       sessionName,
       mode,
       sessionCwd,
-      threadResult.thread.id,
-      task,
+      threadId,
+      initialTask,
       options,
     )
+  }
+
+  async function resumeCodexAppServerSession(
+    sessionName: string,
+    mode: ClaudePermissionMode,
+    cwd: string,
+    threadId: string,
+    createdAt: string,
+    resumedFrom?: string,
+  ): Promise<StreamSession> {
+    await ensureCodexSidecar()
+    await sendCodexRequest('thread/resume', { threadId })
+    return createCodexSessionFromThread(sessionName, mode, cwd, threadId, '', {
+      createdAt,
+      resumedFrom,
+    })
   }
 
   router.post('/sessions', requireWriteAccess, async (req, res) => {
@@ -4755,14 +4247,9 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       return
     }
 
-    const cwd = parseCwd(req.body?.cwd)
-    if (cwd === null) {
-      res.status(400).json({ error: 'Invalid cwd: must be an absolute path' })
-      return
-    }
-
-    if (countTrackedSessions() >= maxSessions) {
-      res.status(429).json({ error: `Session limit reached (${maxSessions})` })
+    const resumeFromSession = parseOptionalSessionName(req.body?.resumeFromSession)
+    if (resumeFromSession === null) {
+      res.status(400).json({ error: 'Invalid resume session name' })
       return
     }
 
@@ -4771,9 +4258,41 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       return
     }
 
-    const sessionType = parseSessionType(req.body?.sessionType)
-    const agentType = parseAgentType(req.body?.agentType)
-    const requestedHost = parseOptionalHost(req.body?.host)
+    let resumeSource: ResolvedResumableSessionSource | undefined
+    if (resumeFromSession) {
+      let persistedState: PersistedSessionsState
+      try {
+        persistedState = await readPersistedSessionsState()
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to load persisted sessions'
+        res.status(500).json({ error: message })
+        return
+      }
+
+      const resolved = resolveResumableSessionSource(resumeFromSession, persistedState)
+      if (!resolved.source) {
+        res.status(resolved.error?.status ?? 404).json({
+          error: resolved.error?.message ?? `Session "${resumeFromSession}" is not resumable`,
+        })
+        return
+      }
+      resumeSource = resolved.source
+    }
+
+    if (sessions.size >= maxSessions && !resumeSource?.liveSession) {
+      res.status(429).json({ error: `Session limit reached (${maxSessions})` })
+      return
+    }
+
+    const cwd = resumeSource?.source.cwd ?? parseCwd(req.body?.cwd)
+    if (cwd === null) {
+      res.status(400).json({ error: 'Invalid cwd: must be an absolute path' })
+      return
+    }
+
+    const sessionType = resumeSource ? 'stream' : parseSessionType(req.body?.sessionType)
+    const agentType = resumeSource?.source.agentType ?? parseAgentType(req.body?.agentType)
+    const requestedHost = resumeSource?.source.host ?? parseOptionalHost(req.body?.host)
     if (requestedHost === null) {
       res.status(400).json({ error: 'Invalid host: expected machine ID string' })
       return
@@ -4799,6 +4318,20 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     const requestedMachineCwd = cwd ?? machine?.cwd
     const sessionCwd = requestedMachineCwd ?? process.env.HOME ?? '/tmp'
     const remoteMachine = isRemoteMachine(machine) ? machine : undefined
+
+    if (
+      resumeSource &&
+      !resumeSource.liveSession &&
+      resumeSource.source.agentType === 'codex' &&
+      resumeSource.source.codexThreadId &&
+      !(await hasCodexRolloutFile(resumeSource.source.codexThreadId, resumeSource.source.createdAt))
+    ) {
+      clearCodexResumeMetadata(resumeFromSession!)
+      res.status(409).json({
+        error: codexRolloutUnavailableMessage(resumeFromSession!),
+      })
+      return
+    }
 
     if (agentType === 'openclaw') {
       const rawAgentId = req.body?.agentId
@@ -4835,19 +4368,28 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
         return
       }
 
-      const parentSessionName = parseSessionName(req.body?.parentSession) || undefined
       try {
-        const session = agentType === 'codex'
-          ? await createCodexAppServerSession(sessionName, mode, task ?? '', requestedMachineCwd, { parentSession: parentSessionName })
-          : createStreamSession(sessionName, mode, task ?? '', requestedMachineCwd, machine, agentType, { parentSession: parentSessionName })
-        sessions.set(sessionName, session)
-        // If a parent session is specified, register this session as a spawned worker
-        if (parentSessionName) {
-          const parent = sessions.get(parentSessionName)
-          if (parent?.kind === 'stream' && !parent.spawnedWorkers.includes(sessionName)) {
-            parent.spawnedWorkers.push(sessionName)
-          }
+        const session = resumeSource
+          ? (
+              agentType === 'codex'
+                ? await createCodexAppServerSession(sessionName, mode, task ?? '', requestedMachineCwd, {
+                  resumeSessionId: resumeSource.source.codexThreadId,
+                  resumedFrom: resumeFromSession,
+                })
+                : createStreamSession(sessionName, mode, task ?? '', requestedMachineCwd, machine, agentType, {
+                  resumeSessionId: resumeSource.source.claudeSessionId,
+                  resumedFrom: resumeFromSession,
+                })
+            )
+          : (
+              agentType === 'codex'
+                ? await createCodexAppServerSession(sessionName, mode, task ?? '', requestedMachineCwd)
+                : createStreamSession(sessionName, mode, task ?? '', requestedMachineCwd, machine, agentType)
+            )
+        if (resumeSource?.liveSession) {
+          retireLiveCodexSessionForResume(resumeFromSession!, resumeSource.liveSession)
         }
+        sessions.set(sessionName, session)
         schedulePersistedSessionsWrite()
         res.status(201).json({
           sessionName,
@@ -4858,6 +4400,13 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
           created: true,
         })
       } catch (err) {
+        if (resumeFromSession && isMissingCodexRolloutError(err)) {
+          clearCodexResumeMetadata(resumeFromSession)
+          res.status(409).json({
+            error: codexRolloutUnavailableMessage(resumeFromSession),
+          })
+          return
+        }
         const message = err instanceof Error ? err.message : 'Failed to create stream session'
         res.status(500).json({ error: message })
       }
@@ -4894,7 +4443,6 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
         task: task && task.length > 0 ? task : undefined,
         pty,
         buffer: '',
-        bufferBytesDropped: 0,
         clients: new Set(),
         createdAt,
         lastEventAt: createdAt,
@@ -4955,15 +4503,13 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       return
     }
 
-    let session = sessions.get(sessionName)
+    const session = sessions.get(sessionName)
     if (!session || (session.kind !== 'stream' && session.kind !== 'openclaw')) {
       res.status(404).json({ error: `Stream session "${sessionName}" not found` })
       return
     }
 
-    const text = typeof req.body?.text === 'string'
-      ? req.body.text.trim()
-      : (typeof req.body?.message === 'string' ? req.body.message.trim() : '')
+    const text = typeof req.body?.text === 'string' ? req.body.text.trim() : ''
     if (text.length === 0) {
       res.status(400).json({ error: 'text must be a non-empty string' })
       return
@@ -4975,231 +4521,13 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       return
     }
 
-    if (session.autoRotatePending) {
-      await rotateStreamSessionIfNeeded(sessionName)
-      const live = sessions.get(sessionName)
-      if (!live || live.kind !== 'stream') {
-        res.status(404).json({ error: `Stream session "${sessionName}" not found` })
-        return
-      }
-      session = live
-    }
-
-    const userMsg = JSON.stringify({ type: 'user', message: { role: 'user', content: text } })
-    const sent = session.codexThreadId
-      ? await startCodexTurn(session, text)
-      : writeToStdin(session, userMsg + '\n')
-    if (sent) {
-      const userEvent: StreamJsonEvent = {
-        type: 'user',
-        message: { role: 'user', content: text },
-      } as unknown as StreamJsonEvent
-      appendStreamEvent(session, userEvent)
-      broadcastStreamEvent(session, userEvent)
-    }
-    res.json({ sent })
-  })
-
-  router.post('/sessions/:name/message', requireWriteAccess, async (req, res) => {
-    const sessionName = parseSessionName(req.params.name)
-    if (!sessionName) {
-      res.status(400).json({ error: 'Invalid session name' })
+    const sent = await sendTextToStreamSession(session, text)
+    if (!sent) {
+      res.status(503).json({ sent: false, error: 'Stream session unavailable' })
       return
     }
 
-    const session = sessions.get(sessionName)
-    if (!session || (session.kind !== 'stream' && session.kind !== 'openclaw')) {
-      res.status(404).json({ error: `Stream session "${sessionName}" not found` })
-      return
-    }
-
-    const text = typeof req.body?.message === 'string' ? req.body.message.trim() : ''
-    if (text.length === 0) {
-      res.status(400).json({ error: 'message required' })
-      return
-    }
-
-    // /reset rotates the underlying Claude session for commander sessions
-    // without removing the HTTP session entry.
-    if (
-      text === '/reset' &&
-      sessionName.startsWith(COMMANDER_SESSION_NAME_PREFIX) &&
-      session.kind === 'stream'
-    ) {
-      try {
-        await resetCommanderSession(sessionName)
-        res.json({ reset: true })
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
-        res.status(500).json({ error: `Reset failed: ${message}` })
-      }
-      return
-    }
-
-    if (session.kind === 'openclaw') {
-      void dispatchOpenClawHook(session, text)
-      res.status(202).json({ queued: true, queueDepth: 0 })
-      return
-    }
-
-    if (session.pendingMessageCount >= MAX_PENDING_SESSION_MESSAGES) {
-      res.status(429).json({ error: 'Queue full' })
-      return
-    }
-
-    session.pendingMessageCount += 1
-    const queueDepth = session.pendingMessageCount
-
-    void session.messageQueue.enqueue(session.name, async () => {
-      try {
-        let liveSession = sessions.get(sessionName)
-        if (!liveSession || liveSession.kind !== 'stream') {
-          return
-        }
-
-        await waitForTurnCompletion(liveSession)
-
-        liveSession = sessions.get(sessionName)
-        if (!liveSession || liveSession.kind !== 'stream') {
-          return
-        }
-
-        if (liveSession.autoRotatePending) {
-          await rotateStreamSessionIfNeeded(sessionName, { allowPendingCount: 1 })
-          liveSession = sessions.get(sessionName)
-          if (!liveSession || liveSession.kind !== 'stream') {
-            return
-          }
-          await waitForTurnCompletion(liveSession)
-        }
-
-        if (liveSession.lastTurnCompleted && liveSession.agentType !== 'codex' && !isCommandRoomSessionName(sessionName)) {
-          liveSession.lastTurnCompleted = false
-          liveSession.completedTurnAt = undefined
-        }
-
-        if (liveSession.agentType === 'codex' && liveSession.codexThreadId) {
-          await startCodexTurn(liveSession, text)
-          return
-        }
-
-        const userMsg = JSON.stringify({
-          type: 'user',
-          message: { role: 'user', content: text },
-        })
-        writeToStdin(liveSession, userMsg + '\n')
-      } finally {
-        const liveSession = sessions.get(sessionName)
-        if (liveSession && liveSession.kind === 'stream') {
-          liveSession.pendingMessageCount = Math.max(0, liveSession.pendingMessageCount - 1)
-          if (liveSession.pendingMessageCount === 0 && liveSession.autoRotatePending) {
-            scheduleAutoRotationIfNeeded(sessionName)
-          }
-        } else {
-          session.pendingMessageCount = Math.max(0, session.pendingMessageCount - 1)
-        }
-      }
-    }).catch(() => {})
-
-    res.status(202).json({ queued: true, queueDepth })
-  })
-
-  // ── Session Reset (commander-only) ──────────────────────────────────
-  // Rotates the underlying Claude process: flush journal, kill old process,
-  // spawn new one (no --resume), transfer WS clients, broadcast system event.
-  async function resetCommanderSession(sessionName: string): Promise<StreamSession> {
-    const session = sessions.get(sessionName)
-    if (!session || session.kind !== 'stream') {
-      throw new Error(`Session "${sessionName}" not found`)
-    }
-
-    await waitForTurnCompletion(session)
-
-    const live = sessions.get(sessionName)
-    if (!live || live.kind !== 'stream') {
-      throw new Error('Session disappeared during reset')
-    }
-
-    const commanderId = sessionName.slice(COMMANDER_SESSION_NAME_PREFIX.length)
-    try {
-      const journal = new JournalWriter(commanderId)
-      const noOpGhClient = { postIssueComment: async () => {} }
-      const flusher = new EmergencyFlusher(commanderId, journal, noOpGhClient)
-      await flusher.betweenTaskFlush({
-        currentIssue: null,
-        taskState: 'Session reset by user',
-        pendingSpikeObservations: [],
-        trigger: 'between-task',
-      })
-    } catch {
-      // Journal flush is best-effort — do not block reset on failure.
-    }
-
-    const oldClients = new Set(live.clients)
-    const oldEvents = live.events.slice()
-    const oldUsage = { ...live.usage }
-    const oldLastEventAt = live.lastEventAt
-
-    const rotated = await createReplacementStreamSession(sessionName, live)
-
-    const rotationEvent: StreamJsonEvent = {
-      type: 'system',
-      subtype: 'session_reset',
-      text: 'Session rotated — Claude context cleared, memory preserved.',
-    }
-    appendStreamEvent(live, rotationEvent)
-
-    rotated.events = [...oldEvents, rotationEvent]
-    rotated.usage = oldUsage
-    rotated.lastEventAt = oldLastEventAt
-    rotated.conversationEntryCount = 0
-    rotated.autoRotatePending = false
-
-    for (const client of oldClients) {
-      rotated.clients.add(client)
-    }
-    live.clients.clear()
-
-    sessions.set(sessionName, rotated)
-    cleanupStreamMessageQueue(live)
-    live.process.kill('SIGTERM')
-
-    broadcastStreamEvent(rotated, rotationEvent)
-    await sendTextToStreamSession(rotated, COMMANDER_ROTATION_CONTINUATION_PROMPT)
-    schedulePersistedSessionsWrite()
-    return rotated
-  }
-
-  router.post('/sessions/:name/reset', requireWriteAccess, async (req, res) => {
-    const sessionName = parseSessionName(req.params.name)
-    if (!sessionName) {
-      res.status(400).json({ error: 'Invalid session name' })
-      return
-    }
-
-    if (!sessionName.startsWith(COMMANDER_SESSION_NAME_PREFIX)) {
-      res.status(400).json({ error: 'Reset is only supported for commander sessions' })
-      return
-    }
-
-    const session = sessions.get(sessionName)
-    if (!session) {
-      res.status(404).json({ error: `Session "${sessionName}" not found` })
-      return
-    }
-
-    if (session.kind !== 'stream') {
-      res.status(400).json({ error: 'Reset is only supported for stream sessions' })
-      return
-    }
-
-    try {
-      await resetCommanderSession(sessionName)
-      res.json({ reset: true, sessionName })
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      res.status(500).json({ error: `Reset failed: ${message}` })
-    }
+    res.json({ sent: true })
   })
 
   router.post('/sessions/:name/pre-kill-debrief', requireWriteAccess, async (req, res) => {
@@ -5215,44 +4543,24 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       return
     }
 
-    // PTY sessions have no structured I/O — debrief is meaningless. Return immediately.
     if (session.kind === 'pty') {
       res.json({ debriefed: false, reason: 'pty-session' })
       return
     }
 
-    if (!supportsPreKillDebrief(session)) {
+    if (session.kind !== 'stream') {
+      res.json({ debriefed: false, reason: 'unsupported-session-type' })
+      return
+    }
+
+    if (session.agentType === 'openclaw') {
       res.json({ debriefed: false, reason: 'unsupported-agent-type' })
       return
     }
 
-    // Stream sessions: fire-and-forget debrief, return immediately to avoid 504.
-    const sessionLength = estimateSessionLength(session)
-    const mode = getDebriefModeForSessionLength(sessionLength)
-    const timeoutMs = getDebriefTimeoutMs(mode)
-
-    debriefStateBySessionName.set(sessionName, {
-      status: 'pending',
-      startedAt: new Date().toISOString(),
-      timeoutMs,
-    })
-
-    void (async () => {
-      try {
-        const result = await triggerPreKillDebrief(sessionName, session)
-        const state = debriefStateBySessionName.get(sessionName)
-        if (state) {
-          state.status = result.timedOut ? 'timed-out' : 'completed'
-        }
-      } catch {
-        const state = debriefStateBySessionName.get(sessionName)
-        if (state) {
-          state.status = 'timed-out'
-        }
-      }
-    })()
-
-    res.json({ debriefStarted: true, timeoutMs })
+    // Keep the kill flow non-blocking until the full debrief pipeline is
+    // ported into this app codepath.
+    res.json({ debriefStarted: false, reason: 'not-supported-yet' })
   })
 
   router.get('/sessions/:name/debrief-status', requireWriteAccess, (req, res) => {
@@ -5262,13 +4570,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       return
     }
 
-    const state = debriefStateBySessionName.get(sessionName)
-    if (!state) {
-      res.json({ status: 'none' })
-      return
-    }
-
-    res.json({ status: state.status })
+    res.json({ status: 'none' })
   })
 
   router.delete('/sessions/:name', requireWriteAccess, async (req, res) => {
@@ -5280,34 +4582,15 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
 
     const session = sessions.get(sessionName)
     if (!session) {
+      const hadExited = exitedStreamSessions.delete(sessionName)
+      const hadCompleted = completedSessions.delete(sessionName)
+      if (hadExited || hadCompleted) {
+        schedulePersistedSessionsWrite()
+        res.json({ killed: true })
+        return
+      }
       res.status(404).json({ error: `Session "${sessionName}" not found` })
       return
-    }
-
-    // Never block on debrief — DELETE returns immediately. Frontend must call
-    // POST /pre-kill-debrief first and poll GET /debrief-status for stream sessions.
-
-    // For command-room sessions that an executor may be monitoring, add a
-    // synthetic completion so the executor detects termination instead of
-    // timing out when it polls and gets 404 after the session is removed.
-    if (isCommandRoomSessionName(sessionName) && session.kind === 'stream' && !completedSessions.has(sessionName)) {
-      const killEvent: StreamJsonEvent = { type: 'system', text: 'Session killed by API request' }
-      if (session.finalResultEvent) {
-        completedSessions.set(
-          sessionName,
-          toCompletedSession(
-            sessionName,
-            session.completedTurnAt ?? new Date().toISOString(),
-            session.finalResultEvent,
-            session.usage.costUsd,
-          ),
-        )
-      } else {
-        completedSessions.set(
-          sessionName,
-          toExitBasedCompletedSession(sessionName, killEvent, session.usage.costUsd),
-        )
-      }
     }
 
     for (const client of session.clients) {
@@ -5317,19 +4600,475 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     if (session.kind === 'pty') {
       session.pty.kill()
     } else if (session.kind === 'stream') {
-      cleanupStreamMessageQueue(session)
+      if (session.agentType === 'codex') {
+        clearCodexTurnWatchdog(session)
+        markCodexTurnHealthy(session)
+      }
       session.process.kill('SIGTERM')
-    } else {
+    } else if (session.kind === 'openclaw') {
       session.gatewayWs?.close()
       session.gatewayWs = null
     }
+    // External sessions have no local process — just remove from the map.
 
     sessions.delete(sessionName)
+    exitedStreamSessions.delete(sessionName)
+    completedSessions.delete(sessionName)
     sessionEventHandlers.delete(sessionName)
-    debriefStateBySessionName.delete(sessionName)
     schedulePersistedSessionsWrite()
 
     res.json({ killed: true })
+  })
+
+  function buildPersistedEntryFromExitedSession(
+    sessionName: string,
+    exited: ExitedStreamSessionState,
+  ): PersistedStreamSession {
+    return {
+      name: sessionName,
+      agentType: exited.agentType,
+      mode: exited.mode,
+      cwd: exited.cwd,
+      host: exited.host,
+      createdAt: exited.createdAt,
+      claudeSessionId: exited.claudeSessionId,
+      codexThreadId: exited.codexThreadId,
+      parentSession: exited.parentSession,
+      spawnedWorkers: [...exited.spawnedWorkers],
+      resumedFrom: exited.resumedFrom,
+      sessionState: 'exited',
+      hadResult: exited.hadResult,
+      conversationEntryCount: exited.conversationEntryCount,
+      events: [...exited.events],
+    }
+  }
+
+  function buildPersistedEntryFromLiveStreamSession(
+    sessionName: string,
+    session: StreamSession,
+  ): PersistedStreamSession {
+    return {
+      name: sessionName,
+      agentType: session.agentType,
+      mode: session.mode,
+      cwd: session.cwd,
+      host: session.host,
+      createdAt: session.createdAt,
+      claudeSessionId: session.claudeSessionId,
+      codexThreadId: session.codexThreadId,
+      parentSession: session.parentSession,
+      spawnedWorkers: [...session.spawnedWorkers],
+      resumedFrom: session.resumedFrom,
+      sessionState: 'active',
+      hadResult: Boolean(session.finalResultEvent),
+      conversationEntryCount: session.conversationEntryCount,
+      events: [...session.events],
+    }
+  }
+
+function parseCodexSidecarError(error: unknown): { code?: number; message?: string } | null {
+  if (!(error instanceof Error)) {
+    return null
+  }
+
+  try {
+    const parsed = JSON.parse(error.message) as { code?: unknown; message?: unknown }
+    return {
+      code: typeof parsed.code === 'number' ? parsed.code : undefined,
+      message: typeof parsed.message === 'string' ? parsed.message : undefined,
+    }
+  } catch {
+    return null
+  }
+}
+
+function isMissingCodexRolloutError(error: unknown): boolean {
+  const parsed = parseCodexSidecarError(error)
+  return parsed?.code === -32600 && Boolean(parsed.message?.includes('no rollout found for thread id'))
+}
+
+function codexRolloutUnavailableMessage(sessionName: string): string {
+  return `Session "${sessionName}" can no longer be resumed because its Codex rollout is unavailable`
+}
+
+function codexRolloutDirectoryForCreatedAt(createdAt: string): string | null {
+  const date = new Date(createdAt)
+  if (Number.isNaN(date.getTime())) {
+    return null
+  }
+
+  const iso = date.toISOString()
+  return path.join(homedir(), '.codex', 'sessions', iso.slice(0, 4), iso.slice(5, 7), iso.slice(8, 10))
+}
+
+async function hasCodexRolloutFile(threadId: string, createdAt: string): Promise<boolean> {
+  const directory = codexRolloutDirectoryForCreatedAt(createdAt)
+  if (!directory) {
+    return true
+  }
+
+  try {
+    const entries = await readdir(directory, { withFileTypes: true })
+    return entries.some((entry) => entry.isFile() && entry.name.includes(threadId))
+  } catch {
+    return false
+  }
+}
+
+async function isExitedSessionResumeAvailable(entry: PersistedStreamSession): Promise<boolean> {
+  if (!hasResumeIdentifier(entry)) {
+    return false
+  }
+
+  if (entry.agentType !== 'codex' || !entry.codexThreadId) {
+    return true
+  }
+
+  return hasCodexRolloutFile(entry.codexThreadId, entry.createdAt)
+}
+
+  function hasResumeIdentifier(entry: PersistedStreamSession): boolean {
+    if (entry.agentType === 'claude') {
+      return Boolean(entry.claudeSessionId)
+    }
+    if (entry.agentType === 'codex') {
+      return Boolean(entry.codexThreadId)
+    }
+    return false
+  }
+
+  function canResumeLiveStreamSession(session: StreamSession): boolean {
+    return (
+      session.agentType === 'codex' &&
+      Boolean(session.codexThreadId) &&
+      Boolean(session.codexTurnStaleAt)
+    )
+  }
+
+  function snapshotExitedStreamSession(session: StreamSession): ExitedStreamSessionState {
+    return {
+      phase: 'exited',
+      hadResult: Boolean(session.finalResultEvent),
+      agentType: session.agentType,
+      mode: session.mode,
+      cwd: session.cwd,
+      host: session.host,
+      parentSession: session.parentSession,
+      spawnedWorkers: [...session.spawnedWorkers],
+      createdAt: session.createdAt,
+      claudeSessionId: session.claudeSessionId,
+      codexThreadId: session.codexThreadId,
+      resumedFrom: session.resumedFrom,
+      conversationEntryCount: session.conversationEntryCount,
+      events: [...session.events],
+    }
+  }
+
+  function clearCodexResumeMetadata(sessionName: string): void {
+    const liveSession = sessions.get(sessionName)
+    if (liveSession?.kind === 'stream' && liveSession.agentType === 'codex') {
+      liveSession.codexThreadId = undefined
+      liveSession.codexTurnStaleAt = undefined
+    }
+
+    const exitedSession = exitedStreamSessions.get(sessionName)
+    if (exitedSession?.agentType === 'codex') {
+      exitedSession.codexThreadId = undefined
+    }
+
+    schedulePersistedSessionsWrite()
+  }
+
+  function retireLiveCodexSessionForResume(sessionName: string, session: StreamSession): void {
+    clearCodexTurnWatchdog(session)
+    markCodexTurnHealthy(session)
+    session.codexNotificationCleanup?.()
+    session.codexNotificationCleanup = undefined
+    for (const client of session.clients) {
+      client.close(1000, 'Session resumed')
+    }
+    exitedStreamSessions.set(sessionName, snapshotExitedStreamSession(session))
+    sessions.delete(sessionName)
+    sessionEventHandlers.delete(sessionName)
+  }
+
+  function resolveResumableSessionSource(
+    sessionName: string,
+    persistedState: PersistedSessionsState,
+  ): { source?: ResolvedResumableSessionSource; error?: { status: number; message: string } } {
+    const liveSession = sessions.get(sessionName)
+    if (liveSession) {
+      if (liveSession.kind !== 'stream' || liveSession.agentType === 'openclaw') {
+        return {
+          error: { status: 404, message: `Session "${sessionName}" is not resumable` },
+        }
+      }
+      if (!canResumeLiveStreamSession(liveSession)) {
+        return {
+          error: { status: 409, message: `Session "${sessionName}" is not resumable right now` },
+        }
+      }
+      return {
+        source: {
+          source: buildPersistedEntryFromLiveStreamSession(sessionName, liveSession),
+          liveSession,
+        },
+      }
+    }
+
+    const exitedSession = exitedStreamSessions.get(sessionName)
+    const persistedSource = persistedState.sessions.find((entry) => entry.name === sessionName)
+    let source = exitedSession ? buildPersistedEntryFromExitedSession(sessionName, exitedSession) : undefined
+    if ((!source || !hasResumeIdentifier(source)) && persistedSource) {
+      source = persistedSource
+    }
+
+    if (!source || source.agentType === 'openclaw') {
+      return {
+        error: { status: 404, message: `Session "${sessionName}" not found` },
+      }
+    }
+
+    if (!hasResumeIdentifier(source)) {
+      return {
+        error: { status: 409, message: `Session "${sessionName}" is missing resume metadata` },
+      }
+    }
+
+    return { source: { source } }
+  }
+
+  router.post('/sessions/:name/resume', requireWriteAccess, async (req, res) => {
+    const originalName = parseSessionName(req.params.name)
+    if (!originalName) {
+      res.status(400).json({ error: 'Invalid session name' })
+      return
+    }
+
+    let persistedState: PersistedSessionsState
+    try {
+      persistedState = await readPersistedSessionsState()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to load persisted sessions'
+      res.status(500).json({ error: message })
+      return
+    }
+
+    const resolved = resolveResumableSessionSource(originalName, persistedState)
+    if (!resolved.source) {
+      res.status(resolved.error?.status ?? 404).json({
+        error: resolved.error?.message ?? `Session "${originalName}" is not resumable`,
+      })
+      return
+    }
+    const { source, liveSession } = resolved.source
+
+    if (sessions.size >= maxSessions && !liveSession) {
+      res.status(429).json({ error: `Session limit reached (${maxSessions})` })
+      return
+    }
+
+    if (source.agentType === 'codex' && source.host) {
+      res.status(400).json({
+        error: 'Remote stream sessions are currently supported for claude only',
+      })
+      return
+    }
+
+    let machine: MachineConfig | undefined
+    if (source.host) {
+      try {
+        const machines = await readMachineRegistry()
+        machine = machines.find((entry) => entry.id === source.host)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to read machines registry'
+        res.status(500).json({ error: message })
+        return
+      }
+      if (!machine) {
+        res.status(400).json({ error: `Unknown host machine "${source.host}"` })
+        return
+      }
+    }
+
+    if (
+      !liveSession &&
+      source.agentType === 'codex' &&
+      source.codexThreadId &&
+      !(await hasCodexRolloutFile(source.codexThreadId, source.createdAt))
+    ) {
+      clearCodexResumeMetadata(originalName)
+      res.status(409).json({
+        error: codexRolloutUnavailableMessage(originalName),
+      })
+      return
+    }
+
+    try {
+      const resumedSession = source.agentType === 'codex'
+        ? await createCodexAppServerSession(originalName, source.mode, '', source.cwd, {
+          resumeSessionId: source.codexThreadId,
+          resumedFrom: source.resumedFrom,
+        })
+        : createStreamSession(
+          originalName,
+          source.mode,
+          '',
+          source.cwd,
+          machine,
+          'claude',
+          {
+            resumeSessionId: source.claudeSessionId,
+            resumedFrom: source.resumedFrom,
+          },
+        )
+      if (liveSession) {
+        retireLiveCodexSessionForResume(originalName, liveSession)
+      }
+      completedSessions.delete(originalName)
+      sessions.set(originalName, resumedSession)
+      schedulePersistedSessionsWrite()
+      res.status(201).json({
+        name: originalName,
+        resumedFrom: originalName,
+      })
+    } catch (error) {
+      if (isMissingCodexRolloutError(error)) {
+        clearCodexResumeMetadata(originalName)
+        res.status(409).json({
+          error: codexRolloutUnavailableMessage(originalName),
+        })
+        return
+      }
+      const message = error instanceof Error ? error.message : 'Failed to resume session'
+      res.status(500).json({ error: message })
+    }
+  })
+
+  // ── External session teleport endpoints ───────────────────────────
+
+  router.post('/sessions/register', requireWriteAccess, (req, res) => {
+    const name = parseSessionName(req.body?.name)
+    if (!name) {
+      res.status(400).json({ error: 'Invalid or missing session name' })
+      return
+    }
+
+    if (sessions.has(name)) {
+      res.status(409).json({ error: `Session "${name}" already exists` })
+      return
+    }
+
+    if (sessions.size >= maxSessions) {
+      res.status(503).json({ error: 'Maximum session limit reached' })
+      return
+    }
+
+    const agentType = parseAgentType(req.body?.agentType)
+    const machine = typeof req.body?.machine === 'string' ? req.body.machine.trim() : ''
+    const cwd = typeof req.body?.cwd === 'string' ? req.body.cwd.trim() : ''
+    const task = typeof req.body?.task === 'string' ? req.body.task.trim() : undefined
+    const metadata = typeof req.body?.metadata === 'object' && req.body.metadata !== null
+      ? req.body.metadata as Record<string, unknown>
+      : undefined
+
+    if (!machine) {
+      res.status(400).json({ error: 'machine is required' })
+      return
+    }
+
+    const now = Date.now()
+    const session: ExternalSession = {
+      kind: 'external',
+      name,
+      agentType,
+      machine,
+      cwd: cwd || '/',
+      host: machine,
+      task,
+      status: 'connected',
+      lastHeartbeat: now,
+      events: [],
+      clients: new Set(),
+      createdAt: new Date(now).toISOString(),
+      lastEventAt: new Date(now).toISOString(),
+      metadata,
+    }
+
+    sessions.set(name, session)
+    res.status(201).json({
+      registered: true,
+      name,
+      agentType,
+      machine,
+      cwd: session.cwd,
+    })
+  })
+
+  router.post('/sessions/:name/heartbeat', requireWriteAccess, (req, res) => {
+    const sessionName = parseSessionName(req.params.name)
+    if (!sessionName) {
+      res.status(400).json({ error: 'Invalid session name' })
+      return
+    }
+
+    const session = sessions.get(sessionName)
+    if (!session || session.kind !== 'external') {
+      res.status(404).json({ error: `External session "${sessionName}" not found` })
+      return
+    }
+
+    const now = Date.now()
+    session.lastHeartbeat = now
+    session.status = 'connected'
+    session.lastEventAt = new Date(now).toISOString()
+
+    // Allow updating metadata on heartbeat
+    if (typeof req.body?.metadata === 'object' && req.body.metadata !== null) {
+      session.metadata = { ...session.metadata, ...req.body.metadata as Record<string, unknown> }
+    }
+
+    res.json({ ok: true, status: session.status })
+  })
+
+  router.post('/sessions/:name/events', requireWriteAccess, (req, res) => {
+    const sessionName = parseSessionName(req.params.name)
+    if (!sessionName) {
+      res.status(400).json({ error: 'Invalid session name' })
+      return
+    }
+
+    const session = sessions.get(sessionName)
+    if (!session || session.kind !== 'external') {
+      res.status(404).json({ error: `External session "${sessionName}" not found` })
+      return
+    }
+
+    const events = Array.isArray(req.body?.events) ? req.body.events as unknown[] : []
+    if (events.length === 0) {
+      res.status(400).json({ error: 'events must be a non-empty array' })
+      return
+    }
+
+    let accepted = 0
+    for (const rawEvent of events) {
+      if (typeof rawEvent !== 'object' || rawEvent === null) continue
+      const event = rawEvent as StreamJsonEvent
+      if (typeof event.type !== 'string' || !event.type) continue
+
+      session.events.push(event)
+      session.lastEventAt = new Date().toISOString()
+      session.lastHeartbeat = Date.now()
+      broadcastStreamEvent(session, event)
+      accepted += 1
+    }
+
+    // Cap event buffer
+    if (session.events.length > MAX_STREAM_EVENTS) {
+      session.events = session.events.slice(-MAX_STREAM_EVENTS)
+    }
+
+    res.json({ accepted })
   })
 
   async function restorePersistedSessions(): Promise<void> {
@@ -5337,35 +5076,83 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     if (persisted.sessions.length === 0) return
 
     for (const entry of persisted.sessions) {
-      if (countTrackedSessions() >= maxSessions) {
-        break
-      }
       if (sessions.has(entry.name)) {
         continue
       }
 
       try {
-        if (entry.agentType === 'codex') {
-          if (entry.host) {
+        if (entry.sessionState === 'exited') {
+          const hadResult = entry.hadResult ?? false
+          if (
+            (entry.agentType === 'claude' && !entry.claudeSessionId) ||
+            (entry.agentType === 'codex' && !entry.codexThreadId)
+          ) {
             continue
           }
-          const session = await createCodexAppServerSession(
+
+          exitedStreamSessions.set(entry.name, {
+            phase: 'exited',
+            hadResult,
+            agentType: entry.agentType,
+            mode: entry.mode,
+            cwd: entry.cwd,
+            host: entry.host,
+            parentSession: entry.parentSession,
+            spawnedWorkers: entry.spawnedWorkers ? [...entry.spawnedWorkers] : [],
+            createdAt: entry.createdAt,
+            claudeSessionId: entry.claudeSessionId,
+            codexThreadId: entry.codexThreadId,
+            resumedFrom: entry.resumedFrom,
+            conversationEntryCount: entry.conversationEntryCount ?? countCompletedTurnEntries(entry.events ?? []),
+            events: entry.events ? [...entry.events] : [],
+          })
+
+          if (hadResult) {
+            const events = entry.events ?? []
+            const resultEvent = [...events].reverse().find((evt) => evt.type === 'result')
+            if (resultEvent) {
+              const totalCost = typeof resultEvent.total_cost_usd === 'number'
+                ? resultEvent.total_cost_usd
+                : (typeof resultEvent.cost_usd === 'number' ? resultEvent.cost_usd : 0)
+              completedSessions.set(
+                entry.name,
+                toCompletedSession(
+                  entry.name,
+                  entry.createdAt,
+                  resultEvent,
+                  totalCost,
+                ),
+              )
+            } else {
+              completedSessions.set(entry.name, {
+                name: entry.name,
+                completedAt: entry.createdAt,
+                subtype: 'success',
+                finalComment: '',
+                costUsd: 0,
+              })
+            }
+          }
+          continue
+        }
+
+        if (sessions.size >= maxSessions) {
+          break
+        }
+
+        if (entry.agentType === 'codex') {
+          if (!entry.codexThreadId || entry.host) {
+            continue
+          }
+          const session = await resumeCodexAppServerSession(
             entry.name,
             entry.mode,
-            '',
             entry.cwd,
-            {
-              createdAt: entry.createdAt,
-              parentSession: entry.parentSession,
-              spawnedWorkers: entry.spawnedWorkers,
-            },
+            entry.codexThreadId,
+            entry.createdAt,
+            entry.resumedFrom,
           )
-          session.conversationEntryCount = entry.conversationEntryCount ?? 0
-          session.autoRotatePending = session.conversationEntryCount >= autoRotateEntryThreshold
           sessions.set(entry.name, session)
-          if (session.autoRotatePending) {
-            scheduleAutoRotationIfNeeded(entry.name)
-          }
           continue
         }
 
@@ -5392,44 +5179,18 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
           {
             resumeSessionId: entry.claudeSessionId,
             createdAt: entry.createdAt,
-            systemPrompt: entry.systemPrompt,
-            maxTurns: entry.maxTurns,
+            resumedFrom: entry.resumedFrom,
           },
         )
         // Restore accumulated event history for WS replay and rebuild usage totals.
         if (entry.events && entry.events.length > 0) {
           session.events = entry.events
           for (const evt of session.events) {
-            const evtType = evt.type as string
-            if (evtType === 'message_delta' && evt.usage) {
-              const u = evt.usage as { input_tokens?: number; output_tokens?: number }
-              if (codexUsageIsTotal(evt)) {
-                if (u.input_tokens !== undefined) session.usage.inputTokens = u.input_tokens
-                if (u.output_tokens !== undefined) session.usage.outputTokens = u.output_tokens
-              } else {
-                if (u.input_tokens !== undefined) session.usage.inputTokens += u.input_tokens
-                if (u.output_tokens !== undefined) session.usage.outputTokens += u.output_tokens
-              }
-            }
-            if (evtType === 'result') {
-              const totalCost = evt.total_cost_usd as number | undefined
-              const cost = evt.cost_usd as number | undefined
-              if (typeof totalCost === 'number') session.usage.costUsd = totalCost
-              else if (typeof cost === 'number') session.usage.costUsd = cost
-            }
-            if (evtType === 'result' && evt.usage) {
-              const u = evt.usage as { input_tokens?: number; output_tokens?: number }
-              session.usage.inputTokens = u.input_tokens ?? session.usage.inputTokens
-              session.usage.outputTokens = u.output_tokens ?? session.usage.outputTokens
-            }
+            applyStreamUsageEvent(session, evt)
           }
         }
         session.conversationEntryCount = entry.conversationEntryCount ?? countCompletedTurnEntries(session.events)
-        session.autoRotatePending = session.conversationEntryCount >= autoRotateEntryThreshold
         sessions.set(entry.name, session)
-        if (session.autoRotatePending) {
-          scheduleAutoRotationIfNeeded(entry.name)
-        }
       } catch {
         // Ignore individual restore failures and continue restoring others.
       }
@@ -5520,8 +5281,8 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       }
 
       wss.handleUpgrade(req, socket, head, (ws) => {
-        if (session.kind === 'stream' || session.kind === 'openclaw') {
-          // Stream session: send buffered events as JSON array for replay.
+        if (session.kind === 'stream' || session.kind === 'openclaw' || session.kind === 'external') {
+          // Stream/external session: send buffered events as JSON array for replay.
           // Include the accumulated usage so the client can set totals
           // directly rather than re-accumulating from individual deltas.
           if (session.events.length > 0) {
@@ -5538,7 +5299,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
             sessions.get(sessionName)?.clients.delete(ws)
           })
 
-          ws.on('message', (data) => {
+          ws.on('message', async (data) => {
             // Look up the live session on every message — the map entry may have
             // been replaced by a respawn while this WS connection is still open.
             // Using the stale closed-over `session` after a respawn would write to
@@ -5548,6 +5309,9 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
               ws.close(4004, 'Session not found')
               return
             }
+
+            // External sessions are read-only viewers — ignore input from WS clients.
+            if (liveSession.kind === 'external') return
 
             try {
               const msg = JSON.parse(data.toString()) as {
@@ -5594,38 +5358,32 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
                 }
 
                 if (inputText || validImages.length > 0) {
-                  // For Codex sessions, send `turn/start` instead of stdin.
-                  const codexThreadId = liveSession.codexThreadId
-                  if (codexThreadId) {
-                    if (validImages.length > 0 && !inputText) {
-                      // Image-only sends cannot be forwarded to Codex — reject explicitly so the
-                      // UI doesn't get stuck in a streaming state with no completion event.
-                      const errEvent: StreamJsonEvent = {
-                        type: 'system',
-                        text: 'Image-only messages are not supported in Codex sessions. Please include text with your image.',
-                      }
-                      broadcastStreamEvent(liveSession, errEvent)
-                    } else if (validImages.length > 0) {
-                      console.warn(`[agents] Codex session ${sessionName}: ignoring ${validImages.length} image(s) — not yet supported`)
+                // For codex sessions, use the sidecar transport and only
+                // record the user event after Codex accepts the turn.
+                const codexThreadId = liveSession.codexThreadId
+                if (codexThreadId) {
+                  if (validImages.length > 0 && !inputText) {
+                    // Image-only sends cannot be forwarded to Codex — reject explicitly so the
+                    // UI doesn't get stuck in a streaming state with no completion event.
+                    const errEvent: StreamJsonEvent = {
+                      type: 'system',
+                      text: 'Image-only messages are not supported in Codex sessions. Please include text with your image.',
                     }
-                    if (inputText) {
-                      // Persist user message in session events for replay on reconnect.
-                      const userEvent: StreamJsonEvent = {
-                        type: 'user',
-                        message: { role: 'user', content: inputText },
-                      } as unknown as StreamJsonEvent
-                      appendStreamEvent(liveSession, userEvent)
-                      broadcastStreamEvent(liveSession, userEvent)
-
-                      void startCodexTurn(liveSession, inputText)
-                    }
-                  } else {
-                    // Clear completed state on new input so reusable sessions
-                    // become active again. One-shot sessions remain completed.
-                    if (liveSession.lastTurnCompleted && !isOneShotStreamSessionName(sessionName)) {
-                      liveSession.lastTurnCompleted = false
-                      liveSession.completedTurnAt = undefined
-                    }
+                    broadcastStreamEvent(liveSession, errEvent)
+                  } else if (validImages.length > 0) {
+                    console.warn(`[agents] Codex session ${sessionName}: ignoring ${validImages.length} image(s) — not yet supported`)
+                  }
+                  if (inputText) {
+                    await sendTextToStreamSession(liveSession, inputText)
+                  }
+                } else {
+                  // Clear completed state on new input so the RPG world-state poller
+                  // immediately sees the session as active again. Command-room sessions
+                  // are intentionally one-shot and must remain in completed state.
+                  if (liveSession.lastTurnCompleted && !isCommandRoomSessionName(sessionName)) {
+                    liveSession.lastTurnCompleted = false
+                    liveSession.completedTurnAt = undefined
+                  }
 
                   // Build content: array with text+image blocks when images present, plain string otherwise
                   const content = validImages.length > 0
@@ -5659,26 +5417,27 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
                     const resumeId = liveSession.claudeSessionId
                     const pendingInput = userMsg + '\n'
                     void readMachineRegistry()
-                      .then(async (machines) => {
+                      .then((machines) => {
                         const machine = liveSession.host
                           ? machines.find((m) => m.id === liveSession.host)
                           : undefined
-                        if (liveSession.host && !machine) {
-                          throw new Error(`Remote host "${liveSession.host}" unavailable for session respawn`)
-                        }
-                        const newSession = await createReplacementStreamSession(
+                        const newSession = createStreamSession(
                           sessionName,
-                          liveSession,
+                          liveSession.mode,
+                          '',
+                          liveSession.cwd,
+                          machine,
+                          'claude',
                           {
                             resumeSessionId: resumeId,
-                            preserveMaxTurns: true,
+                            parentSession: liveSession.parentSession,
+                            spawnedWorkers: liveSession.spawnedWorkers,
+                            resumedFrom: liveSession.resumedFrom,
                           },
                         )
                         newSession.events = liveSession.events.slice()
                         newSession.usage = { ...liveSession.usage }
-                        newSession.pendingMessageCount = liveSession.pendingMessageCount
                         newSession.conversationEntryCount = liveSession.conversationEntryCount
-                        newSession.autoRotatePending = liveSession.autoRotatePending
                         // Transfer connected WebSocket clients before swapping the
                         // map entry so broadcasts from the new process reach them.
                         for (const client of liveSession.clients) {
@@ -5706,7 +5465,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
                       })
                       .catch(() => {})
                   }
-                  }
+                }
                 } // end if (inputText || validImages.length > 0)
               } else if (msg.type === 'tool_answer' && msg.toolId && msg.answers && !liveSession.codexThreadId) {
                 // Serialize string[] values to comma-separated strings
@@ -5807,10 +5566,6 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     })
   }
 
-  if (autoResumeSessions) {
-    void restorePersistedSessions().catch(() => undefined)
-  }
-
   const sessionsInterface: CommanderSessionsInterface = {
     async createCommanderSession({
       name,
@@ -5826,30 +5581,29 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
         const sessionCwd = cwd ?? process.env.HOME ?? '/tmp'
         if (resumeCodexThreadId) {
           try {
-            session = await createCodexSessionFromThread(
+            session = await createCodexAppServerSession(
               name,
               'dangerouslySkipPermissions',
-              sessionCwd,
-              resumeCodexThreadId,
               '',
-              { systemPrompt, maxTurns },
+              sessionCwd,
+              { resumeSessionId: resumeCodexThreadId },
             )
           } catch {
             session = await createCodexAppServerSession(
               name,
               'dangerouslySkipPermissions',
-              systemPrompt,
+              '',
               sessionCwd,
-              { systemPrompt, maxTurns },
+              { systemPrompt },
             )
           }
         } else {
           session = await createCodexAppServerSession(
             name,
             'dangerouslySkipPermissions',
-            systemPrompt,
+            '',
             sessionCwd,
-            { systemPrompt, maxTurns },
+            { systemPrompt },
           )
         }
       } else {
@@ -5863,19 +5617,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
           { systemPrompt, resumeSessionId, maxTurns },
         )
       }
-
-      const existing = sessions.get(name)
-      if (existing) {
-        for (const client of existing.clients) {
-          session.clients.add(client)
-        }
-        existing.clients.clear()
-      }
-
       sessions.set(name, session)
-      if (existing) {
-        stopSessionRuntime(existing, { closeClients: false })
-      }
       schedulePersistedSessionsWrite()
       return session
     },
@@ -5892,9 +5634,26 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
         return
       }
 
+      for (const client of session.clients) {
+        client.close(1000, 'Commander stopped')
+      }
+
+      if (session.kind === 'stream') {
+        if (session.agentType === 'codex') {
+          clearCodexTurnWatchdog(session)
+          markCodexTurnHealthy(session)
+        }
+        session.process.kill('SIGTERM')
+      } else if (session.kind === 'openclaw') {
+        session.gatewayWs?.close()
+        session.gatewayWs = null
+      } else if (session.kind === 'pty') {
+        session.pty.kill()
+      }
+      // External sessions have no local process.
+
       sessions.delete(name)
       sessionEventHandlers.delete(name)
-      stopSessionRuntime(session, { closeReason: 'Commander stopped' })
       schedulePersistedSessionsWrite()
     },
     getSession(name) {

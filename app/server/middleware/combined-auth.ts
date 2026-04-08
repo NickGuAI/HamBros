@@ -3,6 +3,7 @@ import { bearerTokenFromHeader } from '@hambros/auth-providers'
 import { authorizeApiKeyRequest, type ApiKeyAuthOptions } from './auth.js'
 import {
   authorizeAuth0Request,
+  auth0UserHasRequiredPermissions,
   createAuth0Verifier,
   type Auth0AuthorizationResult,
   type Auth0Options,
@@ -46,6 +47,21 @@ export function combinedAuth(options: CombinedAuthOptions = {}): RequestHandler 
     if (bearerToken) {
       auth0AttemptResult = await authorizeAuth0Request(req, options, verifyAuth0Token)
       if (auth0AttemptResult.ok) {
+        if (
+          !auth0UserHasRequiredPermissions(
+            auth0AttemptResult.user,
+            options.requiredApiKeyScopes,
+          )
+        ) {
+          if (options.optional) {
+            next()
+            return
+          }
+
+          res.status(403).json({ error: 'Insufficient permissions' })
+          return
+        }
+
         req.user = auth0AttemptResult.user
         req.authMode = 'auth0'
         next()

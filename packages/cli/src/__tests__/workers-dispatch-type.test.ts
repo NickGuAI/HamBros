@@ -30,7 +30,7 @@ const config = createHammurabiConfig({
 })
 
 describe('runWorkersCli dispatch --type', () => {
-  it('allows --type agent without --issue or --branch', async () => {
+  it('allows --type agent without --issue or --branch when --session is provided', async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
       new Response(
         JSON.stringify({
@@ -83,6 +83,30 @@ describe('runWorkersCli dispatch --type', () => {
     )
   })
 
+  it('requires --session when --type agent is used', async () => {
+    const fetchImpl = vi.fn<typeof fetch>()
+    const stdout = createBufferWriter()
+
+    const exitCode = await runWorkersCli(
+      [
+        'dispatch',
+        '--type',
+        'agent',
+        '--task',
+        'Investigate flaky tests',
+      ],
+      {
+        fetchImpl,
+        readConfig: async () => config,
+        stdout: stdout.writer,
+      },
+    )
+
+    expect(exitCode).toBe(1)
+    expect(stdout.read()).toContain('Usage:')
+    expect(fetchImpl).not.toHaveBeenCalled()
+  })
+
   it('defaults to factory behavior when --type is omitted', async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
       new Response(
@@ -104,8 +128,6 @@ describe('runWorkersCli dispatch --type', () => {
     const exitCode = await runWorkersCli(
       [
         'dispatch',
-        '--session',
-        'commander-main',
         '--issue',
         'https://github.com/NickGuAI/monorepo-g/issues/123',
       ],
@@ -130,6 +152,7 @@ describe('runWorkersCli dispatch --type', () => {
 
     expect(payload.workerType).toBeUndefined()
     expect(payload.issueUrl).toBe('https://github.com/NickGuAI/monorepo-g/issues/123')
+    expect(payload.parentSession).toBeUndefined()
   })
 
   it('requires --issue or --branch when --type is factory or omitted', async () => {
@@ -137,7 +160,7 @@ describe('runWorkersCli dispatch --type', () => {
     const stdout = createBufferWriter()
 
     const missingForDefaultFactory = await runWorkersCli(
-      ['dispatch', '--session', 'commander-main'],
+      ['dispatch'],
       {
         fetchImpl,
         readConfig: async () => config,
@@ -146,7 +169,7 @@ describe('runWorkersCli dispatch --type', () => {
     )
 
     const missingForExplicitFactory = await runWorkersCli(
-      ['dispatch', '--session', 'commander-main', '--type', 'factory'],
+      ['dispatch', '--type', 'factory'],
       {
         fetchImpl,
         readConfig: async () => config,
@@ -164,7 +187,7 @@ describe('runWorkersCli dispatch --type', () => {
     const stdout = createBufferWriter()
 
     const exitCode = await runWorkersCli(
-      ['dispatch', '--session', 'commander-main', '--type', 'invalid', '--task', 'x'],
+      ['dispatch', '--type', 'invalid', '--task', 'x'],
       {
         fetchImpl,
         readConfig: async () => config,

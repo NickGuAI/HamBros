@@ -71,7 +71,7 @@ async function startServer(options: {
         monitorSession: options.monitorSession,
       }),
       now: () => new Date('2026-03-02T01:00:00.000Z'),
-    }),
+    }).router,
   )
 
   const httpServer = createServer(app)
@@ -162,19 +162,21 @@ describe('createCommandRoomRouter', () => {
       }),
     })
     expect(createResponse.status).toBe(201)
-    const created = await readJson<{ id: string; timezone?: string }>(createResponse)
+    const created = await readJson<{ id: string; timezone?: string; nextRun: string | null }>(createResponse)
     const taskId = created.id
     expect(taskId).toBeTruthy()
     expect(created.timezone).toBe('America/Los_Angeles')
+    expect(created.nextRun).toEqual(expect.any(String))
 
     const listResponse = await fetch(`${server.baseUrl}/api/command-room/tasks`, {
       headers: AUTH_HEADERS,
     })
     expect(listResponse.status).toBe(200)
-    const listed = await readJson<Array<{ id: string; lastRunStatus: string | null }>>(listResponse)
+    const listed = await readJson<Array<{ id: string; lastRunStatus: string | null; nextRun: string | null }>>(listResponse)
     expect(listed).toHaveLength(1)
     expect(listed[0]?.id).toBe(taskId)
     expect(listed[0]?.lastRunStatus).toBeNull()
+    expect(listed[0]?.nextRun).toEqual(expect.any(String))
 
     const updateResponse = await fetch(`${server.baseUrl}/api/command-room/tasks/${taskId}`, {
       method: 'PATCH',
@@ -188,9 +190,10 @@ describe('createCommandRoomRouter', () => {
       }),
     })
     expect(updateResponse.status).toBe(200)
-    const updated = await readJson<{ enabled: boolean; timezone?: string }>(updateResponse)
+    const updated = await readJson<{ enabled: boolean; timezone?: string; nextRun: string | null }>(updateResponse)
     expect(updated.enabled).toBe(false)
     expect(updated.timezone).toBe('America/New_York')
+    expect(updated.nextRun).toBeNull()
 
     const triggerResponse = await fetch(
       `${server.baseUrl}/api/command-room/tasks/${taskId}/trigger`,

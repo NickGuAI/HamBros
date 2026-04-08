@@ -6,6 +6,7 @@ import { resolveCommanderDataDir } from '../commanders/paths.js'
 const DEFAULT_TASK_STORE_PATH = 'data/command-room/tasks.json'
 
 export type CommandRoomAgentType = 'claude' | 'codex'
+export type CommandRoomTaskType = 'instruction' | 'memory_compact'
 
 export interface CronTask {
   id: string
@@ -17,6 +18,8 @@ export interface CronTask {
   workDir: string
   agentType: CommandRoomAgentType
   instruction: string
+  taskType?: CommandRoomTaskType
+  model?: string
   enabled: boolean
   createdAt: string
   commanderId?: string
@@ -37,6 +40,8 @@ export interface CreateCronTaskInput {
   workDir: string
   agentType: CommandRoomAgentType
   instruction: string
+  taskType?: CommandRoomTaskType
+  model?: string
   enabled: boolean
   commanderId?: string
   permissionMode?: string
@@ -52,6 +57,8 @@ export interface UpdateCronTaskInput {
   workDir?: string
   agentType?: CommandRoomAgentType
   instruction?: string
+  taskType?: CommandRoomTaskType
+  model?: string
   enabled?: boolean
   permissionMode?: string
   sessionType?: 'stream' | 'pty'
@@ -68,6 +75,7 @@ interface TaskLocation {
 }
 
 const AGENT_TYPES = new Set<CommandRoomAgentType>(['claude', 'codex'])
+const TASK_TYPES = new Set<CommandRoomTaskType>(['instruction', 'memory_compact'])
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
@@ -88,6 +96,13 @@ function asAgentType(value: unknown): CommandRoomAgentType | null {
   return null
 }
 
+function asTaskType(value: unknown): CommandRoomTaskType | null {
+  if (value === 'instruction' || value === 'memory_compact') {
+    return value
+  }
+  return null
+}
+
 function isCronTask(value: unknown): value is CronTask {
   if (!isObject(value)) {
     return false
@@ -103,6 +118,8 @@ function isCronTask(value: unknown): value is CronTask {
     typeof value.workDir === 'string' &&
     AGENT_TYPES.has(value.agentType as CommandRoomAgentType) &&
     typeof value.instruction === 'string' &&
+    (value.taskType === undefined || TASK_TYPES.has(value.taskType as CommandRoomTaskType)) &&
+    (value.model === undefined || typeof value.model === 'string') &&
     typeof value.enabled === 'boolean' &&
     typeof value.createdAt === 'string' &&
     (value.commanderId === undefined || typeof value.commanderId === 'string')
@@ -180,6 +197,7 @@ export class CommandRoomTaskStore {
   async createTask(input: CreateCronTaskInput): Promise<CronTask> {
     const commanderId = asTrimmedString(input.commanderId)
     const description = asTrimmedString(input.description)
+    const model = asTrimmedString(input.model)
     const nextTask: CronTask = {
       id: randomUUID(),
       name: input.name,
@@ -190,6 +208,8 @@ export class CommandRoomTaskStore {
       workDir: input.workDir,
       agentType: input.agentType,
       instruction: input.instruction,
+      taskType: asTaskType(input.taskType) ?? 'instruction',
+      ...(model ? { model } : {}),
       enabled: input.enabled,
       createdAt: new Date().toISOString(),
       ...(commanderId ? { commanderId } : {}),
@@ -259,6 +279,22 @@ export class CommandRoomTaskStore {
       const instruction = asTrimmedString(update.instruction)
       if (instruction) {
         nextTask.instruction = instruction
+      }
+      if (Object.prototype.hasOwnProperty.call(update, 'taskType')) {
+        const taskType = asTaskType(update.taskType)
+        if (taskType) {
+          nextTask.taskType = taskType
+        } else {
+          delete nextTask.taskType
+        }
+      }
+      if (Object.prototype.hasOwnProperty.call(update, 'model')) {
+        const model = asTrimmedString(update.model)
+        if (model) {
+          nextTask.model = model
+        } else {
+          delete nextTask.model
+        }
       }
       if (typeof update.enabled === 'boolean') {
         nextTask.enabled = update.enabled

@@ -11,6 +11,28 @@ export interface CommanderWorkflow {
   systemPromptTemplate?: string
 }
 
+export function mergeWorkflows(
+  base: CommanderWorkflow | null,
+  override: CommanderWorkflow | null,
+): CommanderWorkflow | null {
+  if (!base && !override) {
+    return null
+  }
+
+  if (!base) {
+    return override ? { ...override } : null
+  }
+
+  if (!override) {
+    return { ...base }
+  }
+
+  return {
+    ...base,
+    ...override,
+  }
+}
+
 function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
   return typeof error === 'object' && error !== null && 'code' in error
 }
