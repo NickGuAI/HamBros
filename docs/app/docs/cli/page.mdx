@@ -4,11 +4,17 @@ The `hambros` CLI provides command-line access to local install setup, startup, 
 
 ## Installation
 
-The CLI is included in the HamBros monorepo as `@hambros/cli`, and `install.sh` installs it onto your `PATH` as `hambros`:
+The CLI is included in the HamBros monorepo as `@hambros/cli`. The recommended install path is:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/NickGuAI/HamBros/main/install.sh | bash
+```
+
+If you are working from a source checkout instead, build the workspace dependencies first:
 
 ```bash
 # From the HamBros root
-pnpm --filter app run build:deps
+pnpm --filter hambros run build:deps
 ```
 
 The CLI binary is available at `packages/cli/bin/hambros.mjs`.
@@ -42,7 +48,7 @@ Launches HamBros from the installed app root, not from your current shell direct
 hambros start
 ```
 
-When a production client build exists, `hambros start` runs the source server with `NODE_ENV=production` so the built UI is served correctly. If compiled server artifacts are the only available entrypoint, it falls back to the built server.
+When a production client build exists, `hambros start` runs the source server with `NODE_ENV=production` so the built UI is served correctly at `http://localhost:20001`. If compiled server artifacts are the only available entrypoint, it falls back to the built server.
 
 ---
 

@@ -124,13 +124,17 @@ export default function HomePage() {
             Up and running in minutes
           </h2>
           <div className="card-sumi p-6 font-mono text-sm leading-loose bg-sumi-black text-washi-white border-none">
-            <p className="text-sumi-mist"># Clone and install</p>
-            <p>git clone https://github.com/NickGuAI/HamBros.git</p>
-            <p>cd HamBros && pnpm install</p>
-            <p className="mt-3 text-sumi-mist"># Build dependencies and start</p>
-            <p>pnpm --filter app run build:deps</p>
-            <p>pnpm --filter app run dev</p>
+            <p className="text-sumi-mist"># Install or upgrade HamBros</p>
+            <p>curl -fsSL https://raw.githubusercontent.com/NickGuAI/HamBros/main/install.sh | bash</p>
+            <p className="mt-3 text-sumi-mist"># Configure your local instance</p>
+            <p>hambros init</p>
+            <p className="mt-3 text-sumi-mist"># Start the dashboard</p>
+            <p>hambros start</p>
           </div>
+          <p className="mt-4 text-sm text-sumi-diluted text-center leading-relaxed">
+            The installer uses <code>~/.hambros</code> by default, adds the <code>hambros</code> CLI to your path,
+            and serves the built UI from <code>http://localhost:20001</code>.
+          </p>
           <div className="text-center mt-8">
             <Link href="/docs/getting-started/installation" className="btn-ghost text-sm">
               Full installation guide

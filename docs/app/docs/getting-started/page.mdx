@@ -11,24 +11,19 @@ Get HamBros running locally in under five minutes.
 ## Quick Start
 
 ```bash
-# Clone the repository
-git clone https://github.com/NickGuAI/HamBros.git
-cd HamBros
+# Install or upgrade HamBros
+curl -fsSL https://raw.githubusercontent.com/NickGuAI/HamBros/main/install.sh | bash
 
-# Install dependencies
-pnpm install
+# Configure your local instance
+hambros init
 
-# Copy environment config
-cp app/.env.example app/.env
-
-# Build shared packages
-pnpm --filter app run build:deps
-
-# Start development server
-pnpm --filter app run dev
+# Start HamBros
+hambros start
 ```
 
-The app will be available at **http://localhost:5200**. The API server runs on port **20001**.
+This installs HamBros into **`~/.hambros`** by default, adds the `hambros` CLI to your `PATH`, and serves the dashboard at **http://localhost:20001**.
+
+If you want to work from a local clone instead of the installer-managed setup, use the [Installation](/docs/getting-started/installation) guide's source workflow.
 
 ## Default Authentication
 

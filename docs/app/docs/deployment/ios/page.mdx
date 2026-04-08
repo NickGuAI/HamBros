@@ -24,13 +24,13 @@ Use your server's LAN IP address — `localhost` won't work from a physical devi
 ### 2. Build the Frontend
 
 ```bash
-pnpm --filter app run build
+pnpm --filter hambros run build
 ```
 
 ### 3. Sync Capacitor
 
 ```bash
-pnpm --filter app run cap:sync
+pnpm --filter hambros run cap:sync
 ```
 
 This copies the built web assets into the Capacitor iOS project.
@@ -38,7 +38,7 @@ This copies the built web assets into the Capacitor iOS project.
 ### 4. Open in Xcode
 
 ```bash
-pnpm --filter app run cap:ios
+pnpm --filter hambros run cap:ios
 ```
 
 This opens the Xcode project. From there:
@@ -76,7 +76,7 @@ The HamBros mobile interface includes:
 
 For local development:
 1. Ensure your Mac and iOS device are on the same network
-2. Set `HAMMURABI_ALLOWED_ORIGINS` to include the Capacitor origin
+2. Set `HAMBROS_ALLOWED_ORIGINS` to include the Capacitor origin
 3. The server's port (20001) must be accessible from the device
 
 For production:

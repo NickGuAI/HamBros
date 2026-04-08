@@ -7,10 +7,10 @@ HamBros is configured through environment variables in `app/.env`. All variables
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `20001` | Express API server port |
-| `HAMMURABI_ALLOWED_ORIGINS` | `http://localhost:5173` | CORS allowed origins (comma-separated) |
-| `HAMMURABI_MAX_AGENT_SESSIONS` | `10` | Maximum concurrent agent sessions |
-| `HAMMURABI_INTERNAL_API_KEY` | — | Internal API key for server-side session creation |
-| `HAMMURABI_SETTINGS_ENCRYPTION_KEY` | auto-generated | Key for encrypting stored API keys |
+| `HAMBROS_ALLOWED_ORIGINS` | `http://localhost:5173` | CORS allowed origins (comma-separated) |
+| `HAMBROS_MAX_AGENT_SESSIONS` | `10` | Maximum concurrent agent sessions |
+| `HAMBROS_INTERNAL_API_KEY` | — | Internal API key for server-side session creation |
+| `HAMBROS_SETTINGS_ENCRYPTION_KEY` | auto-generated | Key for encrypting stored API keys |
 
 ## Authentication
 
@@ -64,7 +64,7 @@ On first boot, HamBros generates a master API key at `app/data/api-keys/master-k
 **Before deploying to production:**
 1. Create a new API key through the Services UI
 2. Delete the master key file
-3. Set `HAMMURABI_SETTINGS_ENCRYPTION_KEY` to a strong random value
+3. Set `HAMBROS_SETTINGS_ENCRYPTION_KEY` to a strong random value
 
 ## iOS / Capacitor
 
@@ -77,6 +77,6 @@ VITE_APP_URL=http://your-server-ip:20001
 Then run:
 
 ```bash
-pnpm --filter app run cap:sync
-pnpm --filter app run cap:ios
+pnpm --filter hambros run cap:sync
+pnpm --filter hambros run cap:ios
 ```

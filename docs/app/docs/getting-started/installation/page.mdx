@@ -10,6 +10,8 @@ hambros start
 
 `install.sh` installs or upgrades HamBros into `~/.hambros` (or `$HAMBROS_HOME`), builds the app, and installs a persistent `hambros` CLI on your `PATH`.
 
+After `hambros start`, open **http://localhost:20001** in your browser.
+
 ## Prerequisites
 
 | Requirement | Version | Check |
@@ -61,7 +63,7 @@ At minimum, the defaults work for local development. See [Configuration](/docs/g
 ## Start Development
 
 ```bash
-pnpm --filter app run dev
+pnpm --filter hambros run dev
 ```
 
 This runs both the Vite dev server (port 5173) and the Express API server (port 20001) concurrently. The Vite dev server proxies `/api` requests to Express.
@@ -70,16 +72,16 @@ You can also run them separately:
 
 ```bash
 # Frontend only
-pnpm --filter app run dev:client
+pnpm --filter hambros run dev:client
 
 # Backend only
-pnpm --filter app run dev:server
+pnpm --filter hambros run dev:server
 ```
 
 ## Production Build
 
 ```bash
-pnpm --filter app run build
+pnpm --filter hambros run build
 ```
 
 The production build outputs to `app/dist/` (client) and `app/dist-server/` (server).

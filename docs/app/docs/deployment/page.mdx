@@ -10,17 +10,32 @@ HamBros can be self-hosted on any machine with Node.js 20+ or deployed to cloud 
 - pnpm 9+
 - A Linux or macOS server (Windows via WSL)
 
-### Production Build
+### Recommended Install
 
 ```bash
-# Clone and install
+curl -fsSL https://raw.githubusercontent.com/NickGuAI/HamBros/main/install.sh | bash
+hambros init
+```
+
+This installs HamBros into `~/.hambros` by default, builds the app, and installs the `hambros` CLI into `~/.local/bin/hambros`.
+
+### Start the Server
+
+```bash
+hambros start
+```
+
+The server listens on port `20001` by default and serves the built UI from the same process.
+
+### Manual Source Build
+
+If you need a checkout-managed deployment instead of the installer-managed layout:
+
+```bash
 git clone https://github.com/NickGuAI/HamBros.git
 cd HamBros
 pnpm install
-
-# Build everything
-pnpm --filter app run build:deps
-pnpm --filter app run build
+pnpm --filter hambros run build
 ```
 
 This produces:
@@ -33,12 +48,14 @@ This produces:
 npm install -g pm2
 
 # Start the server
-pm2 start app/dist-server/index.js --name hambros
+pm2 start "$HOME/.local/bin/hambros" --name hambros -- start
 
 # Auto-restart on reboot
 pm2 startup
 pm2 save
 ```
+
+If your Node.js or pnpm binaries live outside the default system `PATH`, add the required paths in your PM2 startup environment before enabling auto-start.
 
 ### Running with systemd
 
@@ -52,8 +69,10 @@ After=network.target
 [Service]
 Type=simple
 User=hambros
-WorkingDirectory=/opt/hambros/app
-ExecStart=/usr/bin/node dist-server/index.js
+WorkingDirectory=/home/hambros
+Environment=HAMBROS_HOME=/home/hambros/.hambros
+Environment=PATH=/home/hambros/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/hambros/.local/bin/hambros start
 Restart=on-failure
 RestartSec=10
 Environment=PORT=20001
@@ -74,8 +93,8 @@ For production, set at minimum:
 
 ```env
 PORT=20001
-HAMMURABI_ALLOWED_ORIGINS=https://your-domain.com
-HAMMURABI_SETTINGS_ENCRYPTION_KEY=<random-32-char-string>
+HAMBROS_ALLOWED_ORIGINS=https://your-domain.com
+HAMBROS_SETTINGS_ENCRYPTION_KEY=<random-32-char-string>
 NODE_ENV=production
 ```
 
@@ -115,7 +134,7 @@ app/data/
 └── telemetry/      # Telemetry JSONL store
 ```
 
-Back up this directory regularly. It is gitignored by default.
+For the default installer layout, this directory lives under `~/.hambros/app/data/`. Back it up regularly. It is gitignored by default.
 
 ## Vercel (Docs Site Only)
 
@@ -137,8 +156,8 @@ Before deploying to production:
 
 - [ ] Delete the master key file (`app/data/api-keys/master-key.json`)
 - [ ] Create scoped API keys for each consumer
-- [ ] Set `HAMMURABI_SETTINGS_ENCRYPTION_KEY` to a strong random value
-- [ ] Configure `HAMMURABI_ALLOWED_ORIGINS` to your domain only
+- [ ] Set `HAMBROS_SETTINGS_ENCRYPTION_KEY` to a strong random value
+- [ ] Configure `HAMBROS_ALLOWED_ORIGINS` to your domain only
 - [ ] Set up HTTPS via reverse proxy or load balancer
 - [ ] Configure Auth0 for team access (optional)
 - [ ] Set up regular backups of `app/data/`
