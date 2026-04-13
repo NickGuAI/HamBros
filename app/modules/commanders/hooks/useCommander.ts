@@ -3,13 +3,14 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { fetchJson, fetchVoid, getAccessToken } from '../../../src/lib/api'
 import { getWsBase } from '../../../src/lib/api-base'
 import { createReconnectBackoff, shouldReconnectWebSocketClose } from '../../agents/ws-reconnect'
+import type { ClaudeEffortLevel } from '../../claude-effort.js'
 
 const COMMANDERS_QUERY_KEY = ['commanders', 'sessions'] as const
 const MAX_TERMINAL_LINES = 2000
 
 export type CommanderState = 'idle' | 'running' | 'paused' | 'stopped'
 export type CommanderWsStatus = 'connecting' | 'connected' | 'disconnected'
-export type CommanderAgentType = 'claude' | 'codex'
+export type CommanderAgentType = 'claude' | 'codex' | 'gemini'
 
 export interface CommanderHeartbeatState {
   intervalMs: number
@@ -40,10 +41,13 @@ export interface CommanderUiFields {
 export interface CommanderSession {
   id: string
   host: string
+  /** Human-readable label set at creation time; falls back to host when absent */
+  displayName?: string
   pid: number | null
   state: CommanderState
   created: string
   agentType?: CommanderAgentType
+  effort?: ClaudeEffortLevel
   cwd?: string
   persona?: string
   heartbeat: CommanderHeartbeatState
@@ -78,7 +82,7 @@ export interface CommanderCronTask {
   lastRun: string | null
   nextRun: string | null
   eventBridgeRuleArn?: string
-  agentType?: 'claude' | 'codex'
+  agentType?: 'claude' | 'codex' | 'gemini'
   sessionType?: 'stream' | 'pty'
   permissionMode?: string
   workDir?: string
@@ -89,6 +93,7 @@ export interface CommanderCreateInput {
   host: string
   taskSource?: { owner: string; repo: string; label?: string }
   cwd?: string
+  effort?: ClaudeEffortLevel
 }
 
 export interface CommanderProfileUpdateInput {
@@ -97,6 +102,7 @@ export interface CommanderProfileUpdateInput {
   borderColor?: string
   accentColor?: string
   speakingTone?: string
+  effort?: ClaudeEffortLevel
 }
 
 export interface CommanderAvatarUploadInput {
@@ -119,12 +125,19 @@ interface CommanderStartInput {
   agentType?: CommanderAgentType
 }
 
+interface ManualHeartbeatTriggerResponse {
+  runId: string
+  timestamp: string
+  sessionName: string
+  triggered: boolean
+}
+
 interface CommanderCronCreateInput {
   commanderId: string
   schedule: string
   instruction: string
   enabled?: boolean
-  agentType?: 'claude' | 'codex'
+  agentType?: 'claude' | 'codex' | 'gemini'
   sessionType?: 'stream' | 'pty'
   permissionMode?: string
   workDir?: string
@@ -356,6 +369,17 @@ async function stopCommanderSession(commanderId: string): Promise<{ stopped: boo
   })
 }
 
+async function triggerCommanderHeartbeat(
+  commanderId: string,
+): Promise<ManualHeartbeatTriggerResponse> {
+  return fetchJson<ManualHeartbeatTriggerResponse>(
+    `/api/commanders/${encodeURIComponent(commanderId)}/heartbeat/trigger`,
+    {
+      method: 'POST',
+    },
+  )
+}
+
 async function sendCommanderMessage(input: CommanderMessageInput): Promise<{ accepted: boolean }> {
   return fetchJson<{ accepted: boolean }>(`/api/commanders/${encodeURIComponent(input.commanderId)}/message`, {
     method: 'POST',
@@ -452,6 +476,7 @@ async function updateCommanderProfile(input: CommanderProfileUpdateInput): Promi
       borderColor: input.borderColor,
       accentColor: input.accentColor,
       speakingTone: input.speakingTone,
+      effort: input.effort,
     }),
   })
 }
@@ -709,6 +734,16 @@ export function useCommander() {
     },
   })
 
+  const triggerHeartbeatMutation = useMutation({
+    mutationFn: triggerCommanderHeartbeat,
+    onSuccess: async (_data, commanderId) => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: COMMANDERS_QUERY_KEY }),
+        queryClient.invalidateQueries({ queryKey: ['commanders', 'heartbeat-log', commanderId] }),
+      ])
+    },
+  })
+
   const sendMessageMutation = useMutation({
     mutationFn: sendCommanderMessage,
     onSuccess: async () => {
@@ -803,6 +838,13 @@ export function useCommander() {
     [stopMutation],
   )
 
+  const triggerHeartbeat = useCallback(
+    async (commanderId: string) => {
+      await triggerHeartbeatMutation.mutateAsync(commanderId)
+    },
+    [triggerHeartbeatMutation],
+  )
+
   const sendMessage = useCallback(
     async (input: CommanderMessageInput) => {
       await sendMessageMutation.mutateAsync(input)
@@ -886,6 +928,7 @@ export function useCommander() {
     createCommander,
     startCommander,
     stopCommander,
+    triggerHeartbeat,
     sendMessage,
     assignTask,
     addCron,
@@ -898,6 +941,9 @@ export function useCommander() {
     createCommanderPending: createSessionMutation.isPending,
     startPending: startMutation.isPending,
     stopPending: stopMutation.isPending,
+    triggerHeartbeatPendingCommanderId: triggerHeartbeatMutation.isPending
+      ? triggerHeartbeatMutation.variables ?? null
+      : null,
     sendMessagePending: sendMessageMutation.isPending,
     assignTaskPending: assignTaskMutation.isPending,
     addCronPending: createCronMutation.isPending,
@@ -911,6 +957,7 @@ export function useCommander() {
       toErrorMessage(createSessionMutation.error) ??
       toErrorMessage(startMutation.error) ??
       toErrorMessage(stopMutation.error) ??
+      toErrorMessage(triggerHeartbeatMutation.error) ??
       toErrorMessage(sendMessageMutation.error) ??
       toErrorMessage(assignTaskMutation.error) ??
       toErrorMessage(createCronMutation.error) ??

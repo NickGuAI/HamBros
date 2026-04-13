@@ -6,6 +6,7 @@ export default defineConfig({
     alias: {
       '@': path.resolve(__dirname, './src'),
       '@modules': path.resolve(__dirname, './modules'),
+      'node:sqlite': path.resolve(__dirname, './modules/commanders/__tests__/stubs/node-sqlite.ts'),
     },
   },
   test: {

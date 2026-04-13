@@ -140,3 +140,16 @@ export async function scaffoldCommanderWorkflow(
     return workflowPath
   }
 }
+
+export async function readCommanderWorkflowMarkdown(
+  commanderId: string,
+  basePath?: string,
+): Promise<string | null> {
+  const { commanderRoot } = resolveCommanderPaths(commanderId, basePath)
+  const workflowPath = path.join(commanderRoot, COMMANDER_WORKFLOW_FILE)
+  try {
+    return await readFile(workflowPath, 'utf8')
+  } catch {
+    return null
+  }
+}

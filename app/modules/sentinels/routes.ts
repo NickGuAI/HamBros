@@ -356,7 +356,7 @@ export function createSentinelsRouter(options: SentinelsRouterOptions = {}): Sen
 
     const agentType = parseOptionalAgentType(req.body?.agentType)
     if (agentType === null) {
-      res.status(400).json({ error: 'agentType must be claude or codex when provided' })
+      res.status(400).json({ error: 'agentType must be claude, codex, or gemini when provided' })
       return
     }
 
@@ -525,7 +525,7 @@ export function createSentinelsRouter(options: SentinelsRouterOptions = {}): Sen
     if ('agentType' in body) {
       const agentType = parseOptionalAgentType(body.agentType)
       if (!agentType) {
-        res.status(400).json({ error: 'agentType must be claude or codex' })
+        res.status(400).json({ error: 'agentType must be claude, codex, or gemini' })
         return
       }
       patch.agentType = agentType

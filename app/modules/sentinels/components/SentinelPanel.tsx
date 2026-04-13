@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { ChevronDown, Clock3, Plus } from 'lucide-react'
+import { ChevronDown } from 'lucide-react'
 import { cn, formatCost, timeAgo } from '@/lib/utils'
 import { ModalFormContainer } from '../../components/ModalFormContainer'
 import { useSentinelHistory, useSentinels } from '../hooks/useSentinels'
@@ -9,6 +9,8 @@ import { SentinelDetail } from './SentinelDetail'
 
 interface SentinelPanelProps {
   commanderId: string | null | undefined
+  showCreateForm: boolean
+  onCloseCreateForm: () => void
 }
 
 function statusBadgeClass(status: Sentinel['status']): string {
@@ -57,9 +59,8 @@ function lastRunSummary(sentinel: Sentinel): string {
   return `Last: "${action}" - ${timeAgo(sentinel.lastRun)} - ${formatCost(latest.costUsd)}`
 }
 
-function SentinelPanelClient({ commanderId }: SentinelPanelProps) {
+function SentinelPanelClient({ commanderId, showCreateForm, onCloseCreateForm }: SentinelPanelProps) {
   const [expandedSentinelId, setExpandedSentinelId] = useState<string | null>(null)
-  const [showCreateForm, setShowCreateForm] = useState(false)
 
   const sentinelState = useSentinels(commanderId)
   const historyState = useSentinelHistory(expandedSentinelId)
@@ -71,33 +72,17 @@ function SentinelPanelClient({ commanderId }: SentinelPanelProps) {
 
   return (
     <section className="card-sumi min-h-[12rem] overflow-hidden flex flex-col">
-      <header className="px-4 py-3 border-b border-ink-border bg-washi-aged/60 flex items-center justify-between gap-3">
-        <div className="flex items-center gap-2">
-          <Clock3 size={14} className="text-sumi-diluted" />
-          <h3 className="section-title">Sentinels</h3>
-        </div>
-        <button
-          type="button"
-          onClick={() => setShowCreateForm((value) => !value)}
-          disabled={!commanderId}
-          className="btn-ghost !px-3 !py-1.5 text-xs inline-flex min-h-[44px] items-center gap-1.5 disabled:opacity-60 disabled:cursor-not-allowed"
-        >
-          <Plus size={12} />
-          {showCreateForm ? 'Close' : 'New'}
-        </button>
-      </header>
-
       <ModalFormContainer
         open={Boolean(commanderId && showCreateForm)}
         title="Create Sentinel"
-        onClose={() => setShowCreateForm(false)}
+        onClose={onCloseCreateForm}
       >
         <SentinelCreateForm
           skillOptions={sentinelState.skillOptions}
           isSubmitting={sentinelState.createPending}
           error={sentinelState.actionError}
           onSubmit={sentinelState.createSentinel}
-          onCancel={() => setShowCreateForm(false)}
+          onCancel={onCloseCreateForm}
         />
       </ModalFormContainer>
 
@@ -195,3 +180,4 @@ export function SentinelPanel(props: SentinelPanelProps) {
 
   return <SentinelPanelClient {...props} />
 }
+

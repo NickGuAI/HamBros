@@ -47,7 +47,7 @@ function AppFrame({ signOut }: { signOut: () => void }) {
                 {moduleRoutes.map((route) => (
                   <Route
                     key={route.path}
-                    path={route.path}
+                    path={route.path + '/*'}
                     element={<route.Component />}
                   />
                 ))}

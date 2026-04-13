@@ -12,10 +12,17 @@ import type { AuthUser } from '@hambros/auth-providers'
 import type { ApiKeyStoreLike } from '../../server/api-keys/store.js'
 import { combinedAuth } from '../../server/middleware/combined-auth.js'
 import { createAuth0Verifier } from '../../server/middleware/auth0.js'
+import type { HammurabiEvent } from '../../src/types/hammurabi-events.js'
 import { bootstrapFactoryWorktree } from '../factory/worktree.js'
 import { resolveCommanderNamesPath } from '../commanders/paths.js'
 import type { QuestStore } from '../commanders/quest-store.js'
 import { CommanderSessionStore, type CommanderSession } from '../commanders/store.js'
+import {
+  DEFAULT_CLAUDE_EFFORT_LEVEL,
+  normalizeClaudeEffortLevel,
+  parseOptionalClaudeEffort,
+  type ClaudeEffortLevel,
+} from '../claude-effort.js'
 import {
   listWorkspaceTree,
   readWorkspaceFilePreview,
@@ -25,7 +32,22 @@ import {
   toWorkspaceError,
   WorkspaceError,
 } from '../workspace/index.js'
+import { normalizeClaudeEvent } from './normalize-claude-event.js'
 import { normalizeCodexEvent } from './normalize-codex-event.js'
+import {
+  createGeminiTurnState,
+  normalizeGeminiPromptResponse,
+  normalizeGeminiSessionUpdate,
+  type GeminiTurnState,
+} from './normalize-gemini-event.js'
+import { normalizeOpenClawEvent } from './normalize-openclaw-event.js'
+import {
+  appendTranscriptEvent,
+  readSessionMeta,
+  readTranscriptTail,
+  type TranscriptMeta,
+  writeSessionMeta,
+} from './transcript-store.js'
 
 const DEFAULT_MAX_SESSIONS = 10
 const DEFAULT_TASK_DELAY_MS = 3000
@@ -50,6 +72,11 @@ const DEFAULT_OPENCLAW_GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL?.trim() ||
 const execFileAsync = promisify(execFile)
 const CODEX_SIDECAR_LOG_TAIL_LIMIT = 20
 const CODEX_SIDECAR_LOG_TEXT_LIMIT = 500
+const CODEX_RUNTIME_TEARDOWN_TIMEOUT_MS = 5000
+const CODEX_RUNTIME_FORCE_KILL_WAIT_MS = 1000
+const CLAUDE_DISABLE_ADAPTIVE_THINKING_ENV = 'CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING'
+const CLAUDE_DISABLE_ADAPTIVE_THINKING_VALUE = '1'
+const RESTORED_REPLAY_TURN_LIMIT = 20
 
 function truncateLogText(value: string, maxChars = CODEX_SIDECAR_LOG_TEXT_LIMIT): string {
   const normalized = value.replace(/\s+/g, ' ').trim()
@@ -71,25 +98,26 @@ function rawDataToText(data: RawData): string {
 
 type ClaudePermissionMode = 'default' | 'acceptEdits' | 'dangerouslySkipPermissions'
 
-type AgentType = 'claude' | 'codex' | 'openclaw'
+type AgentType = 'claude' | 'codex' | 'gemini' | 'openclaw'
 
 function parseAgentType(raw: unknown): AgentType {
   if (raw === 'codex') return 'codex'
+  if (raw === 'gemini') return 'gemini'
   if (raw === 'openclaw') return 'openclaw'
   return 'claude'
 }
 
-const CLAUDE_MODE_COMMANDS: Record<ClaudePermissionMode, string> = {
-  default: 'unset CLAUDECODE && claude',
-  acceptEdits: 'unset CLAUDECODE && claude --permission-mode acceptEdits',
-  dangerouslySkipPermissions: 'unset CLAUDECODE && claude --dangerously-skip-permissions',
-}
+const CLAUDE_BASE_PTY_COMMAND =
+  `export ${CLAUDE_DISABLE_ADAPTIVE_THINKING_ENV}=${CLAUDE_DISABLE_ADAPTIVE_THINKING_VALUE} && unset CLAUDECODE`
 
 const CODEX_MODE_COMMANDS: Record<ClaudePermissionMode, string> = {
   default: 'codex',
   acceptEdits: 'codex --full-auto',
   dangerouslySkipPermissions: 'codex --dangerously-bypass-approvals-and-sandbox',
 }
+
+const GEMINI_ACP_COMMAND = 'gemini'
+const GEMINI_ACP_ARGS = ['--acp']
 
 export interface AgentSession {
   name: string
@@ -98,6 +126,7 @@ export interface AgentSession {
   pid: number
   sessionType?: 'pty' | 'stream' | 'external'
   agentType?: AgentType
+  effort?: ClaudeEffortLevel
   cwd?: string
   host?: string
   parentSession?: string
@@ -154,6 +183,7 @@ interface PtySession {
   kind: 'pty'
   name: string
   agentType: AgentType
+  effort?: ClaudeEffortLevel
   cwd: string
   host?: string
   task?: string
@@ -164,15 +194,33 @@ interface PtySession {
   lastEventAt: string
 }
 
-interface StreamJsonEvent {
-  type: string
-  [key: string]: unknown
+type StreamJsonEvent = HammurabiEvent
+
+interface CodexSessionRuntimeHandle {
+  process: ChildProcess | null
+  ensureConnected(): Promise<void>
+  sendRequest(method: string, params: unknown): Promise<unknown>
+  addNotificationListener(threadId: string, cb: (method: string, params: unknown) => void): () => void
+  log(level: 'info' | 'warn' | 'error', message: string, extra?: Record<string, unknown>): void
+  teardown(options?: { threadId?: string; reason?: string; timeoutMs?: number }): Promise<void>
+  teardownOnProcessExit(threadId?: string): void
+}
+
+interface GeminiAcpRuntimeHandle {
+  process: ChildProcess | null
+  ensureConnected(): Promise<void>
+  sendRequest(method: string, params: unknown): Promise<unknown>
+  sendNotification(method: string, params: unknown): void
+  addNotificationListener(sessionId: string, cb: (method: string, params: unknown) => void): () => void
+  teardown(options?: { reason?: string; timeoutMs?: number }): Promise<void>
+  teardownOnProcessExit(): void
 }
 
 interface StreamSession {
   kind: 'stream'
   name: string
   agentType: AgentType
+  effort?: ClaudeEffortLevel
   mode: ClaudePermissionMode
   cwd: string
   host?: string
@@ -192,12 +240,20 @@ interface StreamSession {
   completedTurnAt?: string
   claudeSessionId?: string
   codexThreadId?: string
+  geminiSessionId?: string
   resumedFrom?: string
   finalResultEvent?: StreamJsonEvent
   conversationEntryCount: number
   codexTurnWatchdogTimer?: NodeJS.Timeout
   codexTurnStaleAt?: string
   codexNotificationCleanup?: () => void
+  codexRuntime?: CodexSessionRuntimeHandle
+  codexRuntimeTeardownPromise?: Promise<void>
+  geminiNotificationCleanup?: () => void
+  geminiRuntime?: GeminiAcpRuntimeHandle
+  geminiRuntimeTeardownPromise?: Promise<void>
+  geminiPendingSystemPrompt?: string
+  geminiTurnState?: GeminiTurnState
   /** True when this session was spawned during restore with no new task.
    * Used to skip the persist-write on exit so the file is not overwritten
    * with an empty list just because the idle resume process exited. */
@@ -208,6 +264,7 @@ interface OpenClawSession {
   kind: 'openclaw'
   name: string
   agentType: 'openclaw'
+  effort?: ClaudeEffortLevel
   cwd: string
   host?: string
   task?: string
@@ -226,6 +283,7 @@ interface ExternalSession {
   kind: 'external'
   name: string
   agentType: AgentType
+  effort?: ClaudeEffortLevel
   machine: string
   cwd: string
   host?: string
@@ -270,6 +328,7 @@ interface ExitedStreamSessionState {
   phase: 'exited'
   hadResult: boolean
   agentType: AgentType
+  effort?: ClaudeEffortLevel
   mode: ClaudePermissionMode
   cwd: string
   host?: string
@@ -278,6 +337,7 @@ interface ExitedStreamSessionState {
   createdAt: string
   claudeSessionId?: string
   codexThreadId?: string
+  geminiSessionId?: string
   resumedFrom?: string
   conversationEntryCount: number
   events: StreamJsonEvent[]
@@ -287,6 +347,7 @@ interface StreamSessionCreateOptions {
   resumeSessionId?: string
   systemPrompt?: string
   maxTurns?: number
+  effort?: ClaudeEffortLevel
   createdAt?: string
   parentSession?: string
   spawnedWorkers?: string[]
@@ -300,9 +361,67 @@ interface CodexSessionCreateOptions {
   spawnedWorkers?: string[]
   systemPrompt?: string
   resumedFrom?: string
+  machine?: MachineConfig
+}
+
+interface GeminiSessionCreateOptions {
+  resumeSessionId?: string
+  createdAt?: string
+  parentSession?: string
+  spawnedWorkers?: string[]
+  systemPrompt?: string
+  resumedFrom?: string
+  machine?: MachineConfig
+  maxTurns?: number
 }
 
 type AnySession = PtySession | StreamSession | OpenClawSession | ExternalSession
+
+const codexSessionMapsForProcessExit = new Set<WeakRef<Map<string, AnySession>>>()
+let codexProcessExitHookInstalled = false
+
+function registerCodexProcessExitSessionMap(sessions: Map<string, AnySession>): void {
+  codexSessionMapsForProcessExit.add(new WeakRef(sessions))
+  if (codexProcessExitHookInstalled) {
+    return
+  }
+
+  codexProcessExitHookInstalled = true
+  process.on('exit', () => {
+    for (const ref of codexSessionMapsForProcessExit) {
+      const sessionMap = ref.deref()
+      if (!sessionMap) {
+        codexSessionMapsForProcessExit.delete(ref)
+        continue
+      }
+
+      for (const session of sessionMap.values()) {
+        if (session.kind !== 'stream' || session.agentType !== 'codex') {
+          continue
+        }
+
+        if (session.codexTurnWatchdogTimer) {
+          clearTimeout(session.codexTurnWatchdogTimer)
+          session.codexTurnWatchdogTimer = undefined
+        }
+        session.codexTurnStaleAt = undefined
+        session.codexNotificationCleanup?.()
+        session.codexNotificationCleanup = undefined
+
+        if (session.codexRuntime) {
+          session.codexRuntime.teardownOnProcessExit?.(session.codexThreadId)
+          continue
+        }
+
+        try {
+          session.process.kill('SIGTERM')
+        } catch {
+          // Best effort only during process exit.
+        }
+      }
+    }
+  })
+}
 
 export interface AgentsRouterOptions {
   ptySpawner?: PtySpawner
@@ -333,16 +452,19 @@ export interface CommanderSessionsInterface {
   createCommanderSession(params: {
     name: string
     systemPrompt: string
-    agentType: 'claude' | 'codex'
+    agentType: 'claude' | 'codex' | 'gemini'
+    effort?: ClaudeEffortLevel
     cwd?: string
     resumeSessionId?: string
     resumeCodexThreadId?: string
+    resumeGeminiSessionId?: string
     maxTurns?: number
   }): Promise<StreamSession>
   sendToSession(name: string, text: string): Promise<boolean>
   deleteSession(name: string): void
   getSession(name: string): StreamSession | undefined
   subscribeToEvents(name: string, handler: (event: StreamJsonEvent) => void): () => void
+  shutdown?(): Promise<void>
 }
 
 function parseSessionName(rawSessionName: unknown): string | null {
@@ -380,6 +502,24 @@ function parseClaudePermissionMode(rawMode: unknown): ClaudePermissionMode | nul
   }
 
   return rawMode
+}
+
+function parseClaudeEffort(rawEffort: unknown): ClaudeEffortLevel | null | undefined {
+  return parseOptionalClaudeEffort(rawEffort)
+}
+
+function buildClaudePtyCommand(
+  mode: ClaudePermissionMode,
+  effort: ClaudeEffortLevel = DEFAULT_CLAUDE_EFFORT_LEVEL,
+): string {
+  const base = `${CLAUDE_BASE_PTY_COMMAND} && claude --effort ${effort}`
+  if (mode === 'acceptEdits') {
+    return `${base} --permission-mode acceptEdits`
+  }
+  if (mode === 'dangerouslySkipPermissions') {
+    return `${base} --dangerously-skip-permissions`
+  }
+  return base
 }
 
 function parseOptionalTask(rawTask: unknown): string | null {
@@ -509,7 +649,7 @@ export interface MachineConfig {
   cwd?: string
 }
 
-const MACHINE_TOOL_KEYS = ['claude', 'codex', 'git', 'node'] as const
+const MACHINE_TOOL_KEYS = ['claude', 'codex', 'gemini', 'git', 'node'] as const
 
 type MachineToolKey = (typeof MACHINE_TOOL_KEYS)[number]
 
@@ -532,12 +672,14 @@ interface MachineHealthReport {
 interface PersistedStreamSession {
   name: string
   agentType: AgentType
+  effort?: ClaudeEffortLevel
   mode: ClaudePermissionMode
   cwd: string
   host?: string
   createdAt: string
   claudeSessionId?: string
   codexThreadId?: string
+  geminiSessionId?: string
   conversationEntryCount?: number
   events?: StreamJsonEvent[]
   parentSession?: string
@@ -684,6 +826,79 @@ function buildRemoteCommand(command: string, args: string[], cwd?: string): stri
   return `exec ${base}`
 }
 
+function buildClaudeSpawnEnv(baseEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return {
+    ...baseEnv,
+    CLAUDECODE: undefined,
+    [CLAUDE_DISABLE_ADAPTIVE_THINKING_ENV]: CLAUDE_DISABLE_ADAPTIVE_THINKING_VALUE,
+  }
+}
+
+function buildClaudeShellInvocation(args: string[]): string {
+  const command = ['claude', ...args].map(shellEscape).join(' ')
+  return [
+    `export ${CLAUDE_DISABLE_ADAPTIVE_THINKING_ENV}=${CLAUDE_DISABLE_ADAPTIVE_THINKING_VALUE}`,
+    'unset CLAUDECODE',
+    command,
+  ].join(' && ')
+}
+
+function buildCodexAppServerInvocation(listenUrl = 'stdio://'): string {
+  return buildRemoteCommand('codex', ['app-server', '--listen', listenUrl])
+}
+
+function buildGeminiAcpInvocation(): string {
+  return buildRemoteCommand(GEMINI_ACP_COMMAND, GEMINI_ACP_ARGS)
+}
+
+function mapGeminiMode(mode: ClaudePermissionMode): 'default' | 'autoEdit' | 'yolo' {
+  if (mode === 'acceptEdits') {
+    return 'autoEdit'
+  }
+  if (mode === 'dangerouslySkipPermissions') {
+    return 'yolo'
+  }
+  return 'default'
+}
+
+function buildGeminiSystemPrompt(systemPrompt?: string, maxTurns?: number): string | undefined {
+  const parts: string[] = []
+  if (typeof systemPrompt === 'string' && systemPrompt.trim().length > 0) {
+    parts.push(systemPrompt.trim())
+  }
+  if (typeof maxTurns === 'number' && Number.isFinite(maxTurns) && maxTurns > 0) {
+    parts.push(`Execution limit: finish and hand back control within ${maxTurns} turn(s).`)
+  }
+  if (parts.length === 0) {
+    return undefined
+  }
+  return parts.join('\n\n')
+}
+
+function buildGeminiPromptText(session: StreamSession, text: string): string {
+  const trimmed = text.trim()
+  const pendingSystemPrompt = typeof session.geminiPendingSystemPrompt === 'string'
+    ? session.geminiPendingSystemPrompt.trim()
+    : ''
+
+  if (!pendingSystemPrompt) {
+    return trimmed
+  }
+
+  session.geminiPendingSystemPrompt = undefined
+  if (!trimmed) {
+    return pendingSystemPrompt
+  }
+
+  return [
+    'System instructions:',
+    pendingSystemPrompt,
+    '',
+    'User request:',
+    trimmed,
+  ].join('\n')
+}
+
 function buildSshDestination(machine: MachineConfig & { host: string }): string {
   if (machine.user) {
     return `${machine.user}@${machine.host}`
@@ -734,6 +949,7 @@ function buildMachineProbeScript(): string {
     '}',
     'probe claude claude',
     'probe codex codex',
+    'probe gemini gemini',
     'probe git git',
     'probe node node',
   ].join('\n')
@@ -962,11 +1178,15 @@ function parsePersistedStreamSessionEntry(value: unknown): PersistedStreamSessio
   const createdAt = typeof raw.createdAt === 'string' ? raw.createdAt : new Date(0).toISOString()
   const host = typeof raw.host === 'string' && raw.host.trim().length > 0 ? raw.host.trim() : undefined
   const agentType = parseAgentType(raw.agentType)
+  const effort = normalizeClaudeEffortLevel(raw.effort, DEFAULT_CLAUDE_EFFORT_LEVEL)
   const claudeSessionId = typeof raw.claudeSessionId === 'string' && raw.claudeSessionId.trim().length > 0
     ? raw.claudeSessionId.trim()
     : undefined
   const codexThreadId = typeof raw.codexThreadId === 'string' && raw.codexThreadId.trim().length > 0
     ? raw.codexThreadId.trim()
+    : undefined
+  const geminiSessionId = typeof raw.geminiSessionId === 'string' && raw.geminiSessionId.trim().length > 0
+    ? raw.geminiSessionId.trim()
     : undefined
   const parentSession = typeof raw.parentSession === 'string' && raw.parentSession.trim().length > 0
     ? raw.parentSession.trim()
@@ -1002,7 +1222,7 @@ function parsePersistedStreamSessionEntry(value: unknown): PersistedStreamSessio
 
   const parsedEvents = Array.isArray(raw.events)
     ? (raw.events as unknown[]).filter((e): e is StreamJsonEvent => !!asObject(e))
-    : []
+    : undefined
   const parsedSpawnedWorkers = Array.isArray(raw.spawnedWorkers)
     ? (raw.spawnedWorkers as unknown[])
       .filter((entry): entry is string => typeof entry === 'string' && SESSION_NAME_PATTERN.test(entry.trim()))
@@ -1013,17 +1233,19 @@ function parsePersistedStreamSessionEntry(value: unknown): PersistedStreamSessio
     name,
     mode,
     agentType,
+    effort: agentType === 'claude' ? effort : undefined,
     cwd: path.resolve(cwd),
     host,
     createdAt,
     claudeSessionId,
     codexThreadId,
+    geminiSessionId,
     parentSession,
     spawnedWorkers: parsedSpawnedWorkers,
     resumedFrom,
     sessionState,
     hadResult,
-    conversationEntryCount: conversationEntryCount ?? countCompletedTurnEntries(parsedEvents),
+    conversationEntryCount: conversationEntryCount ?? countCompletedTurnEntries(parsedEvents ?? []),
     events: parsedEvents,
   }
 }
@@ -1123,9 +1345,10 @@ function buildClaudeStreamArgs(
   resumeSessionId?: string,
   systemPrompt?: string,
   maxTurns?: number,
+  effort: ClaudeEffortLevel = DEFAULT_CLAUDE_EFFORT_LEVEL,
 ): string[] {
   // Claude CLI requires --verbose when using --print (-p) with stream-json output.
-  const args = ['-p', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json']
+  const args = ['-p', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json', '--effort', effort]
   if (mode === 'acceptEdits') {
     args.push('--permission-mode', 'acceptEdits')
   } else if (mode === 'dangerouslySkipPermissions') {
@@ -1176,7 +1399,7 @@ function toCompletedSession(sessionName: string, completedAt: string, event: Str
  *  without emitting a result (e.g. crash, AskUserQuestion block, or Codex format). */
 function toExitBasedCompletedSession(
   sessionName: string,
-  event: StreamJsonEvent & { exitCode?: number; signal?: string; text?: string },
+  event: StreamJsonEvent & { exitCode?: number; signal?: string | number; text?: string },
   costUsd: number,
 ): CompletedSession {
   const code = typeof event.exitCode === 'number' ? event.exitCode : -1
@@ -1196,6 +1419,7 @@ function toExitBasedCompletedSession(
 export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRouterResult {
   const router = Router()
   const sessions = new Map<string, AnySession>()
+  registerCodexProcessExitSessionMap(sessions)
   const sessionEventHandlers = new Map<string, Set<(event: StreamJsonEvent) => void>>()
   const completedSessions = new Map<string, CompletedSession>()
   const exitedStreamSessions = new Map<string, ExitedStreamSessionState>()
@@ -1287,6 +1511,131 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     })
   }
 
+  function warnTranscriptStoreFailure(action: string, sessionName: string, error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error)
+    console.warn(`[agents] Failed to ${action} for "${sessionName}": ${message}`)
+  }
+
+  function buildTranscriptMeta(session: StreamSession): TranscriptMeta {
+    return {
+      agentType: session.agentType,
+      effort: session.effort,
+      cwd: session.cwd,
+      host: session.host,
+      createdAt: session.createdAt,
+      claudeSessionId: session.claudeSessionId,
+      codexThreadId: session.codexThreadId,
+      geminiSessionId: session.geminiSessionId,
+    }
+  }
+
+  function writeTranscriptMeta(session: StreamSession): void {
+    void writeSessionMeta(session.name, buildTranscriptMeta(session)).catch((error) => {
+      warnTranscriptStoreFailure('write transcript meta', session.name, error)
+    })
+  }
+
+  function appendGenericTranscriptEvent(session: StreamSession, event: StreamJsonEvent): void {
+    void appendTranscriptEvent(session.name, event).catch((error) => {
+      warnTranscriptStoreFailure('append transcript event', session.name, error)
+    })
+    writeTranscriptMeta(session)
+  }
+
+  function mergePersistedSessionWithTranscriptMeta(
+    entry: PersistedStreamSession,
+    rawMeta: TranscriptMeta | null,
+  ): PersistedStreamSession {
+    const meta = asObject(rawMeta)
+    if (!meta) {
+      return entry
+    }
+
+    let agentType = entry.agentType
+    if (meta.agentType === 'claude' || meta.agentType === 'codex' || meta.agentType === 'gemini') {
+      agentType = meta.agentType
+    }
+    const effort = normalizeClaudeEffortLevel(
+      meta.effort,
+      entry.effort ?? DEFAULT_CLAUDE_EFFORT_LEVEL,
+    )
+
+    const metaCwd = typeof meta.cwd === 'string' ? meta.cwd.trim() : ''
+    const cwd = metaCwd.startsWith('/') ? path.resolve(metaCwd) : entry.cwd
+
+    const metaHost = parseOptionalHost(meta.host)
+    const host = metaHost === null ? entry.host : metaHost
+
+    const metaCreatedAt = typeof meta.createdAt === 'string' && meta.createdAt.trim().length > 0
+      ? meta.createdAt
+      : entry.createdAt
+
+    const claudeSessionId = typeof meta.claudeSessionId === 'string' && meta.claudeSessionId.trim().length > 0
+      ? meta.claudeSessionId.trim()
+      : entry.claudeSessionId
+
+    const codexThreadId = typeof meta.codexThreadId === 'string' && meta.codexThreadId.trim().length > 0
+      ? meta.codexThreadId.trim()
+      : entry.codexThreadId
+
+    const geminiSessionId = typeof meta.geminiSessionId === 'string' && meta.geminiSessionId.trim().length > 0
+      ? meta.geminiSessionId.trim()
+      : entry.geminiSessionId
+
+    return {
+      ...entry,
+      agentType,
+      effort: agentType === 'claude' ? effort : undefined,
+      cwd,
+      host,
+      createdAt: metaCreatedAt,
+      claudeSessionId,
+      codexThreadId,
+      geminiSessionId,
+    }
+  }
+
+  async function resolveRestoredReplaySource(
+    entry: PersistedStreamSession,
+  ): Promise<{ entry: PersistedStreamSession; events: StreamJsonEvent[] }> {
+    let resolvedEntry = entry
+    try {
+      resolvedEntry = mergePersistedSessionWithTranscriptMeta(entry, await readSessionMeta(entry.name))
+    } catch (error) {
+      warnTranscriptStoreFailure('read transcript meta', entry.name, error)
+    }
+
+    try {
+      const transcriptEvents = await readTranscriptTail(entry.name, RESTORED_REPLAY_TURN_LIMIT)
+      if (transcriptEvents.length > 0) {
+        return {
+          entry: resolvedEntry,
+          events: transcriptEvents.filter((event): event is StreamJsonEvent => !!asObject(event)),
+        }
+      }
+    } catch (error) {
+      warnTranscriptStoreFailure('read transcript tail', entry.name, error)
+    }
+
+    return {
+      entry: resolvedEntry,
+      events: resolvedEntry.events ? [...resolvedEntry.events] : [],
+    }
+  }
+
+  function applyRestoredReplayState(
+    session: StreamSession,
+    events: StreamJsonEvent[],
+    conversationEntryCount?: number,
+  ): void {
+    session.events = [...events]
+    session.usage = { inputTokens: 0, outputTokens: 0, costUsd: 0 }
+    for (const event of session.events) {
+      applyStreamUsageEvent(session, event)
+    }
+    session.conversationEntryCount = conversationEntryCount ?? countCompletedTurnEntries(session.events)
+  }
+
   function resolveWorkerState(workerSessionName: string): WorkerState {
     const active = sessions.get(workerSessionName)
     if (active?.kind === 'stream') {
@@ -1357,7 +1706,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       return spawner
     }
 
-    const nodePty = await import('node-pty')
+    const nodePty = await import('@lydell/node-pty')
     spawner = {
       spawn: (file, args, opts) => nodePty.spawn(file, args, opts) as unknown as PtyHandle,
     }
@@ -1458,6 +1807,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       sessionsByName.set(session.name, {
         name: session.name,
         agentType: session.agentType,
+        effort: session.effort,
         mode: session.mode,
         cwd: session.cwd,
         host: session.host,
@@ -1470,6 +1820,8 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
         sessionState: 'active',
         hadResult: Boolean(session.finalResultEvent),
         conversationEntryCount: session.conversationEntryCount,
+        // Keep persisted events as backward-compatible replay fallback when
+        // transcript-tail restore data is unavailable.
         events: session.events,
       })
     }
@@ -1482,6 +1834,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       sessionsByName.set(sessionName, {
         name: sessionName,
         agentType: exited.agentType,
+        effort: exited.effort,
         mode: exited.mode,
         cwd: exited.cwd,
         host: exited.host,
@@ -1494,6 +1847,8 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
         sessionState: 'exited',
         hadResult: exited.hadResult,
         conversationEntryCount: exited.conversationEntryCount,
+        // Keep persisted events as backward-compatible replay fallback when
+        // transcript-tail restore data is unavailable.
         events: exited.events,
       })
     }
@@ -1553,7 +1908,13 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       for (const client of session.clients) {
         client.close(1000, 'Session ended')
       }
-      session.process.kill('SIGTERM')
+      if (session.agentType === 'codex') {
+        clearCodexTurnWatchdog(session)
+        markCodexTurnHealthy(session)
+        void teardownCodexSessionRuntime(session, 'Pruning stale command-room session')
+      } else {
+        session.process.kill('SIGTERM')
+      }
       sessions.delete(sessionName)
       changed = true
     }
@@ -2314,9 +2675,11 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     const hasRequestedAgentType =
       typeof req.body?.agentType === 'string' && req.body.agentType.trim().length > 0
     const parsedAgentType = parseAgentType(req.body?.agentType)
-    const workerAgentType: 'claude' | 'codex' = hasRequestedAgentType
-      ? (parsedAgentType === 'codex' ? 'codex' : 'claude')
-      : (parentSession?.agentType === 'codex' ? 'codex' : 'claude')
+    const workerAgentType: 'claude' | 'codex' | 'gemini' = hasRequestedAgentType
+      ? (parsedAgentType === 'codex' || parsedAgentType === 'gemini' ? parsedAgentType : 'claude')
+      : (parentSession?.agentType === 'codex' || parentSession?.agentType === 'gemini'
+          ? parentSession.agentType
+          : 'claude')
     const workerMode: ClaudePermissionMode = parentSession?.mode ?? 'default'
 
     const targetMachineId = requestedMachine ?? parentSession?.host
@@ -2382,8 +2745,22 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
             workerMode,
             resolvedTask,
             workerCwd,
-            workerParentOptions,
+            {
+              ...workerParentOptions,
+              machine: targetMachine,
+            },
           )
+          : workerAgentType === 'gemini'
+            ? await createGeminiAcpSession(
+              workerSessionName,
+              workerMode,
+              resolvedTask,
+              workerCwd,
+              {
+                ...workerParentOptions,
+                machine: targetMachine,
+              },
+            )
           : createStreamSession(
             workerSessionName,
             workerMode,
@@ -2453,7 +2830,10 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
           workerMode,
           resolvedTask,
           worktree.path,
-          workerParentOptions,
+          {
+            ...workerParentOptions,
+            machine: targetMachine,
+          },
         )
         : createStreamSession(
           workerSessionName,
@@ -2612,6 +2992,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
         pid,
         sessionType: active.kind === 'external' ? 'external' : (active.kind === 'pty' ? 'pty' : 'stream'),
         agentType: active.agentType,
+        effort: active.effort,
         cwd: active.cwd,
         host: active.host ?? (active.kind === 'external' ? active.machine : undefined),
         parentSession: active.kind === 'stream' ? active.parentSession : undefined,
@@ -2677,6 +3058,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
         pid,
         sessionType: session.kind === 'external' ? 'external' : (session.kind === 'pty' ? 'pty' : 'stream'),
         agentType: session.agentType,
+        effort: session.effort,
         cwd: session.cwd,
         host: session.host ?? (session.kind === 'external' ? session.machine : undefined),
         parentSession: session.kind === 'stream' ? session.parentSession : undefined,
@@ -2706,6 +3088,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
         pid: 0,
         sessionType: 'stream',
         agentType: exited.agentType,
+        effort: exited.effort,
         cwd: exited.cwd,
         host: exited.host,
         parentSession: exited.parentSession,
@@ -2846,6 +3229,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     }
 
     appendCommanderTranscriptEvent(session, event)
+    appendGenericTranscriptEvent(session, event)
   }
 
   function broadcastStreamEvent(session: StreamSession | OpenClawSession | ExternalSession, event: StreamJsonEvent): void {
@@ -2865,55 +3249,6 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
           // Ignore handler failures to avoid interrupting stream delivery.
         }
       }
-    }
-  }
-
-  function normalizeOpenClawEvent(rawEvent: unknown): StreamJsonEvent | null {
-    const event = asObject(rawEvent)
-    if (!event) return null
-    const type = typeof event.type === 'string' ? event.type : ''
-    if (!type) return null
-
-    // Pass-through events whose shape already matches StreamJsonEvent.
-    const passthrough = new Set(['content_block_start', 'content_block_stop', 'tool_use', 'result'])
-    if (passthrough.has(type)) {
-      return event as StreamJsonEvent
-    }
-
-    switch (type) {
-      case 'content_block_delta': {
-        // Only pass through when a delta object is present — matches plan mapping.
-        const delta = asObject(event.delta)
-        return delta ? event as StreamJsonEvent : null
-      }
-      case 'thinking_delta': {
-        // Map OpenClaw thinking_delta → content_block_delta with thinking_delta.
-        const delta = asObject(event.delta)
-        const thinking = typeof event.thinking === 'string'
-          ? event.thinking
-          : (typeof delta?.thinking === 'string' ? delta.thinking : '')
-        if (!thinking) return null
-        return {
-          type: 'content_block_delta',
-          delta: { type: 'thinking_delta', thinking },
-        } as StreamJsonEvent
-      }
-      case 'thinking_start': {
-        // Map OpenClaw thinking_start → content_block_delta with thinking_delta.
-        const thinking = typeof event.thinking === 'string' ? event.thinking : ''
-        if (!thinking) return null
-        return {
-          type: 'content_block_delta',
-          delta: { type: 'thinking_delta', thinking },
-        } as StreamJsonEvent
-      }
-      case 'done': {
-        // Map OpenClaw done → result event.
-        const result = typeof event.result === 'string' ? event.result : ''
-        return { type: 'result', result } as StreamJsonEvent
-      }
-      default:
-        return null
     }
   }
 
@@ -3004,7 +3339,8 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
 
       const normalized = normalizeOpenClawEvent(parsed)
       if (!normalized) return
-      // Save event to replay buffer (openclaw sessions don't use usage tracking).
+      // OpenClaw still relies on the in-memory replay buffer here until its
+      // gateway path is migrated into the shared transcript store.
       session.lastEventAt = new Date().toISOString()
       session.events.push(normalized)
       if (session.events.length > MAX_STREAM_EVENTS) {
@@ -3078,7 +3414,14 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     exitedStreamSessions.delete(sessionName)
 
     const initializedAt = new Date().toISOString()
-    const args = buildClaudeStreamArgs(mode, options.resumeSessionId, options.systemPrompt, options.maxTurns)
+    const effort = normalizeClaudeEffortLevel(options.effort, DEFAULT_CLAUDE_EFFORT_LEVEL)
+    const args = buildClaudeStreamArgs(
+      mode,
+      options.resumeSessionId,
+      options.systemPrompt,
+      options.maxTurns,
+      effort,
+    )
 
     const remote = isRemoteMachine(machine)
     const localSpawnCwd = process.env.HOME || '/tmp'
@@ -3087,7 +3430,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     const spawnCommand = remote ? 'ssh' : 'claude'
     // For remote stream sessions, wrap in an interactive login shell so PATH
     // from shell init files includes user-local tool installs (Homebrew/nvm/etc).
-    const remoteClaude = ['claude', ...args].map(shellEscape).join(' ')
+    const remoteClaude = buildClaudeShellInvocation(args)
     const remoteStreamCmd = requestedCwd
       ? `cd ${shellEscape(requestedCwd)} && exec $SHELL -lic ${shellEscape(remoteClaude)}`
       : `exec $SHELL -lic ${shellEscape(remoteClaude)}`
@@ -3098,7 +3441,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
 
     const childProcess: ChildProcess = spawn(spawnCommand, spawnArgs, {
       cwd: spawnCwd,
-      env: { ...process.env, CLAUDECODE: undefined },
+      env: buildClaudeSpawnEnv(),
       stdio: ['pipe', 'pipe', 'pipe'],
     })
 
@@ -3106,6 +3449,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       kind: 'stream',
       name: sessionName,
       agentType,
+      effort: agentType === 'claude' ? effort : undefined,
       mode,
       cwd: sessionCwd,
       host: remote ? machine.id : undefined,
@@ -3127,6 +3471,8 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       restoredIdle: Boolean(options.resumeSessionId) && task.length === 0,
     }
 
+    writeTranscriptMeta(session)
+
     // Prevent unhandled 'error' events on stdin from crashing the process.
     // This can fire if the child exits before stdin is fully drained.
     if (typeof childProcess.stdin?.on === 'function') {
@@ -3147,8 +3493,17 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
         if (!trimmed) continue
         try {
           const event = JSON.parse(trimmed) as StreamJsonEvent
-          appendStreamEvent(session, event)
-          broadcastStreamEvent(session, event)
+          const normalized = session.agentType === 'claude'
+            ? normalizeClaudeEvent(event) as StreamJsonEvent | StreamJsonEvent[] | null
+            : event
+          if (!normalized) {
+            continue
+          }
+          const events = Array.isArray(normalized) ? normalized : [normalized]
+          for (const normalizedEvent of events) {
+            appendStreamEvent(session, normalizedEvent)
+            broadcastStreamEvent(session, normalizedEvent)
+          }
         } catch {
           // Skip unparseable lines
         }
@@ -3289,30 +3644,8 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     return session
   }
 
-  // ── Codex App-Server Sidecar ─────────────────────────────────────
-  interface CodexSidecar {
-    process: ChildProcess | null
-    port: number
-    ws: WebSocket | null
-    stopKeepAlive: (() => void) | null
-    requestId: number
-    pendingRequests: Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>
-    notificationListeners: Map<string, Set<(method: string, params: unknown) => void>>
-    stdoutTail: string[]
-    stderrTail: string[]
-  }
-
-  const codexSidecar: CodexSidecar = {
-    process: null,
-    port: 0,
-    ws: null,
-    stopKeepAlive: null,
-    requestId: 0,
-    pendingRequests: new Map(),
-    notificationListeners: new Map(),
-    stdoutTail: [],
-    stderrTail: [],
-  }
+  // ── Codex Session Runtime ────────────────────────────────────────
+  type CodexNotificationCallback = (method: string, params: unknown) => void
 
   function codexFailureMessage(reason: string): string {
     return `Codex transport failure: ${reason}`
@@ -3333,47 +3666,925 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     }
   }
 
-  function logCodexSidecar(
-    level: 'info' | 'warn' | 'error',
-    message: string,
-    extra: Record<string, unknown> = {},
-  ): void {
-    const payload = JSON.stringify({
-      pid: codexSidecar.process?.pid ?? null,
-      port: codexSidecar.port || null,
-      activeSessions: listActiveCodexSessionNames(),
-      pendingRequests: codexSidecar.pendingRequests.size,
-      listenerThreads: codexSidecar.notificationListeners.size,
-      ...(codexSidecar.stderrTail.length > 0 ? { stderrTail: codexSidecar.stderrTail } : {}),
-      ...(codexSidecar.stdoutTail.length > 0 ? { stdoutTail: codexSidecar.stdoutTail } : {}),
-      ...extra,
-    })
-    const line = `[agents][codex-sidecar] ${message} ${payload}`
-    if (level === 'error') {
-      console.error(line)
-      return
+  function childProcessHasExited(processToCheck: ChildProcess): boolean {
+    if (processToCheck.exitCode === undefined && processToCheck.signalCode === undefined) {
+      return true
     }
-    if (level === 'warn') {
-      console.warn(line)
-      return
-    }
-    console.info(line)
+    return processToCheck.exitCode !== null && processToCheck.exitCode !== undefined
+      || processToCheck.signalCode !== null && processToCheck.signalCode !== undefined
   }
 
-  function recordCodexSidecarOutput(stream: 'stdout' | 'stderr', chunk: Buffer): void {
-    const lines = chunk.toString()
-      .split(/\r?\n/g)
-      .map((line) => truncateLogText(line))
-      .filter((line) => line.length > 0)
-    if (lines.length === 0) {
-      return
+  class CodexSessionRuntime implements CodexSessionRuntimeHandle {
+    readonly sessionName: string
+    readonly machine: (MachineConfig & { host: string }) | null
+    readonly transportMode: 'ws' | 'stdio'
+    process: ChildProcess | null = null
+    port = 0
+    ws: WebSocket | null = null
+    stopKeepAlive: (() => void) | null = null
+    requestId = 0
+    pendingRequests = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>()
+    notificationListeners = new Map<string, Set<CodexNotificationCallback>>()
+    stdoutTail: string[] = []
+    stderrTail: string[] = []
+    teardownPromise: Promise<void> | null = null
+    teardownInProgress = false
+    transportInitialized = false
+    stdioBuffer = ''
+
+    constructor(sessionName: string, machine?: MachineConfig) {
+      this.sessionName = sessionName
+      this.machine = isRemoteMachine(machine) ? machine : null
+      this.transportMode = this.machine ? 'stdio' : 'ws'
     }
 
-    const tail = stream === 'stderr' ? codexSidecar.stderrTail : codexSidecar.stdoutTail
-    appendCodexSidecarTail(tail, lines)
+    log(level: 'info' | 'warn' | 'error', message: string, extra: Record<string, unknown> = {}): void {
+      const payload = JSON.stringify({
+        sessionName: this.sessionName,
+        pid: this.process?.pid ?? null,
+        port: this.port || null,
+        transportMode: this.transportMode,
+        machineId: this.machine?.id ?? null,
+        activeSessions: listActiveCodexSessionNames(),
+        pendingRequests: this.pendingRequests.size,
+        listenerThreads: this.notificationListeners.size,
+        ...(this.stderrTail.length > 0 ? { stderrTail: this.stderrTail } : {}),
+        ...(this.stdoutTail.length > 0 ? { stdoutTail: this.stdoutTail } : {}),
+        ...extra,
+      })
+      const line = `[agents][codex-sidecar] ${message} ${payload}`
+      if (level === 'error') {
+        console.error(line)
+        return
+      }
+      if (level === 'warn') {
+        console.warn(line)
+        return
+      }
+      console.info(line)
+    }
 
-    if (stream === 'stderr') {
-      console.warn(`[agents][codex-sidecar][stderr] ${truncateLogText(lines.join(' | '), 800)}`)
+    private recordOutput(stream: 'stdout' | 'stderr', chunk: Buffer): void {
+      const lines = chunk.toString()
+        .split(/\r?\n/g)
+        .map((line) => truncateLogText(line))
+        .filter((line) => line.length > 0)
+      if (lines.length === 0) {
+        return
+      }
+
+      const tail = stream === 'stderr' ? this.stderrTail : this.stdoutTail
+      appendCodexSidecarTail(tail, lines)
+
+      if (stream === 'stderr') {
+        console.warn(`[agents][codex-sidecar][stderr] ${truncateLogText(lines.join(' | '), 800)}`)
+      }
+    }
+
+    private handleProtocolMessage(payloadText: string): void {
+      try {
+        const msg = JSON.parse(payloadText) as {
+          id?: number
+          method?: string
+          params?: unknown
+          result?: unknown
+          error?: unknown
+        }
+        if (msg.id !== undefined && this.pendingRequests.has(msg.id)) {
+          const pending = this.pendingRequests.get(msg.id)!
+          this.pendingRequests.delete(msg.id)
+          if (msg.error) {
+            pending.reject(new Error(JSON.stringify(msg.error)))
+          } else {
+            pending.resolve(msg.result)
+          }
+          return
+        }
+        if (msg.method && msg.params) {
+          const threadId = (msg.params as Record<string, unknown>).threadId as string | undefined
+          if (threadId) {
+            const listeners = this.notificationListeners.get(threadId)
+            if (listeners) {
+              for (const cb of listeners) {
+                cb(msg.method, msg.params)
+              }
+            }
+          }
+        }
+      } catch (error) {
+        this.log('warn', 'Failed to parse Codex runtime payload', {
+          error: truncateLogText(error instanceof Error ? error.message : String(error)),
+          payloadSnippet: truncateLogText(payloadText, 800),
+        })
+      }
+    }
+
+    private recordStdioProtocol(chunk: Buffer): void {
+      this.stdioBuffer += chunk.toString()
+      let newlineIndex = this.stdioBuffer.indexOf('\n')
+      while (newlineIndex >= 0) {
+        const line = this.stdioBuffer.slice(0, newlineIndex).trim()
+        this.stdioBuffer = this.stdioBuffer.slice(newlineIndex + 1)
+        if (line.length > 0) {
+          this.handleProtocolMessage(line)
+        }
+        newlineIndex = this.stdioBuffer.indexOf('\n')
+      }
+    }
+
+    private attachProcess(cp: ChildProcess): void {
+      this.process = cp
+      this.stdioBuffer = ''
+      cp.stdout?.on('data', (chunk: Buffer) => {
+        if (this.transportMode === 'stdio') {
+          this.recordStdioProtocol(chunk)
+          return
+        }
+        this.recordOutput('stdout', chunk)
+      })
+      cp.stderr?.on('data', (chunk: Buffer) => {
+        this.recordOutput('stderr', chunk)
+      })
+
+      const cpEmitter = cp as unknown as NodeJS.EventEmitter
+      cpEmitter.on('exit', (code: number | null, signal: string | null) => {
+        const detail = signal
+          ? `Codex runtime exited with signal ${signal}`
+          : `Codex runtime exited with code ${code ?? -1}`
+        this.log('error', 'Codex runtime process exited', {
+          detail,
+          exitCode: code ?? -1,
+          signal: signal ?? null,
+        })
+        this.process = null
+        this.transportInitialized = false
+        this.detachKeepAlive()
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.terminate()
+        }
+        this.ws = null
+        this.rejectPendingRequests(new Error(detail))
+        this.failOwningSession(detail, typeof code === 'number' ? code : 1, signal ?? undefined)
+      })
+      cpEmitter.on('error', (err: Error) => {
+        this.log('error', 'Codex runtime process error', {
+          error: truncateLogText(err.message),
+        })
+        this.process = null
+        this.transportInitialized = false
+        this.detachKeepAlive()
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.terminate()
+        }
+        this.ws = null
+        this.rejectPendingRequests(err)
+        this.failOwningSession(`Codex runtime process error: ${err.message}`)
+      })
+    }
+
+    private sendTransportPayload(payloadText: string): void {
+      if (this.transportMode === 'stdio') {
+        const stdin = this.process?.stdin
+        if (!stdin || stdin.writable === false) {
+          throw new Error('Codex runtime not connected')
+        }
+        stdin.write(payloadText + '\n')
+        return
+      }
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        throw new Error('Codex sidecar not connected')
+      }
+      this.ws.send(payloadText)
+    }
+
+    private rejectPendingRequests(error: Error): void {
+      for (const pending of this.pendingRequests.values()) {
+        pending.reject(error)
+      }
+      this.pendingRequests.clear()
+    }
+
+    private detachKeepAlive(): void {
+      this.stopKeepAlive?.()
+      this.stopKeepAlive = null
+    }
+
+    private failOwningSession(reason: string, exitCode = 1, signal?: string): void {
+      const candidate = sessions.get(this.sessionName)
+      if (!candidate || candidate.kind !== 'stream' || candidate.agentType !== 'codex') {
+        return
+      }
+      if (candidate.codexRuntime !== this) {
+        return
+      }
+      if (this.teardownPromise || this.teardownInProgress) {
+        return
+      }
+      void failCodexSession(this.sessionName, candidate, reason, exitCode, signal)
+    }
+
+    private handleDisconnect(ws: WebSocket, detail: string): void {
+      if (this.ws !== ws) {
+        return
+      }
+      this.log('warn', 'Codex sidecar disconnected', {
+        detail: truncateLogText(detail),
+        readyState: ws.readyState,
+      })
+      this.detachKeepAlive()
+      this.transportInitialized = false
+      this.ws = null
+      this.rejectPendingRequests(new Error(detail))
+      this.failOwningSession(detail)
+    }
+
+    private async openSocket(port: number, timeoutMs: number): Promise<WebSocket> {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}`)
+
+      return new Promise<WebSocket>((resolve, reject) => {
+        let settled = false
+
+        const cleanup = () => {
+          clearTimeout(timeout)
+          ws.off('open', onOpen)
+          ws.off('error', onError)
+        }
+
+        const rejectOnce = (error: Error) => {
+          if (settled) {
+            return
+          }
+          settled = true
+          cleanup()
+          try {
+            ws.terminate()
+          } catch {
+            // Best-effort cleanup only.
+          }
+          reject(error)
+        }
+
+        const onOpen = () => {
+          if (settled) {
+            return
+          }
+          settled = true
+          cleanup()
+          resolve(ws)
+        }
+
+        const onError = (error: Error) => {
+          rejectOnce(error)
+        }
+
+        const timeout = setTimeout(() => {
+          rejectOnce(new Error('Codex sidecar connection timeout'))
+        }, timeoutMs)
+
+        ws.once('open', onOpen)
+        ws.once('error', onError)
+      })
+    }
+
+    private async connectSocket(
+      port: number,
+      options: { totalTimeoutMs?: number; attemptTimeoutMs?: number; retryDelayMs?: number } = {},
+    ): Promise<WebSocket> {
+      const totalTimeoutMs = options.totalTimeoutMs ?? 5000
+      const attemptTimeoutMs = options.attemptTimeoutMs ?? 500
+      const retryDelayMs = options.retryDelayMs ?? 50
+      const startedAt = Date.now()
+      let lastError: Error | null = null
+
+      while (Date.now() - startedAt < totalTimeoutMs) {
+        const remainingMs = totalTimeoutMs - (Date.now() - startedAt)
+        const timeoutMs = Math.max(50, Math.min(attemptTimeoutMs, remainingMs))
+
+        try {
+          return await this.openSocket(port, timeoutMs)
+        } catch (error) {
+          lastError = error instanceof Error ? error : new Error(String(error))
+        }
+
+        if (!this.process) {
+          break
+        }
+
+        const delayMs = Math.min(retryDelayMs, Math.max(0, totalTimeoutMs - (Date.now() - startedAt)))
+        if (delayMs <= 0) {
+          break
+        }
+        await new Promise((resolve) => setTimeout(resolve, delayMs))
+      }
+
+      this.log('error', 'Unable to connect to Codex sidecar WebSocket', {
+        totalTimeoutMs,
+        attemptTimeoutMs,
+        retryDelayMs,
+        lastError: truncateLogText((lastError ?? new Error('Codex sidecar connection timeout')).message),
+      })
+      throw lastError ?? new Error('Codex sidecar connection timeout')
+    }
+
+    async ensureConnected(): Promise<void> {
+      if (this.transportMode === 'ws' && this.ws?.readyState === WebSocket.OPEN && this.transportInitialized) return
+      if (this.transportMode === 'stdio' && this.process && this.transportInitialized) return
+
+      if (this.ws) {
+        this.detachKeepAlive()
+        this.ws = null
+      }
+
+      if (!this.process) {
+        this.stdoutTail = []
+        this.stderrTail = []
+        if (this.machine) {
+          const remoteCommand = buildLoginShellCommand(buildCodexAppServerInvocation())
+          const cp = spawn('ssh', buildSshArgs(this.machine, remoteCommand, false), {
+            stdio: ['pipe', 'pipe', 'pipe'],
+            env: { ...process.env },
+          })
+          this.attachProcess(cp)
+          this.log('info', 'Spawned remote Codex runtime process')
+        } else {
+          const { createServer } = await import('node:net')
+          const port = await new Promise<number>((resolve, reject) => {
+            const srv = createServer()
+            srv.listen(0, '127.0.0.1', () => {
+              const addr = srv.address()
+              const p = typeof addr === 'object' && addr ? addr.port : 0
+              srv.close(() => resolve(p))
+            })
+            const serverEmitter = srv as unknown as NodeJS.EventEmitter
+            serverEmitter.on('error', reject)
+          })
+          this.port = port
+          const cp = spawn('codex', ['app-server', '--listen', `ws://127.0.0.1:${port}`], {
+            stdio: ['pipe', 'pipe', 'pipe'],
+            env: { ...process.env },
+          })
+          this.attachProcess(cp)
+          this.log('info', 'Spawned Codex sidecar process')
+        }
+      }
+
+      if (this.transportMode === 'ws') {
+        const ws = await this.connectSocket(this.port)
+        this.log('info', 'Connected to Codex sidecar WebSocket')
+
+        ws.on('message', (data: RawData) => {
+          const payloadText = rawDataToText(data)
+          this.handleProtocolMessage(payloadText)
+        })
+
+        ws.on('close', (code, reasonBuffer) => {
+          const reason = reasonBuffer.toString().trim()
+          const detail = reason
+            ? `Codex sidecar connection closed (code ${code}): ${reason}`
+            : `Codex sidecar connection closed (code ${code})`
+          this.handleDisconnect(ws, detail)
+        })
+
+        ws.on('error', (error) => {
+          const detail = error instanceof Error
+            ? `Codex sidecar connection error: ${error.message}`
+            : 'Codex sidecar connection error'
+          this.handleDisconnect(ws, detail)
+        })
+
+        this.ws = ws
+        this.stopKeepAlive = attachWebSocketKeepAlive(ws, () => {
+          const detail = 'Codex sidecar keepalive timeout'
+          this.log('warn', 'Codex sidecar keepalive timeout', {
+            readyState: ws.readyState,
+          })
+          this.handleDisconnect(ws, detail)
+        })
+      }
+
+      await this.sendRequest('initialize', {
+        clientInfo: { name: 'hammurabi', version: '0.1.0' },
+      })
+      this.sendTransportPayload(JSON.stringify({ method: 'initialized', params: {} }))
+      this.transportInitialized = true
+    }
+
+    sendRequest(method: string, params: unknown): Promise<unknown> {
+      return new Promise((resolve, reject) => {
+        const id = ++this.requestId
+        this.pendingRequests.set(id, { resolve, reject })
+        try {
+          this.sendTransportPayload(JSON.stringify({ jsonrpc: '2.0', id, method, params }))
+        } catch (error) {
+          this.pendingRequests.delete(id)
+          reject(error instanceof Error ? error : new Error(String(error)))
+          return
+        }
+        setTimeout(() => {
+          if (this.pendingRequests.has(id)) {
+            this.pendingRequests.delete(id)
+            this.log('warn', 'Codex request timed out', {
+              id,
+              method,
+              timeoutMs: 30000,
+            })
+            reject(new Error(`Codex request ${method} timed out`))
+          }
+        }, 30000)
+      })
+    }
+
+    addNotificationListener(threadId: string, cb: CodexNotificationCallback): () => void {
+      if (!this.notificationListeners.has(threadId)) {
+        this.notificationListeners.set(threadId, new Set())
+      }
+      this.notificationListeners.get(threadId)!.add(cb)
+      return () => {
+        const set = this.notificationListeners.get(threadId)
+        if (set) {
+          set.delete(cb)
+          if (set.size === 0) this.notificationListeners.delete(threadId)
+        }
+      }
+    }
+
+    private async waitForProcessExit(processToWait: ChildProcess, timeoutMs: number): Promise<boolean> {
+      if (childProcessHasExited(processToWait)) {
+        return true
+      }
+
+      return new Promise<boolean>((resolve) => {
+        let settled = false
+        const finish = (didExit: boolean) => {
+          if (settled) {
+            return
+          }
+          settled = true
+          clearTimeout(timer)
+          processToWait.off('exit', onExit)
+          processToWait.off('error', onError)
+          resolve(didExit)
+        }
+
+        const onExit = () => finish(true)
+        const onError = () => finish(true)
+        const timer = setTimeout(() => finish(false), timeoutMs)
+
+        processToWait.once('exit', onExit)
+        processToWait.once('error', onError)
+      })
+    }
+
+    async teardown(options: { threadId?: string; reason?: string; timeoutMs?: number } = {}): Promise<void> {
+      if (this.teardownPromise) {
+        return this.teardownPromise
+      }
+
+      this.teardownPromise = (async () => {
+        this.teardownInProgress = true
+        const threadId = options.threadId
+        const reason = options.reason ?? 'Codex runtime teardown'
+        const timeoutMs = options.timeoutMs ?? CODEX_RUNTIME_TEARDOWN_TIMEOUT_MS
+
+        if (threadId) {
+          try {
+            await this.sendRequest('thread/archive', { threadId })
+          } catch (error) {
+            this.log('warn', 'Codex thread archive failed during teardown', {
+              threadId,
+              error: truncateLogText(error instanceof Error ? error.message : String(error)),
+            })
+          }
+        }
+
+        this.detachKeepAlive()
+        this.notificationListeners.clear()
+        this.transportInitialized = false
+
+        const ws = this.ws
+        this.ws = null
+        this.rejectPendingRequests(new Error(reason))
+        if (ws) {
+          try {
+            if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+              ws.close(1000, 'Session teardown')
+            }
+          } catch {
+            // Continue with force-close path.
+          }
+          if (ws.readyState !== WebSocket.CLOSED) {
+            ws.terminate()
+          }
+        }
+
+        const runtimeProcess = this.process
+        this.process = null
+        this.port = 0
+        if (!runtimeProcess) {
+          return
+        }
+        if (childProcessHasExited(runtimeProcess)) {
+          return
+        }
+
+        try {
+          runtimeProcess.kill('SIGTERM')
+        } catch {
+          // Best-effort termination before escalation.
+        }
+
+        const exitedAfterTerm = await this.waitForProcessExit(runtimeProcess, timeoutMs)
+        if (exitedAfterTerm) {
+          return
+        }
+
+        this.log('warn', 'Codex runtime did not exit after SIGTERM; escalating to SIGKILL', {
+          timeoutMs,
+        })
+
+        try {
+          runtimeProcess.kill('SIGKILL')
+        } catch {
+          // Process may have already exited.
+        }
+        await this.waitForProcessExit(runtimeProcess, CODEX_RUNTIME_FORCE_KILL_WAIT_MS)
+      })()
+
+      try {
+        await this.teardownPromise
+      } finally {
+        this.teardownInProgress = false
+        this.teardownPromise = null
+      }
+    }
+
+    teardownOnProcessExit(threadId?: string): void {
+      this.teardownInProgress = true
+      if (threadId) {
+        void this.sendRequest('thread/archive', { threadId }).catch(() => {})
+      }
+
+      this.detachKeepAlive()
+      this.ws?.terminate()
+      this.ws = null
+      this.transportInitialized = false
+      this.rejectPendingRequests(new Error('Process exiting'))
+      this.notificationListeners.clear()
+      if (this.process) {
+        try {
+          this.process.kill('SIGTERM')
+        } catch {
+          // Best effort only during process shutdown.
+        }
+      }
+      this.process = null
+      this.port = 0
+    }
+  }
+
+  type GeminiNotificationCallback = (method: string, params: unknown) => void
+
+  class GeminiAcpRuntime implements GeminiAcpRuntimeHandle {
+    readonly sessionName: string
+    readonly machine: (MachineConfig & { host: string }) | null
+    process: ChildProcess | null = null
+    requestId = 0
+    pendingRequests = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>()
+    notificationListeners = new Map<string, Set<GeminiNotificationCallback>>()
+    stdoutTail: string[] = []
+    stderrTail: string[] = []
+    teardownPromise: Promise<void> | null = null
+    transportInitialized = false
+    stdioBuffer = ''
+
+    constructor(sessionName: string, machine?: MachineConfig) {
+      this.sessionName = sessionName
+      this.machine = isRemoteMachine(machine) ? machine : null
+    }
+
+    private log(level: 'info' | 'warn' | 'error', message: string, extra: Record<string, unknown> = {}): void {
+      const payload = JSON.stringify({
+        sessionName: this.sessionName,
+        pid: this.process?.pid ?? null,
+        machineId: this.machine?.id ?? null,
+        pendingRequests: this.pendingRequests.size,
+        listenerSessions: this.notificationListeners.size,
+        ...(this.stderrTail.length > 0 ? { stderrTail: this.stderrTail } : {}),
+        ...(this.stdoutTail.length > 0 ? { stdoutTail: this.stdoutTail } : {}),
+        ...extra,
+      })
+      const line = `[agents][gemini-acp] ${message} ${payload}`
+      if (level === 'error') {
+        console.error(line)
+        return
+      }
+      if (level === 'warn') {
+        console.warn(line)
+        return
+      }
+      console.info(line)
+    }
+
+    private recordOutput(stream: 'stdout' | 'stderr', chunk: Buffer): void {
+      const lines = chunk.toString()
+        .split(/\r?\n/g)
+        .map((line) => truncateLogText(line))
+        .filter((line) => line.length > 0)
+      if (lines.length === 0) {
+        return
+      }
+
+      const tail = stream === 'stderr' ? this.stderrTail : this.stdoutTail
+      appendCodexSidecarTail(tail, lines)
+
+      if (stream === 'stderr') {
+        console.warn(`[agents][gemini-acp][stderr] ${truncateLogText(lines.join(' | '), 800)}`)
+      }
+    }
+
+    private rejectPendingRequests(error: Error): void {
+      for (const pending of this.pendingRequests.values()) {
+        pending.reject(error)
+      }
+      this.pendingRequests.clear()
+    }
+
+    private handleProtocolMessage(payloadText: string): void {
+      try {
+        const msg = JSON.parse(payloadText) as {
+          id?: number
+          method?: string
+          params?: unknown
+          result?: unknown
+          error?: unknown
+        }
+        if (msg.id !== undefined && this.pendingRequests.has(msg.id)) {
+          const pending = this.pendingRequests.get(msg.id)!
+          this.pendingRequests.delete(msg.id)
+          if (msg.error) {
+            pending.reject(new Error(JSON.stringify(msg.error)))
+          } else {
+            pending.resolve(msg.result)
+          }
+          return
+        }
+
+        if (typeof msg.method !== 'string') {
+          return
+        }
+
+        const params = asObject(msg.params)
+        const sessionId = typeof params?.sessionId === 'string' && params.sessionId.trim().length > 0
+          ? params.sessionId.trim()
+          : undefined
+        if (!sessionId) {
+          return
+        }
+
+        const listeners = this.notificationListeners.get(sessionId)
+        if (!listeners) {
+          return
+        }
+        for (const cb of listeners) {
+          cb(msg.method, msg.params)
+        }
+      } catch (error) {
+        this.log('warn', 'Failed to parse Gemini ACP payload', {
+          error: truncateLogText(error instanceof Error ? error.message : String(error)),
+          payloadSnippet: truncateLogText(payloadText, 800),
+        })
+      }
+    }
+
+    private recordStdioProtocol(chunk: Buffer): void {
+      this.stdioBuffer += chunk.toString()
+      let newlineIndex = this.stdioBuffer.indexOf('\n')
+      while (newlineIndex >= 0) {
+        const line = this.stdioBuffer.slice(0, newlineIndex).trim()
+        this.stdioBuffer = this.stdioBuffer.slice(newlineIndex + 1)
+        if (line.length > 0) {
+          this.handleProtocolMessage(line)
+        }
+        newlineIndex = this.stdioBuffer.indexOf('\n')
+      }
+    }
+
+    private attachProcess(cp: ChildProcess): void {
+      this.process = cp
+      this.stdioBuffer = ''
+      cp.stdout?.on('data', (chunk: Buffer) => {
+        this.recordOutput('stdout', chunk)
+        this.recordStdioProtocol(chunk)
+      })
+      cp.stderr?.on('data', (chunk: Buffer) => {
+        this.recordOutput('stderr', chunk)
+      })
+
+      const cpEmitter = cp as unknown as NodeJS.EventEmitter
+      cpEmitter.on('exit', (code: number | null, signal: string | null) => {
+        const detail = signal
+          ? `Gemini ACP runtime exited with signal ${signal}`
+          : `Gemini ACP runtime exited with code ${code ?? -1}`
+        this.log('warn', 'Gemini ACP runtime process exited', {
+          detail,
+          exitCode: code ?? -1,
+          signal: signal ?? null,
+        })
+        this.process = null
+        this.transportInitialized = false
+        this.rejectPendingRequests(new Error(detail))
+        this.notificationListeners.clear()
+      })
+      cpEmitter.on('error', (err: Error) => {
+        this.log('error', 'Gemini ACP runtime process error', {
+          error: truncateLogText(err.message),
+        })
+        this.process = null
+        this.transportInitialized = false
+        this.rejectPendingRequests(err)
+        this.notificationListeners.clear()
+      })
+    }
+
+    private sendTransportPayload(payloadText: string): void {
+      const stdin = this.process?.stdin
+      if (!stdin || stdin.writable === false) {
+        throw new Error('Gemini ACP runtime not connected')
+      }
+      stdin.write(payloadText + '\n')
+    }
+
+    private async waitForProcessExit(processToWait: ChildProcess, timeoutMs: number): Promise<boolean> {
+      if (childProcessHasExited(processToWait)) {
+        return true
+      }
+
+      return new Promise<boolean>((resolve) => {
+        let settled = false
+        const finish = (didExit: boolean) => {
+          if (settled) {
+            return
+          }
+          settled = true
+          clearTimeout(timer)
+          processToWait.off('exit', onExit)
+          processToWait.off('error', onError)
+          resolve(didExit)
+        }
+
+        const onExit = () => finish(true)
+        const onError = () => finish(true)
+        const timer = setTimeout(() => finish(false), timeoutMs)
+
+        processToWait.once('exit', onExit)
+        processToWait.once('error', onError)
+      })
+    }
+
+    async ensureConnected(): Promise<void> {
+      if (this.process && this.transportInitialized) {
+        return
+      }
+
+      if (!this.process) {
+        this.stdoutTail = []
+        this.stderrTail = []
+        const cp = this.machine
+          ? spawn(
+            'ssh',
+            buildSshArgs(this.machine, buildLoginShellCommand(buildGeminiAcpInvocation()), false),
+            {
+              stdio: ['pipe', 'pipe', 'pipe'],
+              env: { ...process.env },
+            },
+          )
+          : spawn(GEMINI_ACP_COMMAND, GEMINI_ACP_ARGS, {
+            stdio: ['pipe', 'pipe', 'pipe'],
+            env: { ...process.env },
+          })
+        this.attachProcess(cp)
+        this.log('info', this.machine ? 'Spawned remote Gemini ACP runtime' : 'Spawned Gemini ACP runtime')
+      }
+
+      await this.sendRequest('initialize', {
+        protocolVersion: 1,
+        clientInfo: { name: 'hammurabi', version: '0.1.0' },
+        clientCapabilities: {
+          auth: { terminal: false },
+          fs: { readTextFile: false, writeTextFile: false },
+          terminal: false,
+        },
+      })
+      this.transportInitialized = true
+    }
+
+    sendRequest(method: string, params: unknown): Promise<unknown> {
+      return new Promise((resolve, reject) => {
+        const id = ++this.requestId
+        this.pendingRequests.set(id, { resolve, reject })
+        try {
+          this.sendTransportPayload(JSON.stringify({ jsonrpc: '2.0', id, method, params }))
+        } catch (error) {
+          this.pendingRequests.delete(id)
+          reject(error instanceof Error ? error : new Error(String(error)))
+          return
+        }
+        setTimeout(() => {
+          if (this.pendingRequests.has(id)) {
+            this.pendingRequests.delete(id)
+            this.log('warn', 'Gemini ACP request timed out', {
+              id,
+              method,
+              timeoutMs: 30000,
+            })
+            reject(new Error(`Gemini ACP request ${method} timed out`))
+          }
+        }, 30000)
+      })
+    }
+
+    sendNotification(method: string, params: unknown): void {
+      this.sendTransportPayload(JSON.stringify({ jsonrpc: '2.0', method, params }))
+    }
+
+    addNotificationListener(sessionId: string, cb: GeminiNotificationCallback): () => void {
+      if (!this.notificationListeners.has(sessionId)) {
+        this.notificationListeners.set(sessionId, new Set())
+      }
+      this.notificationListeners.get(sessionId)!.add(cb)
+      return () => {
+        const listeners = this.notificationListeners.get(sessionId)
+        if (!listeners) {
+          return
+        }
+        listeners.delete(cb)
+        if (listeners.size === 0) {
+          this.notificationListeners.delete(sessionId)
+        }
+      }
+    }
+
+    async teardown(options: { reason?: string; timeoutMs?: number } = {}): Promise<void> {
+      if (this.teardownPromise) {
+        return this.teardownPromise
+      }
+
+      this.teardownPromise = (async () => {
+        const reason = options.reason ?? 'Gemini ACP teardown'
+        const timeoutMs = options.timeoutMs ?? CODEX_RUNTIME_TEARDOWN_TIMEOUT_MS
+
+        this.transportInitialized = false
+        this.notificationListeners.clear()
+        this.rejectPendingRequests(new Error(reason))
+
+        const runtimeProcess = this.process
+        this.process = null
+        if (!runtimeProcess || childProcessHasExited(runtimeProcess)) {
+          return
+        }
+
+        try {
+          runtimeProcess.kill('SIGTERM')
+        } catch {
+          // Best-effort termination before escalation.
+        }
+
+        const exitedAfterTerm = await this.waitForProcessExit(runtimeProcess, timeoutMs)
+        if (exitedAfterTerm) {
+          return
+        }
+
+        this.log('warn', 'Gemini ACP runtime did not exit after SIGTERM; escalating to SIGKILL', {
+          timeoutMs,
+        })
+
+        try {
+          runtimeProcess.kill('SIGKILL')
+        } catch {
+          // Process may have already exited.
+        }
+        await this.waitForProcessExit(runtimeProcess, CODEX_RUNTIME_FORCE_KILL_WAIT_MS)
+      })()
+
+      try {
+        await this.teardownPromise
+      } finally {
+        this.teardownPromise = null
+      }
+    }
+
+    teardownOnProcessExit(): void {
+      this.transportInitialized = false
+      this.notificationListeners.clear()
+      this.rejectPendingRequests(new Error('Process exiting'))
+      if (this.process) {
+        try {
+          this.process.kill('SIGTERM')
+        } catch {
+          // Best effort only during process shutdown.
+        }
+      }
+      this.process = null
     }
   }
 
@@ -3421,13 +4632,6 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       type: 'system',
       text: `Codex is waiting for ${approvalTarget} approval, but Hammurabi does not yet handle Codex approval prompts. This turn may appear stalled until it is approved externally or rerun in an auto-approve mode.${extras ? ` ${extras}` : ''}`,
     }
-  }
-
-  function rejectPendingCodexRequests(error: Error): void {
-    for (const pending of codexSidecar.pendingRequests.values()) {
-      pending.reject(error)
-    }
-    codexSidecar.pendingRequests.clear()
   }
 
   function clearCodexTurnWatchdog(session: StreamSession): void {
@@ -3523,7 +4727,11 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
 
     let resolved = false
     try {
-      const readResult = await sendCodexRequest('thread/read', {
+      const runtime = session.codexRuntime
+      if (!runtime) {
+        return
+      }
+      const readResult = await runtime.sendRequest('thread/read', {
         threadId: session.codexThreadId,
         includeTurns: true,
       })
@@ -3556,7 +4764,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
         resolved = true
       }
     } catch (error) {
-      logCodexSidecar('warn', 'Codex watchdog thread/read reconciliation failed', {
+      session.codexRuntime?.log('warn', 'Codex watchdog thread/read reconciliation failed', {
         sessionName: session.name,
         threadId: session.codexThreadId,
         error: truncateLogText(error instanceof Error ? error.message : String(error)),
@@ -3576,7 +4784,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     appendStreamEvent(session, staleEvent)
     broadcastStreamEvent(session, staleEvent)
     schedulePersistedSessionsWrite()
-    logCodexSidecar('warn', 'Codex turn marked stale after watchdog timeout', {
+    session.codexRuntime?.log('warn', 'Codex turn marked stale after watchdog timeout', {
       sessionName: session.name,
       threadId: session.codexThreadId,
       timeoutSeconds,
@@ -3595,32 +4803,65 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     }, codexTurnWatchdogTimeoutMs)
   }
 
-  function detachCodexSidecarKeepAlive(): void {
-    codexSidecar.stopKeepAlive?.()
-    codexSidecar.stopKeepAlive = null
-  }
-
-  function handleCodexSidecarDisconnect(ws: WebSocket, detail: string): void {
-    if (codexSidecar.ws !== ws) {
+  async function teardownCodexSessionRuntime(
+    session: StreamSession,
+    reason: string,
+  ): Promise<void> {
+    if (session.codexRuntimeTeardownPromise) {
+      await session.codexRuntimeTeardownPromise
       return
     }
-    logCodexSidecar('warn', 'Codex sidecar disconnected', {
-      detail: truncateLogText(detail),
-      readyState: ws.readyState,
+
+    const runtime = session.codexRuntime
+    if (!runtime) {
+      try {
+        session.process.kill('SIGTERM')
+      } catch {
+        // Best-effort cleanup only.
+      }
+      return
+    }
+
+    session.codexNotificationCleanup?.()
+    session.codexNotificationCleanup = undefined
+
+    const teardownPromise = runtime.teardown({
+      threadId: session.codexThreadId,
+      reason,
+      timeoutMs: CODEX_RUNTIME_TEARDOWN_TIMEOUT_MS,
     })
-    detachCodexSidecarKeepAlive()
-    codexSidecar.ws = null
-    rejectPendingCodexRequests(new Error(detail))
-    failAllCodexSessions(detail)
+    session.codexRuntimeTeardownPromise = teardownPromise
+    try {
+      await teardownPromise
+    } finally {
+      session.codexRuntimeTeardownPromise = undefined
+      session.codexNotificationCleanup = undefined
+      session.codexRuntime = undefined
+    }
   }
 
-  function failCodexSession(
+  async function shutdownCodexRuntimes(reason = 'Hammurabi shutdown'): Promise<void> {
+    const codexSessions = [...sessions.values()].filter((session): session is StreamSession =>
+      session.kind === 'stream' && session.agentType === 'codex'
+    )
+
+    await Promise.allSettled(codexSessions.map(async (session) => {
+      clearCodexTurnWatchdog(session)
+      markCodexTurnHealthy(session)
+      for (const client of session.clients) {
+        client.close(1001, 'Server shutting down')
+      }
+      await teardownCodexSessionRuntime(session, reason)
+    }))
+  }
+
+  async function failCodexSession(
     sessionName: string,
     session: StreamSession,
     reason: string,
     exitCode = 1,
     signal?: string,
-  ): void {
+  ): Promise<void> {
     if (sessions.get(sessionName) !== session) {
       return
     }
@@ -3665,12 +4906,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     )
     exitedStreamSessions.set(sessionName, snapshotExitedStreamSession(session))
 
-    // Keep failure cleanup on the existing kill/archive contract for Codex sessions.
-    try {
-      session.process.kill('SIGTERM')
-    } catch {
-      // Best-effort cleanup; continue with session teardown.
-    }
+    await teardownCodexSessionRuntime(session, message)
 
     for (const client of session.clients) {
       client.close(1000, 'Session ended')
@@ -3679,301 +4915,326 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     sessionEventHandlers.delete(sessionName)
   }
 
-  function failAllCodexSessions(reason: string, exitCode = 1, signal?: string): void {
-    const codexSessions = [...sessions.entries()].filter(([, candidate]) =>
-      candidate.kind === 'stream' && candidate.agentType === 'codex'
-    ) as Array<[string, StreamSession]>
-
-    if (codexSessions.length === 0) {
-      codexSidecar.notificationListeners.clear()
+  async function teardownGeminiSessionRuntime(
+    session: StreamSession,
+    reason: string,
+  ): Promise<void> {
+    if (session.geminiRuntimeTeardownPromise) {
+      await session.geminiRuntimeTeardownPromise
       return
     }
 
-    logCodexSidecar('warn', 'Failing Codex sessions after transport failure', {
-      reason: truncateLogText(reason),
-      exitCode,
-      signal: signal ?? null,
-      affectedSessions: codexSessions.map(([sessionName]) => sessionName),
-    })
-    for (const [sessionName, session] of codexSessions) {
-      failCodexSession(sessionName, session, reason, exitCode, signal)
-    }
-    codexSidecar.notificationListeners.clear()
-    schedulePersistedSessionsWrite()
-  }
-
-  async function ensureCodexSidecar(): Promise<void> {
-    if (codexSidecar.ws?.readyState === WebSocket.OPEN) return
-
-    if (codexSidecar.ws) {
-      detachCodexSidecarKeepAlive()
-      codexSidecar.ws = null
-    }
-
-    if (!codexSidecar.process) {
-      // Pick a free port
-      const { createServer } = await import('node:net')
-      const port = await new Promise<number>((resolve, reject) => {
-        const srv = createServer()
-        srv.listen(0, '127.0.0.1', () => {
-          const addr = srv.address()
-          const p = typeof addr === 'object' && addr ? addr.port : 0
-          srv.close(() => resolve(p))
-        })
-        const serverEmitter = srv as unknown as NodeJS.EventEmitter
-        serverEmitter.on('error', reject)
-      })
-      codexSidecar.port = port
-      codexSidecar.stdoutTail = []
-      codexSidecar.stderrTail = []
-
-      const cp = spawn('codex', ['app-server', '--listen', `ws://127.0.0.1:${port}`], {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env },
-      })
-      codexSidecar.process = cp
-      cp.stdout?.on('data', (chunk: Buffer) => {
-        recordCodexSidecarOutput('stdout', chunk)
-      })
-      cp.stderr?.on('data', (chunk: Buffer) => {
-        recordCodexSidecarOutput('stderr', chunk)
-      })
-      logCodexSidecar('info', 'Spawned Codex sidecar process')
-
-      const cpEmitter = cp as unknown as NodeJS.EventEmitter
-      cpEmitter.on('exit', (code: number | null, signal: string | null) => {
-        const detail = signal
-          ? `Codex sidecar exited with signal ${signal}`
-          : `Codex sidecar exited with code ${code ?? -1}`
-        logCodexSidecar('error', 'Codex sidecar process exited', {
-          detail,
-          exitCode: code ?? -1,
-          signal: signal ?? null,
-        })
-        codexSidecar.process = null
-        detachCodexSidecarKeepAlive()
-        if (codexSidecar.ws && codexSidecar.ws.readyState === WebSocket.OPEN) {
-          codexSidecar.ws.terminate()
-        }
-        codexSidecar.ws = null
-        rejectPendingCodexRequests(new Error(detail))
-        failAllCodexSessions(detail, typeof code === 'number' ? code : 1, signal ?? undefined)
-      })
-      cpEmitter.on('error', (err: Error) => {
-        logCodexSidecar('error', 'Codex sidecar process error', {
-          error: truncateLogText(err.message),
-        })
-        codexSidecar.process = null
-        detachCodexSidecarKeepAlive()
-        if (codexSidecar.ws && codexSidecar.ws.readyState === WebSocket.OPEN) {
-          codexSidecar.ws.terminate()
-        }
-        codexSidecar.ws = null
-        rejectPendingCodexRequests(err)
-        failAllCodexSessions(`Codex sidecar process error: ${err.message}`)
-      })
-
-    }
-
-    // Connect as soon as the sidecar binds instead of sleeping through a fixed delay.
-    const ws = await connectCodexSidecarSocket(codexSidecar.port)
-    logCodexSidecar('info', 'Connected to Codex sidecar WebSocket')
-
-    ws.on('message', (data: RawData) => {
-      const payloadText = rawDataToText(data)
+    const runtime = session.geminiRuntime
+    if (!runtime) {
       try {
-        const msg = JSON.parse(payloadText) as { id?: number; method?: string; params?: unknown; result?: unknown; error?: unknown }
-        if (msg.id !== undefined && codexSidecar.pendingRequests.has(msg.id)) {
-          const pending = codexSidecar.pendingRequests.get(msg.id)!
-          codexSidecar.pendingRequests.delete(msg.id)
-          if (msg.error) {
-            pending.reject(new Error(JSON.stringify(msg.error)))
-          } else {
-            pending.resolve(msg.result)
-          }
-        } else if (msg.method && msg.params) {
-          // Notification — dispatch to listeners
-          const threadId = (msg.params as Record<string, unknown>).threadId as string | undefined
-          if (threadId) {
-            const listeners = codexSidecar.notificationListeners.get(threadId)
-            if (listeners) {
-              for (const cb of listeners) {
-                cb(msg.method, msg.params)
-              }
-            }
-          }
-        }
-      } catch (error) {
-        logCodexSidecar('warn', 'Failed to parse Codex sidecar WebSocket payload', {
-          error: truncateLogText(error instanceof Error ? error.message : String(error)),
-          payloadSnippet: truncateLogText(payloadText, 800),
-        })
+        session.process.kill('SIGTERM')
+      } catch {
+        // Best-effort cleanup only.
       }
-    })
+      return
+    }
 
-    ws.on('close', (code, reasonBuffer) => {
-      const reason = reasonBuffer.toString().trim()
-      const detail = reason
-        ? `Codex sidecar connection closed (code ${code}): ${reason}`
-        : `Codex sidecar connection closed (code ${code})`
-      handleCodexSidecarDisconnect(ws, detail)
-    })
+    session.geminiNotificationCleanup?.()
+    session.geminiNotificationCleanup = undefined
 
-    ws.on('error', (error) => {
-      const detail = error instanceof Error
-        ? `Codex sidecar connection error: ${error.message}`
-        : 'Codex sidecar connection error'
-      handleCodexSidecarDisconnect(ws, detail)
+    const teardownPromise = runtime.teardown({
+      reason,
+      timeoutMs: CODEX_RUNTIME_TEARDOWN_TIMEOUT_MS,
     })
-
-    codexSidecar.ws = ws
-    codexSidecar.stopKeepAlive = attachWebSocketKeepAlive(ws, () => {
-      const detail = 'Codex sidecar keepalive timeout'
-      logCodexSidecar('warn', 'Codex sidecar keepalive timeout', {
-        readyState: ws.readyState,
-      })
-      handleCodexSidecarDisconnect(ws, detail)
-    })
-
-    // Send initialize, then the required initialized notification
-    await sendCodexRequest('initialize', {
-      clientInfo: { name: 'hammurabi', version: '0.1.0' },
-    })
-    codexSidecar.ws!.send(JSON.stringify({ method: 'initialized', params: {} }))
+    session.geminiRuntimeTeardownPromise = teardownPromise
+    try {
+      await teardownPromise
+    } finally {
+      session.geminiRuntimeTeardownPromise = undefined
+      session.geminiNotificationCleanup = undefined
+      session.geminiRuntime = undefined
+    }
   }
 
-  function sendCodexRequest(method: string, params: unknown): Promise<unknown> {
-    return new Promise((resolve, reject) => {
-      if (!codexSidecar.ws || codexSidecar.ws.readyState !== WebSocket.OPEN) {
-        reject(new Error('Codex sidecar not connected'))
+  async function shutdownGeminiRuntimes(reason = 'Hammurabi shutdown'): Promise<void> {
+    const geminiSessions = [...sessions.values()].filter((session): session is StreamSession =>
+      session.kind === 'stream' && session.agentType === 'gemini'
+    )
+
+    await Promise.allSettled(geminiSessions.map(async (session) => {
+      for (const client of session.clients) {
+        client.close(1001, 'Server shutting down')
+      }
+      await teardownGeminiSessionRuntime(session, reason)
+    }))
+  }
+
+  async function finalizeGeminiTurnFailure(session: StreamSession, detail: string): Promise<void> {
+    const closeEvents = normalizeGeminiPromptResponse(
+      {
+        stopReason: 'cancelled',
+      },
+      session.geminiTurnState ?? createGeminiTurnState(),
+    )
+    for (const event of closeEvents.filter((event) => event.type !== 'result')) {
+      appendStreamEvent(session, event)
+      broadcastStreamEvent(session, event)
+    }
+
+    const systemEvent: StreamJsonEvent = {
+      type: 'system',
+      text: `Gemini turn failed: ${detail}`,
+    }
+    appendStreamEvent(session, systemEvent)
+    broadcastStreamEvent(session, systemEvent)
+
+    const resultEvent: StreamJsonEvent = {
+      type: 'result',
+      subtype: 'failed',
+      is_error: true,
+      result: `Gemini turn failed: ${detail}`,
+    }
+    appendStreamEvent(session, resultEvent)
+    broadcastStreamEvent(session, resultEvent)
+  }
+
+  async function startGeminiTurn(session: StreamSession, text: string): Promise<void> {
+    const geminiSessionId = session.geminiSessionId
+    if (!geminiSessionId) {
+      throw new Error('Gemini session is missing a session id')
+    }
+    const runtime = session.geminiRuntime
+    if (!runtime) {
+      throw new Error('Gemini runtime is not initialized')
+    }
+
+    const promptText = buildGeminiPromptText(session, text)
+    session.geminiTurnState = createGeminiTurnState()
+
+    const messageStartEvent: StreamJsonEvent = {
+      type: 'message_start',
+      message: {
+        id: `gemini-${Date.now()}`,
+        role: 'assistant',
+      },
+      source: {
+        provider: 'gemini',
+        backend: 'acp',
+      },
+    }
+    appendStreamEvent(session, messageStartEvent)
+    broadcastStreamEvent(session, messageStartEvent)
+
+    try {
+      const result = await runtime.sendRequest('session/prompt', {
+        sessionId: geminiSessionId,
+        prompt: [{ type: 'text', text: promptText }],
+      })
+      const finalEvents = normalizeGeminiPromptResponse(
+        result,
+        session.geminiTurnState,
+      )
+      for (const event of finalEvents) {
+        appendStreamEvent(session, event)
+        broadcastStreamEvent(session, event)
+      }
+    } catch (error) {
+      if (sessions.get(session.name) !== session) {
         return
       }
-      const id = ++codexSidecar.requestId
-      codexSidecar.pendingRequests.set(id, { resolve, reject })
-      try {
-        codexSidecar.ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }))
-      } catch (error) {
-        codexSidecar.pendingRequests.delete(id)
-        reject(error instanceof Error ? error : new Error(String(error)))
+      const detail = error instanceof Error ? error.message : String(error)
+      await finalizeGeminiTurnFailure(session, detail)
+      throw error
+    }
+  }
+
+  async function createGeminiAcpSession(
+    sessionName: string,
+    mode: ClaudePermissionMode,
+    task: string,
+    cwd: string | undefined,
+    options: GeminiSessionCreateOptions = {},
+  ): Promise<StreamSession> {
+    exitedStreamSessions.delete(sessionName)
+
+    const runtime = new GeminiAcpRuntime(sessionName, options.machine)
+    const initializedAt = new Date().toISOString()
+    const sessionCwd = cwd || process.env.HOME || '/tmp'
+
+    await runtime.ensureConnected()
+
+    const loadOrCreateResult = options.resumeSessionId
+      ? await runtime.sendRequest('session/load', {
+        sessionId: options.resumeSessionId,
+        cwd: sessionCwd,
+        mcpServers: [],
+      }) as { sessionId?: string }
+      : await runtime.sendRequest('session/new', {
+        cwd: sessionCwd,
+        mcpServers: [],
+      }) as { sessionId?: string }
+
+    const geminiSessionId = typeof loadOrCreateResult?.sessionId === 'string' && loadOrCreateResult.sessionId.trim().length > 0
+      ? loadOrCreateResult.sessionId.trim()
+      : options.resumeSessionId
+
+    if (!geminiSessionId) {
+      await runtime.teardown({ reason: 'Gemini ACP session bootstrap failed' })
+      throw new Error('Gemini ACP did not return a session id')
+    }
+
+    const geminiMode = mapGeminiMode(mode)
+    if (geminiMode !== 'default') {
+      await runtime.sendRequest('session/set_mode', {
+        sessionId: geminiSessionId,
+        modeId: geminiMode,
+      })
+    }
+
+    if (!runtime.process) {
+      throw new Error('Gemini ACP runtime process is not initialized')
+    }
+
+    const session: StreamSession = {
+      kind: 'stream',
+      name: sessionName,
+      agentType: 'gemini',
+      mode,
+      cwd: sessionCwd,
+      host: isRemoteMachine(options.machine) ? options.machine.id : undefined,
+      parentSession: options.parentSession,
+      spawnedWorkers: options.spawnedWorkers ? [...options.spawnedWorkers] : [],
+      task: task.length > 0 ? task : undefined,
+      process: runtime.process,
+      events: [],
+      clients: new Set(),
+      createdAt: options.createdAt ?? initializedAt,
+      lastEventAt: initializedAt,
+      usage: { inputTokens: 0, outputTokens: 0, costUsd: 0 },
+      stdoutBuffer: '',
+      stdinDraining: false,
+      lastTurnCompleted: true,
+      conversationEntryCount: 0,
+      geminiSessionId,
+      resumedFrom: options.resumedFrom,
+      geminiRuntime: runtime,
+      geminiPendingSystemPrompt: buildGeminiSystemPrompt(options.systemPrompt, options.maxTurns),
+      geminiTurnState: createGeminiTurnState(),
+      restoredIdle: Boolean(options.resumeSessionId) && task.length === 0,
+    }
+
+    writeTranscriptMeta(session)
+
+    session.geminiNotificationCleanup = runtime.addNotificationListener(geminiSessionId, (method, params) => {
+      if (method !== 'session/update') {
         return
       }
-      setTimeout(() => {
-        if (codexSidecar.pendingRequests.has(id)) {
-          codexSidecar.pendingRequests.delete(id)
-          logCodexSidecar('warn', 'Codex request timed out', {
-            id,
-            method,
-            timeoutMs: 30000,
-          })
-          reject(new Error(`Codex request ${method} timed out`))
-        }
-      }, 30000)
+      const payload = asObject(params)
+      const normalized = normalizeGeminiSessionUpdate(payload?.update, session.geminiTurnState ?? createGeminiTurnState())
+      if (!normalized) {
+        return
+      }
+      const events = Array.isArray(normalized) ? normalized : [normalized]
+      for (const event of events) {
+        appendStreamEvent(session, event)
+        broadcastStreamEvent(session, event)
+      }
     })
-  }
 
-  function addCodexNotificationListener(threadId: string, cb: (method: string, params: unknown) => void): () => void {
-    if (!codexSidecar.notificationListeners.has(threadId)) {
-      codexSidecar.notificationListeners.set(threadId, new Set())
+    if (typeof session.process.stdin?.on === 'function') {
+      session.process.stdin.on('error', () => {
+        // Intentionally ignored — session cleanup is driven by process exit/error handlers.
+      })
     }
-    codexSidecar.notificationListeners.get(threadId)!.add(cb)
-    return () => {
-      const set = codexSidecar.notificationListeners.get(threadId)
-      if (set) {
-        set.delete(cb)
-        if (set.size === 0) codexSidecar.notificationListeners.delete(threadId)
+
+    const cpEmitter = session.process as unknown as NodeJS.EventEmitter
+    cpEmitter.on('exit', (code: number | null, signal: string | null) => {
+      if (sessions.get(sessionName) !== session) return
+
+      const exitCode = code ?? -1
+      const signalText = signal ?? undefined
+      const baseText = signalText
+        ? `Process exited (signal: ${signalText})`
+        : `Process exited with code ${exitCode}`
+      const exitEvent: StreamJsonEvent = {
+        type: 'exit',
+        exitCode,
+        signal: signalText,
+        text: baseText,
       }
-    }
-  }
+      appendStreamEvent(session, exitEvent)
+      broadcastStreamEvent(session, exitEvent)
 
-  async function openCodexSidecarSocket(
-    port: number,
-    timeoutMs: number,
-  ): Promise<WebSocket> {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}`)
-
-    return new Promise<WebSocket>((resolve, reject) => {
-      let settled = false
-
-      const cleanup = () => {
-        clearTimeout(timeout)
-        ws.off('open', onOpen)
-        ws.off('error', onError)
+      for (const client of session.clients) {
+        client.close(1000, 'Session ended')
       }
 
-      const rejectOnce = (error: Error) => {
-        if (settled) {
-          return
-        }
-        settled = true
-        cleanup()
-        try {
-          ws.terminate()
-        } catch {
-          // Best-effort cleanup only.
-        }
-        reject(error)
+      if (session.finalResultEvent) {
+        const evt = session.finalResultEvent
+        completedSessions.set(
+          sessionName,
+          toCompletedSession(
+            sessionName,
+            session.completedTurnAt ?? new Date().toISOString(),
+            evt,
+            session.usage.costUsd,
+          ),
+        )
+      } else if (isCommandRoomSessionName(sessionName)) {
+        completedSessions.set(
+          sessionName,
+          toExitBasedCompletedSession(sessionName, exitEvent, session.usage.costUsd),
+        )
       }
 
-      const onOpen = () => {
-        if (settled) {
-          return
-        }
-        settled = true
-        cleanup()
-        resolve(ws)
-      }
-
-      const onError = (error: Error) => {
-        rejectOnce(error)
-      }
-
-      const timeout = setTimeout(() => {
-        rejectOnce(new Error('Codex sidecar connection timeout'))
-      }, timeoutMs)
-
-      ws.once('open', onOpen)
-      ws.once('error', onError)
+      exitedStreamSessions.set(sessionName, snapshotExitedStreamSession(session))
+      sessions.delete(sessionName)
+      sessionEventHandlers.delete(sessionName)
+      schedulePersistedSessionsWrite()
+      runtime.teardownOnProcessExit()
     })
-  }
 
-  async function connectCodexSidecarSocket(
-    port: number,
-    options: { totalTimeoutMs?: number; attemptTimeoutMs?: number; retryDelayMs?: number } = {},
-  ): Promise<WebSocket> {
-    const totalTimeoutMs = options.totalTimeoutMs ?? 5000
-    const attemptTimeoutMs = options.attemptTimeoutMs ?? 500
-    const retryDelayMs = options.retryDelayMs ?? 50
-    const startedAt = Date.now()
-    let lastError: Error | null = null
+    cpEmitter.on('error', (err: Error) => {
+      if (sessions.get(sessionName) !== session) return
 
-    while (Date.now() - startedAt < totalTimeoutMs) {
-      const remainingMs = totalTimeoutMs - (Date.now() - startedAt)
-      const timeoutMs = Math.max(50, Math.min(attemptTimeoutMs, remainingMs))
+      const errorEvent: StreamJsonEvent = {
+        type: 'system',
+        text: `Process error: ${err.message}`,
+      }
+      appendStreamEvent(session, errorEvent)
+      broadcastStreamEvent(session, errorEvent)
 
+      if (isCommandRoomSessionName(sessionName) && !session.finalResultEvent) {
+        completedSessions.set(
+          sessionName,
+          toExitBasedCompletedSession(sessionName, errorEvent, session.usage.costUsd),
+        )
+      }
+      for (const client of session.clients) {
+        client.close(1000, 'Session ended')
+      }
+
+      exitedStreamSessions.set(sessionName, snapshotExitedStreamSession(session))
+      sessions.delete(sessionName)
+      sessionEventHandlers.delete(sessionName)
+      schedulePersistedSessionsWrite()
+      runtime.teardownOnProcessExit()
+    })
+
+    if (task.length > 0) {
       try {
-        return await openCodexSidecarSocket(port, timeoutMs)
+        resetActiveTurnState(session)
+        const userEvent: StreamJsonEvent = {
+          type: 'user',
+          message: { role: 'user', content: task },
+        } as unknown as StreamJsonEvent
+        appendStreamEvent(session, userEvent)
+        broadcastStreamEvent(session, userEvent)
+        await startGeminiTurn(session, task)
       } catch (error) {
-        lastError = error instanceof Error ? error : new Error(String(error))
+        await runtime.teardown({
+          reason: `Initial Gemini prompt failed: ${error instanceof Error ? error.message : String(error)}`,
+        })
+        throw error
       }
-
-      if (!codexSidecar.process) {
-        break
-      }
-
-      const delayMs = Math.min(retryDelayMs, Math.max(0, totalTimeoutMs - (Date.now() - startedAt)))
-      if (delayMs <= 0) {
-        break
-      }
-      await new Promise((resolve) => setTimeout(resolve, delayMs))
     }
 
-    logCodexSidecar('error', 'Unable to connect to Codex sidecar WebSocket', {
-      totalTimeoutMs,
-      attemptTimeoutMs,
-      retryDelayMs,
-      lastError: truncateLogText((lastError ?? new Error('Codex sidecar connection timeout')).message),
-    })
-    throw lastError ?? new Error('Codex sidecar connection timeout')
+    return session
   }
 
   async function startCodexTurn(session: StreamSession, text: string): Promise<void> {
@@ -3981,14 +5242,40 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     if (!codexThreadId) {
       throw new Error('Codex session is missing a thread id')
     }
-    await ensureCodexSidecar()
-    await sendCodexRequest('turn/start', {
+    const runtime = session.codexRuntime
+    if (!runtime) {
+      throw new Error('Codex runtime is not initialized')
+    }
+    await runtime.ensureConnected()
+    await runtime.sendRequest('turn/start', {
       threadId: codexThreadId,
       input: [{ type: 'text', text }],
     })
   }
 
   async function sendTextToStreamSession(session: StreamSession, text: string): Promise<boolean> {
+    if (session.agentType === 'gemini' && session.geminiSessionId) {
+      try {
+        resetActiveTurnState(session)
+        const userEvent: StreamJsonEvent = {
+          type: 'user',
+          message: { role: 'user', content: text },
+        } as unknown as StreamJsonEvent
+        appendStreamEvent(session, userEvent)
+        broadcastStreamEvent(session, userEvent)
+        await startGeminiTurn(session, text)
+      } catch (error) {
+        if (sessions.get(session.name) !== session) {
+          return false
+        }
+        const detail = error instanceof Error ? error.message : String(error)
+        console.warn(`[agents] Gemini input delivery failed for ${session.name}: ${detail}`)
+        schedulePersistedSessionsWrite()
+        return false
+      }
+      return true
+    }
+
     if (session.agentType === 'codex' && session.codexThreadId) {
       try {
         await startCodexTurn(session, text)
@@ -3999,7 +5286,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
 
         const detail = error instanceof Error ? error.message : String(error)
         console.warn(`[agents] Codex input delivery failed for ${session.name}: ${detail}`)
-        failCodexSession(session.name, session, detail)
+        await failCodexSession(session.name, session, detail)
         schedulePersistedSessionsWrite()
         return false
       }
@@ -4031,13 +5318,12 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     return true
   }
 
-  // normalizeCodexEvent is imported from ./normalize-codex-event.ts
-
   async function createCodexSessionFromThread(
     sessionName: string,
     mode: ClaudePermissionMode,
     sessionCwd: string,
     threadId: string,
+    runtime: CodexSessionRuntimeHandle,
     task: string,
     options: CodexSessionCreateOptions = {},
   ): Promise<StreamSession> {
@@ -4045,22 +5331,10 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
 
     const initializedAt = new Date().toISOString()
     const loggedCodexApprovalRequests = new Set<string>()
-    // Create a virtual StreamSession backed by the codex sidecar.
-    // We use a fake ChildProcess-like object since we're proxying through the sidecar.
-    const fakeProcess = new (await import('node:events')).EventEmitter() as unknown as ChildProcess
+    if (!runtime.process) {
+      throw new Error('Codex runtime process is not initialized')
+    }
     let notificationCleanup = () => {}
-    Object.assign(fakeProcess, {
-      pid: codexSidecar.process?.pid ?? 0,
-      stdin: null,
-      stdout: null,
-      stderr: null,
-      kill: () => {
-        // Archive the thread
-        void sendCodexRequest('thread/archive', { threadId }).catch(() => {})
-        notificationCleanup()
-        return true
-      },
-    })
 
     const session: StreamSession = {
       kind: 'stream',
@@ -4068,10 +5342,11 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       agentType: 'codex',
       mode,
       cwd: sessionCwd,
+      host: isRemoteMachine(options.machine) ? options.machine.id : undefined,
       parentSession: options.parentSession,
       spawnedWorkers: options.spawnedWorkers ? [...options.spawnedWorkers] : [],
       task: task.length > 0 ? task : undefined,
-      process: fakeProcess,
+      process: runtime.process,
       events: [],
       clients: new Set(),
       createdAt: options.createdAt ?? initializedAt,
@@ -4084,11 +5359,14 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       codexThreadId: threadId,
       resumedFrom: options.resumedFrom,
       codexNotificationCleanup: undefined,
+      codexRuntime: runtime,
       restoredIdle: false,
     }
 
+    writeTranscriptMeta(session)
+
     // Listen for codex notifications on this thread.
-    notificationCleanup = addCodexNotificationListener(threadId, (method, params) => {
+    notificationCleanup = runtime.addNotificationListener(threadId, (method, params) => {
       if (!session.lastTurnCompleted) {
         scheduleCodexTurnWatchdog(session)
       }
@@ -4104,7 +5382,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
 
         if (!loggedCodexApprovalRequests.has(approvalKey)) {
           loggedCodexApprovalRequests.add(approvalKey)
-          logCodexSidecar('warn', 'Unsupported Codex approval request', {
+          runtime.log('warn', 'Unsupported Codex approval request', {
             sessionName: session.name,
             threadId,
             method,
@@ -4131,8 +5409,19 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       try {
         await startCodexTurn(session, task)
       } catch (error) {
-        notificationCleanup()
-        session.codexNotificationCleanup = undefined
+        const detail = error instanceof Error ? error.message : String(error)
+        try {
+          await teardownCodexSessionRuntime(session, `Initial Codex turn setup failed: ${detail}`)
+        } catch (teardownError) {
+          runtime.log('warn', 'Codex runtime teardown failed after initial turn setup error', {
+            sessionName: session.name,
+            threadId,
+            originalError: truncateLogText(detail),
+            teardownError: truncateLogText(
+              teardownError instanceof Error ? teardownError.message : String(teardownError),
+            ),
+          })
+        }
         throw error
       }
 
@@ -4156,7 +5445,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     cwd: string | undefined,
     options: CodexSessionCreateOptions = {},
   ): Promise<StreamSession> {
-    await ensureCodexSidecar()
+    const runtime = new CodexSessionRuntime(sessionName, options.machine)
 
     const sessionCwd = cwd || process.env.HOME || '/tmp'
 
@@ -4192,12 +5481,18 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     }
 
     let threadId: string
-    if (options.resumeSessionId) {
-      threadId = options.resumeSessionId
-      await sendCodexRequest('thread/resume', { threadId })
-    } else {
-      const threadResult = await sendCodexRequest('thread/start', threadStartParams) as { thread: { id: string } }
-      threadId = threadResult.thread.id
+    try {
+      await runtime.ensureConnected()
+      if (options.resumeSessionId) {
+        threadId = options.resumeSessionId
+        await runtime.sendRequest('thread/resume', { threadId })
+      } else {
+        const threadResult = await runtime.sendRequest('thread/start', threadStartParams) as { thread: { id: string } }
+        threadId = threadResult.thread.id
+      }
+    } catch (error) {
+      await runtime.teardown({ reason: 'Codex runtime bootstrap failed' })
+      throw error
     }
 
     return createCodexSessionFromThread(
@@ -4205,6 +5500,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       mode,
       sessionCwd,
       threadId,
+      runtime,
       initialTask,
       options,
     )
@@ -4217,12 +5513,13 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     threadId: string,
     createdAt: string,
     resumedFrom?: string,
+    machine?: MachineConfig,
   ): Promise<StreamSession> {
-    await ensureCodexSidecar()
-    await sendCodexRequest('thread/resume', { threadId })
-    return createCodexSessionFromThread(sessionName, mode, cwd, threadId, '', {
+    return createCodexAppServerSession(sessionName, mode, '', cwd, {
+      resumeSessionId: threadId,
       createdAt,
       resumedFrom,
+      machine,
     })
   }
 
@@ -4238,6 +5535,12 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       res.status(400).json({
         error: 'Invalid mode. Expected one of: default, acceptEdits, dangerouslySkipPermissions',
       })
+      return
+    }
+
+    const parsedEffort = parseClaudeEffort(req.body?.effort)
+    if (parsedEffort === null) {
+      res.status(400).json({ error: 'Invalid effort. Expected one of: low, medium, high, max' })
       return
     }
 
@@ -4290,8 +5593,13 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       return
     }
 
-    const sessionType = resumeSource ? 'stream' : parseSessionType(req.body?.sessionType)
     const agentType = resumeSource?.source.agentType ?? parseAgentType(req.body?.agentType)
+    const effort = agentType === 'claude'
+      ? (resumeSource?.source.effort ?? parsedEffort ?? DEFAULT_CLAUDE_EFFORT_LEVEL)
+      : undefined
+    const sessionType = resumeSource || agentType === 'gemini'
+      ? 'stream'
+      : parseSessionType(req.body?.sessionType)
     const requestedHost = resumeSource?.source.host ?? parseOptionalHost(req.body?.host)
     if (requestedHost === null) {
       res.status(400).json({ error: 'Invalid host: expected machine ID string' })
@@ -4324,6 +5632,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       !resumeSource.liveSession &&
       resumeSource.source.agentType === 'codex' &&
       resumeSource.source.codexThreadId &&
+      !resumeSource.source.host &&
       !(await hasCodexRolloutFile(resumeSource.source.codexThreadId, resumeSource.source.createdAt))
     ) {
       clearCodexResumeMetadata(resumeFromSession!)
@@ -4361,13 +5670,6 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     }
 
     if (sessionType === 'stream') {
-      if (remoteMachine && agentType === 'codex') {
-        res.status(400).json({
-          error: 'Remote stream sessions are currently supported for claude only',
-        })
-        return
-      }
-
       try {
         const session = resumeSource
           ? (
@@ -4375,16 +5677,32 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
                 ? await createCodexAppServerSession(sessionName, mode, task ?? '', requestedMachineCwd, {
                   resumeSessionId: resumeSource.source.codexThreadId,
                   resumedFrom: resumeFromSession,
+                  machine,
                 })
+                : agentType === 'gemini'
+                  ? await createGeminiAcpSession(sessionName, mode, task ?? '', requestedMachineCwd, {
+                    resumeSessionId: resumeSource.source.geminiSessionId,
+                    resumedFrom: resumeFromSession,
+                    machine,
+                  })
                 : createStreamSession(sessionName, mode, task ?? '', requestedMachineCwd, machine, agentType, {
+                  effort,
                   resumeSessionId: resumeSource.source.claudeSessionId,
                   resumedFrom: resumeFromSession,
                 })
             )
           : (
               agentType === 'codex'
-                ? await createCodexAppServerSession(sessionName, mode, task ?? '', requestedMachineCwd)
-                : createStreamSession(sessionName, mode, task ?? '', requestedMachineCwd, machine, agentType)
+                ? await createCodexAppServerSession(sessionName, mode, task ?? '', requestedMachineCwd, {
+                  machine,
+                })
+                : agentType === 'gemini'
+                  ? await createGeminiAcpSession(sessionName, mode, task ?? '', requestedMachineCwd, {
+                    machine,
+                  })
+                : createStreamSession(sessionName, mode, task ?? '', requestedMachineCwd, machine, agentType, {
+                  effort,
+                })
             )
         if (resumeSource?.liveSession) {
           retireLiveCodexSessionForResume(resumeFromSession!, resumeSource.liveSession)
@@ -4415,6 +5733,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
 
     // PTY session (default)
     try {
+      const claudeEffort = effort ?? DEFAULT_CLAUDE_EFFORT_LEVEL
       const ptySpawner = await getSpawner()
       const localSpawnCwd = process.env.HOME || '/tmp'
       // Use the remote user's default login shell (e.g. zsh on macOS) instead
@@ -4438,6 +5757,7 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
         kind: 'pty',
         name: sessionName,
         agentType,
+        effort: agentType === 'claude' ? claudeEffort : undefined,
         cwd: sessionCwd,
         host: remoteMachine?.id,
         task: task && task.length > 0 ? task : undefined,
@@ -4467,8 +5787,10 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
 
       sessions.set(sessionName, session)
 
-      const modeCommands = agentType === 'codex' ? CODEX_MODE_COMMANDS : CLAUDE_MODE_COMMANDS
-      pty.write(modeCommands[mode] + '\r')
+      const command = agentType === 'codex'
+        ? CODEX_MODE_COMMANDS[mode]
+        : buildClaudePtyCommand(mode, claudeEffort)
+      pty.write(command + '\r')
 
       if (task && task.length > 0) {
         setTimeout(() => {
@@ -4603,16 +5925,28 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
       if (session.agentType === 'codex') {
         clearCodexTurnWatchdog(session)
         markCodexTurnHealthy(session)
+        await teardownCodexSessionRuntime(session, `Session "${sessionName}" deleted`)
+      } else if (session.agentType === 'gemini') {
+        await teardownGeminiSessionRuntime(session, `Session "${sessionName}" deleted`)
+      } else {
+        session.process.kill('SIGTERM')
       }
-      session.process.kill('SIGTERM')
     } else if (session.kind === 'openclaw') {
       session.gatewayWs?.close()
       session.gatewayWs = null
     }
     // External sessions have no local process — just remove from the map.
 
+    const exitedSnapshot = session.kind === 'stream'
+      ? snapshotDeletedResumableStreamSession(session)
+      : null
+
     sessions.delete(sessionName)
-    exitedStreamSessions.delete(sessionName)
+    if (exitedSnapshot) {
+      exitedStreamSessions.set(sessionName, exitedSnapshot)
+    } else {
+      exitedStreamSessions.delete(sessionName)
+    }
     completedSessions.delete(sessionName)
     sessionEventHandlers.delete(sessionName)
     schedulePersistedSessionsWrite()
@@ -4627,12 +5961,14 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     return {
       name: sessionName,
       agentType: exited.agentType,
+      effort: exited.effort,
       mode: exited.mode,
       cwd: exited.cwd,
       host: exited.host,
       createdAt: exited.createdAt,
       claudeSessionId: exited.claudeSessionId,
       codexThreadId: exited.codexThreadId,
+      geminiSessionId: exited.geminiSessionId,
       parentSession: exited.parentSession,
       spawnedWorkers: [...exited.spawnedWorkers],
       resumedFrom: exited.resumedFrom,
@@ -4650,12 +5986,14 @@ export function createAgentsRouter(options: AgentsRouterOptions = {}): AgentsRou
     return {
       name: sessionName,
       agentType: session.agentType,
+      effort: session.effort,
       mode: session.mode,
       cwd: session.cwd,
       host: session.host,
       createdAt: session.createdAt,
       claudeSessionId: session.claudeSessionId,
       codexThreadId: session.codexThreadId,
+      geminiSessionId: session.geminiSessionId,
       parentSession: session.parentSession,
       spawnedWorkers: [...session.spawnedWorkers],
       resumedFrom: session.resumedFrom,
@@ -4720,7 +6058,7 @@ async function isExitedSessionResumeAvailable(entry: PersistedStreamSession): Pr
     return false
   }
 
-  if (entry.agentType !== 'codex' || !entry.codexThreadId) {
+  if (entry.agentType !== 'codex' || !entry.codexThreadId || entry.host) {
     return true
   }
 
@@ -4733,6 +6071,9 @@ async function isExitedSessionResumeAvailable(entry: PersistedStreamSession): Pr
     }
     if (entry.agentType === 'codex') {
       return Boolean(entry.codexThreadId)
+    }
+    if (entry.agentType === 'gemini') {
+      return Boolean(entry.geminiSessionId)
     }
     return false
   }
@@ -4750,6 +6091,7 @@ async function isExitedSessionResumeAvailable(entry: PersistedStreamSession): Pr
       phase: 'exited',
       hadResult: Boolean(session.finalResultEvent),
       agentType: session.agentType,
+      effort: session.effort,
       mode: session.mode,
       cwd: session.cwd,
       host: session.host,
@@ -4758,6 +6100,42 @@ async function isExitedSessionResumeAvailable(entry: PersistedStreamSession): Pr
       createdAt: session.createdAt,
       claudeSessionId: session.claudeSessionId,
       codexThreadId: session.codexThreadId,
+      geminiSessionId: session.geminiSessionId,
+      resumedFrom: session.resumedFrom,
+      conversationEntryCount: session.conversationEntryCount,
+      events: [...session.events],
+    }
+  }
+
+  function snapshotDeletedResumableStreamSession(session: StreamSession): ExitedStreamSessionState | null {
+    const claudeSessionId = session.agentType === 'claude' && session.lastTurnCompleted
+      ? session.claudeSessionId
+      : undefined
+    const codexThreadId = session.agentType === 'codex'
+      ? session.codexThreadId
+      : undefined
+    const geminiSessionId = session.agentType === 'gemini'
+      ? session.geminiSessionId
+      : undefined
+
+    if (!claudeSessionId && !codexThreadId && !geminiSessionId) {
+      return null
+    }
+
+    return {
+      phase: 'exited',
+      hadResult: Boolean(session.finalResultEvent),
+      agentType: session.agentType,
+      effort: session.effort,
+      mode: session.mode,
+      cwd: session.cwd,
+      host: session.host,
+      parentSession: session.parentSession,
+      spawnedWorkers: [...session.spawnedWorkers],
+      createdAt: session.createdAt,
+      claudeSessionId,
+      codexThreadId,
+      geminiSessionId,
       resumedFrom: session.resumedFrom,
       conversationEntryCount: session.conversationEntryCount,
       events: [...session.events],
@@ -4868,13 +6246,6 @@ async function isExitedSessionResumeAvailable(entry: PersistedStreamSession): Pr
       return
     }
 
-    if (source.agentType === 'codex' && source.host) {
-      res.status(400).json({
-        error: 'Remote stream sessions are currently supported for claude only',
-      })
-      return
-    }
-
     let machine: MachineConfig | undefined
     if (source.host) {
       try {
@@ -4895,6 +6266,7 @@ async function isExitedSessionResumeAvailable(entry: PersistedStreamSession): Pr
       !liveSession &&
       source.agentType === 'codex' &&
       source.codexThreadId &&
+      !source.host &&
       !(await hasCodexRolloutFile(source.codexThreadId, source.createdAt))
     ) {
       clearCodexResumeMetadata(originalName)
@@ -4909,7 +6281,14 @@ async function isExitedSessionResumeAvailable(entry: PersistedStreamSession): Pr
         ? await createCodexAppServerSession(originalName, source.mode, '', source.cwd, {
           resumeSessionId: source.codexThreadId,
           resumedFrom: source.resumedFrom,
+          machine,
         })
+        : source.agentType === 'gemini'
+          ? await createGeminiAcpSession(originalName, source.mode, '', source.cwd, {
+            resumeSessionId: source.geminiSessionId,
+            resumedFrom: source.resumedFrom,
+            machine,
+          })
         : createStreamSession(
           originalName,
           source.mode,
@@ -4918,6 +6297,7 @@ async function isExitedSessionResumeAvailable(entry: PersistedStreamSession): Pr
           machine,
           'claude',
           {
+            effort: source.effort,
             resumeSessionId: source.claudeSessionId,
             resumedFrom: source.resumedFrom,
           },
@@ -5075,17 +6455,20 @@ async function isExitedSessionResumeAvailable(entry: PersistedStreamSession): Pr
     const persisted = await readPersistedSessionsState()
     if (persisted.sessions.length === 0) return
 
-    for (const entry of persisted.sessions) {
-      if (sessions.has(entry.name)) {
+    for (const rawEntry of persisted.sessions) {
+      if (sessions.has(rawEntry.name)) {
         continue
       }
 
       try {
+        const { entry, events } = await resolveRestoredReplaySource(rawEntry)
+
         if (entry.sessionState === 'exited') {
           const hadResult = entry.hadResult ?? false
           if (
             (entry.agentType === 'claude' && !entry.claudeSessionId) ||
-            (entry.agentType === 'codex' && !entry.codexThreadId)
+            (entry.agentType === 'codex' && !entry.codexThreadId) ||
+            (entry.agentType === 'gemini' && !entry.geminiSessionId)
           ) {
             continue
           }
@@ -5102,13 +6485,16 @@ async function isExitedSessionResumeAvailable(entry: PersistedStreamSession): Pr
             createdAt: entry.createdAt,
             claudeSessionId: entry.claudeSessionId,
             codexThreadId: entry.codexThreadId,
+            geminiSessionId: entry.geminiSessionId,
+            effort: entry.agentType === 'claude'
+              ? entry.effort ?? DEFAULT_CLAUDE_EFFORT_LEVEL
+              : undefined,
             resumedFrom: entry.resumedFrom,
-            conversationEntryCount: entry.conversationEntryCount ?? countCompletedTurnEntries(entry.events ?? []),
-            events: entry.events ? [...entry.events] : [],
+            conversationEntryCount: entry.conversationEntryCount ?? countCompletedTurnEntries(events),
+            events: [...events],
           })
 
           if (hadResult) {
-            const events = entry.events ?? []
             const resultEvent = [...events].reverse().find((evt) => evt.type === 'result')
             if (resultEvent) {
               const totalCost = typeof resultEvent.total_cost_usd === 'number'
@@ -5141,8 +6527,16 @@ async function isExitedSessionResumeAvailable(entry: PersistedStreamSession): Pr
         }
 
         if (entry.agentType === 'codex') {
-          if (!entry.codexThreadId || entry.host) {
+          if (!entry.codexThreadId) {
             continue
+          }
+          let machine: MachineConfig | undefined
+          if (entry.host) {
+            const machines = await readMachineRegistry()
+            machine = machines.find((m) => m.id === entry.host)
+            if (!machine) {
+              continue
+            }
           }
           const session = await resumeCodexAppServerSession(
             entry.name,
@@ -5151,7 +6545,38 @@ async function isExitedSessionResumeAvailable(entry: PersistedStreamSession): Pr
             entry.codexThreadId,
             entry.createdAt,
             entry.resumedFrom,
+            machine,
           )
+          applyRestoredReplayState(session, events, entry.conversationEntryCount)
+          sessions.set(entry.name, session)
+          continue
+        }
+
+        if (entry.agentType === 'gemini') {
+          if (!entry.geminiSessionId) {
+            continue
+          }
+          let machine: MachineConfig | undefined
+          if (entry.host) {
+            const machines = await readMachineRegistry()
+            machine = machines.find((m) => m.id === entry.host)
+            if (!machine) {
+              continue
+            }
+          }
+          const session = await createGeminiAcpSession(
+            entry.name,
+            entry.mode,
+            '',
+            entry.cwd,
+            {
+              resumeSessionId: entry.geminiSessionId,
+              createdAt: entry.createdAt,
+              resumedFrom: entry.resumedFrom,
+              machine,
+            },
+          )
+          applyRestoredReplayState(session, events, entry.conversationEntryCount)
           sessions.set(entry.name, session)
           continue
         }
@@ -5177,19 +6602,15 @@ async function isExitedSessionResumeAvailable(entry: PersistedStreamSession): Pr
           machine,
           'claude',
           {
+            effort: entry.effort,
             resumeSessionId: entry.claudeSessionId,
             createdAt: entry.createdAt,
             resumedFrom: entry.resumedFrom,
           },
         )
-        // Restore accumulated event history for WS replay and rebuild usage totals.
-        if (entry.events && entry.events.length > 0) {
-          session.events = entry.events
-          for (const evt of session.events) {
-            applyStreamUsageEvent(session, evt)
-          }
-        }
-        session.conversationEntryCount = entry.conversationEntryCount ?? countCompletedTurnEntries(session.events)
+        // Restore transcript-tail replay first, with persisted events kept as
+        // a backward-compatible fallback when transcript data is unavailable.
+        applyRestoredReplayState(session, events, entry.conversationEntryCount)
         sessions.set(entry.name, session)
       } catch {
         // Ignore individual restore failures and continue restoring others.
@@ -5571,9 +6992,11 @@ async function isExitedSessionResumeAvailable(entry: PersistedStreamSession): Pr
       name,
       systemPrompt,
       agentType,
+      effort,
       cwd,
       resumeSessionId,
       resumeCodexThreadId,
+      resumeGeminiSessionId,
       maxTurns,
     }) {
       let session: StreamSession
@@ -5606,6 +7029,19 @@ async function isExitedSessionResumeAvailable(entry: PersistedStreamSession): Pr
             { systemPrompt },
           )
         }
+      } else if (agentType === 'gemini') {
+        const sessionCwd = cwd ?? process.env.HOME ?? '/tmp'
+        session = await createGeminiAcpSession(
+          name,
+          'dangerouslySkipPermissions',
+          '',
+          sessionCwd,
+          {
+            resumeSessionId: resumeGeminiSessionId,
+            systemPrompt,
+            maxTurns,
+          },
+        )
       } else {
         session = createStreamSession(
           name,
@@ -5614,7 +7050,7 @@ async function isExitedSessionResumeAvailable(entry: PersistedStreamSession): Pr
           cwd,
           undefined,
           'claude',
-          { systemPrompt, resumeSessionId, maxTurns },
+          { systemPrompt, effort, resumeSessionId, maxTurns },
         )
       }
       sessions.set(name, session)
@@ -5642,8 +7078,12 @@ async function isExitedSessionResumeAvailable(entry: PersistedStreamSession): Pr
         if (session.agentType === 'codex') {
           clearCodexTurnWatchdog(session)
           markCodexTurnHealthy(session)
+          void teardownCodexSessionRuntime(session, `Commander stopped session "${name}"`)
+        } else if (session.agentType === 'gemini') {
+          void teardownGeminiSessionRuntime(session, `Commander stopped session "${name}"`)
+        } else {
+          session.process.kill('SIGTERM')
         }
-        session.process.kill('SIGTERM')
       } else if (session.kind === 'openclaw') {
         session.gatewayWs?.close()
         session.gatewayWs = null
@@ -5677,6 +7117,12 @@ async function isExitedSessionResumeAvailable(entry: PersistedStreamSession): Pr
           sessionEventHandlers.delete(name)
         }
       }
+    },
+    async shutdown() {
+      await Promise.all([
+        shutdownCodexRuntimes(),
+        shutdownGeminiRuntimes(),
+      ])
     },
   }
 

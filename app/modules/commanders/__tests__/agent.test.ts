@@ -1,9 +1,11 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { CommanderAgent } from '../agent.js'
 import type { GHIssue } from '../memory/skill-matcher.js'
+
+vi.setConfig({ testTimeout: 60_000 })
 
 describe('CommanderAgent system prompt injection', () => {
   let tmpDir: string

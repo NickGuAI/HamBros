@@ -10,12 +10,8 @@ import {
   type MsgItem,
 } from './session-messages'
 
-function normalizeDescription(value: string | undefined): string {
-  return value?.trim().toLowerCase() ?? ''
-}
-
 type CurrentBlock = {
-  type: 'text' | 'thinking' | 'tool_use'
+  type: 'text' | 'thinking' | 'tool_use' | 'planning_tool_use'
   msgId: string
   toolName?: string
   toolId?: string
@@ -23,6 +19,117 @@ type CurrentBlock = {
 }
 
 const FILE_MUTATING_TOOLS = new Set(['Bash', 'Edit', 'MultiEdit', 'Write', 'NotebookEdit'])
+type PlanningToolName = 'EnterPlanMode' | 'ExitPlanMode'
+
+function normalizeDescription(value: string | undefined): string {
+  return value?.trim().toLowerCase() ?? ''
+}
+
+function isPlanningToolName(value: string | undefined): value is PlanningToolName {
+  return value === 'EnterPlanMode' || value === 'ExitPlanMode'
+}
+
+function asObject(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null
+  }
+  return value as Record<string, unknown>
+}
+
+function parsePlanningPayload(value: unknown): Record<string, unknown> | null {
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (!trimmed) {
+      return null
+    }
+    try {
+      return asObject(JSON.parse(trimmed))
+    } catch {
+      return null
+    }
+  }
+
+  return asObject(value)
+}
+
+function extractNestedText(value: unknown): string | undefined {
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    return trimmed ? trimmed : undefined
+  }
+
+  if (Array.isArray(value)) {
+    const parts = value
+      .map((entry) => extractNestedText(entry))
+      .filter((entry): entry is string => Boolean(entry))
+    return parts.length > 0 ? parts.join('\n') : undefined
+  }
+
+  if (!value || typeof value !== 'object') {
+    return undefined
+  }
+
+  const record = value as Record<string, unknown>
+  if (typeof record.text === 'string' && record.text.trim()) {
+    return record.text.trim()
+  }
+  if (typeof record.message === 'string' && record.message.trim()) {
+    return record.message.trim()
+  }
+  if ('content' in record) {
+    return extractNestedText(record.content)
+  }
+
+  return undefined
+}
+
+function toPlanningMessage(id: string, event: Extract<StreamEvent, { type: 'planning' }>): MsgItem {
+  return {
+    id,
+    kind: 'planning',
+    text: event.action === 'proposed' ? event.plan ?? '' : event.message ?? '',
+    planningAction: event.action,
+    planningPlan: event.action === 'proposed' ? event.plan : undefined,
+    planningApproved: event.action === 'decision' ? event.approved : undefined,
+    planningMessage: event.action === 'decision' ? event.message : undefined,
+  }
+}
+
+function parsePlanningToolResult(
+  content: unknown,
+  isError?: boolean,
+): Extract<StreamEvent, { type: 'planning' }> | null {
+  const parsed = parsePlanningPayload(content)
+
+  if (typeof parsed?.plan === 'string' && parsed.plan.trim()) {
+    return {
+      type: 'planning',
+      action: 'proposed',
+      plan: parsed.plan.trim(),
+    }
+  }
+
+  const approvedValue = parsed?.approved
+  const approved =
+    approvedValue === null || typeof approvedValue === 'boolean' ? approvedValue : undefined
+  const message = extractNestedText(parsed?.message)
+  if (approved !== undefined || message) {
+    return {
+      type: 'planning',
+      action: 'decision',
+      approved: approved ?? null,
+      ...(message ? { message } : {}),
+    }
+  }
+
+  const fallbackMessage = extractNestedText(content)
+  return {
+    type: 'planning',
+    action: 'decision',
+    approved: isError ? false : true,
+    ...(fallbackMessage ? { message: fallbackMessage } : {}),
+  }
+}
 
 export function useStreamEventProcessor(options?: {
   onWorkspaceMutation?: () => void
@@ -31,6 +138,7 @@ export function useStreamEventProcessor(options?: {
   const idCounterRef = useRef(0)
   const currentBlockRef = useRef<CurrentBlock | null>(null)
   const activeAgentMessageIdsRef = useRef<string[]>([])
+  const planningToolNamesRef = useRef<Record<string, PlanningToolName>>({})
 
   const [messages, setMessages] = useState<MsgItem[]>([])
   const [isStreaming, setIsStreaming] = useState(false)
@@ -41,6 +149,7 @@ export function useStreamEventProcessor(options?: {
     idCounterRef.current = 0
     currentBlockRef.current = null
     activeAgentMessageIdsRef.current = []
+    planningToolNamesRef.current = {}
     setMessages([])
     setIsStreaming(false)
   }, [])
@@ -186,6 +295,28 @@ export function useStreamEventProcessor(options?: {
     )
   }, [])
 
+  const appendPlanningMessage = useCallback((event: Extract<StreamEvent, { type: 'planning' }>) => {
+    setMessages((prev) =>
+      capMessages([...prev, toPlanningMessage(nextId(), event)]),
+    )
+  }, [nextId])
+
+  const appendPlanningToolUse = useCallback((toolName: PlanningToolName, input: unknown) => {
+    if (toolName === 'EnterPlanMode') {
+      appendPlanningMessage({ type: 'planning', action: 'enter' })
+      return
+    }
+
+    const parsed = parsePlanningPayload(input)
+    if (typeof parsed?.plan === 'string' && parsed.plan.trim()) {
+      appendPlanningMessage({
+        type: 'planning',
+        action: 'proposed',
+        plan: parsed.plan.trim(),
+      })
+    }
+  }, [appendPlanningMessage])
+
   const processEvent = useCallback(
     (event: StreamEvent, isReplay = false) => {
       if (event.type === 'agent') {
@@ -196,6 +327,11 @@ export function useStreamEventProcessor(options?: {
         if (text) {
           setMessages((prev) => capMessages([...prev, { id: nextId(), kind: 'agent', text }]))
         }
+        return
+      }
+
+      if (event.type === 'planning') {
+        appendPlanningMessage(event)
         return
       }
 
@@ -214,6 +350,63 @@ export function useStreamEventProcessor(options?: {
               const text =
                 (typeof block.thinking === 'string' ? block.thinking : undefined) ??
                 (typeof block.text === 'string' ? block.text : '')
+              const isCodexThinkingEnvelope = event.source?.provider === 'codex'
+              if (isCodexThinkingEnvelope) {
+                const activeThinkingMessageId =
+                  currentBlockRef.current?.type === 'thinking' ? currentBlockRef.current.msgId : undefined
+                const hasThinkingText = text.trim().length > 0
+
+                setMessages((prev) => {
+                  let targetIndex = -1
+                  if (activeThinkingMessageId) {
+                    targetIndex = prev.findIndex(
+                      (msg) => msg.kind === 'thinking' && msg.id === activeThinkingMessageId,
+                    )
+                  }
+                  if (targetIndex === -1) {
+                    for (let i = prev.length - 1; i >= 0; i -= 1) {
+                      const msg = prev[i]
+                      if (msg.kind === 'thinking' && !msg.text.trim()) {
+                        targetIndex = i
+                        break
+                      }
+                    }
+                  }
+
+                  if (!hasThinkingText) {
+                    if (targetIndex === -1) {
+                      return prev
+                    }
+                    const target = prev[targetIndex]
+                    if (target.kind !== 'thinking' || target.text.trim()) {
+                      return prev
+                    }
+                    return prev.filter((msg) => msg.id !== target.id)
+                  }
+
+                  if (targetIndex !== -1) {
+                    const target = prev[targetIndex]
+                    if (target.kind === 'thinking') {
+                      if (target.text === text) {
+                        return prev
+                      }
+                      const updated = [...prev]
+                      updated[targetIndex] = { ...target, text }
+                      return updated
+                    }
+                  }
+
+                  const id = nextId()
+                  return capMessages([...prev, { id, kind: 'thinking', text }])
+                })
+
+                // Codex reasoning completion arrives as an assistant envelope.
+                if (currentBlockRef.current?.type === 'thinking') {
+                  currentBlockRef.current = null
+                }
+                continue
+              }
+
               if (!text) continue
               const id = nextId()
               setMessages((prev) => capMessages([...prev, { id, kind: 'thinking', text }]))
@@ -223,6 +416,12 @@ export function useStreamEventProcessor(options?: {
               const id = nextId()
               setMessages((prev) => capMessages([...prev, { id, kind: 'agent', text }]))
             } else if (block.type === 'tool_use') {
+              if (isPlanningToolName(block.name)) {
+                planningToolNamesRef.current[block.id] = block.name
+                appendPlanningToolUse(block.name, block.input)
+                continue
+              }
+
               const id = nextId()
               if (block.name === 'AskUserQuestion') {
                 const input = block.input as { questions?: AskQuestion[] } | undefined
@@ -338,6 +537,20 @@ export function useStreamEventProcessor(options?: {
           setMessages((prev) => {
             const updated = [...prev]
             for (const result of toolResults) {
+              const planningToolName =
+                result.tool_use_id ? planningToolNamesRef.current[result.tool_use_id] : undefined
+              if (planningToolName) {
+                if (planningToolName === 'ExitPlanMode') {
+                  updated.push(
+                    toPlanningMessage(
+                      nextId(),
+                      parsePlanningToolResult(result.content ?? event.tool_use_result, result.is_error),
+                    ),
+                  )
+                }
+                delete planningToolNamesRef.current[result.tool_use_id!]
+                continue
+              }
               const status = result.is_error ? ('error' as const) : ('success' as const)
               const toolOutput = extractToolResultOutput(result.content)
               let matched = false
@@ -402,6 +615,24 @@ export function useStreamEventProcessor(options?: {
             setMessages((prev) => capMessages([...prev, { id, kind: 'thinking', text: '' }]))
             if (!isReplay) setIsStreaming(true)
           } else if (block.type === 'tool_use') {
+            if (isPlanningToolName(block.name)) {
+              planningToolNamesRef.current[block.id] = block.name
+              if (block.name === 'EnterPlanMode') {
+                currentBlockRef.current = null
+                appendPlanningMessage({ type: 'planning', action: 'enter' })
+              } else {
+                currentBlockRef.current = {
+                  type: 'planning_tool_use',
+                  msgId: nextId(),
+                  toolName: block.name,
+                  toolId: block.id,
+                  inputJsonParts: [],
+                }
+              }
+              if (!isReplay) setIsStreaming(true)
+              break
+            }
+
             const id = nextId()
             currentBlockRef.current = {
               type: 'tool_use',
@@ -430,8 +661,8 @@ export function useStreamEventProcessor(options?: {
               if (block.name === 'Agent') {
                 pushActiveAgentMessageId(id)
               }
-              if (!isReplay) setIsStreaming(true)
             }
+            if (!isReplay) setIsStreaming(true)
           }
           break
         }
@@ -467,6 +698,8 @@ export function useStreamEventProcessor(options?: {
               )
             })
           } else if (delta.type === 'input_json_delta' && cur.type === 'tool_use') {
+            cur.inputJsonParts!.push(delta.partial_json)
+          } else if (delta.type === 'input_json_delta' && cur.type === 'planning_tool_use') {
             cur.inputJsonParts!.push(delta.partial_json)
           }
           break
@@ -537,6 +770,10 @@ export function useStreamEventProcessor(options?: {
                 ),
               )
             }
+          }
+          if (cur?.type === 'planning_tool_use') {
+            const rawJson = cur.inputJsonParts?.join('') ?? ''
+            appendPlanningToolUse(cur.toolName as PlanningToolName, rawJson)
           }
           currentBlockRef.current = null
           break
@@ -661,9 +898,11 @@ export function useStreamEventProcessor(options?: {
     },
     [
       appendSubagentSystemMessage,
+      appendPlanningMessage,
+      appendPlanningToolUse,
       clearActiveAgentMessageIds,
-      nextId,
       onWorkspaceMutation,
+      parsePlanningToolResult,
       pushActiveAgentMessageId,
       removeActiveAgentMessageId,
     ],

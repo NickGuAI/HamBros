@@ -88,10 +88,10 @@ function printUsage(stdout: Writable): void {
   stdout.write('Usage:\n')
   stdout.write('  hammurabi cron list [--commander <id>]\n')
   stdout.write(
-    '  hammurabi cron add --name <name> --schedule "<cron>" --instruction "<text>" [--description "<text>"] [--timezone <tz>] [--model <model>] [--agent claude|codex] [--work-dir <path>] [--machine <id>] [--permission-mode <mode>] [--session-type stream|pty] [--enabled true|false] [--commander <id>]\n',
+    '  hammurabi cron add --name <name> --schedule "<cron>" --instruction "<text>" [--description "<text>"] [--timezone <tz>] [--model <model>] [--agent claude|codex|gemini] [--work-dir <path>] [--machine <id>] [--permission-mode <mode>] [--session-type stream|pty] [--enabled true|false] [--commander <id>]\n',
   )
   stdout.write(
-    '  hammurabi cron update <task-id> [--name <name>] [--description "<text>"] [--schedule "<cron>"] [--timezone <tz>] [--instruction "<text>"] [--model <model>] [--agent claude|codex] [--work-dir <path>] [--machine <id>] [--permission-mode <mode>] [--session-type stream|pty] [--enabled true|false]\n',
+    '  hammurabi cron update <task-id> [--name <name>] [--description "<text>"] [--schedule "<cron>"] [--timezone <tz>] [--instruction "<text>"] [--model <model>] [--agent claude|codex|gemini] [--work-dir <path>] [--machine <id>] [--permission-mode <mode>] [--session-type stream|pty] [--enabled true|false]\n',
   )
   stdout.write('  hammurabi cron delete <task-id>\n')
   stdout.write('  hammurabi cron trigger <task-id>\n')

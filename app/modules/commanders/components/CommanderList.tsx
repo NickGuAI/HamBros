@@ -46,11 +46,11 @@ const CHANNEL_PROVIDER_LABELS: Record<'whatsapp' | 'telegram' | 'discord', strin
 function resolveCommanderDisplayName(session: CommanderSessionCard): string {
   const channelMeta = session.channelMeta
   if (!channelMeta) {
-    return session.host
+    return session.displayName?.trim() || session.host
   }
 
   const providerLabel = CHANNEL_PROVIDER_LABELS[channelMeta.provider]
-  const baseLabel = channelMeta.displayName.trim() || session.host
+  const baseLabel = channelMeta.displayName.trim() || session.displayName?.trim() || session.host
   return `${providerLabel} • ${baseLabel}`
 }
 
@@ -93,7 +93,10 @@ function removeKey(record: Record<string, string>, key: string): Record<string, 
 }
 
 function resolveAgentType(agentType: CommanderSession['agentType']): CommanderAgentType {
-  return agentType === 'codex' ? 'codex' : 'claude'
+  if (agentType === 'codex' || agentType === 'gemini') {
+    return agentType
+  }
+  return 'claude'
 }
 
 export function CommanderList({
@@ -308,7 +311,10 @@ export function CommanderList({
                     value={selectedAgentType}
                     onChange={(event) => {
                       event.stopPropagation()
-                      const nextAgentType = event.target.value === 'codex' ? 'codex' : 'claude'
+                      const nextValue = event.target.value
+                      const nextAgentType = nextValue === 'codex' || nextValue === 'gemini'
+                        ? nextValue
+                        : 'claude'
                       setAgentTypeByCommander((current) => ({
                         ...current,
                         [session.id]: nextAgentType,
@@ -319,6 +325,7 @@ export function CommanderList({
                   >
                     <option value="claude">claude</option>
                     <option value="codex">codex</option>
+                    <option value="gemini">gemini</option>
                   </select>
                 </label>
                 {!isRunning && onStartCommander && (

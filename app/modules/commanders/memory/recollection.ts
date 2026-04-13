@@ -25,6 +25,7 @@ const MAX_MEMORY_BLOCKS = 40
 const MAX_JOURNAL_FILES = 180
 const MAX_KEYWORDS = 32
 const TERM_MIN_LENGTH = 3
+const MIN_EXTERNAL_VECTOR_SCRIPT_CANDIDATES = 32
 const STALE_SPIKE_DAYS = 45
 const STALE_SPIKE_REHEARSAL_FLOOR = 2
 const SPIKE_REPO_DRIFT_THRESHOLD = 8
@@ -235,11 +236,29 @@ function dayDiff(from: string | null, to: string): number {
 }
 
 function extractMemoryBlocks(content: string): string[] {
-  return content
+  const rawBlocks = content
     .split(/\n\s*\n/g)
     .map((block) => block.trim())
     .filter((block) => block.length > 0)
-    .slice(0, MAX_MEMORY_BLOCKS)
+
+  const mergedBlocks: string[] = []
+  for (let index = 0; index < rawBlocks.length; index += 1) {
+    const block = rawBlocks[index]
+    const lines = block.split('\n').map((line) => line.trim()).filter((line) => line.length > 0)
+    const isHeadingOnlyBlock =
+      lines.length === 1 &&
+      /^#{1,6}\s+/.test(lines[0] ?? '')
+
+    if (isHeadingOnlyBlock && index + 1 < rawBlocks.length) {
+      mergedBlocks.push(`${block}\n\n${rawBlocks[index + 1]}`)
+      index += 1
+      continue
+    }
+
+    mergedBlocks.push(block)
+  }
+
+  return mergedBlocks.slice(0, MAX_MEMORY_BLOCKS)
 }
 
 function stemToken(token: string): string {
@@ -1042,6 +1061,10 @@ export class MemoryRecollection {
   }
 
   private async syncVectorIndex(candidates: HybridSearchCandidate[]): Promise<void> {
+    if (candidates.length < MIN_EXTERNAL_VECTOR_SCRIPT_CANDIDATES) {
+      return
+    }
+
     const payload = toVectorPayload(candidates)
     await writeFile(this.vectorCandidatesPath, JSON.stringify(payload), 'utf-8')
 
@@ -1068,6 +1091,14 @@ export class MemoryRecollection {
     topK: number,
     candidates: HybridSearchCandidate[],
   ): Promise<Map<string, number>> {
+    if (candidates.length < MIN_EXTERNAL_VECTOR_SCRIPT_CANDIDATES) {
+      return computeLocalVectorScores(
+        candidates.map((candidate) => ({ id: candidate.id, corpus: candidate.corpus })),
+        cue,
+        topK,
+      )
+    }
+
     const candidateIds = new Set(candidates.map((candidate) => candidate.id))
 
     if (await this.canUseVectorScript()) {

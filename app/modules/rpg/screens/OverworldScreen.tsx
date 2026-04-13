@@ -17,7 +17,7 @@ interface CommanderSession {
   id: string
   host: string
   state: 'idle' | 'running' | 'paused' | 'stopped'
-  agentType: 'claude' | 'codex'
+  agentType: 'claude' | 'codex' | 'gemini'
   currentTask: { issueNumber: number; issueUrl: string; startedAt: string } | null
   completedTasks: number
   totalCostUsd: number

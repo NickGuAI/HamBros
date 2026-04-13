@@ -5,7 +5,7 @@ import { resolveCommanderDataDir } from '../commanders/paths.js'
 
 const DEFAULT_TASK_STORE_PATH = 'data/command-room/tasks.json'
 
-export type CommandRoomAgentType = 'claude' | 'codex'
+export type CommandRoomAgentType = 'claude' | 'codex' | 'gemini'
 export type CommandRoomTaskType = 'instruction' | 'memory_compact'
 
 export interface CronTask {
@@ -74,7 +74,7 @@ interface TaskLocation {
   filePath: string
 }
 
-const AGENT_TYPES = new Set<CommandRoomAgentType>(['claude', 'codex'])
+const AGENT_TYPES = new Set<CommandRoomAgentType>(['claude', 'codex', 'gemini'])
 const TASK_TYPES = new Set<CommandRoomTaskType>(['instruction', 'memory_compact'])
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -90,7 +90,7 @@ function asTrimmedString(value: unknown): string | null {
 }
 
 function asAgentType(value: unknown): CommandRoomAgentType | null {
-  if (value === 'claude' || value === 'codex') {
+  if (value === 'claude' || value === 'codex' || value === 'gemini') {
     return value
   }
   return null

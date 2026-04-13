@@ -10,6 +10,8 @@ import {
   resolveCommanderSessionStorePath,
 } from '../paths.js'
 
+const TEST_UUID = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
+
 describe('commander paths', () => {
   it('prefers COMMANDER_DATA_DIR over legacy env var', () => {
     const resolved = resolveCommanderDataDir({
@@ -29,23 +31,32 @@ describe('commander paths', () => {
   })
 
   it('builds commander-specific memory and skills paths', () => {
-    const paths = resolveCommanderPaths('cmdr-1', '/tmp/cmdr-data')
+    const paths = resolveCommanderPaths(TEST_UUID, '/tmp/cmdr-data')
 
     expect(paths.dataDir).toBe(path.resolve('/tmp/cmdr-data'))
-    expect(paths.commanderRoot).toBe(path.resolve('/tmp/cmdr-data/cmdr-1'))
-    expect(paths.memoryRoot).toBe(path.resolve('/tmp/cmdr-data/cmdr-1/.memory'))
-    expect(paths.skillsRoot).toBe(path.resolve('/tmp/cmdr-data/cmdr-1/skills'))
+    expect(paths.commanderRoot).toBe(path.resolve(`/tmp/cmdr-data/${TEST_UUID}`))
+    expect(paths.memoryRoot).toBe(path.resolve(`/tmp/cmdr-data/${TEST_UUID}/.memory`))
+    expect(paths.skillsRoot).toBe(path.resolve(`/tmp/cmdr-data/${TEST_UUID}/skills`))
     expect(resolveCommanderSessionStorePath('/tmp/cmdr-data')).toBe(
       path.resolve('/tmp/cmdr-data/sessions.json'),
     )
     expect(resolveCommanderNamesPath('/tmp/cmdr-data')).toBe(
       path.resolve('/tmp/cmdr-data/names.json'),
     )
-    expect(resolveCommanderEmailConfigPath('cmdr-1', '/tmp/cmdr-data')).toBe(
-      path.resolve('/tmp/cmdr-data/cmdr-1/email-config.json'),
+    expect(resolveCommanderEmailConfigPath(TEST_UUID, '/tmp/cmdr-data')).toBe(
+      path.resolve(`/tmp/cmdr-data/${TEST_UUID}/email-config.json`),
     )
-    expect(resolveCommanderEmailSeenPath('cmdr-1', '/tmp/cmdr-data')).toBe(
-      path.resolve('/tmp/cmdr-data/cmdr-1/email-seen.json'),
+    expect(resolveCommanderEmailSeenPath(TEST_UUID, '/tmp/cmdr-data')).toBe(
+      path.resolve(`/tmp/cmdr-data/${TEST_UUID}/email-seen.json`),
+    )
+  })
+
+  it('rejects non-UUID commander IDs', () => {
+    expect(() => resolveCommanderPaths('reset-test', '/tmp/cmdr-data')).toThrow(
+      'Invalid commander ID format: "reset-test" — must be a UUID',
+    )
+    expect(() => resolveCommanderPaths('cmdr-1', '/tmp/cmdr-data')).toThrow(
+      'Invalid commander ID format: "cmdr-1" — must be a UUID',
     )
   })
 

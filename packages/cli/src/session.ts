@@ -88,7 +88,7 @@ async function readErrorDetail(response: Response): Promise<string | null> {
 
 function printUsage(stdout: Writable): void {
   stdout.write('Usage:\n')
-  stdout.write('  hammurabi session register --name <name> --machine <machine> [--cwd <path>] [--agent claude|codex|openclaw] [--task <text>]\n')
+  stdout.write('  hammurabi session register --name <name> --machine <machine> [--cwd <path>] [--agent claude|codex|gemini|openclaw] [--task <text>]\n')
   stdout.write('  hammurabi session heartbeat --name <name>\n')
   stdout.write('  hammurabi session events --name <name> --events \'[{"type":"..."}]\'\n')
   stdout.write('  hammurabi session unregister --name <name>\n')

@@ -20,6 +20,9 @@ import {
   DEFAULT_HEARTBEAT_MESSAGE,
 } from '../heartbeat'
 import type { CommanderEmailClient, CommanderInboundEmail } from '../email-poller'
+import type { ClaudeEffortLevel } from '../../claude-effort'
+
+vi.setConfig({ testTimeout: 60_000 })
 
 const AUTH_HEADERS = {
   'x-hammurabi-api-key': 'test-key',
@@ -35,7 +38,8 @@ interface RunningServer {
 interface MockSessionEntry {
   name: string
   systemPrompt: string
-  agentType: 'claude' | 'codex'
+  agentType: 'claude' | 'codex' | 'gemini'
+  effort?: ClaudeEffortLevel
   cwd?: string
   resumeSessionId?: string
   maxTurns?: number
@@ -161,7 +165,7 @@ function createMockSessionsInterface(opts: {
   const createCalls: MockSessionEntry[] = []
   const sendCalls: Array<{ name: string; text: string }> = []
   const activeSessions = new Set<string>(opts.initialActiveSessions ?? [])
-  const agentTypeBySessionName = new Map<string, 'claude' | 'codex'>(
+  const agentTypeBySessionName = new Map<string, 'claude' | 'codex' | 'gemini'>(
     (opts.initialActiveSessions ?? []).map((sessionName) => [sessionName, 'claude']),
   )
   const eventHandlers = new Map<string, Set<(event: unknown) => void>>()
@@ -275,6 +279,7 @@ async function startServer(
     ...options,
     sessionStorePath,
     memoryBasePath,
+    refreshCommanderMemoryIndex: async () => {},
   })
   app.use('/api/commanders', commanders.router)
 
@@ -866,6 +871,87 @@ describe('commanders routes', () => {
     }
   })
 
+  it('triggers a manual heartbeat immediately through /heartbeat/trigger', async () => {
+    const dir = await createTempDir('hammurabi-commanders-heartbeat-manual-trigger-')
+    const storePath = join(dir, 'sessions.json')
+    const memoryBasePath = join(dir, 'memory')
+    const mock = createMockSessionsInterface()
+
+    const server = await startServer({
+      sessionStorePath: storePath,
+      memoryBasePath,
+      sessionsInterface: mock.interface,
+    })
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          host: 'worker-heartbeat-manual',
+          taskSource: { owner: 'example-user', repo: 'example-repo', label: 'commander' },
+        }),
+      })
+      const created = (await createResponse.json()) as { id: string }
+
+      const patchResponse = await fetch(
+        `${server.baseUrl}/api/commanders/${created.id}/heartbeat`,
+        {
+          method: 'PATCH',
+          headers: {
+            ...AUTH_HEADERS,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            intervalMs: 5_000,
+            messageTemplate: '[HEARTBEAT MANUAL {{timestamp}}]',
+          }),
+        },
+      )
+      expect(patchResponse.status).toBe(200)
+
+      const startResponse = await fetch(`${server.baseUrl}/api/commanders/${created.id}/start`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+      })
+      expect(startResponse.status).toBe(200)
+
+      await vi.waitFor(() => {
+        expect(mock.sendCalls).toHaveLength(1)
+      })
+
+      const triggerResponse = await fetch(
+        `${server.baseUrl}/api/commanders/${created.id}/heartbeat/trigger`,
+        {
+          method: 'POST',
+          headers: AUTH_HEADERS,
+        },
+      )
+
+      expect(triggerResponse.status).toBe(200)
+      expect(await triggerResponse.json()).toEqual({
+        runId: expect.any(String),
+        timestamp: expect.any(String),
+        sessionName: `commander-${created.id}`,
+        triggered: true,
+      })
+
+      await vi.waitFor(() => {
+        expect(
+          mock.sendCalls.some((call) => call.text.includes('[HEARTBEAT MANUAL ')),
+        ).toBe(true)
+      })
+    } finally {
+      await server.close()
+    }
+  })
+
   it('writes a heartbeat error entry when commander is not running when heartbeat fires', async () => {
     const dir = await createTempDir('hammurabi-commanders-heartbeat-stop-log-')
     const storePath = join(dir, 'sessions.json')
@@ -1139,7 +1225,7 @@ describe('commanders routes', () => {
     }
   })
 
-  it('uses per-commander COMMANDER.md as authoritative with workspace fallback', async () => {
+  it('prepends per-commander COMMANDER.md before workspace prompt and keeps workspace workflow overrides', async () => {
     const dir = await createTempDir('hammurabi-commanders-workflow-source-')
     const storePath = join(dir, 'sessions.json')
     const memoryBasePath = join(dir, 'memory')
@@ -1177,6 +1263,9 @@ describe('commanders routes', () => {
         }),
       })
       const firstCommander = (await firstCreate.json()) as { id: string }
+      const firstWorkflow = await readFile(join(memoryBasePath, firstCommander.id, 'COMMANDER.md'), 'utf8')
+      expect(firstWorkflow).toContain(`hammurabi memory find --commander ${firstCommander.id}`)
+      expect(firstWorkflow).toContain(workspaceDir)
       const firstStart = await fetch(
         `${server.baseUrl}/api/commanders/${firstCommander.id}/start`,
         {
@@ -1236,9 +1325,58 @@ describe('commanders routes', () => {
       await vi.waitFor(() => {
         expect(mock.createCalls).toHaveLength(2)
       })
-      expect(mock.createCalls[1]?.systemPrompt).toContain('COMMANDER-DIR PROMPT SOURCE')
-      expect(mock.createCalls[1]?.systemPrompt).not.toContain('WORKSPACE PROMPT SOURCE')
-      expect(mock.createCalls[1]?.maxTurns).toBe(7)
+      const secondPrompt = mock.createCalls[1]?.systemPrompt ?? ''
+      expect(secondPrompt).toContain('COMMANDER-DIR PROMPT SOURCE')
+      expect(secondPrompt).toContain('## Workspace Context')
+      expect(secondPrompt).toContain('WORKSPACE PROMPT SOURCE')
+      expect(secondPrompt.indexOf('COMMANDER-DIR PROMPT SOURCE')).toBeLessThan(
+        secondPrompt.indexOf('WORKSPACE PROMPT SOURCE'),
+      )
+      expect(mock.createCalls[1]?.maxTurns).toBe(3)
+
+      const thirdCreate = await fetch(`${server.baseUrl}/api/commanders`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          host: 'worker-workflow-identity-only',
+          taskSource: { owner: 'example-user', repo: 'example-repo', label: 'commander' },
+        }),
+      })
+      const thirdCommander = (await thirdCreate.json()) as { id: string }
+      const thirdCommanderRoot = join(memoryBasePath, thirdCommander.id)
+      await mkdir(thirdCommanderRoot, { recursive: true })
+      await writeFile(
+        join(thirdCommanderRoot, 'COMMANDER.md'),
+        [
+          '---',
+          'maxTurns: 7',
+          '---',
+          'IDENTITY-ONLY PROMPT SOURCE',
+        ].join('\n'),
+        'utf8',
+      )
+
+      const thirdStart = await fetch(
+        `${server.baseUrl}/api/commanders/${thirdCommander.id}/start`,
+        {
+          method: 'POST',
+          headers: {
+            ...AUTH_HEADERS,
+            'content-type': 'application/json',
+          },
+        },
+      )
+      expect(thirdStart.status).toBe(200)
+
+      await vi.waitFor(() => {
+        expect(mock.createCalls).toHaveLength(3)
+      })
+      expect(mock.createCalls[2]?.systemPrompt).toContain('IDENTITY-ONLY PROMPT SOURCE')
+      expect(mock.createCalls[2]?.systemPrompt).not.toContain('WORKSPACE PROMPT SOURCE')
+      expect(mock.createCalls[2]?.maxTurns).toBe(7)
     } finally {
       await server.close()
     }
@@ -1911,6 +2049,68 @@ describe('commanders routes', () => {
           resumeSessionId: undefined,
         }),
       )
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('defaults commander Claude effort to max and lets profile updates change the launched effort', async () => {
+    const dir = await createTempDir('hammurabi-commanders-effort-')
+    const storePath = join(dir, 'sessions.json')
+    const memoryBasePath = join(dir, 'memory')
+    const mock = createMockSessionsInterface()
+
+    const server = await startServer({
+      sessionStorePath: storePath,
+      memoryBasePath,
+      sessionsInterface: mock.interface,
+    })
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          host: 'worker-effort',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+      const created = (await createResponse.json()) as { id: string; effort?: string }
+      expect(created.effort).toBe('max')
+
+      const patchResponse = await fetch(`${server.baseUrl}/api/commanders/${created.id}/profile`, {
+        method: 'PATCH',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          effort: 'high',
+        }),
+      })
+      expect(patchResponse.status).toBe(200)
+
+      const startResponse = await fetch(`${server.baseUrl}/api/commanders/${created.id}/start`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+      })
+      expect(startResponse.status).toBe(200)
+
+      expect(mock.createCalls[0]).toEqual(expect.objectContaining({
+        agentType: 'claude',
+        effort: 'high',
+      }))
+
+      const persisted = JSON.parse(await readFile(storePath, 'utf8')) as {
+        sessions: Array<{ effort?: string }>
+      }
+      expect(persisted.sessions[0]?.effort).toBe('high')
     } finally {
       await server.close()
     }
@@ -2623,6 +2823,85 @@ describe('commanders routes', () => {
       })
       expect(emptyListResponse.status).toBe(200)
       expect(await emptyListResponse.json()).toEqual([])
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('lists quests across commanders from the aggregate quests route', async () => {
+    const dir = await createTempDir('hammurabi-commanders-quest-routes-aggregate-')
+    const storePath = join(dir, 'sessions.json')
+    const server = await startServer({ sessionStorePath: storePath })
+
+    try {
+      const firstCommanderResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          host: 'worker-quest-aggregate-a',
+        }),
+      })
+      const firstCommander = (await firstCommanderResponse.json()) as { id: string }
+
+      const secondCommanderResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          host: 'worker-quest-aggregate-b',
+        }),
+      })
+      const secondCommander = (await secondCommanderResponse.json()) as { id: string }
+
+      await fetch(`${server.baseUrl}/api/commanders/${firstCommander.id}/quests`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          source: 'manual',
+          instruction: 'Investigate issue #882',
+        }),
+      })
+
+      await fetch(`${server.baseUrl}/api/commanders/${secondCommander.id}/quests`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          source: 'manual',
+          instruction: 'Implement issue #881',
+        }),
+      })
+
+      const response = await fetch(`${server.baseUrl}/api/commanders/quests`, {
+        headers: AUTH_HEADERS,
+      })
+      expect(response.status).toBe(200)
+
+      const quests = (await response.json()) as Array<{
+        instruction: string
+        commanderId?: string
+      }>
+      expect(quests).toHaveLength(2)
+      expect(quests).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          instruction: 'Investigate issue #882',
+          commanderId: firstCommander.id,
+        }),
+        expect.objectContaining({
+          instruction: 'Implement issue #881',
+          commanderId: secondCommander.id,
+        }),
+      ]))
     } finally {
       await server.close()
     }

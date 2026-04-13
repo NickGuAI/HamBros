@@ -3,7 +3,7 @@ import { AlertTriangle, Plus } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 export type QuestSource = 'idea' | 'github-issue' | 'manual' | 'voice-log'
-export type QuestAgentType = 'claude' | 'codex'
+export type QuestAgentType = 'claude' | 'codex' | 'gemini'
 export type QuestPermissionMode = 'default' | 'acceptEdits' | 'bypassPermissions'
 export type QuestArtifactType = 'github_issue' | 'github_pr' | 'url' | 'file'
 

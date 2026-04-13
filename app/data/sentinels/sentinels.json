@@ -1,0 +1,53 @@
+{
+  "sentinels": [
+    {
+      "id": "0518cd5b-5e3b-4639-a838-f360dcbdde93",
+      "name": "aria-birthday-venue-monitor",
+      "instruction": "Monitor birthday party venue email replies. Config file has all IDs and contacts.\n\n## Step 0 — Load config + memory each run\nRead ~/.hammurabi/aria-venue-sentinel-config.md for all IDs, emails, auth setup, and block IDs.\nRead sentinel memory for per-venue state from prior runs.\n\n## CRITICAL: Tool Rules\n- Email reads: gog CLI via gog_helper.py ONLY (direct gog bash is hook-blocked).\n  Pattern: python3 <sentinel_dir>/gog_helper.py gmail search \"from:VENUE_EMAIL\" --account yu.gu.columbia@gmail.com --plain --max 10\n- Drafts: gog_helper.py gmail drafts create (never send — see Draft Rule).\n- Notion: curl with personal key ONLY. No Notion MCP.\n- gog auth: see config file for setup command.\n\n## Goal Per Venue\nExtract: A.Cost  B.Package(inclusions/duration/capacity)  C.Process(booking/deposit/deadlines)\n\n## Each Run — Per Venue Workflow\n\n### 1. Check for new emails\nSearch for inbound from venue email AND outbound to venue.\nRecord each email in memory: Message ID, thread ID, timestamp, direction (→ sent / ← received), brief content summary.\n\n### 2. Update Notion — TWO locations per venue\n\n**A. Table row** (config: \"Notion Row IDs\") — PATCH /v1/blocks/{row_id}\nBody: {\"table_row\": {\"cells\": [[Venue],[Contact],[Status],[Price Range],[Capacity],[Notes]]}}\nAll 6 cells required. Notes = A/B/C summary only (keep short).\n\n**B. Email Threads section** (config: \"Notion Email Threads Section Block IDs\") — PATCH /v1/blocks/{log_block_id}\nBody: {\"paragraph\": {\"rich_text\": [{\"type\": \"text\", \"text\": {\"content\": \"FULL_EMAIL_LOG\"}}]}}\nFormat for the email log content:\n  → YYYY-MM-DD HH:MMZ  Nick → venue@email.com: [subject/summary]\n  ← YYYY-MM-DD HH:MMZ  ContactName: [key content summary]\n  → YYYY-MM-DD HH:MMZ  Nick [DRAFT created, not sent]: [what it asks]\nInclude ALL emails found — sent and received — chronologically.\nUpdate this block on EVERY run if new emails are found (replace full content, not append).\n\n### 3. Draft Rule — NEVER AUTO-SEND\nThe sentinel MUST NOT auto-send emails. Instead:\n\n**Scenario A — venue is asking a question or awaiting Nick's decision:**\n  - Create a draft reply using gog_helper.py gmail drafts create\n  - Include --reply-to-message-id of the venue's last message, --cc CC_ADDRESS (from config)\n  - Table Status → \"📝 Draft in inbox — awaiting review\"\n  - Email log entry → \"→ [timestamp] [DRAFT created]: [brief description]\"\n\n**Scenario B — no reply and 48h+ since last outbound AND last draft (nudge):**\n  - Create a polite nudge draft (not sent)\n  - Table Status → \"📝 Nudge draft in inbox — awaiting review\"\n  - Email log entry → \"→ [timestamp] [DRAFT nudge created]\"\n\n**Scenario C — reply received, A/B/C incomplete, no open questions:**\n  - Create a follow-up draft asking remaining questions\n  - Table Status → \"📝 Follow-up draft in inbox — awaiting review\"\n\nFor ALL drafts: log the draft message ID in memory to avoid duplicates.\nDo NOT create a draft if one was already created within the last 48h (check memory).\n\n### 4. Draft Content Rules — STRICT\nAll drafts written by the sentinel MUST follow these rules without exception:\n\n**NEVER include in any draft:**\n- Confirmations of any kind (\"We'd like to confirm...\", \"We'll take the slot...\", \"We're planning to book...\")\n- Promises or commitments (\"We'll be there\", \"We're going ahead with...\", \"Count us in\")\n- Any implication that a decision has been made (\"We've decided...\", \"We're going with...\")\n- Date/time commitments (\"We'll come on May 17\", \"We want the 3 PM slot\")\n- Deposit or payment intent (\"We'll send the deposit\", \"We'll pay via...\")\n\n**Drafts must only:**\n- Ask clarifying questions to gather missing A/B/C info\n- Express general interest without committing (\"We're exploring options for a birthday party\")\n- Request additional information (\"Could you share more details about X?\")\n- Follow up on an unanswered inquiry (\"We sent an inquiry on [date] and wanted to check in\")\n- Acknowledge a venue's reply neutrally (\"Thank you for your response — we have a few follow-up questions\")\n\nThe draft is for Nick to review and edit before sending. Write it as a starting point, not a final answer.\n\n### 5. A/B/C complete — no open questions\nTable Status → \"✅ Info complete\". No draft needed.\n\n### 6. All venues done\nAll info-complete or declined: run hammurabi sentinel complete on own sentinel ID.\n\n## Standing Rules\n- Names OK in emails. NEVER mention age, birthdate, or milestone details.\n- Funzy Play: DO NOT create any draft until Lingyi (JC planner) replies.\n- Luna De Papel: info-complete, no action needed.\n- LSC: May 17 unavailable. A/B/C extracted. No draft until Nick decides on alternate date.\n- Notion table status values: Emailed / Replied / Info complete / Declined /\n  📝 Draft in inbox — awaiting review / 📝 Nudge draft in inbox — awaiting review /\n  📝 Follow-up draft in inbox — awaiting review\n\n## Notion API Reminder\n- Table rows: PATCH /v1/blocks/{row_id} with table_row.cells (all 6 cells)\n- Email log paragraphs: PATCH /v1/blocks/{log_block_id} with paragraph.rich_text\n- Use personal_api_key from config (path in config file)\n- notion_update_rows.py in sentinel dir can be reused/extended",
+      "schedule": "0 */6 * * *",
+      "status": "paused",
+      "parentCommanderId": "d285cab7-b685-45c6-94f6-e689231e4924",
+      "memoryPath": "/home/ec2-user/App/apps/hammurabi/data/sentinels/0518cd5b-5e3b-4639-a838-f360dcbdde93/memory.md",
+      "outputDir": "/home/ec2-user/App/apps/hammurabi/data/sentinels/0518cd5b-5e3b-4639-a838-f360dcbdde93",
+      "workDir": "/home/ec2-user/App/apps/hammurabi",
+      "createdAt": "2026-04-09T17:47:10.479Z",
+      "lastRun": "2026-04-10T17:22:54.292Z",
+      "totalRuns": 2,
+      "totalCostUsd": 0,
+      "history": [
+        {
+          "timestamp": "2026-04-10T17:22:54.292Z",
+          "action": "ERROR",
+          "result": "Session \"sentinel-aria-birthday-venue-monitor-2026-04-10T16-53-53-964Z\" did not complete after 30 status checks",
+          "costUsd": 0,
+          "durationSec": 1740,
+          "sessionId": "sentinel-aria-birthday-venue-monitor-2026-04-10T16-53-53-964Z",
+          "runFile": "/home/ec2-user/App/apps/hammurabi/data/sentinels/0518cd5b-5e3b-4639-a838-f360dcbdde93/runs/2026-04-10T16-53-53-964Z.md",
+          "memoryUpdated": false,
+          "source": "manual"
+        },
+        {
+          "timestamp": "2026-04-09T22:29:00.413Z",
+          "action": "ERROR",
+          "result": "Session \"sentinel-aria-birthday-venue-monitor-2026-04-09T22-00-00-070Z\" did not complete after 30 status checks",
+          "costUsd": 0,
+          "durationSec": 1740,
+          "sessionId": "sentinel-aria-birthday-venue-monitor-2026-04-09T22-00-00-070Z",
+          "runFile": "/home/ec2-user/App/apps/hammurabi/data/sentinels/0518cd5b-5e3b-4639-a838-f360dcbdde93/runs/2026-04-09T22-00-00-070Z.md",
+          "memoryUpdated": false,
+          "source": "cron"
+        }
+      ],
+      "skills": [
+        "gog",
+        "notion"
+      ],
+      "seedMemory": "Config: ~/.hammurabi/aria-venue-sentinel-config.md — read every run. Contains gog auth, thread IDs, venue emails, CC address, Notion key path, table row IDs, AND email log block IDs. DRAFT RULE: Never auto-send. Never confirm or promise anything — drafts are for Nick to review only.",
+      "permissionMode": "bypassPermissions",
+      "agentType": "claude",
+      "timezone": "America/New_York",
+      "model": "sonnet",
+      "maxRuns": 30
+    }
+  ]
+}

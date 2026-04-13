@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
-import { ClipboardCheck, Clock3, MessageSquare, Pencil, Play, Square, Trash2 } from 'lucide-react'
+import { ClipboardCheck, Clock3, MessageSquare, Pencil, Play, Square, Trash2, Zap } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { CommanderAgentType, CommanderSession } from '../hooks/useCommander'
 
@@ -8,11 +8,13 @@ export interface CommanderCardProps {
   commander: CommanderSession
   onStart: (id: string, agentType: CommanderAgentType) => void
   onStop: (id: string) => void
+  onTriggerHeartbeat?: (id: string) => void
   onOpenChat: (id: string, agentType: CommanderAgentType) => void
   onDelete: (id: string) => void
   onEdit: (id: string) => void
   isStartPending: boolean
   isStopPending: boolean
+  isTriggerHeartbeatPending?: boolean
   isDeletePending: boolean
 }
 
@@ -58,11 +60,13 @@ export function CommanderCard({
   commander,
   onStart,
   onStop,
+  onTriggerHeartbeat,
   onOpenChat,
   onDelete,
   onEdit,
   isStartPending,
   isStopPending,
+  isTriggerHeartbeatPending = false,
   isDeletePending,
 }: CommanderCardProps) {
   const [agentType, setAgentType] = useState<CommanderAgentType>('claude')
@@ -142,6 +146,30 @@ export function CommanderCard({
         </div>
       )}
 
+      {/* Pill nav */}
+      <div className="mt-3 flex gap-1 p-1 rounded-full bg-washi-aged/60 border border-ink-border w-fit">
+        <Link
+          to={`/sentinels?commander=${commander.id}`}
+          className="px-3 py-1 rounded-full text-[10px] uppercase tracking-wide font-medium text-sumi-gray hover:text-sumi-black hover:bg-washi-white transition-all"
+          onClick={(e) => e.stopPropagation()}
+        >
+          Sentinels
+        </Link>
+        <Link
+          to={`/quests?commander=${commander.id}`}
+          className="px-3 py-1 rounded-full text-[10px] uppercase tracking-wide font-medium text-sumi-gray hover:text-sumi-black hover:bg-washi-white transition-all"
+          onClick={(e) => e.stopPropagation()}
+        >
+          Quests
+        </Link>
+        <Link
+          to={`/command-room?commander=${commander.id}`}
+          className="px-3 py-1 rounded-full text-[10px] uppercase tracking-wide font-medium text-sumi-gray hover:text-sumi-black hover:bg-washi-white transition-all"
+          onClick={(e) => e.stopPropagation()}
+        >
+          Cron
+        </Link>
+      </div>
 
       {/* Primary actions */}
       <div className="mt-4 grid grid-cols-2 gap-2">
@@ -151,13 +179,15 @@ export function CommanderCard({
               <select
                 value={agentType}
                 onChange={(e) => {
-                  const next = e.target.value === 'codex' ? 'codex' : 'claude'
+                  const nextValue = e.target.value
+                  const next = nextValue === 'codex' || nextValue === 'gemini' ? nextValue : 'claude'
                   setAgentType(next as CommanderAgentType)
                 }}
                 className="w-full bg-transparent text-center text-sumi-black focus:outline-none"
               >
                 <option value="claude">claude</option>
                 <option value="codex">codex</option>
+                <option value="gemini">gemini</option>
               </select>
             </label>
             <button
@@ -179,6 +209,17 @@ export function CommanderCard({
           >
             <Square size={10} className="fill-current" />
             Stop
+          </button>
+        )}
+        {isRunning && onTriggerHeartbeat && (
+          <button
+            type="button"
+            disabled={isTriggerHeartbeatPending}
+            onClick={() => onTriggerHeartbeat(commander.id)}
+            className={ACTION_CONTROL_CLASSES}
+          >
+            <Zap size={12} />
+            {isTriggerHeartbeatPending ? 'Triggering...' : 'Heartbeat'}
           </button>
         )}
         <button

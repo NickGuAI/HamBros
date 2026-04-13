@@ -5,7 +5,7 @@ import { fetchJson } from '@/lib/api'
 const TASKS_QUERY_KEY = ['command-room', 'tasks'] as const
 export const RUNS_QUERY_KEY = (taskId: string | null) => ['command-room', 'runs', taskId] as const
 
-export type CommandRoomAgentType = 'claude' | 'codex'
+export type CommandRoomAgentType = 'claude' | 'codex' | 'gemini'
 export type WorkflowRunStatus = 'running' | 'complete' | 'failed' | 'timeout'
 
 export interface CronTask {

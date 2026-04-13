@@ -1,4 +1,4 @@
-import { type FormEvent, useState } from 'react'
+import { type FormEvent, useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ChevronUp, Plus, X } from 'lucide-react'
 import { cn, timeAgo } from '@/lib/utils'
@@ -17,7 +17,6 @@ import {
 
 type QuestStatus = 'pending' | 'active' | 'done' | 'failed'
 type QuestDisplayStatus = QuestStatus | 'unknown'
-const ONE_DAY_MS = 24 * 60 * 60 * 1000
 
 interface QuestContract {
   cwd?: string | null
@@ -39,6 +38,7 @@ interface CommanderQuest {
   status: QuestStatus | string
   instruction: string
   source: QuestSource | string
+  commanderId?: string | null
   createdAt?: string | null
   completedAt?: string | null
   githubIssueUrl?: string | null
@@ -66,6 +66,8 @@ interface DeleteQuestInput {
   commanderId: string
   questId: string
 }
+
+type QuestBoardCommander = Pick<CommanderSession, 'id' | 'host'>
 
 const STATUS_META: Record<
   QuestDisplayStatus,
@@ -249,6 +251,10 @@ async function fetchCommanderQuests(commanderId: string): Promise<CommanderQuest
   return fetchJson<CommanderQuest[]>(`/api/commanders/${encodeURIComponent(commanderId)}/quests`)
 }
 
+async function fetchAllCommanderQuests(): Promise<CommanderQuest[]> {
+  return fetchJson<CommanderQuest[]>('/api/commanders/quests')
+}
+
 async function createCommanderQuest(input: CreateQuestInput): Promise<CommanderQuest> {
   return fetchJson<CommanderQuest>(`/api/commanders/${encodeURIComponent(input.commanderId)}/quests`, {
     method: 'POST',
@@ -302,14 +308,6 @@ function resolveCompletedTimestamp(quest: CommanderQuest): number | null {
   return parseDateMillis(quest.completedAt) ?? parseDateMillis(quest.createdAt)
 }
 
-function isCompletedWithin24Hours(quest: CommanderQuest, nowMillis: number): boolean {
-  const completedTimestamp = resolveCompletedTimestamp(quest)
-  if (completedTimestamp === null) {
-    return false
-  }
-  return nowMillis - completedTimestamp <= ONE_DAY_MS
-}
-
 function sortByMostRecent(quests: CommanderQuest[]): CommanderQuest[] {
   return [...quests].sort((left, right) => {
     const leftTimestamp = resolveCompletedTimestamp(left) ?? 0
@@ -337,12 +335,26 @@ function questTimeLabel(quest: CommanderQuest, status: QuestDisplayStatus): stri
   return created ? `created ${created}` : 'created'
 }
 
+function toKanbanStatus(rawStatus: string): QuestStatus {
+  const normalized = normalizeStatus(rawStatus)
+  if (normalized === 'unknown') {
+    return 'active'
+  }
+  return normalized
+}
+
 function QuestCard({
   quest,
+  commanderLabel,
+  expanded,
+  onToggleExpanded,
   isDeleting,
   onDelete,
 }: {
   quest: CommanderQuest
+  commanderLabel: string | null
+  expanded: boolean
+  onToggleExpanded: (questId: string) => void
   isDeleting: boolean
   onDelete: (quest: CommanderQuest) => Promise<void>
 }) {
@@ -355,12 +367,24 @@ function QuestCard({
   return (
     <article className="rounded-lg border border-ink-border bg-washi-white px-3 py-2.5">
       <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <p className="text-sm text-sumi-black line-clamp-2">
-            <span className="font-mono mr-2">{statusMeta.symbol}</span>
-            {quest.instruction}
-          </p>
-        </div>
+        <button
+          type="button"
+          onClick={() => onToggleExpanded(quest.id)}
+          className="min-w-0 flex-1 text-left"
+        >
+          <div className="flex items-start gap-2">
+            <ChevronUp
+              size={14}
+              className={cn('mt-0.5 shrink-0 transition-transform duration-200', expanded ? '' : 'rotate-180')}
+            />
+            <div className="min-w-0">
+              <p className={cn('text-sm text-sumi-black', expanded ? 'whitespace-pre-wrap' : 'line-clamp-2')}>
+                <span className="font-mono mr-2">{statusMeta.symbol}</span>
+                {quest.instruction}
+              </p>
+            </div>
+          </div>
+        </button>
         <div className="flex shrink-0 items-center gap-2">
           <span className={cn('badge-sumi', statusMeta.badgeClassName)}>
             {statusMeta.label}
@@ -381,13 +405,20 @@ function QuestCard({
         <p className="text-whisper text-sumi-diluted mt-1 truncate">{contract}</p>
       )}
 
-      {note && (
-        <p className="text-whisper text-sumi-mist mt-1 line-clamp-2">
+      <div className="mt-2 flex items-center justify-between gap-3">
+        <span className="text-whisper text-sumi-diluted truncate">
+          {[commanderLabel, sourceLabel(quest.source)].filter(Boolean).join(' • ')}
+        </span>
+        <span className="text-whisper text-sumi-diluted shrink-0">{questTimeLabel(quest, status)}</span>
+      </div>
+
+      {expanded && note && (
+        <p className="text-whisper text-sumi-mist mt-2 whitespace-pre-wrap">
           {status === 'done' ? 'Completed:' : status === 'failed' ? 'Failed:' : 'Note:'} {note}
         </p>
       )}
 
-      {questArtifacts.length > 0 && (
+      {expanded && questArtifacts.length > 0 && (
         <div className="mt-2 flex flex-wrap gap-1.5">
           {questArtifacts.map((artifact, index) => {
             const isHttp = /^https?:\/\//i.test(artifact.href)
@@ -408,23 +439,20 @@ function QuestCard({
           })}
         </div>
       )}
-
-      <div className="mt-2 flex items-center justify-between gap-3">
-        <span className="text-whisper text-sumi-diluted truncate">{sourceLabel(quest.source)}</span>
-        <span className="text-whisper text-sumi-diluted shrink-0">{questTimeLabel(quest, status)}</span>
-      </div>
     </article>
   )
 }
 
 export function QuestBoard({
-  commander,
+  commanders,
+  selectedCommanderId,
 }: {
-  commander: CommanderSession | null
+  commanders: QuestBoardCommander[]
+  selectedCommanderId: string | null
 }) {
   const queryClient = useQueryClient()
   const [showForm, setShowForm] = useState(false)
-  const [completedOpen, setCompletedOpen] = useState(false)
+  const [filterCommanderId, setFilterCommanderId] = useState<string | null>(selectedCommanderId)
   const [instruction, setInstruction] = useState('')
   const [source, setSource] = useState<QuestSource>('manual')
   const [githubIssueUrl, setGithubIssueUrl] = useState('')
@@ -440,29 +468,72 @@ export function QuestBoard({
   const [formError, setFormError] = useState<string | null>(null)
   const [fetchingIssue, setFetchingIssue] = useState(false)
   const [deletingQuestId, setDeletingQuestId] = useState<string | null>(null)
+  const [expandedQuestIds, setExpandedQuestIds] = useState<string[]>([])
+
+  useEffect(() => {
+    if (filterCommanderId === 'all') {
+      return
+    }
+    if (filterCommanderId && commanders.some((commander) => commander.id === filterCommanderId)) {
+      return
+    }
+    if (!selectedCommanderId && commanders.length === 0) {
+      return
+    }
+    setFilterCommanderId(selectedCommanderId ?? commanders[0]?.id ?? 'all')
+  }, [commanders, filterCommanderId, selectedCommanderId])
+
+  useEffect(() => {
+    if (filterCommanderId === 'all') {
+      setShowForm(false)
+    }
+  }, [filterCommanderId])
+
+  const activeFilterCommanderId = filterCommanderId ?? 'all'
+  const selectedCommander = activeFilterCommanderId === 'all'
+    ? null
+    : commanders.find((commander) => commander.id === activeFilterCommanderId) ?? null
+  const commanderLabels = useMemo(
+    () => new Map(commanders.map((commander) => [commander.id, commander.host])),
+    [commanders],
+  )
 
   const questsQuery = useQuery({
-    queryKey: ['commanders', 'quests', commander?.id ?? 'none'],
-    queryFn: () => fetchCommanderQuests(commander!.id),
-    enabled: Boolean(commander?.id),
+    queryKey: ['commanders', 'quests', activeFilterCommanderId],
+    queryFn: () => (
+      activeFilterCommanderId === 'all'
+        ? fetchAllCommanderQuests()
+        : fetchCommanderQuests(activeFilterCommanderId)
+    ),
+    enabled: activeFilterCommanderId === 'all' || Boolean(selectedCommander?.id),
     refetchInterval: 10_000,
   })
 
   const createQuestMutation = useMutation({
     mutationFn: createCommanderQuest,
     onSuccess: async (_createdQuest, input) => {
-      await queryClient.invalidateQueries({
-        queryKey: ['commanders', 'quests', input.commanderId],
-      })
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ['commanders', 'quests', input.commanderId],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ['commanders', 'quests', 'all'],
+        }),
+      ])
     },
   })
 
   const deleteQuestMutation = useMutation({
     mutationFn: deleteCommanderQuest,
     onSuccess: async (_data, input) => {
-      await queryClient.invalidateQueries({
-        queryKey: ['commanders', 'quests', input.commanderId],
-      })
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ['commanders', 'quests', input.commanderId],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ['commanders', 'quests', 'all'],
+        }),
+      ])
     },
   })
 
@@ -500,7 +571,7 @@ export function QuestBoard({
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault()
-    if (!commander) {
+    if (!selectedCommander) {
       return
     }
 
@@ -531,7 +602,7 @@ export function QuestBoard({
     setFormError(null)
     try {
       await createQuestMutation.mutateAsync({
-        commanderId: commander.id,
+        commanderId: selectedCommander.id,
         instruction: trimmedInstruction,
         source,
         ...(trimmedGitHubIssueUrl ? { githubIssueUrl: trimmedGitHubIssueUrl } : {}),
@@ -577,13 +648,14 @@ export function QuestBoard({
   }
 
   async function handleDelete(quest: CommanderQuest): Promise<void> {
-    if (!commander) {
+    const commanderId = quest.commanderId ?? selectedCommander?.id
+    if (!commanderId) {
       return
     }
     setDeletingQuestId(quest.id)
     try {
       await deleteQuestMutation.mutateAsync({
-        commanderId: commander.id,
+        commanderId,
         questId: quest.id,
       })
     } finally {
@@ -591,38 +663,67 @@ export function QuestBoard({
     }
   }
 
+  function toggleQuestExpanded(questId: string): void {
+    setExpandedQuestIds((current) => (
+      current.includes(questId)
+        ? current.filter((entry) => entry !== questId)
+        : [...current, questId]
+    ))
+  }
+
   const quests = questsQuery.data ?? []
-  const pendingQuests = sortByMostRecent(quests.filter((quest) => normalizeStatus(quest.status) === 'pending'))
-  const activeQuests = sortByMostRecent(quests.filter((quest) => {
-    const status = normalizeStatus(quest.status)
-    return status === 'active' || status === 'unknown'
-  }))
-  const completedQuests = sortByMostRecent(quests.filter((quest) => {
-    const status = normalizeStatus(quest.status)
-    return status === 'done' || status === 'failed'
-  }))
-  const nowMillis = Date.now()
-  const recentCompletedQuests = completedQuests.filter((quest) => isCompletedWithin24Hours(quest, nowMillis))
-  const olderCompletedQuests = completedQuests.filter((quest) => !isCompletedWithin24Hours(quest, nowMillis))
+  const kanbanColumns: Array<{ key: QuestStatus; title: string; emptyLabel: string }> = [
+    { key: 'pending', title: 'Pending', emptyLabel: 'No pending quests.' },
+    { key: 'active', title: 'Active', emptyLabel: 'No active quests.' },
+    { key: 'done', title: 'Done', emptyLabel: 'No completed quests.' },
+    { key: 'failed', title: 'Failed', emptyLabel: 'No failed quests.' },
+  ]
+  const questsByStatus = Object.fromEntries(
+    kanbanColumns.map(({ key }) => [
+      key,
+      sortByMostRecent(quests.filter((quest) => toKanbanStatus(quest.status) === key)),
+    ]),
+  ) as Record<QuestStatus, CommanderQuest[]>
   const apiError = toErrorMessage(questsQuery.error) ?? toErrorMessage(createQuestMutation.error)
 
   return (
     <section className="card-sumi min-h-[16rem] xl:h-full overflow-hidden flex flex-col xl:min-h-0">
-      <header className="px-4 py-3 border-b border-ink-border bg-washi-aged/60 flex items-center justify-between gap-3">
-        <h3 className="section-title">Quest Board</h3>
+      <div className="px-3 pt-3 pb-1 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+        <div className="space-y-1">
+          <label
+            className="block text-whisper text-sumi-diluted uppercase tracking-wider"
+            htmlFor="quests-commander-filter"
+          >
+            Commander
+          </label>
+          <select
+            id="quests-commander-filter"
+            value={activeFilterCommanderId}
+            onChange={(event) => setFilterCommanderId(event.target.value)}
+            className="w-full min-w-[15rem] rounded border border-ink-border bg-washi-white px-3 py-2 text-sm text-sumi-black focus:outline-none focus:border-sumi-black/40"
+          >
+            <option value="all">All commanders</option>
+            {commanders.map((commander) => (
+              <option key={commander.id} value={commander.id}>
+                {commander.host} ({commander.id.slice(0, 8)})
+              </option>
+            ))}
+          </select>
+        </div>
+
         <button
           type="button"
           onClick={() => setShowForm((current) => !current)}
-          disabled={!commander}
+          disabled={!selectedCommander}
           className="btn-ghost !px-3 !py-1.5 text-xs inline-flex min-h-[44px] items-center gap-1.5 disabled:opacity-60 disabled:cursor-not-allowed"
         >
           <Plus size={12} />
           {showForm ? 'Close' : 'Add Quest'}
         </button>
-      </header>
+      </div>
 
       <ModalFormContainer
-        open={Boolean(commander && showForm)}
+        open={Boolean(selectedCommander && showForm)}
         title="Add Quest"
         onClose={() => setShowForm(false)}
       >
@@ -661,120 +762,45 @@ export function QuestBoard({
       </ModalFormContainer>
 
       <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-3">
-        {!commander && (
-          <p className="text-sm text-sumi-diluted">Select a commander to view quests.</p>
+        {commanders.length === 0 && (
+          <p className="text-sm text-sumi-diluted">Create a commander to start tracking quests.</p>
         )}
 
-        {commander && questsQuery.isLoading && quests.length === 0 && (
+        {commanders.length > 0 && questsQuery.isLoading && quests.length === 0 && (
           <div className="flex items-center justify-center h-28">
             <div className="w-3 h-3 rounded-full bg-sumi-mist animate-breathe" />
           </div>
         )}
 
-        {commander && !questsQuery.isLoading && quests.length === 0 && !apiError && (
-          <p className="text-sm text-sumi-diluted">No quests created for this commander.</p>
-        )}
-
-        {commander && quests.length > 0 && (
-          <div className="space-y-3">
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              <section className="space-y-2">
+        {commanders.length > 0 && !questsQuery.isLoading && !apiError && (
+          <div className="grid grid-cols-1 gap-3 xl:grid-cols-4">
+            {kanbanColumns.map((column) => {
+              const columnQuests = questsByStatus[column.key]
+              return (
+                <section key={column.key} className="space-y-2">
                 <div className="flex items-center justify-between rounded-lg border border-ink-border bg-washi-aged/60 px-3 py-2">
-                  <p className="text-whisper uppercase tracking-wide text-sumi-diluted">Pending</p>
-                  <span className="font-mono text-whisper text-sumi-mist">{pendingQuests.length}</span>
+                    <p className="text-whisper uppercase tracking-wide text-sumi-diluted">{column.title}</p>
+                    <span className="font-mono text-whisper text-sumi-mist">{columnQuests.length}</span>
                 </div>
-                {pendingQuests.length === 0 && (
+                  {columnQuests.length === 0 && (
                   <p className="rounded-lg border border-dashed border-ink-border px-3 py-2 text-whisper text-sumi-diluted">
-                    No pending quests.
+                      {column.emptyLabel}
                   </p>
                 )}
-                {pendingQuests.map((quest) => (
+                  {columnQuests.map((quest) => (
                   <QuestCard
                     key={quest.id}
                     quest={quest}
+                      commanderLabel={commanderLabels.get(quest.commanderId ?? '') ?? null}
+                      expanded={expandedQuestIds.includes(quest.id)}
+                      onToggleExpanded={toggleQuestExpanded}
                     isDeleting={deleteQuestMutation.isPending || deletingQuestId === quest.id}
                     onDelete={handleDelete}
                   />
                 ))}
               </section>
-
-              <section className="space-y-2">
-                <div className="flex items-center justify-between rounded-lg border border-ink-border bg-washi-aged/60 px-3 py-2">
-                  <p className="text-whisper uppercase tracking-wide text-sumi-diluted">Active</p>
-                  <span className="font-mono text-whisper text-sumi-mist">{activeQuests.length}</span>
-                </div>
-                {activeQuests.length === 0 && (
-                  <p className="rounded-lg border border-dashed border-ink-border px-3 py-2 text-whisper text-sumi-diluted">
-                    No active quests.
-                  </p>
-                )}
-                {activeQuests.map((quest) => (
-                  <QuestCard
-                    key={quest.id}
-                    quest={quest}
-                    isDeleting={deleteQuestMutation.isPending || deletingQuestId === quest.id}
-                    onDelete={handleDelete}
-                  />
-                ))}
-              </section>
-            </div>
-
-            <section className="space-y-2">
-              <div className="flex items-center justify-between rounded-lg border border-ink-border bg-washi-aged/60 px-3 py-2">
-                <p className="text-whisper uppercase tracking-wide text-sumi-diluted">Completed</p>
-                <span className="font-mono text-whisper text-sumi-mist">
-                  {completedQuests.length} completed
-                </span>
-              </div>
-
-              {recentCompletedQuests.length === 0 && completedQuests.length === 0 && (
-                <p className="rounded-lg border border-dashed border-ink-border px-3 py-2 text-whisper text-sumi-diluted">
-                  No completed quests yet.
-                </p>
-              )}
-
-              {recentCompletedQuests.map((quest) => (
-                <QuestCard
-                  key={quest.id}
-                  quest={quest}
-                  isDeleting={deleteQuestMutation.isPending || deletingQuestId === quest.id}
-                  onDelete={handleDelete}
-                />
-              ))}
-
-              {olderCompletedQuests.length > 0 && (
-                <details
-                  open={completedOpen}
-                  onToggle={(event) => {
-                    setCompletedOpen(event.currentTarget.open)
-                  }}
-                  className="rounded-lg border border-ink-border bg-washi-aged/40"
-                >
-                  <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-xs text-sumi-diluted">
-                    <ChevronUp
-                      size={14}
-                      className={cn(
-                        'transition-transform duration-200',
-                        completedOpen ? '' : 'rotate-180',
-                      )}
-                    />
-                    <span className="font-mono">
-                      {olderCompletedQuests.length} older completed quest{olderCompletedQuests.length !== 1 ? 's' : ''} (&gt;24h)
-                    </span>
-                  </summary>
-                  <div className="space-y-2 border-t border-ink-border px-2 py-2">
-                    {olderCompletedQuests.map((quest) => (
-                      <QuestCard
-                        key={quest.id}
-                        quest={quest}
-                        isDeleting={deleteQuestMutation.isPending || deletingQuestId === quest.id}
-                        onDelete={handleDelete}
-                      />
-                    ))}
-                  </div>
-                </details>
-              )}
-            </section>
+              )
+            })}
           </div>
         )}
       </div>

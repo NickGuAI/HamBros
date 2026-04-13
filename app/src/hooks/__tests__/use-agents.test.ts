@@ -5,7 +5,6 @@ import {
   killSession,
   triggerPreKillDebrief,
   getDebriefStatus,
-  resetSession,
 } from '@/hooks/use-agents'
 
 vi.mock('@/lib/api', () => ({
@@ -101,26 +100,3 @@ describe('getDebriefStatus', () => {
   })
 })
 
-describe('resetSession', () => {
-  beforeEach(() => {
-    vi.mocked(fetchJson).mockReset()
-  })
-
-  it('posts to the dedicated reset endpoint', async () => {
-    vi.mocked(fetchJson).mockResolvedValue({ reset: true })
-
-    await expect(resetSession('commander-alpha')).resolves.toEqual({ reset: true })
-
-    expect(fetchJson).toHaveBeenCalledWith('/api/agents/sessions/commander-alpha/reset', {
-      method: 'POST',
-    })
-  })
-
-  it('rejects when the server does not acknowledge reset', async () => {
-    vi.mocked(fetchJson).mockResolvedValue({})
-
-    await expect(resetSession('commander-alpha')).rejects.toThrow(
-      'Session reset was not acknowledged by server',
-    )
-  })
-})

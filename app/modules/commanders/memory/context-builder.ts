@@ -323,6 +323,13 @@ export class MemoryContextBuilder {
       .slice(-4)
       .map((message) => `${message.role}: ${message.content}`)
       .join('\n')
+    if (!task && cues.trim().length === 0) {
+      return {
+        content: '### Cue-based Recollection\n_No relevant recollections found._',
+        skillsMatched: [],
+      }
+    }
+
     const recollection = await this.recollection.recall({
       cue: cues,
       task,

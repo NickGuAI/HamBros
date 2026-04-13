@@ -2,10 +2,11 @@ import type { AskQuestion } from '@/types'
 
 export const MAX_CLIENT_MESSAGES = 500
 export const SUBAGENT_WORKING_LABEL = 'subagent working…'
+export type PlanningAction = 'enter' | 'proposed' | 'decision'
 
 export interface MsgItem {
   id: string
-  kind: 'system' | 'user' | 'thinking' | 'agent' | 'tool' | 'ask'
+  kind: 'system' | 'user' | 'thinking' | 'agent' | 'tool' | 'ask' | 'planning'
   text: string
   timestamp?: string
   children?: MsgItem[]
@@ -26,6 +27,11 @@ export interface MsgItem {
   askQuestions?: AskQuestion[]
   askAnswered?: boolean
   askSubmitting?: boolean
+  // planning-specific (kind === 'planning')
+  planningAction?: PlanningAction
+  planningPlan?: string
+  planningApproved?: boolean | null
+  planningMessage?: string
 }
 
 /** Cap an array of messages to prevent unbounded memory growth. */

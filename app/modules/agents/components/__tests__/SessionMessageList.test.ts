@@ -57,3 +57,83 @@ describe('SessionMessageList thinking blocks', () => {
     container.remove()
   })
 })
+
+describe('SessionMessageList planning blocks', () => {
+  it('renders enter, proposed, and decision planning messages with collapsible plan text', () => {
+    const container = document.createElement('div')
+    document.body.appendChild(container)
+    const root = createRoot(container)
+
+    const messages: MsgItem[] = [
+      {
+        id: 'planning-enter',
+        kind: 'planning',
+        text: '',
+        planningAction: 'enter',
+      },
+      {
+        id: 'planning-proposed',
+        kind: 'planning',
+        text: '',
+        planningAction: 'proposed',
+        planningPlan: '1. Capture the event\n2. Render the plan',
+      },
+      {
+        id: 'planning-decision',
+        kind: 'planning',
+        text: '',
+        planningAction: 'decision',
+        planningApproved: true,
+        planningMessage: 'Looks good. Continue.',
+      },
+      {
+        id: 'ask-1',
+        kind: 'ask',
+        text: '',
+        toolId: 'ask-tool-1',
+        toolName: 'AskUserQuestion',
+        askQuestions: [
+          {
+            question: 'Keep ask rendering?',
+            header: 'Plan',
+            options: [{ label: 'Yes', description: 'Keep it visible' }],
+            multiSelect: false,
+          },
+        ],
+        askAnswered: false,
+      },
+    ]
+
+    flushSync(() => {
+      root.render(createElement(SessionMessageList, { messages, onAnswer: () => undefined }))
+    })
+
+    expect(container.textContent).toContain('Agent entered plan mode')
+    expect(container.textContent).toContain('Proposed Plan')
+    expect(container.textContent).toContain('Capture the event')
+    expect(container.textContent).toContain('Approved')
+    expect(container.textContent).toContain('Looks good. Continue.')
+    expect(container.textContent).toContain('Keep ask rendering?')
+
+    const buttons = Array.from(container.querySelectorAll('button'))
+    const proposedToggle = buttons.find((button) => button.textContent?.includes('Proposed Plan'))
+    if (!proposedToggle) {
+      throw new Error('expected proposed plan toggle button')
+    }
+
+    flushSync(() => {
+      proposedToggle.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    expect(container.textContent).not.toContain('Capture the event')
+
+    flushSync(() => {
+      proposedToggle.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    expect(container.textContent).toContain('Capture the event')
+
+    flushSync(() => {
+      root.unmount()
+    })
+    container.remove()
+  })
+})

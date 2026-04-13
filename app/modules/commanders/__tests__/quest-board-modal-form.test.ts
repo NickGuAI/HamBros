@@ -41,13 +41,20 @@ describe('QuestBoard modal form', () => {
   it('renders the extracted quest create form in modal mode', () => {
     const html = renderToStaticMarkup(
       createElement(QuestBoard, {
-        commander: {
+        commanders: [{
           id: 'commander-1',
-        },
+          host: 'Athena',
+        }],
+        selectedCommanderId: 'commander-1',
       }),
     )
 
+    expect(html).toContain('Commander')
     expect(html).toContain('Add Quest')
+    expect(html).toContain('Pending')
+    expect(html).toContain('Active')
+    expect(html).toContain('Done')
+    expect(html).toContain('Failed')
     expect(html).toContain('Source')
     expect(html).toContain('Instruction')
     expect(html).toContain('skills (comma-separated)')

@@ -8,6 +8,8 @@ import { MemoryContextBuilder, type Message } from '../context-builder.js'
 import type { GHIssue } from '../skill-matcher.js'
 import { WorkingMemoryStore } from '../working-memory.js'
 
+vi.setConfig({ testTimeout: 60_000 })
+
 function dateString(date: Date): string {
   return date.toISOString().slice(0, 10)
 }

@@ -2,6 +2,11 @@ import { memo, type FormEvent, type ReactNode, useEffect, useState } from 'react
 import { AlertTriangle, Plus } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { AgentSession, AgentType, ClaudePermissionMode, Machine, SessionType } from '@/types'
+import {
+  CLAUDE_EFFORT_LEVELS,
+  DEFAULT_CLAUDE_EFFORT_LEVEL,
+  type ClaudeEffortLevel,
+} from '../../claude-effort.js'
 import { ScheduleExpressionField } from '../../components/ScheduleExpressionField'
 import { DirectoryPicker } from './DirectoryPicker'
 
@@ -39,7 +44,21 @@ export const CODEX_MODE_OPTIONS: Array<{
   },
 ]
 
-const DEFAULT_AGENT_OPTIONS: AgentType[] = ['claude', 'codex', 'openclaw']
+export const GEMINI_MODE_OPTIONS: Array<{
+  value: ClaudePermissionMode
+  label: string
+  description: string
+}> = [
+  { value: 'default', label: 'default', description: 'gemini --acp (mode: default)' },
+  { value: 'acceptEdits', label: 'autoEdit', description: 'gemini --acp (mode: autoEdit)' },
+  {
+    value: 'dangerouslySkipPermissions',
+    label: 'yolo',
+    description: 'gemini --acp (mode: yolo)',
+  },
+]
+
+const DEFAULT_AGENT_OPTIONS: AgentType[] = ['claude', 'codex', 'gemini', 'openclaw']
 const NOOP_SET_STRING = (_value: string): undefined => undefined
 
 function getResumeSourceStateLabel(session: AgentSession | null): string {
@@ -69,6 +88,8 @@ function NewSessionFormComponent({
   setMode,
   task,
   setTask,
+  effort,
+  setEffort,
   agentType,
   setAgentType,
   sessionType,
@@ -108,6 +129,8 @@ function NewSessionFormComponent({
   setMode: (v: ClaudePermissionMode) => void
   task: string
   setTask: (v: string) => void
+  effort: ClaudeEffortLevel
+  setEffort: (v: ClaudeEffortLevel) => void
   agentType: AgentType
   setAgentType: (v: AgentType) => void
   sessionType: SessionType
@@ -201,6 +224,18 @@ function NewSessionFormComponent({
     }
   }, [agentType, showOpenClaw])
 
+  useEffect(() => {
+    if (agentType === 'gemini' && sessionType !== 'stream') {
+      setSessionType('stream')
+    }
+  }, [agentType, sessionType, setSessionType])
+
+  useEffect(() => {
+    if (agentType !== 'claude' && effort !== DEFAULT_CLAUDE_EFFORT_LEVEL) {
+      setEffort(DEFAULT_CLAUDE_EFFORT_LEVEL)
+    }
+  }, [agentType, effort, setEffort])
+
   return (
     <form onSubmit={onSubmit} className="space-y-3">
       <div>
@@ -230,14 +265,18 @@ function NewSessionFormComponent({
         <div>
           <label className="section-title block mb-2">Session Type</label>
           <div className="flex gap-2">
-            {([
-              { value: 'stream', label: 'Stream', description: 'Chat UI, supports resume' },
-              { value: 'pty', label: 'PTY', description: 'Terminal UI, no resume' },
-            ] as const).map((option) => (
+            {(
+              agentType === 'gemini'
+                ? [{ value: 'stream', label: 'Stream', description: 'ACP chat UI, supports resume' }]
+                : [
+                    { value: 'stream', label: 'Stream', description: 'Chat UI, supports resume' },
+                    { value: 'pty', label: 'PTY', description: 'Terminal UI, no resume' },
+                  ]
+            ).map((option) => (
               <button
                 key={option.value}
                 type="button"
-                onClick={() => setSessionType(option.value)}
+                onClick={() => setSessionType(option.value as SessionType)}
                 disabled={resumeLocked}
                 className={cn(
                   'flex-1 text-left rounded-lg border px-3 py-2 transition-colors min-h-[44px]',
@@ -265,6 +304,11 @@ function NewSessionFormComponent({
               <span>PTY sessions cannot be resumed after server restart</span>
             </div>
           )}
+          {agentType === 'gemini' && (
+            <div className="mt-2 flex items-start gap-2 rounded-lg bg-sky-500/10 px-3 py-2 text-xs text-sky-700">
+              <span>Gemini uses ACP-backed stream sessions only.</span>
+            </div>
+          )}
         </div>
       )}
 
@@ -284,7 +328,7 @@ function NewSessionFormComponent({
             ))}
           </select>
           <p className="mt-1 text-whisper text-sumi-mist">
-            Only resumable Claude and Codex sessions appear here.
+            Only resumable Claude, Codex, and Gemini sessions appear here.
           </p>
           {resumeSource && (
             <div className="mt-2 rounded-lg border border-ink-border bg-washi-aged/70 px-3 py-2 text-sm text-sumi-gray">
@@ -402,7 +446,9 @@ function NewSessionFormComponent({
       <div>
         <label className="section-title block mb-2">Permission Mode</label>
         <div className="grid gap-2">
-          {(agentType === 'codex' ? CODEX_MODE_OPTIONS : CLAUDE_MODE_OPTIONS).map((option) => (
+          {(agentType === 'codex'
+            ? CODEX_MODE_OPTIONS
+            : (agentType === 'gemini' ? GEMINI_MODE_OPTIONS : CLAUDE_MODE_OPTIONS)).map((option) => (
             <button
               key={option.value}
               type="button"
@@ -427,6 +473,28 @@ function NewSessionFormComponent({
           ))}
         </div>
       </div>
+      )}
+
+      {agentType === 'claude' && (
+        <div>
+          <label className="section-title block mb-2">Claude Effort</label>
+          <select
+            value={effort}
+            onChange={(event) => setEffort(event.target.value as ClaudeEffortLevel)}
+            disabled={resumeLocked}
+            className={cn(
+              'w-full px-3 py-2 rounded-lg border border-ink-border bg-washi-aged text-[16px] md:text-sm focus:outline-none focus:border-ink-border-hover',
+              resumeLocked && 'cursor-not-allowed opacity-60',
+            )}
+          >
+            {CLAUDE_EFFORT_LEVELS.map((level) => (
+              <option key={level} value={level}>{level}</option>
+            ))}
+          </select>
+          <p className="mt-1 text-whisper text-sumi-mist">
+            Default is `max`. Resume reuses the selected session’s Claude effort.
+          </p>
+        </div>
       )}
 
       {beforeTaskField}

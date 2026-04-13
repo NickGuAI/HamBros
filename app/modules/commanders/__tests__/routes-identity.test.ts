@@ -144,6 +144,10 @@ describe('commanders identity routes', () => {
       expect(commanderMdOnDisk).toContain('host: "identity-worker"')
       expect(commanderMdOnDisk).toContain('cwd: "/workspace/example-repo"')
 
+      const workflowMdPath = join(memoryBasePath, created.id, 'COMMANDER.md')
+      const workflowMdOnDisk = await readFile(workflowMdPath, 'utf8')
+      expect(workflowMdOnDisk).toContain(`hammurabi memory find --commander ${created.id}`)
+
       const listResponse = await fetch(`${server.baseUrl}/api/commanders`, {
         headers: AUTH_HEADERS,
       })
@@ -157,8 +161,14 @@ describe('commanders identity routes', () => {
         headers: AUTH_HEADERS,
       })
       expect(detailResponse.status).toBe(200)
-      const detail = (await detailResponse.json()) as { commanderMd?: string | null }
-      expect(detail.commanderMd).toBe(commanderMdOnDisk)
+      const detail = (await detailResponse.json()) as {
+        commanderMd?: string | null
+        identityMd?: string | null
+        workflowMd?: string | null
+      }
+      expect(detail.commanderMd).toBe(workflowMdOnDisk)
+      expect(detail.workflowMd).toBe(workflowMdOnDisk)
+      expect(detail.identityMd).toBe(commanderMdOnDisk)
     } finally {
       await server.close()
     }

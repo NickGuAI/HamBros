@@ -1,0 +1,14 @@
+{
+  "sentinelId": "527f0199-a0b8-4685-a8f2-a0145506339a",
+  "sentinelName": "aria-birthday-venue-monitor",
+  "runNumber": 2,
+  "timestamp": "2026-04-09T04:29:00.325Z",
+  "action": "ERROR",
+  "result": "Session \"sentinel-aria-birthday-venue-monitor-2026-04-09T04-00-00-031Z\" did not complete after 30 status checks",
+  "costUsd": 0,
+  "durationSec": 1740,
+  "sessionId": "sentinel-aria-birthday-venue-monitor-2026-04-09T04-00-00-031Z",
+  "memoryUpdated": false,
+  "status": "timeout",
+  "source": "cron"
+}

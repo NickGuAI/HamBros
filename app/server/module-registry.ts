@@ -41,6 +41,7 @@ export interface HammurabiModule {
   routePrefix: string
   router: Router
   handleUpgrade?: (req: IncomingMessage, socket: Duplex, head: Buffer) => void
+  shutdown?: () => Promise<void> | void
 }
 
 interface ModuleRegistryOptions {
@@ -229,6 +230,7 @@ export function createModules(options: ModuleRegistryOptions = {}): ModuleRegist
       routePrefix: '/api/agents',
       router: agents.router,
       handleUpgrade: agents.handleUpgrade,
+      shutdown: agents.sessionsInterface.shutdown,
     },
     {
       name: 'commanders',

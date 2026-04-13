@@ -97,7 +97,7 @@ function parseOptionalModel(
 }
 
 function parseAgentType(raw: unknown): CommandRoomAgentType | null {
-  if (raw === 'claude' || raw === 'codex') {
+  if (raw === 'claude' || raw === 'codex' || raw === 'gemini') {
     return raw
   }
   return null
@@ -286,7 +286,7 @@ export function createCommandRoomRouter(
 
     const agentType = parseAgentType(req.body?.agentType)
     if (!agentType) {
-      res.status(400).json({ error: 'agentType must be claude or codex' })
+      res.status(400).json({ error: 'agentType must be claude, codex, or gemini' })
       return
     }
 
@@ -412,7 +412,7 @@ export function createCommandRoomRouter(
     if ('agentType' in body) {
       const agentType = parseAgentType(body.agentType)
       if (!agentType) {
-        res.status(400).json({ error: 'agentType must be claude or codex' })
+        res.status(400).json({ error: 'agentType must be claude, codex, or gemini' })
         return
       }
       update.agentType = agentType

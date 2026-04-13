@@ -27,7 +27,7 @@ interface MachineHealthPayload {
     ok: boolean
     destination?: string
   }
-  tools: Record<'claude' | 'codex' | 'git' | 'node', MachineToolStatus>
+  tools: Record<'claude' | 'codex' | 'gemini' | 'git' | 'node', MachineToolStatus>
 }
 
 interface AddOptions {
@@ -70,11 +70,12 @@ export interface MachinesCliDependencies {
 const TOOL_PACKAGE_NAMES = {
   claude: '@anthropic-ai/claude-code',
   codex: '@openai/codex',
+  gemini: '@google/gemini-cli',
 } as const
 
 type BootstrapTool = keyof typeof TOOL_PACKAGE_NAMES
 
-const DEFAULT_BOOTSTRAP_TOOLS: BootstrapTool[] = ['claude', 'codex']
+const DEFAULT_BOOTSTRAP_TOOLS: BootstrapTool[] = ['claude', 'codex', 'gemini']
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
@@ -207,6 +208,7 @@ function parseHealth(payload: unknown): MachineHealthPayload | null {
   const tools: MachineHealthPayload['tools'] = {
     claude: parseToolStatus(toolsRaw.claude),
     codex: parseToolStatus(toolsRaw.codex),
+    gemini: parseToolStatus(toolsRaw.gemini),
     git: parseToolStatus(toolsRaw.git),
     node: parseToolStatus(toolsRaw.node),
   }

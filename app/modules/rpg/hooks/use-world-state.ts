@@ -4,7 +4,7 @@ import { fetchJson } from '../../../src/lib/api'
 export type WorldAgentStatus = 'active' | 'idle' | 'stale' | 'completed'
 export type WorldAgentPhase = 'idle' | 'thinking' | 'tool_use' | 'blocked' | 'completed'
 export type SessionType = 'pty' | 'stream'
-export type AgentType = 'claude' | 'codex'
+export type AgentType = 'claude' | 'codex' | 'gemini'
 
 export interface WorldAgent {
   id: string

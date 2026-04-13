@@ -1,5 +1,5 @@
 /** Supported agent providers */
-export type AgentProvider = 'claude' | 'codex'
+export type AgentProvider = 'claude' | 'codex' | 'gemini'
 
 /** MCP server configuration (stdio or remote) */
 export interface McpServerConfig {

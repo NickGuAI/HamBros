@@ -127,6 +127,87 @@ function ThinkingBlock({ text }: { text: string }) {
   )
 }
 
+function PlanningBlock({ msg }: { msg: MsgItem }) {
+  const [expanded, setExpanded] = useState(true)
+  const action = msg.planningAction ?? 'enter'
+
+  if (action === 'enter') {
+    return (
+      <div className="rounded border border-amber-200/15 bg-amber-500/[0.06] px-3 py-2">
+        <div className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.2em] text-amber-100/70">
+          <FileText size={11} className="shrink-0 text-amber-200/80" />
+          <span>Agent entered plan mode</span>
+        </div>
+      </div>
+    )
+  }
+
+  if (action === 'proposed') {
+    return (
+      <div className="rounded border border-white/10 bg-white/[0.03]">
+        <button
+          type="button"
+          onClick={() => setExpanded((prev) => !prev)}
+          className="flex w-full items-center gap-2 px-3 py-2 text-left"
+        >
+          <FileText size={12} className="shrink-0 text-amber-200/80" />
+          <span className="font-mono text-[10px] uppercase tracking-[0.2em] text-white/55">
+            Proposed Plan
+          </span>
+          <ChevronRight
+            size={12}
+            className={cn('ml-auto shrink-0 text-white/40 transition-transform', expanded && 'rotate-90')}
+          />
+        </button>
+        {expanded && (
+          <div className="border-t border-white/8 px-3 py-3">
+            <div className="prose prose-invert prose-sm max-w-none break-words text-zinc-100">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                {msg.planningPlan ?? msg.text}
+              </ReactMarkdown>
+            </div>
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  if (action !== 'decision') {
+    return null
+  }
+
+  const decisionLabel =
+    msg.planningApproved === true
+      ? 'Approved'
+      : msg.planningApproved === false
+        ? 'Rejected'
+        : 'Decision recorded'
+  const decisionClass =
+    msg.planningApproved === true
+      ? 'border-emerald-300/20 bg-emerald-500/8 text-emerald-300/80'
+      : msg.planningApproved === false
+        ? 'border-red-300/20 bg-red-500/8 text-red-300/80'
+        : 'border-white/10 bg-white/[0.04] text-white/65'
+  const DecisionIcon = msg.planningApproved === false ? AlertTriangle : Check
+  const decisionMessage = (msg.planningMessage ?? msg.text).trim()
+
+  return (
+    <div className="rounded border border-white/10 bg-white/[0.03] px-3 py-2.5">
+      <div className="flex items-center gap-2">
+        <span className={cn('inline-flex items-center gap-1.5 rounded-full border px-2 py-1 font-mono text-[10px] uppercase tracking-[0.18em]', decisionClass)}>
+          <DecisionIcon size={10} />
+          {decisionLabel}
+        </span>
+      </div>
+      {decisionMessage && (
+        <div className="mt-2 border-t border-white/8 pt-2 text-sm leading-relaxed text-white/70 whitespace-pre-wrap break-words">
+          {decisionMessage}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function isAgentAccentColor(value: string): boolean {
   const t = value.trim()
   if (t.length > 80) {
@@ -321,6 +402,9 @@ function ToolBlock({ msg, nested = false }: { msg: MsgItem; nested?: boolean }) 
                   }
                   if (child.kind === 'thinking') {
                     return <ThinkingBlock key={child.id} text={child.text} />
+                  }
+                  if (child.kind === 'planning') {
+                    return <PlanningBlock key={child.id} msg={child} />
                   }
                   if (child.kind === 'user') {
                     return <UserMessage key={child.id} text={child.text} images={child.images} />
@@ -535,6 +619,8 @@ export function SessionMessageList({
             return <UserMessage key={msg.id} text={msg.text} images={msg.images} />
           case 'thinking':
             return <ThinkingBlock key={msg.id} text={msg.text} />
+          case 'planning':
+            return <PlanningBlock key={msg.id} msg={msg} />
           case 'agent':
             return (
               <AgentMessage

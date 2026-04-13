@@ -23,7 +23,6 @@ import {
   Zap,
   Mic,
   Paperclip,
-  RotateCcw,
   MoreVertical,
 } from 'lucide-react'
 import {
@@ -32,7 +31,6 @@ import {
   resumeSession as resumeAgentSession,
   triggerPreKillDebrief,
   getDebriefStatus,
-  resetSession,
   useAgentSessions,
   useMachines,
 } from '@/hooks/use-agents'
@@ -54,6 +52,10 @@ import { SkillsPicker } from './components/SkillsPicker'
 import { WorkspaceOverlay } from './components/WorkspaceOverlay'
 import { capMessages } from './components/session-messages'
 import { useStreamEventProcessor } from './components/use-stream-event-processor'
+import {
+  DEFAULT_CLAUDE_EFFORT_LEVEL,
+  type ClaudeEffortLevel,
+} from '../claude-effort.js'
 
 type WorkerStatus = 'running' | 'down' | 'starting' | 'done'
 
@@ -319,6 +321,9 @@ function SessionCard({
           PID {session.pid}
         </span>
         <span>{timeAgo(session.created)}</span>
+        {session.agentType === 'claude' && (
+          <span>effort {session.effort ?? DEFAULT_CLAUDE_EFFORT_LEVEL}</span>
+        )}
       </div>
 
       {shouldShowWorkerSummary && workerSummary && (
@@ -723,8 +728,6 @@ function MobileSessionView({
   const [dispatchTask, setDispatchTask] = useState('')
   const [dispatchError, setDispatchError] = useState<string | null>(null)
   const [isDispatching, setIsDispatching] = useState(false)
-  const [isResetting, setIsResetting] = useState(false)
-  const [resetError, setResetError] = useState<string | null>(null)
   const [pendingImages, setPendingImages] = useState<{ mediaType: string; data: string }[]>([])
   const [dismissedWorkers, setDismissedWorkers] = useState<Set<string>>(new Set())
   const [fileChips, setFileChips] = useState<string[]>([])
@@ -830,8 +833,6 @@ function MobileSessionView({
     setDispatchOpen(false)
     setDispatchError(null)
     setDispatchValue('')
-    setIsResetting(false)
-    setResetError(null)
   }, [sessionName])
 
   const isCommanderSession = sessionName.startsWith('commander-')
@@ -1201,34 +1202,6 @@ function MobileSessionView({
     }
   }
 
-  async function handleResetSession() {
-    if (isResetting) return
-    const confirmed = window.confirm(
-      "Are you sure? This will clear Claude's current context. Memory, journal, and quests are preserved.",
-    )
-    if (!confirmed) return
-
-    setIsResetting(true)
-    setResetError(null)
-
-    try {
-      await resetSession(sessionName)
-      setMessages((prev) => capMessages([
-        ...prev,
-        {
-          id: `system-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          kind: 'system',
-          text: 'Session rotated — Claude context cleared, memory preserved.',
-        },
-      ]))
-      autoScrollRef.current = true
-    } catch (caughtError) {
-      setResetError(formatError(caughtError, 'Failed to reset session'))
-    } finally {
-      setIsResetting(false)
-    }
-  }
-
   async function handleDispatch(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (isDispatching) return
@@ -1443,20 +1416,6 @@ function MobileSessionView({
                   <Power size={13} className="shrink-0" />
                   {isKilling ? 'Killing...' : 'Kill Session'}
                 </button>
-                {isCommanderSession && (
-                  <button
-                    type="button"
-                    className="flex w-full items-center gap-2 px-3 py-2.5 text-left text-xs text-amber-600 transition-colors hover:bg-amber-500/5"
-                    onClick={() => {
-                      setShowOverflowMenu(false)
-                      void handleResetSession()
-                    }}
-                    disabled={isResetting}
-                  >
-                    <RotateCcw size={13} className="shrink-0" />
-                    {isResetting ? 'Resetting...' : 'Reset Session'}
-                  </button>
-                )}
                 <div className="border-t border-ink-border" />
                 <button
                   type="button"
@@ -1474,13 +1433,6 @@ function MobileSessionView({
           )}
         </div>
       </div>
-
-      {resetError && (
-        <div className="mx-3 mt-2 flex items-start gap-2 rounded border border-accent-vermillion/40 bg-accent-vermillion/10 px-3 py-2 text-whisper text-accent-vermillion">
-          <AlertTriangle size={14} className="mt-0.5 shrink-0" />
-          <span>{resetError}</span>
-        </div>
-      )}
 
       {/* Messages area — fills remaining height */}
       <div
@@ -1905,6 +1857,7 @@ export default function AgentsPage() {
   const [name, setName] = useState('')
   const [mode, setMode] = useState<ClaudePermissionMode>('default')
   const [task, setTask] = useState('')
+  const [effort, setEffort] = useState<ClaudeEffortLevel>(DEFAULT_CLAUDE_EFFORT_LEVEL)
   const [cwd, setCwd] = useState('')
   const [resumeFromSession, setResumeFromSession] = useState('')
   const [agentType, setAgentType] = useState<AgentType>('claude')
@@ -1932,7 +1885,7 @@ export default function AgentsPage() {
       if (paramCwd) setCwd(paramCwd)
       if (paramName) setName(paramName)
       if (paramSession) setSelectedSession(paramSession)
-      if (paramAgentType === 'codex' || paramAgentType === 'claude') {
+      if (paramAgentType === 'codex' || paramAgentType === 'claude' || paramAgentType === 'gemini') {
         setAgentType(paramAgentType)
       }
       if (paramCwd || paramName) setShowNewSessionForm(true)
@@ -1989,6 +1942,13 @@ export default function AgentsPage() {
       setCwd(nextCwd)
     }
 
+    if (resumeSource.agentType === 'claude') {
+      const nextEffort = resumeSource.effort ?? DEFAULT_CLAUDE_EFFORT_LEVEL
+      if (effort !== nextEffort) {
+        setEffort(nextEffort)
+      }
+    }
+
     const nextHost = resumeSource.host ?? ''
     if (selectedHost !== nextHost) {
       setSelectedHost(nextHost)
@@ -2013,6 +1973,7 @@ export default function AgentsPage() {
         name: name.trim(),
         mode,
         task: task.trim() || undefined,
+        effort,
         cwd: cwd.trim() || undefined,
         resumeFromSession: resumeFromSession || undefined,
         sessionType,
@@ -2023,6 +1984,7 @@ export default function AgentsPage() {
 
       setName('')
       setTask('')
+      setEffort(DEFAULT_CLAUDE_EFFORT_LEVEL)
       setCwd('')
       setResumeFromSession('')
       setMode('default')
@@ -2038,7 +2000,7 @@ export default function AgentsPage() {
     } finally {
       setIsCreating(false)
     }
-  }, [isCreating, name, mode, task, cwd, agentType, openclawAgentId, sessionType, selectedHost, isMobile, queryClient])
+  }, [isCreating, name, mode, task, effort, cwd, agentType, openclawAgentId, sessionType, selectedHost, isMobile, queryClient])
 
   async function handleKillSession(
     sessionName: string,
@@ -2154,6 +2116,8 @@ export default function AgentsPage() {
                     setMode={setMode}
                     task={task}
                     setTask={setTask}
+                    effort={effort}
+                    setEffort={setEffort}
                     agentType={agentType}
                     setAgentType={setAgentType}
                     openclawAgentId={openclawAgentId}
@@ -2186,6 +2150,8 @@ export default function AgentsPage() {
                   setMode={setMode}
                   task={task}
                   setTask={setTask}
+                  effort={effort}
+                  setEffort={setEffort}
                   agentType={agentType}
                   setAgentType={setAgentType}
                   openclawAgentId={openclawAgentId}

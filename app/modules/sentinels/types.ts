@@ -1,6 +1,6 @@
 export type SentinelStatus = 'active' | 'paused' | 'completed' | 'cancelled'
 
-export type SentinelAgentType = 'claude' | 'codex'
+export type SentinelAgentType = 'claude' | 'codex' | 'gemini'
 
 export interface SentinelHistoryEntry {
   timestamp: string

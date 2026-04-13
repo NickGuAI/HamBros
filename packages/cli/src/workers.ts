@@ -10,7 +10,7 @@ interface DispatchOptions {
   task?: string
   branch?: string
   machine?: string
-  agentType?: 'claude' | 'codex'
+  agentType?: 'claude' | 'codex' | 'gemini'
   workerType?: 'factory' | 'agent'
 }
 
@@ -49,7 +49,7 @@ function printUsage(stdout: Writable): void {
   stdout.write('Usage:\n')
   stdout.write('  hammurabi workers list\n')
   stdout.write(
-    '  hammurabi workers dispatch [--session <name>] [--type factory|agent] [--issue <url>] [--task <text>] [--branch <name>] [--machine <id>] [--agent claude|codex]\n',
+    '  hammurabi workers dispatch [--session <name>] [--type factory|agent] [--issue <url>] [--task <text>] [--branch <name>] [--machine <id>] [--agent claude|codex|gemini]\n',
   )
   stdout.write('  hammurabi workers kill <name>\n')
   stdout.write('  hammurabi workers status <session-name>\n')
@@ -172,7 +172,7 @@ function parseDispatchOptions(args: readonly string[]): DispatchOptions | null {
   let task: string | undefined
   let branch: string | undefined
   let machine: string | undefined
-  let agentType: 'claude' | 'codex' | undefined
+  let agentType: 'claude' | 'codex' | 'gemini' | undefined
   let workerType: 'factory' | 'agent' | undefined
 
   for (let index = 0; index < args.length; index += 1) {
@@ -205,7 +205,7 @@ function parseDispatchOptions(args: readonly string[]): DispatchOptions | null {
     } else if (flag === '--machine') {
       machine = value
     } else if (flag === '--agent') {
-      if (value !== 'claude' && value !== 'codex') {
+      if (value !== 'claude' && value !== 'codex' && value !== 'gemini') {
         return null
       }
       agentType = value

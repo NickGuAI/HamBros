@@ -4,7 +4,7 @@ const DEFAULT_MAX_POLL_ATTEMPTS = 30
 
 export type AgentSessionTransportMode = 'default' | 'acceptEdits' | 'dangerouslySkipPermissions'
 export type AgentSessionKind = 'pty' | 'stream'
-export type AgentType = 'claude' | 'codex'
+export type AgentType = 'claude' | 'codex' | 'gemini'
 
 export type SessionCompletionStatus = 'SUCCESS' | 'PARTIAL' | 'BLOCKED'
 export type SessionRuntimeState = 'queued' | 'running' | 'completed' | 'failed' | 'unknown'

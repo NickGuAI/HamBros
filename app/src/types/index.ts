@@ -1,3 +1,7 @@
+import type { HammurabiEvent } from './hammurabi-events.js'
+import type { ClaudeEffortLevel } from '../../modules/claude-effort.js'
+export type { HammurabiEvent, HammurabiEventSource } from './hammurabi-events.js'
+
 // Module system types
 export interface FrontendModule {
   name: string
@@ -9,7 +13,7 @@ export interface FrontendModule {
 }
 
 // Agents types
-export type AgentType = 'claude' | 'codex' | 'openclaw'
+export type AgentType = 'claude' | 'codex' | 'gemini' | 'openclaw'
 
 export type AgentSessionStatus = 'active' | 'idle' | 'stale' | 'completed' | 'exited'
 
@@ -28,6 +32,7 @@ export interface AgentSession {
   pid: number
   sessionType?: SessionType
   agentType?: AgentType
+  effort?: ClaudeEffortLevel
   cwd?: string
   host?: string
   parentSession?: string
@@ -87,6 +92,7 @@ export interface CreateSessionInput {
   cwd?: string
   sessionType?: SessionType
   agentType?: AgentType
+  effort?: ClaudeEffortLevel
   host?: string
   agentId?: string
   resumeFromSession?: string
@@ -105,74 +111,8 @@ export interface AskQuestion {
   multiSelect: boolean
 }
 
-// Stream-JSON event types emitted by `claude --output-format stream-json`
-export type StreamEvent =
-  // Legacy fine-grained streaming events
-  | { type: 'message_start'; message: { id: string; role: string } }
-  | {
-      type: 'content_block_start'
-      index: number
-      content_block: { type: 'text' } | { type: 'thinking' } | { type: 'tool_use'; id: string; name: string }
-    }
-  | {
-      type: 'content_block_delta'
-      index: number
-      delta:
-        | { type: 'text_delta'; text: string }
-        | { type: 'thinking_delta'; thinking: string }
-        | { type: 'input_json_delta'; partial_json: string }
-    }
-  | { type: 'content_block_stop'; index: number }
-  | { type: 'message_delta'; delta: { stop_reason?: string }; usage?: { input_tokens?: number; output_tokens?: number } }
-  | { type: 'message_stop' }
-  // Newer envelope-style events
-  | {
-      type: 'assistant'
-      message: {
-        id: string
-        role: 'assistant'
-        content: Array<
-          | { type: 'text'; text: string }
-          | { type: 'thinking'; thinking?: string; text?: string }
-          | { type: 'tool_use'; id: string; name: string; input?: Record<string, unknown> }
-        >
-        usage?: { input_tokens?: number; output_tokens?: number }
-      }
-    }
-  | {
-      type: 'user'
-      message: {
-        role: 'user'
-        content:
-          | string
-          | Array<
-              | { type: 'tool_result'; tool_use_id?: string; content?: string; is_error?: boolean }
-              | { type: 'text'; text: string }
-              | { type: 'image'; source?: { type?: string; media_type?: string; data?: string } }
-            >
-      }
-      tool_use_result?: { stdout?: string; stderr?: string; interrupted?: boolean; isImage?: boolean; noOutputExpected?: boolean }
-    }
-  | {
-      type: 'result'
-      result: string
-      is_error?: boolean
-      duration_ms?: number
-      duration_api_ms?: number
-      num_turns?: number
-      usage?: {
-        input_tokens?: number
-        output_tokens?: number
-        cache_read_input_tokens?: number
-        cache_creation_input_tokens?: number
-      }
-      cost_usd?: number
-      total_cost_usd?: number
-    }
-  | { type: 'exit'; exitCode: number; signal?: string | number }
-  | { type: 'system'; text?: string; subtype?: string; description?: string; last_tool_name?: string }
-  | { type: 'agent'; message?: unknown; text?: unknown }
-  | { type: 'rate_limit_event'; [key: string]: unknown }
+// Stream events in the agents UI now use the shared Hammurabi contract.
+export type StreamEvent = HammurabiEvent
 
 // Telemetry types
 export type SessionStatus = 'active' | 'idle' | 'stale' | 'completed'

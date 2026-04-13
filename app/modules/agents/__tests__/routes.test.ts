@@ -18,12 +18,26 @@ vi.mock('node:child_process', async (importOriginal) => {
   }
 })
 
+const { mockedNodePtySpawn } = vi.hoisted(() => ({
+  mockedNodePtySpawn: vi.fn(),
+}))
+
+vi.mock('@lydell/node-pty', () => ({
+  spawn: mockedNodePtySpawn,
+}))
+
 import {
   createAgentsRouter,
   type AgentsRouterOptions,
   type PtyHandle,
   type PtySpawner,
 } from '../routes'
+import {
+  appendTranscriptEvent,
+  resetTranscriptStoreRoot,
+  setTranscriptStoreRoot,
+  writeSessionMeta,
+} from '../transcript-store'
 import { CommanderSessionStore, type CommanderSession } from '../../commanders/store'
 import { spawn as spawnFn } from 'node:child_process'
 
@@ -250,12 +264,70 @@ function connectWs(
   })
 }
 
+async function connectWsWithReplay(
+  baseUrl: string,
+  sessionName: string,
+  apiKey = 'test-key',
+): Promise<{
+  ws: WebSocket
+  replay: {
+    type: 'replay'
+    events: Array<Record<string, unknown>>
+    usage?: { inputTokens: number; outputTokens: number; costUsd: number }
+  }
+}> {
+  const wsUrl = baseUrl.replace('http://', 'ws://') +
+    `/api/agents/sessions/${encodeURIComponent(sessionName)}/terminal?api_key=${apiKey}`
+  const ws = new WebSocket(wsUrl)
+
+  const replayPromise = new Promise<{
+    type: 'replay'
+    events: Array<Record<string, unknown>>
+    usage?: { inputTokens: number; outputTokens: number; costUsd: number }
+  }>((resolve, reject) => {
+    ws.on('message', (data) => {
+      const parsed = JSON.parse(data.toString()) as {
+        type: string
+        events?: Array<Record<string, unknown>>
+        usage?: { inputTokens: number; outputTokens: number; costUsd: number }
+      }
+      if (parsed.type === 'replay' && Array.isArray(parsed.events)) {
+        resolve({
+          type: 'replay',
+          events: parsed.events,
+          usage: parsed.usage,
+        })
+      }
+    })
+    ws.on('error', reject)
+    ws.on('unexpected-response', (_req, res) => {
+      reject(new Error(`WebSocket upgrade rejected with status ${res.statusCode}`))
+    })
+  })
+
+  await new Promise<void>((resolve, reject) => {
+    ws.on('open', () => resolve())
+    ws.on('error', reject)
+    ws.on('unexpected-response', (_req, res) => {
+      reject(new Error(`WebSocket upgrade rejected with status ${res.statusCode}`))
+    })
+  })
+
+  return {
+    ws,
+    replay: await replayPromise,
+  }
+}
+
 afterEach(() => {
   vi.clearAllMocks()
+  mockedNodePtySpawn.mockReset()
+  resetTranscriptStoreRoot()
 })
 
 beforeEach(() => {
   vi.spyOn(CommanderSessionStore.prototype, 'list').mockResolvedValue([])
+  mockedNodePtySpawn.mockImplementation(() => createMockPtyHandle())
 })
 
 describe('agents routes', () => {
@@ -871,6 +943,7 @@ describe('agents routes', () => {
             'ssh:ok',
             'claude:1.0.31',
             'codex:0.1.2503271400',
+            'gemini:missing',
             'git:git version 2.45.1',
             'node:v22.14.0',
             '',
@@ -895,6 +968,7 @@ describe('agents routes', () => {
         tools: {
           claude: { ok: true, version: '1.0.31', raw: '1.0.31' },
           codex: { ok: true, version: '0.1.2503271400', raw: '0.1.2503271400' },
+          gemini: { ok: false, version: null, raw: 'missing' },
           git: { ok: true, version: 'git version 2.45.1', raw: 'git version 2.45.1' },
           node: { ok: true, version: 'v22.14.0', raw: 'v22.14.0' },
         },
@@ -1149,10 +1223,80 @@ describe('agents routes', () => {
       rows: 40,
     }))
     expect(lastHandle()!.write).toHaveBeenCalledWith(
-      'unset CLAUDECODE && claude --permission-mode acceptEdits\r',
+      'export CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1 && unset CLAUDECODE && claude --effort max --permission-mode acceptEdits\r',
     )
 
     await server.close()
+  })
+
+  it('creates a PTY-backed claude session with the default PTY loader', async () => {
+    const handle = createMockPtyHandle()
+    mockedNodePtySpawn.mockReturnValue(handle)
+    const server = await startServer()
+
+    try {
+      const response = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'agent-default-loader-01',
+          mode: 'default',
+        }),
+      })
+
+      expect(response.status).toBe(201)
+      expect(await response.json()).toEqual({
+        sessionName: 'agent-default-loader-01',
+        mode: 'default',
+        sessionType: 'pty',
+        agentType: 'claude',
+        created: true,
+      })
+      expect(mockedNodePtySpawn).toHaveBeenCalledWith(
+        'bash',
+        ['-l'],
+        expect.objectContaining({
+          name: 'xterm-256color',
+          cols: 120,
+          rows: 40,
+        }),
+      )
+      expect(handle.write).toHaveBeenCalledWith(
+        'export CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1 && unset CLAUDECODE && claude --effort max\r',
+      )
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('uses the requested Claude effort for PTY sessions', async () => {
+    const { spawner, lastHandle } = createMockPtySpawner()
+    const server = await startServer({ ptySpawner: spawner })
+
+    try {
+      const response = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'agent-effort-pty-01',
+          mode: 'default',
+          effort: 'high',
+        }),
+      })
+
+      expect(response.status).toBe(201)
+      expect(lastHandle()!.write).toHaveBeenCalledWith(
+        'export CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1 && unset CLAUDECODE && claude --effort high\r',
+      )
+    } finally {
+      await server.close()
+    }
   })
 
   it('returns 409 when session already exists on create', async () => {
@@ -1323,7 +1467,7 @@ describe('agents routes', () => {
     })
     expect(lastHandle()!.write).toHaveBeenNthCalledWith(
       1,
-      'unset CLAUDECODE && claude --dangerously-skip-permissions\r',
+      'export CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1 && unset CLAUDECODE && claude --effort max --dangerously-skip-permissions\r',
     )
     expect(lastHandle()!.write).toHaveBeenNthCalledWith(
       2,
@@ -2140,11 +2284,12 @@ describe('agents directories endpoint', () => {
  * Creates a mock ChildProcess-like object with controllable stdin/stdout
  * for testing stream session behavior without spawning a real process.
  */
-function createMockChildProcess() {
+function createMockChildProcess(onWrite?: (data: string) => void) {
   const emitter = new EventEmitter()
   const stdoutEmitter = new EventEmitter()
   const stdinChunks: string[] = []
   const stdinEmitter = new EventEmitter()
+  let exited = false
 
   const stdout = Object.assign(stdoutEmitter, {
     // Provide enough of the Readable interface for the routes code
@@ -2156,11 +2301,23 @@ function createMockChildProcess() {
     writable: true,
     write: vi.fn((data: string) => {
       stdinChunks.push(data)
+      onWrite?.(data)
       return true
     }),
     on: stdinEmitter.on.bind(stdinEmitter),
     once: stdinEmitter.once.bind(stdinEmitter),
   })
+
+  const emitExit = (code: number | null, signal: string | null = null) => {
+    if (exited) {
+      return
+    }
+    exited = true
+    cp.exitCode = code
+    cp.signalCode = signal
+    emitter.emit('exit', code, signal)
+    emitter.emit('close', code, signal)
+  }
 
   // Build a mock ChildProcess with the EventEmitter cast pattern used by routes.ts
   const cp = Object.assign(emitter, {
@@ -2168,7 +2325,12 @@ function createMockChildProcess() {
     stdout,
     stdin,
     stderr: new EventEmitter(),
-    kill: vi.fn(),
+    exitCode: null as number | null,
+    signalCode: null as string | null,
+    kill: vi.fn((signal?: string) => {
+      emitExit(null, typeof signal === 'string' ? signal : 'SIGTERM')
+      return true
+    }),
     // For stdinChunks inspection in tests
     _stdinChunks: stdinChunks,
   })
@@ -2179,8 +2341,7 @@ function createMockChildProcess() {
       stdoutEmitter.emit('data', Buffer.from(data))
     },
     emitExit(code: number, signal: string | null = null) {
-      emitter.emit('exit', code, signal)
-      emitter.emit('close', code, signal)
+      emitExit(code, signal)
     },
     emitError(err: Error) {
       emitter.emit('error', err)
@@ -2191,36 +2352,347 @@ function createMockChildProcess() {
   }
 }
 
+interface MockGeminiAcpRuntime {
+  requests: Array<{ id?: number; method?: string; params?: unknown }>
+  promptTexts: string[]
+}
+
+function installMockGeminiAcpRuntime(): MockGeminiAcpRuntime {
+  const requests: Array<{ id?: number; method?: string; params?: unknown }> = []
+  const promptTexts: string[] = []
+  let sessionCounter = 0
+
+  const buildProcess = () => createMockChildProcess((data) => {
+    for (const line of data.split(/\r?\n/g)) {
+      const trimmed = line.trim()
+      if (!trimmed) {
+        continue
+      }
+
+      const parsed = JSON.parse(trimmed) as {
+        id?: number
+        method?: string
+        params?: unknown
+      }
+      requests.push(parsed)
+
+      if (typeof parsed.id !== 'number' || typeof parsed.method !== 'string') {
+        continue
+      }
+
+      switch (parsed.method) {
+        case 'initialize':
+          processMock.emitStdout(`${JSON.stringify({
+            jsonrpc: '2.0',
+            id: parsed.id,
+            result: {
+              protocolVersion: 1,
+              agentCapabilities: { loadSession: true },
+            },
+          })}\n`)
+          break
+        case 'session/new': {
+          sessionCounter += 1
+          processMock.emitStdout(`${JSON.stringify({
+            jsonrpc: '2.0',
+            id: parsed.id,
+            result: { sessionId: `gemini-session-${sessionCounter}` },
+          })}\n`)
+          break
+        }
+        case 'session/load': {
+          const params = (parsed.params && typeof parsed.params === 'object')
+            ? parsed.params as { sessionId?: unknown }
+            : {}
+          const sessionId = typeof params.sessionId === 'string' ? params.sessionId : 'gemini-session-restored'
+          processMock.emitStdout(`${JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId,
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'history should be ignored' },
+              },
+            },
+          })}\n`)
+          processMock.emitStdout(`${JSON.stringify({
+            jsonrpc: '2.0',
+            id: parsed.id,
+            result: {},
+          })}\n`)
+          break
+        }
+        case 'session/set_mode':
+          processMock.emitStdout(`${JSON.stringify({ jsonrpc: '2.0', id: parsed.id, result: {} })}\n`)
+          break
+        case 'session/prompt': {
+          const params = (parsed.params && typeof parsed.params === 'object')
+            ? parsed.params as { sessionId?: unknown; prompt?: Array<{ text?: unknown }> }
+            : {}
+          const sessionId = typeof params.sessionId === 'string' ? params.sessionId : 'gemini-session-1'
+          const text = Array.isArray(params.prompt) && typeof params.prompt[0]?.text === 'string'
+            ? params.prompt[0].text
+            : ''
+          promptTexts.push(text)
+          processMock.emitStdout(`${JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId,
+              update: {
+                sessionUpdate: 'agent_thought_chunk',
+                content: { type: 'text', text: 'pondering...' },
+              },
+            },
+          })}\n`)
+          processMock.emitStdout(`${JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId,
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: `reply ${promptTexts.length}` },
+              },
+            },
+          })}\n`)
+          processMock.emitStdout(`${JSON.stringify({
+            jsonrpc: '2.0',
+            id: parsed.id,
+            result: {
+              stopReason: 'end_turn',
+              usage: {
+                inputTokens: 5,
+                outputTokens: 7,
+                totalTokens: 12,
+              },
+            },
+          })}\n`)
+          break
+        }
+        default:
+          processMock.emitStdout(`${JSON.stringify({ jsonrpc: '2.0', id: parsed.id, result: {} })}\n`)
+          break
+      }
+    }
+  })
+
+  let processMock = buildProcess()
+
+  mockedSpawn.mockImplementation((command, args) => {
+    if (command === 'gemini' && Array.isArray(args) && args[0] === '--acp') {
+      processMock = buildProcess()
+      return processMock.cp as never
+    }
+
+    if (command === 'ssh' && Array.isArray(args)) {
+      const remoteCommand = typeof args[args.length - 1] === 'string' ? args[args.length - 1] : ''
+      if (remoteCommand.includes('gemini') && remoteCommand.includes('--acp')) {
+        processMock = buildProcess()
+        return processMock.cp as never
+      }
+    }
+
+    return createMockChildProcess().cp as never
+  })
+
+  return {
+    requests,
+    promptTexts,
+  }
+}
+
 type CodexTurnStartBehavior = 'success' | 'error'
 
 interface MockCodexSidecar {
   closeConnection(code?: number, reason?: string): Promise<void>
+  closeConnectionForThread(threadId: string, code?: number, reason?: string): Promise<void>
   closeServer(): Promise<void>
   emitProcessError(error: Error): void
+  emitProcessErrorForThread(threadId: string, error: Error): void
   emitProcessExit(code?: number, signal?: string | null): void
+  emitProcessExitForThread(threadId: string, code?: number, signal?: string | null): void
   emitNotification(method: string, params: Record<string, unknown>): void
   emitStderr(data: string): void
+  getProcessKillCallCount(threadId: string): number
   getRequests(method?: string): Array<{ id?: number; method?: string; params?: unknown }>
+  getRuntimeSpawnCount(): number
+  getStartedThreadIds(): string[]
   setThreadReadResult(result: unknown): void
   setThreadReadError(message: string | null): void
   setTurnStartBehavior(behavior: CodexTurnStartBehavior): void
   suppressPongResponses(): void
 }
 
+interface MockCodexRuntime {
+  id: number
+  transport: 'ws' | 'stdio'
+  processMock: ReturnType<typeof createMockChildProcess>
+  server: WebSocketServer | null
+  socket: WebSocket | null
+  turnStartBehavior: CodexTurnStartBehavior
+  threadReadResult: unknown
+  threadReadError: string | null
+}
+
 function installMockCodexSidecar(): MockCodexSidecar {
-  const processMock = createMockChildProcess()
   const requests: Array<{ id?: number; method?: string; params?: unknown }> = []
-  let server: WebSocketServer | null = null
-  let socket: WebSocket | null = null
+  const runtimes = new Map<number, MockCodexRuntime>()
+  const threadToRuntime = new Map<string, MockCodexRuntime>()
+  const startedThreadIds: string[] = []
+  let runtimeCounter = 0
   let threadCounter = 0
-  let turnStartBehavior: CodexTurnStartBehavior = 'success'
-  let threadReadResult: unknown = { thread: { id: 'thread-1', turns: [] } }
-  let threadReadError: string | null = null
+  let defaultTurnStartBehavior: CodexTurnStartBehavior = 'success'
+  let defaultThreadReadResult: unknown = { thread: { id: 'thread-1', turns: [] } }
+  let defaultThreadReadError: string | null = null
   let hasCustomThreadReadResult = false
 
+  const firstRuntime = (): MockCodexRuntime | null => {
+    for (const runtime of runtimes.values()) {
+      return runtime
+    }
+    return null
+  }
+
+  const runtimeForThread = (threadId: string): MockCodexRuntime => {
+    const runtime = threadToRuntime.get(threadId)
+    if (!runtime) {
+      throw new Error(`No Codex runtime registered for thread ${threadId}`)
+    }
+    return runtime
+  }
+
+  const resolveRuntime = (threadId?: string): MockCodexRuntime => {
+    if (threadId) {
+      return runtimeForThread(threadId)
+    }
+    const runtime = firstRuntime()
+    if (!runtime) {
+      throw new Error('No active Codex runtimes')
+    }
+    return runtime
+  }
+
+  const runtimeSocket = (runtime: MockCodexRuntime): WebSocket => {
+    if (!runtime.socket) {
+      throw new Error(`Codex runtime ${runtime.id} socket not connected`)
+    }
+    return runtime.socket
+  }
+
+  const sendRuntimeMessage = (runtime: MockCodexRuntime, payload: Record<string, unknown>) => {
+    const encoded = JSON.stringify(payload)
+    if (runtime.transport === 'stdio') {
+      runtime.processMock.emitStdout(`${encoded}\n`)
+      return
+    }
+    runtimeSocket(runtime).send(encoded)
+  }
+
+  const handleRequest = (
+    runtime: MockCodexRuntime,
+    parsed: { id?: number; method?: string; params?: unknown },
+  ) => {
+    requests.push(parsed)
+
+    if (parsed.id === undefined) {
+      return
+    }
+
+    switch (parsed.method) {
+      case 'initialize':
+        sendRuntimeMessage(runtime, { jsonrpc: '2.0', id: parsed.id, result: {} })
+        break
+      case 'thread/start': {
+        threadCounter += 1
+        const threadId = `thread-${threadCounter}`
+        startedThreadIds.push(threadId)
+        threadToRuntime.set(threadId, runtime)
+        if (!hasCustomThreadReadResult) {
+          runtime.threadReadResult = { thread: { id: threadId, turns: [] } }
+        }
+        sendRuntimeMessage(runtime, {
+          jsonrpc: '2.0',
+          id: parsed.id,
+          result: { thread: { id: threadId } },
+        })
+        break
+      }
+      case 'thread/resume': {
+        const params = (parsed.params ?? {}) as { threadId?: unknown }
+        if (typeof params.threadId === 'string' && params.threadId.length > 0) {
+          if (!startedThreadIds.includes(params.threadId)) {
+            startedThreadIds.push(params.threadId)
+          }
+          threadToRuntime.set(params.threadId, runtime)
+        }
+        sendRuntimeMessage(runtime, { jsonrpc: '2.0', id: parsed.id, result: {} })
+        break
+      }
+      case 'thread/archive':
+        sendRuntimeMessage(runtime, { jsonrpc: '2.0', id: parsed.id, result: {} })
+        break
+      case 'thread/read':
+        if (runtime.threadReadError) {
+          sendRuntimeMessage(runtime, {
+            jsonrpc: '2.0',
+            id: parsed.id,
+            error: { code: -32001, message: runtime.threadReadError },
+          })
+        } else {
+          sendRuntimeMessage(runtime, { jsonrpc: '2.0', id: parsed.id, result: runtime.threadReadResult })
+        }
+        break
+      case 'turn/start':
+        if (runtime.turnStartBehavior === 'error') {
+          sendRuntimeMessage(runtime, {
+            jsonrpc: '2.0',
+            id: parsed.id,
+            error: { code: -32000, message: 'Injected turn/start failure' },
+          })
+        } else {
+          sendRuntimeMessage(runtime, { jsonrpc: '2.0', id: parsed.id, result: { accepted: true } })
+        }
+        break
+      default:
+        sendRuntimeMessage(runtime, { jsonrpc: '2.0', id: parsed.id, result: {} })
+        break
+    }
+  }
+
   mockedSpawn.mockImplementation((command, args) => {
+    if (command === 'ssh' && Array.isArray(args)) {
+      const remoteCommand = typeof args[args.length - 1] === 'string' ? args[args.length - 1] : ''
+      if (remoteCommand.includes('codex') && remoteCommand.includes('app-server') && remoteCommand.includes('stdio://')) {
+        const processMock = createMockChildProcess((data) => {
+          for (const line of data.split(/\r?\n/g)) {
+            const trimmed = line.trim()
+            if (!trimmed) {
+              continue
+            }
+            const parsed = JSON.parse(trimmed) as { id?: number; method?: string; params?: unknown }
+            handleRequest(runtime, parsed)
+          }
+        })
+        const runtimeId = ++runtimeCounter
+        const runtime: MockCodexRuntime = {
+          id: runtimeId,
+          transport: 'stdio',
+          processMock,
+          server: null,
+          socket: null,
+          turnStartBehavior: defaultTurnStartBehavior,
+          threadReadResult: defaultThreadReadResult,
+          threadReadError: defaultThreadReadError,
+        }
+        runtimes.set(runtimeId, runtime)
+        return processMock.cp as never
+      }
+    }
+
     if (command !== 'codex' || !Array.isArray(args)) {
-      return processMock.cp as never
+      return createMockChildProcess().cp as never
     }
 
     const listenIndex = args.indexOf('--listen')
@@ -2229,71 +2701,34 @@ function installMockCodexSidecar(): MockCodexSidecar {
     }
 
     const listenUrl = new URL(args[listenIndex + 1])
-    server = new WebSocketServer({
+    const processMock = createMockChildProcess()
+    const runtimeId = ++runtimeCounter
+    const server = new WebSocketServer({
       host: listenUrl.hostname,
       port: Number(listenUrl.port),
     })
+    const runtime: MockCodexRuntime = {
+      id: runtimeId,
+      transport: 'ws',
+      processMock,
+      server,
+      socket: null,
+      turnStartBehavior: defaultTurnStartBehavior,
+      threadReadResult: defaultThreadReadResult,
+      threadReadError: defaultThreadReadError,
+    }
+    runtimes.set(runtimeId, runtime)
 
     server.on('connection', (client) => {
-      socket = client as unknown as WebSocket
+      runtime.socket = client as unknown as WebSocket
       client.on('close', () => {
-        if (socket === (client as unknown as WebSocket)) {
-          socket = null
+        if (runtime.socket === (client as unknown as WebSocket)) {
+          runtime.socket = null
         }
       })
       client.on('message', (data) => {
         const parsed = JSON.parse(data.toString()) as { id?: number; method?: string; params?: unknown }
-        requests.push(parsed)
-
-        if (parsed.id === undefined) {
-          return
-        }
-
-        switch (parsed.method) {
-          case 'initialize':
-            client.send(JSON.stringify({ jsonrpc: '2.0', id: parsed.id, result: {} }))
-            break
-          case 'thread/start':
-            threadCounter += 1
-            if (!hasCustomThreadReadResult) {
-              threadReadResult = { thread: { id: `thread-${threadCounter}`, turns: [] } }
-            }
-            client.send(JSON.stringify({
-              jsonrpc: '2.0',
-              id: parsed.id,
-              result: { thread: { id: `thread-${threadCounter}` } },
-            }))
-            break
-          case 'thread/resume':
-          case 'thread/archive':
-            client.send(JSON.stringify({ jsonrpc: '2.0', id: parsed.id, result: {} }))
-            break
-          case 'thread/read':
-            if (threadReadError) {
-              client.send(JSON.stringify({
-                jsonrpc: '2.0',
-                id: parsed.id,
-                error: { code: -32001, message: threadReadError },
-              }))
-            } else {
-              client.send(JSON.stringify({ jsonrpc: '2.0', id: parsed.id, result: threadReadResult }))
-            }
-            break
-          case 'turn/start':
-            if (turnStartBehavior === 'error') {
-              client.send(JSON.stringify({
-                jsonrpc: '2.0',
-                id: parsed.id,
-                error: { code: -32000, message: 'Injected turn/start failure' },
-              }))
-            } else {
-              client.send(JSON.stringify({ jsonrpc: '2.0', id: parsed.id, result: { accepted: true } }))
-            }
-            break
-          default:
-            client.send(JSON.stringify({ jsonrpc: '2.0', id: parsed.id, result: {} }))
-            break
-        }
+        handleRequest(runtime, parsed)
       })
     })
 
@@ -2302,67 +2737,111 @@ function installMockCodexSidecar(): MockCodexSidecar {
 
   return {
     async closeConnection(code = 1011, reason = 'Injected transport failure') {
-      if (!socket) {
-        return
-      }
+      const runtime = resolveRuntime()
+      const socket = runtimeSocket(runtime)
       await new Promise<void>((resolve) => {
-        socket!.once('close', () => resolve())
-        socket!.close(code, reason)
+        socket.once('close', () => resolve())
+        socket.close(code, reason)
+      })
+    },
+    async closeConnectionForThread(threadId, code = 1011, reason = 'Injected transport failure') {
+      const runtime = resolveRuntime(threadId)
+      const socket = runtimeSocket(runtime)
+      await new Promise<void>((resolve) => {
+        socket.once('close', () => resolve())
+        socket.close(code, reason)
       })
     },
     async closeServer() {
-      if (!server) {
-        return
-      }
-      for (const client of server.clients) {
-        client.terminate()
-      }
-      await new Promise<void>((resolve, reject) => {
-        server!.close((error) => {
-          if (error) {
-            reject(error)
-            return
-          }
-          resolve()
+      const closeJobs = [...runtimes.values()].map(async (runtime) => {
+        if (!runtime.server) {
+          runtime.processMock.emitExit(0, null)
+          return
+        }
+        for (const client of runtime.server.clients) {
+          client.terminate()
+        }
+        await new Promise<void>((resolve, reject) => {
+          runtime.server!.close((error) => {
+            if (error) {
+              reject(error)
+              return
+            }
+            resolve()
+          })
         })
+        runtime.socket = null
       })
-      server = null
-      socket = null
+      await Promise.all(closeJobs)
+      runtimes.clear()
+      threadToRuntime.clear()
     },
     emitProcessError(error: Error) {
-      processMock.emitError(error)
+      const runtime = resolveRuntime()
+      runtime.processMock.emitError(error)
+    },
+    emitProcessErrorForThread(threadId: string, error: Error) {
+      const runtime = resolveRuntime(threadId)
+      runtime.processMock.emitError(error)
     },
     emitProcessExit(code = 1, signal: string | null = null) {
-      processMock.emitExit(code, signal)
+      const runtime = resolveRuntime()
+      runtime.processMock.emitExit(code, signal)
+    },
+    emitProcessExitForThread(threadId: string, code = 1, signal: string | null = null) {
+      const runtime = resolveRuntime(threadId)
+      runtime.processMock.emitExit(code, signal)
     },
     emitNotification(method, params) {
-      socket?.send(JSON.stringify({
+      const runtime = resolveRuntime(typeof params.threadId === 'string' ? params.threadId : undefined)
+      sendRuntimeMessage(runtime, {
         jsonrpc: '2.0',
         method,
         params,
-      }))
+      })
     },
     emitStderr(data) {
-      processMock.cp.stderr.emit('data', Buffer.from(data))
+      const runtime = resolveRuntime()
+      runtime.processMock.cp.stderr.emit('data', Buffer.from(data))
+    },
+    getProcessKillCallCount(threadId) {
+      const runtime = resolveRuntime(threadId)
+      const kill = runtime.processMock.cp.kill as unknown as { mock?: { calls: unknown[][] } }
+      return kill.mock?.calls.length ?? 0
     },
     getRequests(method) {
       return method ? requests.filter((request) => request.method === method) : [...requests]
     },
+    getRuntimeSpawnCount() {
+      return runtimes.size
+    },
+    getStartedThreadIds() {
+      return [...startedThreadIds]
+    },
     setThreadReadResult(result) {
-      threadReadResult = result
-      threadReadError = null
+      defaultThreadReadResult = result
+      defaultThreadReadError = null
       hasCustomThreadReadResult = true
+      for (const runtime of runtimes.values()) {
+        runtime.threadReadResult = result
+        runtime.threadReadError = null
+      }
     },
     setThreadReadError(message) {
-      threadReadError = message
+      defaultThreadReadError = message
+      for (const runtime of runtimes.values()) {
+        runtime.threadReadError = message
+      }
     },
     setTurnStartBehavior(behavior) {
-      turnStartBehavior = behavior
+      defaultTurnStartBehavior = behavior
+      for (const runtime of runtimes.values()) {
+        runtime.turnStartBehavior = behavior
+      }
     },
     suppressPongResponses() {
-      if (!socket) {
-        throw new Error('Codex sidecar socket not connected')
-      }
+      const runtime = resolveRuntime()
+      const socket = runtimeSocket(runtime)
       const interceptedPong = vi.fn(() => socket)
       Object.defineProperty(socket, 'pong', {
         value: interceptedPong,
@@ -2414,8 +2893,12 @@ describe('stream sessions', () => {
     // Verify spawn was called with correct args
     expect(mockedSpawn).toHaveBeenCalledWith(
       'claude',
-      ['-p', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json'],
+      ['-p', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json', '--effort', 'max'],
       expect.objectContaining({
+        env: expect.objectContaining({
+          CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING: '1',
+          CLAUDECODE: undefined,
+        }),
         stdio: ['pipe', 'pipe', 'pipe'],
       }),
     )
@@ -2432,9 +2915,47 @@ describe('stream sessions', () => {
     await server.close()
   })
 
+  it('uses the requested Claude effort for stream sessions and exposes it in the session list', async () => {
+    installMockProcess()
+    const server = await startServer()
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'stream-effort-01',
+          mode: 'default',
+          sessionType: 'stream',
+          effort: 'medium',
+        }),
+      })
+
+      expect(createResponse.status).toBe(201)
+      expect(mockedSpawn).toHaveBeenCalledWith(
+        'claude',
+        ['-p', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json', '--effort', 'medium'],
+        expect.any(Object),
+      )
+
+      const listResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        headers: AUTH_HEADERS,
+      })
+      expect(listResponse.status).toBe(200)
+      const sessions = await listResponse.json() as Array<{ name: string; effort?: string }>
+      expect(sessions.find((session) => session.name === 'stream-effort-01')?.effort).toBe('medium')
+    } finally {
+      await server.close()
+    }
+  })
+
   it('appends commander stream events to JSONL transcript', async () => {
     const mock = installMockProcess()
     const workDir = await mkdtemp(join(tmpdir(), 'hammurabi-commander-jsonl-'))
+    setTranscriptStoreRoot(join(workDir, 'data', 'agents', 'sessions'))
     const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(workDir)
     let server: RunningServer | null = null
 
@@ -2473,6 +2994,22 @@ describe('stream sessions', () => {
         'sessions',
         'claude-commander-123.jsonl',
       )
+      const sharedTranscriptPath = join(
+        workDir,
+        'data',
+        'agents',
+        'sessions',
+        'commander-alpha',
+        'transcript.v1.jsonl',
+      )
+      const metaPath = join(
+        workDir,
+        'data',
+        'agents',
+        'sessions',
+        'commander-alpha',
+        'meta.json',
+      )
 
       await vi.waitFor(async () => {
         const raw = await readFile(transcriptPath, 'utf8')
@@ -2484,6 +3021,21 @@ describe('stream sessions', () => {
         expect(events).toHaveLength(2)
         expect(events[0]).toEqual(initEvent)
         expect(events[1]).toEqual(deltaEvent)
+
+        const sharedRaw = await readFile(sharedTranscriptPath, 'utf8')
+        const sharedEvents = sharedRaw
+          .split('\n')
+          .filter((line) => line.trim().length > 0)
+          .map((line) => JSON.parse(line) as Record<string, unknown>)
+
+        expect(sharedEvents).toEqual(events)
+
+        const meta = JSON.parse(await readFile(metaPath, 'utf8')) as {
+          agentType?: string
+          claudeSessionId?: string
+        }
+        expect(meta.agentType).toBe('claude')
+        expect(meta.claudeSessionId).toBe('claude-commander-123')
       })
     } finally {
       if (server) {
@@ -2491,6 +3043,82 @@ describe('stream sessions', () => {
       }
       cwdSpy.mockRestore()
       await rm(workDir, { recursive: true, force: true })
+    }
+  })
+
+  it('writes Claude stream events to the shared transcript store without dropping persisted replay events', async () => {
+    const mock = installMockProcess()
+    const transcriptRoot = await mkdtemp(join(tmpdir(), 'hammurabi-stream-transcript-'))
+    const sessionStoreDir = await mkdtemp(join(tmpdir(), 'hammurabi-stream-session-store-'))
+    const sessionStorePath = join(sessionStoreDir, 'stream-sessions.json')
+    setTranscriptStoreRoot(transcriptRoot)
+
+    let server: RunningServer | null = null
+
+    try {
+      server = await startServer({ sessionStorePath })
+
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'stream-transcript-01',
+          mode: 'default',
+          sessionType: 'stream',
+          cwd: '/home/ec2-user/projects/transcript-demo',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const initEvent = { type: 'system', subtype: 'init', session_id: 'claude-stream-123' }
+      const messageStartEvent = { type: 'message_start' }
+      const resultEvent = { type: 'result', subtype: 'success', result: 'done' }
+
+      mock.emitStdout(`${JSON.stringify(initEvent)}\n`)
+      mock.emitStdout(`${JSON.stringify(messageStartEvent)}\n`)
+      mock.emitStdout(`${JSON.stringify(resultEvent)}\n`)
+
+      const transcriptPath = join(transcriptRoot, 'stream-transcript-01', 'transcript.v1.jsonl')
+      const metaPath = join(transcriptRoot, 'stream-transcript-01', 'meta.json')
+
+      await vi.waitFor(async () => {
+        const raw = await readFile(transcriptPath, 'utf8')
+        const events = raw
+          .split('\n')
+          .filter((line) => line.trim().length > 0)
+          .map((line) => JSON.parse(line) as Record<string, unknown>)
+
+        expect(events).toEqual([initEvent, messageStartEvent, resultEvent])
+
+        const meta = JSON.parse(await readFile(metaPath, 'utf8')) as {
+          agentType?: string
+          cwd?: string
+          claudeSessionId?: string
+        }
+        expect(meta).toEqual(expect.objectContaining({
+          agentType: 'claude',
+          cwd: '/home/ec2-user/projects/transcript-demo',
+          claudeSessionId: 'claude-stream-123',
+        }))
+
+        const persisted = JSON.parse(await readFile(sessionStorePath, 'utf8')) as {
+          sessions: Array<{ name: string; events?: unknown[] }>
+        }
+        expect(persisted.sessions.find((session) => session.name === 'stream-transcript-01')?.events).toEqual([
+          initEvent,
+          messageStartEvent,
+          resultEvent,
+        ])
+      })
+    } finally {
+      if (server) {
+        await server.close()
+      }
+      await rm(transcriptRoot, { recursive: true, force: true })
+      await rm(sessionStoreDir, { recursive: true, force: true })
     }
   })
 
@@ -2689,6 +3317,8 @@ describe('stream sessions', () => {
         return (
           command === 'claude' &&
           Array.isArray(args) &&
+          args.includes('--effort') &&
+          args.includes('max') &&
           args.includes('--resume') &&
           args.includes('claude-source-session-id') &&
           args.includes('--permission-mode') &&
@@ -2712,6 +3342,96 @@ describe('stream sessions', () => {
       const resumed = listedSessions.find((session) => session.name === 'claude-resumed-custom')
       expect(resumed?.processAlive).toBe(true)
       expect(resumed?.resumedFrom).toBe('claude-source')
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('keeps manually deleted Claude stream sessions available in the resume picker', async () => {
+    const firstMock = createMockChildProcess()
+    const secondMock = createMockChildProcess()
+    mockedSpawn
+      .mockImplementationOnce(() => firstMock.cp as never)
+      .mockImplementationOnce(() => secondMock.cp as never)
+
+    const server = await startServer()
+
+    try {
+      const createSourceResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'claude-killed-source',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'claude',
+        }),
+      })
+      expect(createSourceResponse.status).toBe(201)
+
+      firstMock.emitStdout('{"type":"system","subtype":"init","session_id":"claude-killed-source-session-id"}\n')
+      firstMock.emitStdout('{"type":"result","subtype":"success","result":"done"}\n')
+
+      const deleteResponse = await fetch(`${server.baseUrl}/api/agents/sessions/claude-killed-source`, {
+        method: 'DELETE',
+        headers: AUTH_HEADERS,
+      })
+      expect(deleteResponse.status).toBe(200)
+      expect(await deleteResponse.json()).toEqual({ killed: true })
+
+      await vi.waitFor(async () => {
+        const sessionsResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+          headers: AUTH_HEADERS,
+        })
+        expect(sessionsResponse.status).toBe(200)
+        const listedSessions = await sessionsResponse.json() as Array<{
+          name: string
+          processAlive?: boolean
+          status?: string
+          resumeAvailable?: boolean
+        }>
+        const source = listedSessions.find((session) => session.name === 'claude-killed-source')
+        expect(source).toEqual(expect.objectContaining({
+          name: 'claude-killed-source',
+          processAlive: false,
+          status: 'exited',
+          resumeAvailable: true,
+        }))
+      })
+
+      const createResumedResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'claude-killed-resumed',
+          mode: 'acceptEdits',
+          sessionType: 'stream',
+          resumeFromSession: 'claude-killed-source',
+          task: 'Continue after manual stop',
+        }),
+      })
+      expect(createResumedResponse.status).toBe(201)
+
+      const resumeCall = mockedSpawn.mock.calls.find(([command, args]) => {
+        return (
+          command === 'claude' &&
+          Array.isArray(args) &&
+          args.includes('--effort') &&
+          args.includes('max') &&
+          args.includes('--resume') &&
+          args.includes('claude-killed-source-session-id')
+        )
+      })
+      expect(resumeCall).toBeDefined()
+      expect(secondMock.getStdinWrites()).toContain(
+        `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'Continue after manual stop' } })}\n`,
+      )
     } finally {
       await server.close()
     }
@@ -2781,6 +3501,8 @@ describe('stream sessions', () => {
         return (
           command === 'claude' &&
           Array.isArray(args) &&
+          args.includes('--effort') &&
+          args.includes('max') &&
           args.includes('--resume') &&
           args.includes('claude-resume-123')
         )
@@ -2793,6 +3515,212 @@ describe('stream sessions', () => {
       if (firstServer) {
         await firstServer.close()
       }
+      await rm(sessionStoreDir, { recursive: true, force: true })
+    }
+  })
+
+  it('restores startup replay from transcript tail before persisted fallback events', async () => {
+    installMockProcess()
+    const transcriptRoot = await mkdtemp(join(tmpdir(), 'hammurabi-transcript-restore-'))
+    const sessionStoreDir = await mkdtemp(join(tmpdir(), 'hammurabi-stream-session-store-'))
+    const sessionStorePath = join(sessionStoreDir, 'stream-sessions.json')
+    const sessionName = 'stream-transcript-tail-restore'
+    const createdAt = '2026-04-08T00:00:00.000Z'
+    const expectedReplayEvents: Array<Record<string, unknown>> = []
+    let server: RunningServer | null = null
+
+    setTranscriptStoreRoot(transcriptRoot)
+
+    try {
+      await writeFile(
+        sessionStorePath,
+        JSON.stringify({
+          sessions: [
+            {
+              name: sessionName,
+              agentType: 'claude',
+              mode: 'default',
+              cwd: '/home/ec2-user/projects/transcript-restore',
+              createdAt,
+              claudeSessionId: 'claude-stale-from-store',
+              events: [{ type: 'system', marker: 'persisted-fallback-only' }],
+            },
+          ],
+        }),
+        'utf8',
+      )
+
+      await writeSessionMeta(sessionName, {
+        agentType: 'claude',
+        cwd: '/home/ec2-user/projects/transcript-restore',
+        createdAt,
+        claudeSessionId: 'claude-transcript-123',
+      })
+
+      for (let turn = 1; turn <= 22; turn += 1) {
+        const turnId = String(turn).padStart(2, '0')
+        const userEvent = { type: 'user', marker: `turn-${turnId}-user` }
+        const resultEvent = turn === 22
+          ? {
+              type: 'result',
+              marker: `turn-${turnId}-result`,
+              usage: { input_tokens: 222, output_tokens: 111 },
+              total_cost_usd: 0.12,
+            }
+          : { type: 'result', marker: `turn-${turnId}-result` }
+        await appendTranscriptEvent(sessionName, userEvent)
+        await appendTranscriptEvent(sessionName, resultEvent)
+        if (turn > 2) {
+          expectedReplayEvents.push(userEvent, resultEvent)
+        }
+      }
+
+      const partialAssistant = { type: 'assistant', marker: 'partial-assistant' }
+      const partialAsk = {
+        type: 'tool_use',
+        id: 'ask-1',
+        name: 'AskUserQuestion',
+        marker: 'partial-ask',
+      }
+      await appendTranscriptEvent(sessionName, partialAssistant)
+      await appendTranscriptEvent(sessionName, partialAsk)
+      expectedReplayEvents.push(partialAssistant, partialAsk)
+
+      server = await startServer({
+        autoResumeSessions: true,
+        sessionStorePath,
+      })
+
+      await vi.waitFor(async () => {
+        const response = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+          headers: AUTH_HEADERS,
+        })
+        expect(response.status).toBe(200)
+        const sessions = await response.json() as Array<{ name: string }>
+        expect(sessions.some((session) => session.name === sessionName)).toBe(true)
+      })
+
+      const { ws, replay } = await connectWsWithReplay(server.baseUrl, sessionName)
+      expect(replay.events).toEqual(expectedReplayEvents)
+      expect(replay.events).not.toContainEqual({ type: 'system', marker: 'persisted-fallback-only' })
+      expect(replay.usage).toEqual({
+        inputTokens: 222,
+        outputTokens: 111,
+        costUsd: 0.12,
+      })
+
+      const transcriptResumeCall = mockedSpawn.mock.calls.find(([command, args]) => {
+        return (
+          command === 'claude' &&
+          Array.isArray(args) &&
+          args.includes('--effort') &&
+          args.includes('max') &&
+          args.includes('--resume') &&
+          args.includes('claude-transcript-123')
+        )
+      })
+      expect(transcriptResumeCall).toBeDefined()
+      expect(mockedSpawn.mock.calls.some(([command, args]) => {
+        return (
+          command === 'claude' &&
+          Array.isArray(args) &&
+          args.includes('--resume') &&
+          args.includes('claude-stale-from-store')
+        )
+      })).toBe(false)
+
+      ws.close()
+    } finally {
+      if (server) {
+        await server.close()
+      }
+      await rm(transcriptRoot, { recursive: true, force: true })
+      await rm(sessionStoreDir, { recursive: true, force: true })
+    }
+  })
+
+  it('falls back to persisted replay events on startup when transcript tail is unavailable', async () => {
+    installMockProcess()
+    const transcriptRoot = await mkdtemp(join(tmpdir(), 'hammurabi-transcript-fallback-'))
+    const sessionStoreDir = await mkdtemp(join(tmpdir(), 'hammurabi-stream-session-store-'))
+    const sessionStorePath = join(sessionStoreDir, 'stream-sessions.json')
+    const sessionName = 'stream-persisted-fallback-restore'
+    const persistedEvents: Array<Record<string, unknown>> = [
+      {
+        type: 'message_delta',
+        delta: { type: 'text_delta', text: 'persisted-only' },
+        usage: { input_tokens: 100, output_tokens: 50 },
+      },
+      {
+        type: 'result',
+        marker: 'persisted-result',
+        usage: { input_tokens: 120, output_tokens: 60 },
+        total_cost_usd: 0.09,
+      },
+    ]
+    let server: RunningServer | null = null
+
+    setTranscriptStoreRoot(transcriptRoot)
+
+    try {
+      await writeFile(
+        sessionStorePath,
+        JSON.stringify({
+          sessions: [
+            {
+              name: sessionName,
+              agentType: 'claude',
+              mode: 'default',
+              cwd: '/home/ec2-user/projects/persisted-fallback',
+              createdAt: '2026-04-08T00:00:00.000Z',
+              claudeSessionId: 'claude-fallback-123',
+              events: persistedEvents,
+            },
+          ],
+        }),
+        'utf8',
+      )
+
+      server = await startServer({
+        autoResumeSessions: true,
+        sessionStorePath,
+      })
+
+      await vi.waitFor(async () => {
+        const response = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+          headers: AUTH_HEADERS,
+        })
+        expect(response.status).toBe(200)
+        const sessions = await response.json() as Array<{ name: string }>
+        expect(sessions.some((session) => session.name === sessionName)).toBe(true)
+      })
+
+      const { ws, replay } = await connectWsWithReplay(server.baseUrl, sessionName)
+      expect(replay.events).toEqual(persistedEvents)
+      expect(replay.usage).toEqual({
+        inputTokens: 120,
+        outputTokens: 60,
+        costUsd: 0.09,
+      })
+
+      const fallbackResumeCall = mockedSpawn.mock.calls.find(([command, args]) => {
+        return (
+          command === 'claude' &&
+          Array.isArray(args) &&
+          args.includes('--effort') &&
+          args.includes('max') &&
+          args.includes('--resume') &&
+          args.includes('claude-fallback-123')
+        )
+      })
+      expect(fallbackResumeCall).toBeDefined()
+
+      ws.close()
+    } finally {
+      if (server) {
+        await server.close()
+      }
+      await rm(transcriptRoot, { recursive: true, force: true })
       await rm(sessionStoreDir, { recursive: true, force: true })
     }
   })
@@ -2864,6 +3792,8 @@ describe('stream sessions', () => {
         return (
           command === 'claude' &&
           Array.isArray(args) &&
+          args.includes('--effort') &&
+          args.includes('max') &&
           args.includes('--resume') &&
           args.includes('claude-interrupted-123')
         )
@@ -2933,20 +3863,29 @@ describe('stream sessions', () => {
         'ssh',
         expect.arrayContaining(['-p', '22', 'ec2-user@10.0.1.50']),
         expect.objectContaining({
+          env: expect.objectContaining({
+            CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING: '1',
+            CLAUDECODE: undefined,
+          }),
           stdio: ['pipe', 'pipe', 'pipe'],
         }),
       )
       const sshArgs = mockedSpawn.mock.calls[0][1]
       expect(sshArgs[sshArgs.length - 1]).toContain("cd '/home/ec2-user/workspace'")
       expect(sshArgs[sshArgs.length - 1]).toContain('$SHELL -lic')
+      expect(sshArgs[sshArgs.length - 1]).toContain('export CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1')
+      expect(sshArgs[sshArgs.length - 1]).toContain('unset CLAUDECODE')
       expect(sshArgs[sshArgs.length - 1]).toContain('claude')
+      expect(sshArgs[sshArgs.length - 1]).toContain('--effort')
+      expect(sshArgs[sshArgs.length - 1]).toContain('max')
     } finally {
       await server.close()
       await registry.cleanup()
     }
   })
 
-  it('rejects remote codex stream sessions with clear error', async () => {
+  it('creates remote codex stream sessions over ssh', async () => {
+    const sidecar = installMockCodexSidecar()
     const registry = await createTempMachinesRegistry({
       machines: [
         { id: 'gpu-1', label: 'GPU', host: '10.0.1.50', user: 'ec2-user' },
@@ -2967,15 +3906,35 @@ describe('stream sessions', () => {
           sessionType: 'stream',
           agentType: 'codex',
           host: 'gpu-1',
+          task: 'Run remotely',
         }),
       })
 
-      expect(response.status).toBe(400)
+      expect(response.status).toBe(201)
       expect(await response.json()).toEqual({
-        error: 'Remote stream sessions are currently supported for claude only',
+        sessionName: 'stream-remote-codex',
+        mode: 'default',
+        sessionType: 'stream',
+        agentType: 'codex',
+        host: 'gpu-1',
+        created: true,
       })
-      expect(mockedSpawn).not.toHaveBeenCalled()
+
+      expect(mockedSpawn).toHaveBeenCalledWith(
+        'ssh',
+        expect.arrayContaining(['ec2-user@10.0.1.50']),
+        expect.objectContaining({
+          stdio: ['pipe', 'pipe', 'pipe'],
+        }),
+      )
+      const sshArgs = mockedSpawn.mock.calls[0][1]
+      expect(sshArgs[sshArgs.length - 1]).toContain('codex')
+      expect(sshArgs[sshArgs.length - 1]).toContain('app-server')
+      expect(sshArgs[sshArgs.length - 1]).toContain('stdio://')
+      expect(sidecar.getRequests('thread/start')).toHaveLength(1)
+      expect(sidecar.getRequests('turn/start')).toHaveLength(1)
     } finally {
+      await sidecar.closeServer()
       await server.close()
       await registry.cleanup()
     }
@@ -3100,6 +4059,53 @@ describe('stream sessions', () => {
     }
   })
 
+  it('tears down the Codex runtime when initial task bootstrap fails during session creation', async () => {
+    const sidecar = installMockCodexSidecar()
+    sidecar.setTurnStartBehavior('error')
+    const server = await startServer()
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-bootstrap-failure',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+          task: 'bootstrap me',
+        }),
+      })
+
+      expect(createResponse.status).toBe(500)
+      expect(await createResponse.json()).toEqual({
+        error: expect.stringContaining('Injected turn/start failure'),
+      })
+
+      await vi.waitFor(() => {
+        expect(sidecar.getStartedThreadIds()).toEqual(['thread-1'])
+        expect(sidecar.getProcessKillCallCount('thread-1')).toBeGreaterThan(0)
+      })
+
+      const archiveRequests = sidecar.getRequests('thread/archive').filter((request) => {
+        const params = (request.params ?? {}) as { threadId?: unknown }
+        return params.threadId === 'thread-1'
+      })
+      expect(archiveRequests.length).toBeGreaterThan(0)
+
+      const sessionResponse = await fetch(`${server.baseUrl}/api/agents/sessions/codex-bootstrap-failure`, {
+        headers: AUTH_HEADERS,
+      })
+      expect(sessionResponse.status).toBe(404)
+    } finally {
+      await sidecar.closeServer()
+      await server.close()
+    }
+  })
+
   it('delivers REST send requests to Codex sessions through the sidecar transport', async () => {
     const sidecar = installMockCodexSidecar()
     const server = await startServer()
@@ -3164,6 +4170,87 @@ describe('stream sessions', () => {
         status: 'running',
         agentType: 'codex',
       })
+
+      ws.close()
+    } finally {
+      await sidecar.closeServer()
+      await server.close()
+    }
+  })
+
+  it('does not duplicate user events when Codex echoes item/started userMessage after send', async () => {
+    const sidecar = installMockCodexSidecar()
+    const server = await startServer()
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-user-echo-dedupe',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+        }),
+      })
+      expect(createResponse.status).toBe(201)
+
+      const ws = await connectWs(server.baseUrl, 'codex-user-echo-dedupe')
+      const received: Array<{ type: string; message?: { content?: string } }> = []
+      ws.on('message', (data) => {
+        const parsed = JSON.parse(data.toString()) as { type: string; message?: { content?: string } }
+        if (parsed.type !== 'replay') {
+          received.push(parsed)
+        }
+      })
+
+      const sendResponse = await fetch(`${server.baseUrl}/api/agents/sessions/codex-user-echo-dedupe/send`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ text: 'status?' }),
+      })
+
+      expect(sendResponse.status).toBe(200)
+      expect(await sendResponse.json()).toEqual({ sent: true })
+
+      await vi.waitFor(() => {
+        const userEvents = received.filter(
+          (event) => event.type === 'user' && event.message?.content === 'status?',
+        )
+        expect(userEvents).toHaveLength(1)
+      })
+
+      sidecar.emitNotification('item/started', {
+        threadId: 'thread-1',
+        item: {
+          id: 'user-item-1',
+          type: 'userMessage',
+          content: [{ type: 'input_text', text: 'status?' }],
+        },
+      })
+
+      await new Promise((resolve) => setTimeout(resolve, 50))
+
+      const userEvents = received.filter(
+        (event) => event.type === 'user' && event.message?.content === 'status?',
+      )
+      expect(userEvents).toHaveLength(1)
+
+      const session = server.agents.sessionsInterface.getSession('codex-user-echo-dedupe')
+      const storedUserEvents = (session?.events ?? []).filter((event) => {
+        if (event.type !== 'user') {
+          return false
+        }
+        const userEvent = event as { message?: { content?: unknown } }
+        return userEvent.message?.content === 'status?'
+      })
+      expect(storedUserEvents).toHaveLength(1)
 
       ws.close()
     } finally {
@@ -3253,7 +4340,7 @@ describe('stream sessions', () => {
     }
   })
 
-  it('marks Codex sessions failed when the sidecar transport closes', async () => {
+  it('marks a Codex session failed when its runtime transport closes', async () => {
     const sidecar = installMockCodexSidecar()
     const server = await startServer()
 
@@ -3318,7 +4405,269 @@ describe('stream sessions', () => {
     }
   })
 
-  it('fails Codex sessions when sidecar keepalive stops receiving pong frames', async () => {
+  it('isolates Codex runtime transport failures to the affected session', async () => {
+    const sidecar = installMockCodexSidecar()
+    const server = await startServer()
+
+    try {
+      const createA = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-isolation-a',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+        }),
+      })
+      expect(createA.status).toBe(201)
+
+      const createB = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-isolation-b',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+        }),
+      })
+      expect(createB.status).toBe(201)
+
+      await vi.waitFor(() => {
+        expect(sidecar.getRuntimeSpawnCount()).toBe(2)
+        expect(sidecar.getStartedThreadIds()).toHaveLength(2)
+      })
+
+      const [threadA, threadB] = sidecar.getStartedThreadIds()
+      expect(threadA).toBeDefined()
+      expect(threadB).toBeDefined()
+      expect(threadA).not.toBe(threadB)
+
+      const wsA = await connectWs(server.baseUrl, 'codex-isolation-a')
+      const wsB = await connectWs(server.baseUrl, 'codex-isolation-b')
+      const receivedA: Array<{ type: string; text?: string }> = []
+      const receivedB: Array<{ type: string; text?: string }> = []
+
+      wsA.on('message', (data) => {
+        const parsed = JSON.parse(data.toString()) as { type: string; text?: string }
+        if (parsed.type !== 'replay') {
+          receivedA.push(parsed)
+        }
+      })
+      wsB.on('message', (data) => {
+        const parsed = JSON.parse(data.toString()) as { type: string; text?: string }
+        if (parsed.type !== 'replay') {
+          receivedB.push(parsed)
+        }
+      })
+
+      await sidecar.closeConnectionForThread(threadA!, 1011, 'Injected runtime-A transport failure')
+
+      await vi.waitFor(() => {
+        const systemEvent = receivedA.find((event) => event.type === 'system')
+        expect(systemEvent?.text).toContain('Injected runtime-A transport failure')
+      })
+      expect(receivedA.some((event) => event.type === 'exit')).toBe(true)
+
+      await new Promise((resolve) => setTimeout(resolve, 40))
+      expect(receivedB.some((event) => event.type === 'exit')).toBe(false)
+
+      const sendB = await fetch(`${server.baseUrl}/api/agents/sessions/codex-isolation-b/send`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ text: 'still alive?' }),
+      })
+      expect(sendB.status).toBe(200)
+      expect(await sendB.json()).toEqual({ sent: true })
+
+      await vi.waitFor(() => {
+        const turnRequest = sidecar.getRequests('turn/start').find((request) => {
+          const params = (request.params ?? {}) as {
+            threadId?: unknown
+            input?: Array<{ text?: unknown }>
+          }
+          const turnText = Array.isArray(params.input) && typeof params.input[0]?.text === 'string'
+            ? params.input[0].text
+            : undefined
+          return params.threadId === threadB && turnText === 'still alive?'
+        })
+        expect(turnRequest).toBeDefined()
+      })
+
+      const sessionB = await fetch(`${server.baseUrl}/api/agents/sessions/codex-isolation-b`, {
+        headers: AUTH_HEADERS,
+      })
+      expect(sessionB.status).toBe(200)
+      expect(await sessionB.json()).toMatchObject({
+        name: 'codex-isolation-b',
+        completed: false,
+        status: 'running',
+      })
+
+      wsA.close()
+      wsB.close()
+    } finally {
+      await sidecar.closeServer()
+      await server.close()
+    }
+  })
+
+  it('tears down only the deleted Codex runtime when two sessions are active', async () => {
+    const sidecar = installMockCodexSidecar()
+    const server = await startServer()
+
+    try {
+      const createA = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-delete-a',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+        }),
+      })
+      expect(createA.status).toBe(201)
+
+      const createB = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-delete-b',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+        }),
+      })
+      expect(createB.status).toBe(201)
+
+      await vi.waitFor(() => {
+        expect(sidecar.getStartedThreadIds()).toHaveLength(2)
+      })
+      const [threadA, threadB] = sidecar.getStartedThreadIds()
+
+      const deleteResponse = await fetch(`${server.baseUrl}/api/agents/sessions/codex-delete-a`, {
+        method: 'DELETE',
+        headers: AUTH_HEADERS,
+      })
+      expect(deleteResponse.status).toBe(200)
+      expect(await deleteResponse.json()).toEqual({ killed: true })
+
+      await vi.waitFor(() => {
+        expect(sidecar.getProcessKillCallCount(threadA!)).toBeGreaterThan(0)
+      })
+      expect(sidecar.getProcessKillCallCount(threadB!)).toBe(0)
+
+      const archiveRequests = sidecar.getRequests('thread/archive').filter((request) => {
+        const params = (request.params ?? {}) as { threadId?: unknown }
+        return params.threadId === threadA
+      })
+      expect(archiveRequests.length).toBeGreaterThan(0)
+
+      const sendB = await fetch(`${server.baseUrl}/api/agents/sessions/codex-delete-b/send`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ text: 'session b still active' }),
+      })
+      expect(sendB.status).toBe(200)
+      expect(await sendB.json()).toEqual({ sent: true })
+
+      await vi.waitFor(() => {
+        const turnRequest = sidecar.getRequests('turn/start').find((request) => {
+          const params = (request.params ?? {}) as {
+            threadId?: unknown
+            input?: Array<{ text?: unknown }>
+          }
+          const turnText = Array.isArray(params.input) && typeof params.input[0]?.text === 'string'
+            ? params.input[0].text
+            : undefined
+          return params.threadId === threadB && turnText === 'session b still active'
+        })
+        expect(turnRequest).toBeDefined()
+      })
+    } finally {
+      await sidecar.closeServer()
+      await server.close()
+    }
+  })
+
+  it('reaps all active Codex runtimes on sessions shutdown when runtime API exposes shutdown', async () => {
+    const sidecar = installMockCodexSidecar()
+    const server = await startServer()
+
+    try {
+      const createA = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-shutdown-a',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+        }),
+      })
+      expect(createA.status).toBe(201)
+
+      const createB = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'codex-shutdown-b',
+          mode: 'default',
+          sessionType: 'stream',
+          agentType: 'codex',
+        }),
+      })
+      expect(createB.status).toBe(201)
+
+      await vi.waitFor(() => {
+        expect(sidecar.getStartedThreadIds()).toHaveLength(2)
+      })
+
+      const [threadA, threadB] = sidecar.getStartedThreadIds()
+      const maybeShutdown = (server.agents.sessionsInterface as { shutdown?: () => void | Promise<void> }).shutdown
+      if (typeof maybeShutdown !== 'function') {
+        return
+      }
+
+      await maybeShutdown()
+
+      await vi.waitFor(() => {
+        expect(sidecar.getProcessKillCallCount(threadA!)).toBeGreaterThan(0)
+        expect(sidecar.getProcessKillCallCount(threadB!)).toBeGreaterThan(0)
+      })
+    } finally {
+      await sidecar.closeServer()
+      await server.close()
+    }
+  })
+
+  it('fails Codex sessions when runtime keepalive stops receiving pong frames', async () => {
     const sidecar = installMockCodexSidecar()
     const server = await startServer({
       wsKeepAliveIntervalMs: 20,
@@ -3354,7 +4703,7 @@ describe('stream sessions', () => {
 
       await vi.waitFor(() => {
         const systemEvent = received.find((event) => event.type === 'system')
-        expect(systemEvent?.text).toContain('Codex sidecar keepalive timeout')
+        expect(systemEvent?.text).toContain('keepalive timeout')
       })
       expect(received.some((event) => event.type === 'exit')).toBe(true)
 
@@ -3374,7 +4723,7 @@ describe('stream sessions', () => {
     }
   })
 
-  it('logs Codex sidecar stderr output for diagnostics', async () => {
+  it('logs Codex runtime stderr output for diagnostics', async () => {
     const sidecar = installMockCodexSidecar()
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const server = await startServer()
@@ -3400,7 +4749,9 @@ describe('stream sessions', () => {
       await vi.waitFor(() => {
         expect(warnSpy.mock.calls.some(
           ([message]) => typeof message === 'string'
-            && message.includes('[agents][codex-sidecar][stderr] Injected sidecar stderr line'),
+            && message.includes('[agents][codex')
+            && message.includes('[stderr]')
+            && message.includes('Injected sidecar stderr line'),
         )).toBe(true)
       })
     } finally {
@@ -4242,8 +5593,24 @@ describe('stream sessions', () => {
 
     expect(mockedSpawn).toHaveBeenCalledWith(
       'claude',
-      ['-p', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json', '--permission-mode', 'acceptEdits'],
-      expect.any(Object),
+      [
+        '-p',
+        '--verbose',
+        '--output-format',
+        'stream-json',
+        '--input-format',
+        'stream-json',
+        '--effort',
+        'max',
+        '--permission-mode',
+        'acceptEdits',
+      ],
+      expect.objectContaining({
+        env: expect.objectContaining({
+          CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING: '1',
+          CLAUDECODE: undefined,
+        }),
+      }),
     )
 
     await server.close()
@@ -4268,7 +5635,17 @@ describe('stream sessions', () => {
 
     expect(mockedSpawn).toHaveBeenCalledWith(
       'claude',
-      ['-p', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json', '--dangerously-skip-permissions'],
+      [
+        '-p',
+        '--verbose',
+        '--output-format',
+        'stream-json',
+        '--input-format',
+        'stream-json',
+        '--effort',
+        'max',
+        '--dangerously-skip-permissions',
+      ],
       expect.any(Object),
     )
 
@@ -4416,6 +5793,98 @@ describe('stream sessions', () => {
     expect(replay!.events).toHaveLength(2)
     expect((replay!.events![0] as { type: string }).type).toBe('message_start')
     expect((replay!.events![1] as { type: string }).type).toBe('content_block_start')
+
+    ws.close()
+    await server.close()
+  })
+
+  it('normalizes Claude plan-mode events before replay while keeping AskUserQuestion intact', async () => {
+    const mock = installMockProcess()
+    const server = await startServer()
+
+    await fetch(`${server.baseUrl}/api/agents/sessions`, {
+      method: 'POST',
+      headers: {
+        ...AUTH_HEADERS,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: 'stream-plan-mode',
+        mode: 'default',
+        sessionType: 'stream',
+      }),
+    })
+
+    mock.emitStdout('{"type":"assistant","message":{"id":"m1","role":"assistant","content":[{"type":"tool_use","id":"plan-enter","name":"EnterPlanMode"}]}}\n')
+    mock.emitStdout('{"type":"assistant","message":{"id":"m2","role":"assistant","content":[{"type":"tool_use","id":"plan-exit","name":"ExitPlanMode","input":{"plan":"1. Inspect stream handling\\n2. Patch replay"}}]}}\n')
+    mock.emitStdout('{"type":"assistant","message":{"id":"m3","role":"assistant","content":[{"type":"tool_use","id":"ask-1","name":"AskUserQuestion","input":{"questions":[{"question":"Proceed?","header":"Confirm","multiSelect":false,"options":[{"label":"Yes","description":"Continue"}]}]}}]}}\n')
+    mock.emitStdout('{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"plan-exit","content":"{\\"approved\\":true,\\"message\\":\\"Proceeding with the approved plan.\\"}"}]}}\n')
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    const wsUrl = server.baseUrl.replace('http://', 'ws://') +
+      '/api/agents/sessions/stream-plan-mode/terminal?api_key=test-key'
+    const ws = new WebSocket(wsUrl)
+    const messages: Array<{ type: string; events?: unknown[] }> = []
+
+    ws.on('message', (data) => {
+      messages.push(JSON.parse(data.toString()))
+    })
+
+    await new Promise<void>((resolve, reject) => {
+      ws.on('open', () => resolve())
+      ws.on('error', reject)
+    })
+
+    await vi.waitFor(() => {
+      expect(messages.length).toBeGreaterThan(0)
+    })
+
+    const replay = messages.find((message) => message.type === 'replay')
+    expect(replay).toBeDefined()
+
+    const replayEvents = replay!.events as Array<Record<string, unknown>>
+    expect(replayEvents).toEqual([
+      {
+        type: 'planning',
+        action: 'enter',
+      },
+      {
+        type: 'planning',
+        action: 'proposed',
+        plan: '1. Inspect stream handling\n2. Patch replay',
+      },
+      {
+        type: 'assistant',
+        message: {
+          id: 'm3',
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'ask-1',
+              name: 'AskUserQuestion',
+              input: {
+                questions: [
+                  {
+                    question: 'Proceed?',
+                    header: 'Confirm',
+                    multiSelect: false,
+                    options: [{ label: 'Yes', description: 'Continue' }],
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      },
+      {
+        type: 'planning',
+        action: 'decision',
+        approved: true,
+        message: 'Proceeding with the approved plan.',
+      },
+    ])
 
     ws.close()
     await server.close()
@@ -5385,5 +6854,105 @@ describe('stream sessions', () => {
     }).not.toThrow()
 
     await server.close()
+  })
+
+  it('creates, prompts, and resumes Gemini ACP sessions without replaying provider history', async () => {
+    const geminiAcp = installMockGeminiAcpRuntime()
+    const server = await startServer()
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/agents/sessions`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'gemini-acp',
+          mode: 'acceptEdits',
+          agentType: 'gemini',
+        }),
+      })
+
+      expect(createResponse.status).toBe(201)
+      expect(geminiAcp.requests.some((request) => request.method === 'session/new')).toBe(true)
+      expect(
+        geminiAcp.requests.some((request) =>
+          request.method === 'session/set_mode'
+          && (request.params as { modeId?: string } | undefined)?.modeId === 'autoEdit'),
+      ).toBe(true)
+
+      const sendResponse = await fetch(`${server.baseUrl}/api/agents/sessions/gemini-acp/send`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ text: 'hello gemini' }),
+      })
+
+      expect(sendResponse.status).toBe(200)
+      expect(geminiAcp.promptTexts).toEqual(['hello gemini'])
+
+      const liveSession = server.agents.sessionsInterface.getSession('gemini-acp')
+      expect(liveSession?.agentType).toBe('gemini')
+      expect(liveSession?.events).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: 'message_start',
+          source: { provider: 'gemini', backend: 'acp' },
+        }),
+        expect.objectContaining({
+          type: 'content_block_delta',
+          delta: { type: 'thinking_delta', thinking: 'pondering...' },
+          source: { provider: 'gemini', backend: 'acp' },
+        }),
+        expect.objectContaining({
+          type: 'content_block_delta',
+          delta: { type: 'text_delta', text: 'reply 1' },
+          source: { provider: 'gemini', backend: 'acp' },
+        }),
+        expect.objectContaining({
+          type: 'message_delta',
+          usage: { input_tokens: 5, output_tokens: 7 },
+          source: { provider: 'gemini', backend: 'acp' },
+        }),
+        expect.objectContaining({
+          type: 'result',
+          result: 'Turn completed',
+          source: { provider: 'gemini', backend: 'acp' },
+        }),
+      ]))
+
+      const deleteResponse = await fetch(`${server.baseUrl}/api/agents/sessions/gemini-acp`, {
+        method: 'DELETE',
+        headers: AUTH_HEADERS,
+      })
+      expect(deleteResponse.status).toBe(200)
+
+      const resumeResponse = await fetch(`${server.baseUrl}/api/agents/sessions/gemini-acp/resume`, {
+        method: 'POST',
+        headers: AUTH_HEADERS,
+      })
+      expect(resumeResponse.status).toBe(201)
+      expect(geminiAcp.requests.some((request) => request.method === 'session/load')).toBe(true)
+
+      const resumedSession = server.agents.sessionsInterface.getSession('gemini-acp')
+      expect(resumedSession?.agentType).toBe('gemini')
+      expect(resumedSession?.events).toEqual([])
+
+      const resumedSendResponse = await fetch(`${server.baseUrl}/api/agents/sessions/gemini-acp/send`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ text: 'hello again' }),
+      })
+
+      expect(resumedSendResponse.status).toBe(200)
+      expect(geminiAcp.promptTexts).toEqual(['hello gemini', 'hello again'])
+    } finally {
+      await server.close()
+    }
   })
 })

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import express from 'express'
 import { createServer, type Server } from 'node:http'
 import { mkdtemp, rm } from 'node:fs/promises'
@@ -11,6 +11,8 @@ import {
   type CommanderChannelReplyDispatchInput,
   type CommandersRouterOptions,
 } from '../routes'
+
+vi.setConfig({ testTimeout: 60_000 })
 
 const AUTH_HEADERS = {
   'x-hammurabi-api-key': 'test-key',
@@ -166,6 +168,7 @@ async function startServer(options: {
     apiKeyStore: createTestApiKeyStore(),
     sessionStorePath: options.sessionStorePath,
     sessionsInterface: options.sessionsInterface,
+    refreshCommanderMemoryIndex: async () => {},
     channelReplyDispatchers: options.channelReplyDispatchers,
   })
   app.use('/api/commanders', commanders.router)

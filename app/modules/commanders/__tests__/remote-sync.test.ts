@@ -67,6 +67,7 @@ async function startServer(
     apiKeyStore: createTestApiKeyStore(),
     sessionStorePath,
     memoryBasePath,
+    refreshCommanderMemoryIndex: async () => {},
   })
   app.use('/api/commanders', commanders.router)
 

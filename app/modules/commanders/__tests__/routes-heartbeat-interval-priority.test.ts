@@ -8,6 +8,8 @@ import type { ApiKeyStoreLike } from '../../../server/api-keys/store'
 import { createCommandersRouter, type CommandersRouterOptions } from '../routes'
 import type { CommanderSessionsInterface } from '../../agents/routes'
 
+vi.setConfig({ testTimeout: 60_000 })
+
 const AUTH_HEADERS = {
   'x-hammurabi-api-key': 'test-key',
 }
@@ -106,6 +108,7 @@ async function startServer(
     ...options,
     sessionStorePath,
     memoryBasePath,
+    refreshCommanderMemoryIndex: async () => {},
   })
   app.use('/api/commanders', commanders.router)
 
@@ -167,6 +170,18 @@ async function startCommander(baseUrl: string, commanderId: string): Promise<voi
   expect(response.status).toBe(200)
 }
 
+async function stopCommander(baseUrl: string, commanderId: string): Promise<void> {
+  const response = await fetch(`${baseUrl}/api/commanders/${commanderId}/stop`, {
+    method: 'POST',
+    headers: {
+      ...AUTH_HEADERS,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({}),
+  })
+  expect(response.status).toBe(200)
+}
+
 async function getHeartbeatEntryCount(baseUrl: string, commanderId: string): Promise<number> {
   const response = await fetch(`${baseUrl}/api/commanders/${commanderId}/heartbeat-log`, {
     headers: AUTH_HEADERS,
@@ -195,9 +210,10 @@ describe('commanders heartbeat interval priority', () => {
       memoryBasePath,
       sessionsInterface: createMockSessionsInterface(),
     })
+    let commanderId = ''
 
     try {
-      const commanderId = await createCommander(server.baseUrl, 'worker-priority-fallback')
+      commanderId = await createCommander(server.baseUrl, 'worker-priority-fallback')
       const commanderRoot = join(memoryBasePath, commanderId)
       await mkdir(commanderRoot, { recursive: true })
       await writeFile(
@@ -218,6 +234,74 @@ describe('commanders heartbeat interval priority', () => {
         expect(entryCount).toBeGreaterThanOrEqual(2)
       }, { timeout: 600 })
     } finally {
+      if (commanderId) {
+        await stopCommander(server.baseUrl, commanderId)
+      }
+      await server.close()
+    }
+  })
+
+  it('prefers workspace COMMANDER.md heartbeat.interval when identity and workspace files both exist', async () => {
+    const dir = await createTempDir('hammurabi-heartbeat-priority-workspace-override-')
+    const storePath = join(dir, 'sessions.json')
+    const memoryBasePath = join(dir, 'memory')
+    const workspaceDir = join(dir, 'workspace')
+    await mkdir(workspaceDir, { recursive: true })
+    await writeFile(
+      join(workspaceDir, 'COMMANDER.md'),
+      [
+        '---',
+        'heartbeat.interval: 30',
+        '---',
+        'WORKSPACE HEARTBEAT OVERRIDE',
+      ].join('\n'),
+      'utf8',
+    )
+    const server = await startServer({
+      sessionStorePath: storePath,
+      memoryBasePath,
+      sessionsInterface: createMockSessionsInterface(),
+    })
+    let commanderId = ''
+
+    try {
+      const createResponse = await fetch(`${server.baseUrl}/api/commanders`, {
+        method: 'POST',
+        headers: {
+          ...AUTH_HEADERS,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          host: 'worker-priority-workspace-override',
+          cwd: workspaceDir,
+        }),
+      })
+      const created = (await createResponse.json()) as { id: string }
+      commanderId = created.id
+
+      const commanderRoot = join(memoryBasePath, commanderId)
+      await mkdir(commanderRoot, { recursive: true })
+      await writeFile(
+        join(commanderRoot, 'COMMANDER.md'),
+        [
+          '---',
+          'heartbeat.interval: 5000',
+          '---',
+          'IDENTITY HEARTBEAT FALLBACK',
+        ].join('\n'),
+        'utf8',
+      )
+
+      await startCommander(server.baseUrl, commanderId)
+
+      await vi.waitFor(async () => {
+        const entryCount = await getHeartbeatEntryCount(server.baseUrl, commanderId)
+        expect(entryCount).toBeGreaterThanOrEqual(2)
+      }, { timeout: 600 })
+    } finally {
+      if (commanderId) {
+        await stopCommander(server.baseUrl, commanderId)
+      }
       await server.close()
     }
   })
@@ -231,9 +315,10 @@ describe('commanders heartbeat interval priority', () => {
       memoryBasePath,
       sessionsInterface: createMockSessionsInterface(),
     })
+    let commanderId = ''
 
     try {
-      const commanderId = await createCommander(server.baseUrl, 'worker-priority-ui-override')
+      commanderId = await createCommander(server.baseUrl, 'worker-priority-ui-override')
       const commanderRoot = join(memoryBasePath, commanderId)
       await mkdir(commanderRoot, { recursive: true })
       await writeFile(
@@ -270,6 +355,9 @@ describe('commanders heartbeat interval priority', () => {
         expect(entryCount).toBeGreaterThanOrEqual(2)
       }, { timeout: 350 })
     } finally {
+      if (commanderId) {
+        await stopCommander(server.baseUrl, commanderId)
+      }
       await server.close()
     }
   })

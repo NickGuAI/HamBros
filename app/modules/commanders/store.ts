@@ -2,6 +2,11 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import {
+  DEFAULT_CLAUDE_EFFORT_LEVEL,
+  normalizeClaudeEffortLevel,
+  type ClaudeEffortLevel,
+} from '../claude-effort.js'
+import {
   createDefaultHeartbeatState,
   normalizeHeartbeatState,
   type CommanderHeartbeatState,
@@ -71,11 +76,13 @@ export interface CommanderSession {
   pid: number | null
   state: 'idle' | 'running' | 'paused' | 'stopped'
   created: string
-  agentType?: 'claude' | 'codex'
+  agentType?: 'claude' | 'codex' | 'gemini'
+  effort?: ClaudeEffortLevel
   channelMeta?: CommanderChannelMeta
   lastRoute?: CommanderLastRoute
   claudeSessionId?: string
   codexThreadId?: string
+  geminiSessionId?: string
   cwd?: string
   heartbeat: CommanderHeartbeatState
   lastHeartbeat: string | null
@@ -267,8 +274,11 @@ function parseCommanderLastRoute(raw: unknown): CommanderLastRoute | undefined {
   }
 }
 
-function parseAgentType(raw: unknown): 'claude' | 'codex' {
-  return raw === 'codex' ? 'codex' : 'claude'
+function parseAgentType(raw: unknown): 'claude' | 'codex' | 'gemini' {
+  if (raw === 'codex' || raw === 'gemini') {
+    return raw
+  }
+  return 'claude'
 }
 
 function parseCommanderSession(raw: unknown): CommanderSession | null {
@@ -286,11 +296,15 @@ function parseCommanderSession(raw: unknown): CommanderSession | null {
     : undefined
   const created = typeof raw.created === 'string' ? raw.created.trim() : ''
   const agentType = parseAgentType(raw.agentType)
+  const effort = normalizeClaudeEffortLevel(raw.effort, DEFAULT_CLAUDE_EFFORT_LEVEL)
   const claudeSessionId = typeof raw.claudeSessionId === 'string' && raw.claudeSessionId.trim().length > 0
     ? raw.claudeSessionId.trim()
     : undefined
   const codexThreadId = typeof raw.codexThreadId === 'string' && raw.codexThreadId.trim().length > 0
     ? raw.codexThreadId.trim()
+    : undefined
+  const geminiSessionId = typeof raw.geminiSessionId === 'string' && raw.geminiSessionId.trim().length > 0
+    ? raw.geminiSessionId.trim()
     : undefined
   const cwd = typeof raw.cwd === 'string' && raw.cwd.trim().length > 0
     ? raw.cwd.trim()
@@ -339,8 +353,10 @@ function parseCommanderSession(raw: unknown): CommanderSession | null {
     state: state as CommanderSession['state'],
     created,
     agentType,
+    effort,
     claudeSessionId,
     codexThreadId,
+    geminiSessionId,
     cwd,
     ...(channelMeta ? { channelMeta } : {}),
     ...(lastRoute ? { lastRoute } : {}),
@@ -476,6 +492,7 @@ export class CommanderSessionStore {
         state: 'idle',
         created: nowIso,
         agentType: 'claude',
+        effort: DEFAULT_CLAUDE_EFFORT_LEVEL,
         heartbeat: createDefaultHeartbeatState(),
         lastHeartbeat: null,
         heartbeatTickCount: 0,

@@ -111,24 +111,6 @@ export async function getDebriefStatus(
   )
 }
 
-interface ResetSessionResponse {
-  reset?: boolean
-  sessionName?: string
-}
-
-export async function resetSession(sessionName: string): Promise<{ reset: true }> {
-  const response = await fetchJson<ResetSessionResponse>(
-    `/api/agents/sessions/${encodeURIComponent(sessionName)}/reset`,
-    { method: 'POST' },
-  )
-
-  if (response.reset !== true) {
-    throw new Error('Session reset was not acknowledged by server')
-  }
-
-  return { reset: true }
-}
-
 export function useDirectories(dirPath?: string, enabled = true, host?: string) {
   return useQuery({
     queryKey: ['agents', 'directories', dirPath ?? '~', host ?? ''],

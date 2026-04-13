@@ -101,8 +101,8 @@ function parseStatus(raw: unknown): SentinelStatus | null {
   return null
 }
 
-function isSentinelAgentType(raw: unknown): raw is 'claude' | 'codex' {
-  return raw === 'claude' || raw === 'codex'
+function isSentinelAgentType(raw: unknown): raw is 'claude' | 'codex' | 'gemini' {
+  return raw === 'claude' || raw === 'codex' || raw === 'gemini'
 }
 
 function parseSentinel(entry: unknown): Sentinel | null {

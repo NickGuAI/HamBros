@@ -255,7 +255,7 @@ function printUsage(stdout: Writable): void {
   stdout.write('Usage:\n')
   stdout.write('  hammurabi sentinel list [--parent <commander-id>]\n')
   stdout.write(
-    '  hammurabi sentinel create --parent <commander-id> --name <name> --schedule "<cron>" --instruction "<text>" [--skills "a,b"] [--seed-memory "<text>"] [--max-runs <n>] [--timezone <tz>] [--agent claude|codex] [--permission-mode <mode>] [--model <model>] [--work-dir <path>]\n',
+    '  hammurabi sentinel create --parent <commander-id> --name <name> --schedule "<cron>" --instruction "<text>" [--skills "a,b"] [--seed-memory "<text>"] [--max-runs <n>] [--timezone <tz>] [--agent claude|codex|gemini] [--permission-mode <mode>] [--model <model>] [--work-dir <path>]\n',
   )
   stdout.write('  hammurabi sentinel show <sentinel-id>\n')
   stdout.write('  hammurabi sentinel pause <sentinel-id>\n')
@@ -395,8 +395,8 @@ function parseCreateArgs(args: readonly string[]): { ok: true; body: Record<stri
     : undefined
 
   const agentType = values.get('--agent')
-  if (agentType && agentType !== 'claude' && agentType !== 'codex') {
-    return { ok: false, error: '--agent must be claude or codex' }
+  if (agentType && agentType !== 'claude' && agentType !== 'codex' && agentType !== 'gemini') {
+    return { ok: false, error: '--agent must be claude, codex, or gemini' }
   }
 
   const body: Record<string, unknown> = {

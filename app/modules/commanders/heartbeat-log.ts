@@ -3,7 +3,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { resolveCommanderDataDir } from './paths.js'
 
-export type HeartbeatLogOutcome = 'ok' | 'no-quests' | 'error'
+export type HeartbeatLogOutcome = 'ok' | 'no-quests' | 'error' | 'skipped'
 
 export interface HeartbeatLogEntry {
   id: string
@@ -49,7 +49,7 @@ function normalizeOptionalString(raw: unknown): string | undefined {
 }
 
 function parseOutcome(raw: unknown): HeartbeatLogOutcome | null {
-  return raw === 'ok' || raw === 'no-quests' || raw === 'error' ? raw : null
+  return raw === 'ok' || raw === 'no-quests' || raw === 'error' || raw === 'skipped' ? raw : null
 }
 
 function parseEntry(raw: unknown): HeartbeatLogEntry | null {

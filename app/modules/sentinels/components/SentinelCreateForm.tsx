@@ -27,7 +27,7 @@ export function SentinelCreateForm({
   const [skills, setSkills] = useState<string[]>([])
   const [seedMemory, setSeedMemory] = useState('')
   const [maxRuns, setMaxRuns] = useState('')
-  const [agentType, setAgentType] = useState<'claude' | 'codex'>('claude')
+  const [agentType, setAgentType] = useState<'claude' | 'codex' | 'gemini'>('claude')
   const [permissionMode, setPermissionMode] = useState<'default' | 'acceptEdits' | 'dangerouslySkipPermissions'>('acceptEdits')
   const [formError, setFormError] = useState<string | null>(null)
 
@@ -176,12 +176,13 @@ export function SentinelCreateForm({
         <label className="section-title block mb-2">Agent Type</label>
         <select
           value={agentType}
-          onChange={(event) => setAgentType(event.target.value as 'claude' | 'codex')}
+          onChange={(event) => setAgentType(event.target.value as 'claude' | 'codex' | 'gemini')}
           className="w-full px-3 py-2 rounded-lg border border-ink-border bg-washi-aged text-[16px] md:text-sm focus:outline-none focus:border-ink-border-hover"
           required
         >
           <option value="claude">Claude</option>
           <option value="codex">Codex</option>
+          <option value="gemini">Gemini</option>
         </select>
       </div>
 

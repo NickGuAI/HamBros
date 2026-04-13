@@ -150,6 +150,16 @@ server.on('upgrade', (req, socket, head) => {
 
 let isShuttingDown = false
 
+async function shutdownModules(): Promise<void> {
+  const results = await Promise.allSettled(modules.map(async (mod) => {
+    await mod.shutdown?.()
+  }))
+  const rejected = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
+  if (rejected) {
+    throw rejected.reason
+  }
+}
+
 server.listen(port, () => {
   for (const signal of ['SIGTERM', 'SIGINT'] as const) {
     process.on(signal, () => {
@@ -158,14 +168,22 @@ server.listen(port, () => {
       }
       isShuttingDown = true
       logInfo(`Received ${signal}, shutting down`)
-      server.close((error) => {
-        if (error) {
+      void (async () => {
+        try {
+          await shutdownModules()
+          server.close((error) => {
+            if (error) {
+              logError(`Error during shutdown\n${formatError(error)}`)
+              process.exit(1)
+            }
+            logInfo(`Shutdown complete (${signal})`)
+            process.exit(0)
+          })
+        } catch (error) {
           logError(`Error during shutdown\n${formatError(error)}`)
           process.exit(1)
         }
-        logInfo(`Shutdown complete (${signal})`)
-        process.exit(0)
-      })
+      })()
     })
   }
 

@@ -1,14 +1,15 @@
-/**
- * Normalizes Codex app-server JSONRPC notification events into the
- * StreamJsonEvent shape used by the Hammurabi agents session layer.
- *
- * This is a pure function with no closure dependencies, extracted for
- * testability.
- */
+import type { HammurabiEvent, HammurabiEventSource } from '../../src/types/hammurabi-events.js'
 
-interface StreamJsonEvent {
-  type: string
-  [key: string]: unknown
+const CODEX_EVENT_SOURCE: HammurabiEventSource = {
+  provider: 'codex',
+  backend: 'rpc',
+}
+
+function withCodexSource<T extends HammurabiEvent>(event: T): T {
+  return {
+    ...event,
+    source: CODEX_EVENT_SOURCE,
+  } as T
 }
 
 function asObject(value: unknown): Record<string, unknown> | null {
@@ -77,144 +78,177 @@ function extractReasoningTextParts(value: unknown): string[] {
   return parts
 }
 
-export function normalizeCodexEvent(method: string, params: unknown): StreamJsonEvent | StreamJsonEvent[] | null {
+export function normalizeCodexEvent(method: string, params: unknown): HammurabiEvent | HammurabiEvent[] | null {
   const p = asObject(params) ?? {}
 
   switch (method) {
     case 'thread/started':
-      return { type: 'system', text: 'Codex session started' }
+      return withCodexSource({ type: 'system', text: 'Codex session started' })
     case 'thread/tokenUsage/updated': {
       const usageUpdate = extractUsageUpdate(p)
       if (!usageUpdate) {
         return null
       }
-      return {
+      return withCodexSource({
         type: 'message_delta',
         usage: usageUpdate.usage,
         usage_is_total: true,
         ...(usageUpdate.totalCostUsd !== undefined ? { total_cost_usd: usageUpdate.totalCostUsd } : {}),
-      }
+      })
     }
     case 'turn/started':
-      return { type: 'message_start', message: { id: (p.turn as Record<string, unknown>)?.id as string ?? '', role: 'assistant' } }
+      return withCodexSource({
+        type: 'message_start',
+        message: {
+          id: (asObject(p.turn)?.id as string | undefined) ?? '',
+          role: 'assistant',
+        },
+      })
     case 'turn/completed': {
-      const turn = p.turn as Record<string, unknown> | undefined
+      const turn = asObject(p.turn)
       const status = turn?.status as string | undefined
-      return {
+      return withCodexSource({
         type: 'result',
         result: status === 'completed' ? 'Turn completed' : `Turn ${status ?? 'ended'}`,
         is_error: status === 'failed',
-      }
+      })
     }
     case 'item/agentMessage/delta': {
-      const text = (p as Record<string, unknown>).text as string | undefined
+      const text = typeof p.text === 'string' ? p.text : undefined
       if (!text) return null
-      return { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } } as unknown as StreamJsonEvent
+      return withCodexSource({
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'text_delta', text },
+      })
     }
     case 'item/reasoning/summaryTextDelta':
     case 'item/reasoning/textDelta': {
-      const text = extractReasoningTextChunk((p as Record<string, unknown>).delta)
+      const text = extractReasoningTextChunk(p.delta)
       if (!text) return null
-      return { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: text } } as unknown as StreamJsonEvent
+      return withCodexSource({
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'thinking_delta', thinking: text },
+      })
     }
     case 'item/started': {
-      const item = p.item as Record<string, unknown>
+      const item = asObject(p.item)
       if (!item) return null
-      const itemType = item.type as string
+      const itemType = item.type as string | undefined
       if (itemType === 'userMessage') {
-        const content = item.content as Array<{ type: string; text?: string }> | undefined
-        const text = content?.map(c => c.text ?? '').join('') ?? ''
-        return {
-          type: 'user',
-          message: { role: 'user', content: text },
-        } as unknown as StreamJsonEvent
+        // Hammurabi already appends a local user echo immediately after turn/start.
+        // Re-emitting Codex userMessage item/started duplicates transcript entries.
+        return null
       }
       if (itemType === 'reasoning') {
-        return { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } } as unknown as StreamJsonEvent
+        return withCodexSource({
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'thinking', thinking: '' },
+        })
       }
       return null
     }
     case 'item/completed': {
-      const item = p.item as Record<string, unknown>
+      const item = asObject(p.item)
       if (!item) return null
-      const itemType = item.type as string
-      const itemId = item.id as string ?? ''
+      const itemType = item.type as string | undefined
+      const itemId = (item.id as string | undefined) ?? ''
+
       if (itemType === 'agentMessage') {
-        return {
+        return withCodexSource({
           type: 'assistant',
           message: {
             id: itemId,
             role: 'assistant',
-            content: [{ type: 'text', text: item.text as string ?? '' }],
+            content: [{ type: 'text', text: (item.text as string | undefined) ?? '' }],
           },
-        } as unknown as StreamJsonEvent
+        })
       }
+
       if (itemType === 'reasoning') {
         const summaryParts = extractReasoningTextParts(item.summary)
         const contentParts = extractReasoningTextParts(item.content)
         const thinking = [...summaryParts, ...contentParts].join('')
-        return {
+        return withCodexSource({
           type: 'assistant',
           message: {
             id: itemId,
             role: 'assistant',
             content: [{ type: 'thinking', thinking }],
           },
-        } as unknown as StreamJsonEvent
+        })
       }
+
       if (itemType === 'commandExecution') {
-        const events: StreamJsonEvent[] = []
-        events.push({
-          type: 'assistant',
-          message: {
-            id: itemId,
-            role: 'assistant',
-            content: [{
-              type: 'tool_use',
+        const command = typeof item.command === 'string'
+          ? item.command
+          : (typeof item.input === 'string' ? item.input : '')
+        return [
+          withCodexSource({
+            type: 'assistant',
+            message: {
               id: itemId,
-              name: 'Bash',
-              input: { command: (item.command ?? item.input) as string ?? '' },
-            }],
-          },
-        } as unknown as StreamJsonEvent)
-        events.push({
-          type: 'user',
-          message: {
-            role: 'user',
-            content: [{
-              type: 'tool_result',
-              tool_use_id: itemId,
-              content: (item.output ?? '') as string,
-              is_error: (item.exitCode as number | undefined) !== 0,
-            }],
-          },
-        } as unknown as StreamJsonEvent)
-        return events
+              role: 'assistant',
+              content: [{
+                type: 'tool_use',
+                id: itemId,
+                name: 'Bash',
+                input: { command },
+              }],
+            },
+          }),
+          withCodexSource({
+            type: 'user',
+            message: {
+              role: 'user',
+              content: [{
+                type: 'tool_result',
+                tool_use_id: itemId,
+                content: (item.output as string | undefined) ?? '',
+                is_error: (item.exitCode as number | undefined) !== 0,
+              }],
+            },
+          }),
+        ]
       }
+
       if (itemType === 'fileChange') {
-        const events: StreamJsonEvent[] = []
-        events.push({
-          type: 'assistant',
-          message: {
-            id: itemId,
-            role: 'assistant',
-            content: [{
-              type: 'tool_use',
+        const filePath = typeof item.filePath === 'string'
+          ? item.filePath
+          : (typeof item.file === 'string' ? item.file : '')
+        const nextContent = typeof item.content === 'string'
+          ? item.content
+          : (typeof item.patch === 'string' ? item.patch : '')
+        return [
+          withCodexSource({
+            type: 'assistant',
+            message: {
               id: itemId,
-              name: 'Edit',
-              input: { file_path: (item.filePath ?? item.file) as string ?? '', old_string: '', new_string: (item.content ?? item.patch ?? '') as string },
-            }],
-          },
-        } as unknown as StreamJsonEvent)
-        events.push({
-          type: 'user',
-          message: {
-            role: 'user',
-            content: [{ type: 'tool_result', tool_use_id: itemId, content: 'Applied' }],
-          },
-        } as unknown as StreamJsonEvent)
-        return events
+              role: 'assistant',
+              content: [{
+                type: 'tool_use',
+                id: itemId,
+                name: 'Edit',
+                input: {
+                  file_path: filePath,
+                  old_string: '',
+                  new_string: nextContent,
+                },
+              }],
+            },
+          }),
+          withCodexSource({
+            type: 'user',
+            message: {
+              role: 'user',
+              content: [{ type: 'tool_result', tool_use_id: itemId, content: 'Applied' }],
+            },
+          }),
+        ]
       }
+
       return null
     }
     default:
