@@ -1,6 +1,6 @@
 {
   "name": "@gehirn/herd-cli",
-  "version": "0.0.12-beta",
+  "version": "0.0.13-beta",
   "private": false,
   "license": "AGPL-3.0-only",
   "description": "Herd onboarding CLI — configure agents to send telemetry.",

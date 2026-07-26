@@ -185,9 +185,22 @@ export function createPersistenceHelpers(
     )
   }
 
+  /**
+   * Credential recovery is an explicit ownership handoff, not an ordinary
+   * hydrated runtime. A restored recovery placeholder can carry the previous
+   * provider's valid resume id while `lastTurnCompleted` is true, but that id
+   * is still the fallback row being protected—not proof that the replacement
+   * runtime owns a durable snapshot. Keep the row unclaimed until recovery
+   * clears and the replacement independently satisfies the provider snapshot
+   * contract.
+   */
+  function hasAuthoritativeDurableRuntimeIdentity(entry: PersistedStreamSession): boolean {
+    return !entry.credentialPoolRecovery && hasDurableRuntimeIdentity(entry)
+  }
+
   function claimDurablySnapshottedPersistedSessions(state: PersistedSessionsState): void {
     for (const entry of state.sessions) {
-      if (hasDurableRuntimeIdentity(entry)) {
+      if (hasAuthoritativeDurableRuntimeIdentity(entry)) {
         persistedSessionNamesAwaitingDurableSnapshot.delete(entry.name)
       }
     }
@@ -203,7 +216,7 @@ export function createPersistenceHelpers(
       // snapshot contract so an interrupted recovery cannot discard the last
       // known-good row.
       const candidate = getProvider(session.agentType)?.snapshotForPersist(session)
-      if (candidate && hasDurableRuntimeIdentity(candidate)) {
+      if (candidate && hasAuthoritativeDurableRuntimeIdentity(candidate)) {
         persistedSessionNamesAwaitingDurableSnapshot.delete(sessionName)
       }
     }
@@ -215,8 +228,9 @@ export function createPersistenceHelpers(
         cwd: session.cwd,
         createdAt: session.createdAt,
         providerContext: session.providerContext,
+        credentialPoolRecovery: session.credentialPoolRecovery,
       } as PersistedStreamSession
-      if (hasDurableRuntimeIdentity(candidate)) {
+      if (hasAuthoritativeDurableRuntimeIdentity(candidate)) {
         persistedSessionNamesAwaitingDurableSnapshot.delete(sessionName)
       }
     }

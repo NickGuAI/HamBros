@@ -1,32 +1,34 @@
-# Herd v0.0.12-beta
+# Herd v0.0.13-beta
 
-Herd `v0.0.12-beta` is a runtime-durability patch that supersedes
-`v0.0.11-beta`. It closes the active-turn edge case in a restored
-credential-recovery transition.
+Herd `v0.0.13-beta` is a runtime-durability patch that supersedes
+`v0.0.12-beta`. It closes the restored-placeholder edge in a
+credential-recovery transition across normal service restarts.
 
 ## License
 
-- Herd `v0.0.12-beta` is open source under GNU AGPLv3 (`AGPL-3.0-only`).
+- Herd `v0.0.13-beta` is open source under GNU AGPLv3 (`AGPL-3.0-only`).
 - No license purchase is required for commercial use that complies with the
   AGPL.
 - A separate paid commercial agreement is available for proprietary or other
   non-AGPL use; see
-  [COMMERCIAL-LICENSE.md](https://github.com/NickGuAI/Herd/blob/v0.0.12-beta/COMMERCIAL-LICENSE.md).
+  [COMMERCIAL-LICENSE.md](https://github.com/NickGuAI/Herd/blob/v0.0.13-beta/COMMERCIAL-LICENSE.md).
 - Earlier tagged releases retain the license terms included with those
   releases.
 
 ## Highlights
 
-- Runtime-session ownership now transfers only when the provider's own
-  persistence snapshot contract produces a resumable snapshot or daemon
-  handle. A raw provider session identifier observed during an active turn is
-  no longer mistaken for a safe persistence boundary.
-- Credential-recovery replacements retain the last known-good SQLite row while
-  their continuation turn is active. Once the provider reaches a persistable
-  boundary, normal authoritative lifecycle and deletion behavior resumes.
+- A restored credential-recovery placeholder can no longer claim authoritative
+  deletion ownership with the previous provider's resume identifier. The
+  explicit recovery marker keeps the last known-good SQLite row protected.
+- Ownership transfers only after credential recovery clears and the
+  replacement independently satisfies the provider's persistence snapshot
+  contract. Explicit archive operations and ordinary post-recovery lifecycle
+  deletion remain authoritative.
+- A two-process regression now covers successive service boots where a
+  recovery placeholder is removed before its replacement becomes durable.
 - The release retains the restore-readiness barrier, unclaimed-row protection,
-  shutdown flush, and transient recovery protection introduced in
-  `v0.0.10-beta` and `v0.0.11-beta`.
+  shutdown flush, transient recovery protection, and provider safe-boundary
+  ownership checks introduced in `v0.0.10-beta` through `v0.0.12-beta`.
 - The release retains the session composer, automation workspace, quest
   artifacts, self-contained onboarding, hosted Railway lane, credential
   placement model, provider catalogue, and public skill additions introduced
@@ -37,7 +39,7 @@ credential-recovery transition.
 Git checkouts can upgrade in place:
 
 ```bash
-herd update --tag v0.0.12-beta
+herd update --tag v0.0.13-beta
 ```
 
 Fresh installs continue to use:
@@ -52,17 +54,17 @@ curl -fsSL https://herd.gehirn.ai/install.sh | bash
   installer; durable state remains outside the application checkout.
 - Persisted sessions that cannot resume on the current machine, execution
   mode, or current provider-transition stage remain durable instead of being
-  interpreted as deleted. Provider replacements in an active, non-persistable
-  turn retain their last resumable snapshot.
+  interpreted as deleted. Restored recovery placeholders retain their fallback
+  snapshot even when they still expose the prior provider resume identifier.
 - Railway deployments must retain their configured durable volume. Hosted
   images default to daemon-only provider execution unless the host is
   intentionally provider-ready.
 
 ## Verification
 
-- Full application and CLI suites plus targeted persistence-transition,
-  installer, release-runtime, JSON-store, SQLite-readiness, and launch
-  contract tests.
+- Full application and CLI suites plus a two-process recovery-placeholder
+  regression and targeted persistence-transition, installer, release-runtime,
+  JSON-store, SQLite-readiness, and launch contract tests.
 - Application build, documentation checks, public artifact cleanliness, and
   documentation-link validation.
 - Enterprise EC2 container smoke and exact Railway production-image lifecycle

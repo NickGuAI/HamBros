@@ -8,6 +8,15 @@ continues to be the GitHub release body; this file ships in the public artifact.
 
 - No unreleased changes.
 
+## v0.0.13-beta — 2026-07-26
+
+- Prevented restored credential-recovery placeholders from claiming
+  authoritative deletion ownership with the previous provider's resume
+  identifier.
+- Kept the last resumable SQLite row across successive service restarts until
+  the explicit recovery marker clears and the replacement provider produces
+  its own persistable snapshot.
+
 ## v0.0.12-beta — 2026-07-26
 
 - Kept the last resumable SQLite row while a credential-recovery replacement
