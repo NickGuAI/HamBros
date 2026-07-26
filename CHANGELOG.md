@@ -8,6 +8,15 @@ continues to be the GitHub release body; this file ships in the public artifact.
 
 - No unreleased changes.
 
+## v0.0.11-beta — 2026-07-26
+
+- Kept the prior durable SQLite row while a restored credential-recovery
+  session is represented only by a transient provider process without a
+  resume identifier.
+- Transferred runtime-session persistence ownership only after a replacement
+  has a durable provider resume identifier or daemon handle, while preserving
+  normal authoritative deletion after that transition completes.
+
 ## v0.0.10-beta — 2026-07-26
 
 - Made runtime-session restoration part of server readiness. Health now remains

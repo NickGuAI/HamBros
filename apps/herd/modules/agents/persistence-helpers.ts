@@ -40,6 +40,7 @@ import {
   clearCodexTurnWatchdog,
   markCodexTurnHealthy,
 } from './adapters/codex/helpers.js'
+import { getDaemonProcessMetadata } from './daemon/registry.js'
 import { pruneSessionTranscript } from './transcript-store.js'
 import type { MachineRegistryStore } from './machines.js'
 import { getProvider } from './providers/registry.js'
@@ -166,22 +167,61 @@ export function createPersistenceHelpers(
   // poisoning every subsequent call.
   let persistSessionStateQueue: Promise<void> = Promise.resolve()
   let transcriptPruneQueue: Promise<void> = Promise.resolve()
-  const unclaimedPersistedSessionNames = new Set(
+  const persistedSessionNamesAwaitingDurableSnapshot = new Set(
     readSqlitePersistedSessionsState(sqliteDb).sessions.map((entry) => entry.name),
   )
 
   /**
    * A persisted row only becomes part of the authoritative in-memory snapshot
-   * after it has been hydrated into one of the runtime maps. Until then it may
-   * be awaiting provider startup, intentionally dormant on this execution
-   * mode, or temporarily unresumable. Such rows must survive snapshot writes.
+   * after the runtime can emit a durable provider snapshot for it. Mere map
+   * hydration is insufficient: credential recovery can replace a resumable
+   * session with a newly spawned process that has not emitted its provider
+   * resume identifier yet. Until that transition becomes durable, the prior
+   * row must survive snapshot writes.
    */
-  function claimHydratedPersistedSessions(): void {
-    for (const sessionName of sessions.keys()) {
-      unclaimedPersistedSessionNames.delete(sessionName)
+  function hasDurableRuntimeIdentity(entry: PersistedStreamSession): boolean {
+    return Boolean(
+      entry.daemonProcess
+      || getProvider(entry.agentType)?.hasResumeIdentifier(entry),
+    )
+  }
+
+  function claimDurablySnapshottedPersistedSessions(state: PersistedSessionsState): void {
+    for (const entry of state.sessions) {
+      if (hasDurableRuntimeIdentity(entry)) {
+        persistedSessionNamesAwaitingDurableSnapshot.delete(entry.name)
+      }
     }
-    for (const sessionName of exitedStreamSessions.keys()) {
-      unclaimedPersistedSessionNames.delete(sessionName)
+  }
+
+  function claimCurrentDurableRuntimeIdentities(): void {
+    for (const [sessionName, session] of sessions) {
+      if (session.kind !== 'stream') continue
+      const candidate = {
+        name: sessionName,
+        agentType: session.agentType,
+        mode: session.mode,
+        cwd: session.cwd,
+        createdAt: session.createdAt,
+        providerContext: session.providerContext,
+        daemonProcess: getDaemonProcessMetadata(session.process),
+      } as PersistedStreamSession
+      if (hasDurableRuntimeIdentity(candidate)) {
+        persistedSessionNamesAwaitingDurableSnapshot.delete(sessionName)
+      }
+    }
+    for (const [sessionName, session] of exitedStreamSessions) {
+      const candidate = {
+        name: sessionName,
+        agentType: session.agentType,
+        mode: session.mode,
+        cwd: session.cwd,
+        createdAt: session.createdAt,
+        providerContext: session.providerContext,
+      } as PersistedStreamSession
+      if (hasDurableRuntimeIdentity(candidate)) {
+        persistedSessionNamesAwaitingDurableSnapshot.delete(sessionName)
+      }
     }
   }
 
@@ -199,15 +239,15 @@ export function createPersistenceHelpers(
     // Capture ownership at the lifecycle event, rather than only when the
     // queued write eventually runs. This keeps a rapid create/delete sequence
     // from reviving the pre-restore row.
-    claimHydratedPersistedSessions()
+    claimCurrentDurableRuntimeIdentities()
     persistSessionStateQueue = persistSessionStateQueue
       .catch(() => undefined)
       .then(async () => {
         try {
-          claimHydratedPersistedSessions()
           const state = serializePersistedSessionsStateForStore({ sessions, exitedStreamSessions })
+          claimDurablySnapshottedPersistedSessions(state)
           writeSqlitePersistedSessionsState(sqliteDb, state, undefined, {
-            preserveSessionNames: unclaimedPersistedSessionNames,
+            preserveSessionNames: persistedSessionNamesAwaitingDurableSnapshot,
           })
         } catch (error) {
           // Test teardown and process shutdown can remove ephemeral data dirs
@@ -235,7 +275,7 @@ export function createPersistenceHelpers(
     const persisted = readSqlitePersistedSessionsState(sqliteDb)
     for (const entry of persisted.sessions) {
       if (!sessions.has(entry.name) && !exitedStreamSessions.has(entry.name)) {
-        unclaimedPersistedSessionNames.add(entry.name)
+        persistedSessionNamesAwaitingDurableSnapshot.add(entry.name)
       }
     }
 
@@ -254,7 +294,6 @@ export function createPersistenceHelpers(
       restoreCredentialPoolRecovery,
     })
 
-    claimHydratedPersistedSessions()
     schedulePersistedSessionsWrite()
     await persistSessionStateQueue
   }
@@ -262,7 +301,7 @@ export function createPersistenceHelpers(
   function archivePersistedSession(sessionName: string, entry?: PersistedStreamSession): boolean {
     const archived = archiveSqliteRuntimeSession(sqliteDb, sessionName, entry)
     if (archived) {
-      unclaimedPersistedSessionNames.delete(sessionName)
+      persistedSessionNamesAwaitingDurableSnapshot.delete(sessionName)
     }
     return archived
   }
