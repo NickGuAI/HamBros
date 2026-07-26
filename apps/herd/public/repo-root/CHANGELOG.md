@@ -8,6 +8,15 @@ continues to be the GitHub release body; this file ships in the public artifact.
 
 - No unreleased changes.
 
+## v0.0.12-beta — 2026-07-26
+
+- Kept the last resumable SQLite row while a credential-recovery replacement
+  has entered a new provider turn but has not reached the provider's
+  persistable safe boundary.
+- Aligned runtime-session ownership transfer with each provider's actual
+  persistence snapshot contract. Observing a raw provider session identifier
+  during an active turn no longer permits deletion of the last known-good row.
+
 ## v0.0.11-beta — 2026-07-26
 
 - Kept the prior durable SQLite row while a restored credential-recovery

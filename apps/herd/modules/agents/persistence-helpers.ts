@@ -40,7 +40,6 @@ import {
   clearCodexTurnWatchdog,
   markCodexTurnHealthy,
 } from './adapters/codex/helpers.js'
-import { getDaemonProcessMetadata } from './daemon/registry.js'
 import { pruneSessionTranscript } from './transcript-store.js'
 import type { MachineRegistryStore } from './machines.js'
 import { getProvider } from './providers/registry.js'
@@ -197,16 +196,14 @@ export function createPersistenceHelpers(
   function claimCurrentDurableRuntimeIdentities(): void {
     for (const [sessionName, session] of sessions) {
       if (session.kind !== 'stream') continue
-      const candidate = {
-        name: sessionName,
-        agentType: session.agentType,
-        mode: session.mode,
-        cwd: session.cwd,
-        createdAt: session.createdAt,
-        providerContext: session.providerContext,
-        daemonProcess: getDaemonProcessMetadata(session.process),
-      } as PersistedStreamSession
-      if (hasDurableRuntimeIdentity(candidate)) {
+      // A raw provider identifier is not necessarily a resumable snapshot.
+      // Claude, for example, exposes its session id during an active turn but
+      // intentionally withholds that id from persistence until the turn
+      // reaches a safe boundary. Claim ownership only through the provider's
+      // snapshot contract so an interrupted recovery cannot discard the last
+      // known-good row.
+      const candidate = getProvider(session.agentType)?.snapshotForPersist(session)
+      if (candidate && hasDurableRuntimeIdentity(candidate)) {
         persistedSessionNamesAwaitingDurableSnapshot.delete(sessionName)
       }
     }
