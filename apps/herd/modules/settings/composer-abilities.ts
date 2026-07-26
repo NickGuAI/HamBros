@@ -207,6 +207,14 @@ export function normalizePersistedComposerAbilitySettings(value: unknown): Compo
   }
 }
 
+export function isPersistedComposerAbilitySettingsValid(value: unknown): boolean {
+  if (!isRecord(value) || typeof value.customAbilitiesEnabled !== 'boolean') {
+    return false
+  }
+  return !('error' in normalizeAbilityArray(value.defaultAbilities, 'default'))
+    && !('error' in normalizeAbilityArray(value.customAbilities, 'custom'))
+}
+
 export function normalizeComposerAbilitySettingsPatch(
   value: unknown,
 ): NormalizedComposerAbilityPatch | InvalidComposerAbilityPatch {

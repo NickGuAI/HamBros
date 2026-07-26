@@ -16,6 +16,7 @@ pages first.
 - [Credential pools](operate/credential-pools.md)
 - [Machines and workers](operate/machines.md)
 - [Hardening](operate/hardening.md)
+- [Railway hosted control plane](operate/railway.md)
 - [Enterprise EC2](operate/enterprise-ec2.md)
 - [Uninstall](operate/uninstall.md)
 
@@ -35,6 +36,7 @@ pages first.
 - [Credential pools](operate/credential-pools.md)
 - [Machines and workers](operate/machines.md)
 - [Hardening](operate/hardening.md)
+- [Railway hosted control plane](operate/railway.md)
 - [Enterprise EC2](operate/enterprise-ec2.md)
 - [Uninstall](operate/uninstall.md)
 

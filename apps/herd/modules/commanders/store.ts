@@ -31,6 +31,7 @@ import {
   parseCanonicalProviderContext,
 } from '../agents/providers/provider-context-normalization.js'
 import type { ChannelChatType, ChannelProvider } from '../channels/types.js'
+import { withCommanderMutation } from './child-mutation-coordinator.js'
 
 const COMMANDER_STATES = new Set<CommanderSession['state']>([
   'idle',
@@ -90,7 +91,10 @@ export interface CommanderLastRoute {
 
 export interface CommanderSession {
   id: string
+  /** Stable commander identity slug. Never use this field for process routing. */
   host: string
+  /** Explicit machine preference for provider execution. Omitted means runtime policy selects. */
+  executionMachineId?: string
   avatarSeed?: string
   state: 'idle' | 'running' | 'paused' | 'stopped'
   created: string
@@ -132,6 +136,7 @@ export type CommanderConversationSurface =
 
 interface ParsedCommanderSessions {
   sessions: CommanderSession[]
+  needsExecutionMachineBackfill: boolean
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -344,6 +349,9 @@ function parseCommanderSession(
 
   const id = typeof raw.id === 'string' ? raw.id.trim() : ''
   const host = typeof raw.host === 'string' ? raw.host.trim() : ''
+  const remoteOrigin = parseRemoteOrigin(raw.remoteOrigin)
+  const executionMachineId = parseOptionalNonEmptyString(raw.executionMachineId)
+    ?? remoteOrigin?.machineId
   const avatarSeed = typeof raw.avatarSeed === 'string' && raw.avatarSeed.trim().length > 0
     ? raw.avatarSeed.trim()
     : undefined
@@ -392,7 +400,6 @@ function parseCommanderSession(
   const system = raw.system === true
   const archived = raw.archived === true
   const archivedAt = archived ? parseOptionalNonEmptyString(raw.archivedAt) : undefined
-  const remoteOrigin = parseRemoteOrigin(raw.remoteOrigin)
   const state = raw.state
 
   if (
@@ -407,6 +414,7 @@ function parseCommanderSession(
   const session: CommanderSession = {
     id,
     host,
+    ...(executionMachineId ? { executionMachineId } : {}),
     avatarSeed,
     state: state as CommanderSession['state'],
     created,
@@ -444,6 +452,7 @@ function parsePersistedCommanderSessions(
     : []
 
   const sessions: CommanderSession[] = []
+  let needsExecutionMachineBackfill = false
 
   for (const entry of candidates) {
     const session = parseCommanderSession(entry, runtimeConfig)
@@ -451,9 +460,25 @@ function parsePersistedCommanderSessions(
       continue
     }
     sessions.push(session)
+    if (
+      isObject(entry)
+      && !parseOptionalNonEmptyString(entry.executionMachineId)
+      && session.remoteOrigin
+      && session.executionMachineId === session.remoteOrigin.machineId
+    ) {
+      needsExecutionMachineBackfill = true
+    }
   }
 
-  return { sessions }
+  return { sessions, needsExecutionMachineBackfill }
+}
+
+export function isPersistedCommanderSessionsValid(raw: unknown): boolean {
+  if (!isObject(raw) || !Array.isArray(raw.sessions)) {
+    return false
+  }
+  const runtimeConfig = createDefaultCommanderRuntimeConfig()
+  return raw.sessions.every((entry) => parseCommanderSession(entry, runtimeConfig) !== null)
 }
 
 function cloneSession(session: CommanderSession): CommanderSession {
@@ -496,11 +521,13 @@ export function defaultCommanderSessionStorePath(): string {
 
 export interface CommanderSessionStoreOptions {
   runtimeConfig?: CommanderRuntimeConfig
+  lifecycleScope?: string
 }
 
 export class CommanderSessionStore {
   private readonly filePath: string
   private readonly runtimeConfig: CommanderRuntimeConfig
+  private readonly lifecycleScope: string
   private sessionsById: Map<string, CommanderSession> | null = null
   private loadPromise: Promise<void> | null = null
   private mutationQueue: Promise<void> = Promise.resolve()
@@ -511,6 +538,7 @@ export class CommanderSessionStore {
   ) {
     this.filePath = path.resolve(filePath)
     this.runtimeConfig = options.runtimeConfig ?? createDefaultCommanderRuntimeConfig()
+    this.lifecycleScope = path.resolve(options.lifecycleScope ?? path.dirname(this.filePath))
   }
 
   async list(): Promise<CommanderSession[]> {
@@ -527,36 +555,40 @@ export class CommanderSessionStore {
   }
 
   async create(session: CommanderSession): Promise<CommanderSession> {
-    return this.withMutationLock(async () => {
-      await this.ensureLoaded()
-      const sessions = this.sessions()
-      if (sessions.has(session.id)) {
-        throw new Error(`Commander session "${session.id}" already exists`)
-      }
+    return withCommanderMutation(session.id, this.lifecycleScope, () => (
+      this.withMutationLock(async () => {
+        await this.ensureLoaded()
+        const sessions = this.sessions()
+        if (sessions.has(session.id)) {
+          throw new Error(`Commander session "${session.id}" already exists`)
+        }
 
-      sessions.set(session.id, cloneSession(session))
-      await this.writeToDisk()
-      return cloneSession(session)
-    })
+        sessions.set(session.id, cloneSession(session))
+        await this.writeToDisk()
+        return cloneSession(session)
+      })
+    ))
   }
 
   async update(
     id: string,
     mutate: (current: CommanderSession) => CommanderSession,
   ): Promise<CommanderSession | null> {
-    return this.withMutationLock(async () => {
-      await this.ensureLoaded()
-      const sessions = this.sessions()
-      const existing = sessions.get(id)
-      if (!existing) {
-        return null
-      }
+    return withCommanderMutation(id, this.lifecycleScope, () => (
+      this.withMutationLock(async () => {
+        await this.ensureLoaded()
+        const sessions = this.sessions()
+        const existing = sessions.get(id)
+        if (!existing) {
+          return null
+        }
 
-      const next = mutate(cloneSession(existing))
-      sessions.set(id, cloneSession(next))
-      await this.writeToDisk()
-      return cloneSession(next)
-    })
+        const next = mutate(cloneSession(existing))
+        sessions.set(id, cloneSession(next))
+        await this.writeToDisk()
+        return cloneSession(next)
+      })
+    ))
   }
 
   async delete(id: string): Promise<boolean> {
@@ -569,6 +601,25 @@ export class CommanderSessionStore {
       sessions.delete(id)
       await this.writeToDisk()
       return true
+    })
+  }
+
+  /**
+   * Restores the durable parent anchor after an exclusive cleanup failed.
+   * Callers must already own the commander cleanup lease; unlike normal
+   * create/update this method intentionally performs no lifecycle acquisition.
+   */
+  async restoreAfterFailedCleanup(session: CommanderSession): Promise<CommanderSession> {
+    return this.withMutationLock(async () => {
+      await this.ensureLoaded()
+      const sessions = this.sessions()
+      const existing = sessions.get(session.id)
+      if (existing) {
+        return cloneSession(existing)
+      }
+      sessions.set(session.id, cloneSession(session))
+      await this.writeToDisk()
+      return cloneSession(session)
     })
   }
 
@@ -591,9 +642,13 @@ export class CommanderSessionStore {
     this.loadPromise = (async () => {
       const persisted = await this.readFromDisk()
       if (!this.sessionsById) {
-        this.sessionsById = new Map(
+        const loadedSessions = new Map(
           persisted.sessions.map((session) => [session.id, cloneSession(session)]),
         )
+        if (persisted.needsExecutionMachineBackfill) {
+          await this.writeSessionsToDisk([...loadedSessions.values()], { backup: true })
+        }
+        this.sessionsById = loadedSessions
       }
     })()
 
@@ -612,6 +667,7 @@ export class CommanderSessionStore {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
         return {
           sessions: [],
+          needsExecutionMachineBackfill: false,
         }
       }
       throw error
@@ -623,6 +679,7 @@ export class CommanderSessionStore {
     } catch {
       return {
         sessions: [],
+        needsExecutionMachineBackfill: false,
       }
     }
 
@@ -630,7 +687,14 @@ export class CommanderSessionStore {
   }
 
   private async writeToDisk(options: { backup?: boolean } = {}): Promise<void> {
-    const sessions = [...this.sessions().values()]
+    await this.writeSessionsToDisk([...this.sessions().values()], options)
+  }
+
+  private async writeSessionsToDisk(
+    input: CommanderSession[],
+    options: { backup?: boolean } = {},
+  ): Promise<void> {
+    const sessions = input
       .map((session) => serializeSession(session))
       .sort(compareCommanderSessionsForList)
 

@@ -56,7 +56,7 @@ export function createChannelsRuntime(context: ModuleRuntimeContext): ModuleRout
     secretsStore,
     internalToken,
   }))
-  const runtimeManager = new ChannelAdapterRuntimeManager({ bindingStore })
+  const runtimeManager = new ChannelAdapterRuntimeManager({ bindingStore, commanderDataDir })
   const channels = createCommanderChannelsRouter({
     store: bindingStore,
     apiKeyStore: options.apiKeyStore,

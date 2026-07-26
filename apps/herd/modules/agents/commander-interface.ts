@@ -23,6 +23,9 @@ import { getNextStreamEventSeq } from './messages/canonical-timeline.js'
 import { resolveNativeProviderResumeId } from './providers/native-resume.js'
 import { sanitizeProviderContextForPersistence } from './providers/provider-context-normalization.js'
 import { shouldClearResumeProviderContextForCredentialPoolRecovery } from './provider-auth.js'
+import type { MachineLaunchRuntime } from './session/machine-launch.js'
+import { withCommanderRuntimeLaunch } from '../commanders/package-lifecycle-state.js'
+import { resolveCommanderDataDir } from '../commanders/paths.js'
 import type {
   AgentType,
   AnySession,
@@ -111,6 +114,7 @@ export interface CommanderInterfaceContext {
   schedulePersistedSessionsWrite: () => void
 
   createProviderStreamSession: ProviderSessionCreator
+  resolveProviderLaunchMachine: MachineLaunchRuntime['resolveProviderLaunchMachine']
 
   createQueuedMessage: CreateQueuedMessage
   enqueueQueuedMessage: EnqueueQueuedMessage
@@ -119,6 +123,9 @@ export interface CommanderInterfaceContext {
 
   teardownProviderSession: SessionTeardown
   shutdownProviderRuntimes: RuntimeShutdown
+
+  /** Shared lifecycle scope for commander-owned provider runtime launches. */
+  commanderDataDir?: string
 
   getCredentialRecoveryRequest?: (sessionName: string) => CredentialPoolRecoveryRequest | undefined
   clearCredentialRecoveryRequest?: (sessionName: string) => void
@@ -212,6 +219,20 @@ export function createCommanderSessionsInterface(
     clearCredentialRecoveryRequest,
     getActiveCredentialPoolId,
   } = ctx
+  const commanderDataDir = ctx.commanderDataDir ?? resolveCommanderDataDir()
+
+  async function runCommanderRuntimeLaunch<T>(
+    input: Pick<CreateCommanderSessionInput, 'name' | 'commanderId'>,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = sessions.get(input.name)
+    const commanderId = input.commanderId?.trim()
+      || (previous?.creator?.kind === 'commander' ? previous.creator.id?.trim() ?? '' : '')
+    if (!commanderId) {
+      return operation()
+    }
+    return withCommanderRuntimeLaunch(commanderId, commanderDataDir, operation)
+  }
 
   async function buildCommanderSession({
     name,
@@ -225,6 +246,7 @@ export function createCommanderSessionsInterface(
     adaptiveThinking,
     maxThinkingTokens,
     cwd,
+    machineId,
     resumeProviderContext,
     credentialPoolId,
     credentialPoolMode,
@@ -240,7 +262,12 @@ export function createCommanderSessionsInterface(
     if (!provider) {
       throw new Error(`Unknown provider: ${agentType}`)
     }
-    const sessionCwd = cwd ?? process.env.HOME ?? '/tmp'
+    const resolvedMachine = await ctx.resolveProviderLaunchMachine(machineId, agentType)
+    if (!resolvedMachine.ok) {
+      throw resolvedMachine.cause
+    }
+    const machine = resolvedMachine.machine
+    const sessionCwd = cwd ?? machine?.cwd ?? process.env.HOME ?? '/tmp'
     const resumeSessionId = resolveNativeProviderResumeId({
       provider,
       agentType,
@@ -271,7 +298,7 @@ export function createCommanderSessionsInterface(
         'default',
         '',
         sessionCwd,
-        undefined,
+        machine,
         agentType,
         {
           ...baseOptions,
@@ -283,7 +310,7 @@ export function createCommanderSessionsInterface(
         'default',
         '',
         sessionCwd,
-        undefined,
+        machine,
         agentType,
         baseOptions,
       )
@@ -295,93 +322,102 @@ export function createCommanderSessionsInterface(
 
   return {
     async createCommanderSession(input) {
-      const { name } = input
-      const session = await buildCommanderSession(
-        clearResumeContextOnCredentialPoolChange(input, sessions.get(name)),
-      )
-      sessions.set(name, session)
-      schedulePersistedSessionsWrite()
-      return session
+      return runCommanderRuntimeLaunch(input, async () => {
+        const { name } = input
+        const session = await buildCommanderSession(
+          clearResumeContextOnCredentialPoolChange(input, sessions.get(name)),
+        )
+        sessions.set(name, session)
+        schedulePersistedSessionsWrite()
+        return session
+      })
     },
 
     async replaceCommanderSession(input) {
-      const { name } = input
-      const previous = sessions.get(name)
-      const replacement = await buildCommanderSession(
-        clearResumeContextOnCredentialPoolChange(input, previous),
-      )
-      if (input.requireIdleReplacement && previous?.kind === 'stream') {
-        let conflictReason: string | null = null
-        if (sessions.get(name) !== previous) {
-          conflictReason = 'Runtime session changed while settings update was prepared; retry the update'
-        } else if (!previous.lastTurnCompleted) {
-          conflictReason = 'Conversation is mid-turn; runtime settings can change after the current turn completes'
-        } else if (hasQueuedSessionWork(previous)) {
-          conflictReason = 'Conversation has queued work; runtime settings can change after the queue drains'
-        }
-        if (conflictReason) {
-          await teardownProviderSession(replacement, `Aborted runtime settings update for session "${name}"`)
-          throw new CommanderSessionReplacementConflictError(conflictReason)
-        }
-      }
-      if (previous && previous.kind === 'stream' && replacement.kind === 'stream') {
-        // Mirror websocket.ts auto-rotate replacement so same-name provider
-        // swaps preserve replay, usage, entry count, and auto-rotate state.
-        replacement.events = previous.events.slice()
-        replacement.nextEventSeq = getNextStreamEventSeq(replacement.events)
-        replacement.usage = previous.usage ? { ...previous.usage } : previous.usage
-        replacement.conversationEntryCount = previous.conversationEntryCount
-        replacement.autoRotatePending = previous.autoRotatePending
-        const queuedMessages = previous.messageQueue ? previous.messageQueue.list() : replacement.messageQueue.list()
-        const pendingDirectSendMessages = [...previous.pendingDirectSendMessages]
-        const currentQueuedMessage = previous.currentQueuedMessage
-        if (currentQueuedMessage) {
-          if (currentQueuedMessage.priority === 'high') {
-            pendingDirectSendMessages.unshift(currentQueuedMessage)
-          } else {
-            queuedMessages.unshift(currentQueuedMessage)
+      return runCommanderRuntimeLaunch(input, async () => {
+        const { name } = input
+        const previous = sessions.get(name)
+        const inputWithPreservedMachine = input.machineId === undefined
+          && previous?.kind === 'stream'
+          && previous.host
+          ? { ...input, machineId: previous.host }
+          : input
+        const replacement = await buildCommanderSession(
+          clearResumeContextOnCredentialPoolChange(inputWithPreservedMachine, previous),
+        )
+        if (input.requireIdleReplacement && previous?.kind === 'stream') {
+          let conflictReason: string | null = null
+          if (sessions.get(name) !== previous) {
+            conflictReason = 'Runtime session changed while settings update was prepared; retry the update'
+          } else if (!previous.lastTurnCompleted) {
+            conflictReason = 'Conversation is mid-turn; runtime settings can change after the current turn completes'
+          } else if (hasQueuedSessionWork(previous)) {
+            conflictReason = 'Conversation has queued work; runtime settings can change after the queue drains'
+          }
+          if (conflictReason) {
+            await teardownProviderSession(replacement, `Aborted runtime settings update for session "${name}"`)
+            throw new CommanderSessionReplacementConflictError(conflictReason)
           }
         }
-        replacement.currentQueuedMessage = undefined
-        replacement.pendingDirectSendMessages = pendingDirectSendMessages.filter((message, index, messages) => {
-          return message.priority === 'high'
-            && messages.findIndex((candidate) => candidate.id === message.id) === index
-        })
-        replacement.messageQueue = new SessionMessageQueue(
-          previous.messageQueue?.maxSize ?? replacement.messageQueue.maxSize,
-          queuedMessages.filter((message, index, messages) => {
-            return message.priority !== 'high'
+        if (previous && previous.kind === 'stream' && replacement.kind === 'stream') {
+          // Mirror websocket.ts auto-rotate replacement so same-name provider
+          // swaps preserve replay, usage, entry count, and auto-rotate state.
+          replacement.events = previous.events.slice()
+          replacement.nextEventSeq = getNextStreamEventSeq(replacement.events)
+          replacement.usage = previous.usage ? { ...previous.usage } : previous.usage
+          replacement.conversationEntryCount = previous.conversationEntryCount
+          replacement.autoRotatePending = previous.autoRotatePending
+          const queuedMessages = previous.messageQueue ? previous.messageQueue.list() : replacement.messageQueue.list()
+          const pendingDirectSendMessages = [...previous.pendingDirectSendMessages]
+          const currentQueuedMessage = previous.currentQueuedMessage
+          if (currentQueuedMessage) {
+            if (currentQueuedMessage.priority === 'high') {
+              pendingDirectSendMessages.unshift(currentQueuedMessage)
+            } else {
+              queuedMessages.unshift(currentQueuedMessage)
+            }
+          }
+          replacement.currentQueuedMessage = undefined
+          replacement.pendingDirectSendMessages = pendingDirectSendMessages.filter((message, index, messages) => {
+            return message.priority === 'high'
               && messages.findIndex((candidate) => candidate.id === message.id) === index
-          }),
-        )
-        // Transfer connected WS clients to the replacement so broadcasts
-        // from the new runtime reach them without a reconnect round-trip.
-        for (const client of previous.clients) {
-          replacement.clients.add(client)
+          })
+          replacement.messageQueue = new SessionMessageQueue(
+            previous.messageQueue?.maxSize ?? replacement.messageQueue.maxSize,
+            queuedMessages.filter((message, index, messages) => {
+              return message.priority !== 'high'
+                && messages.findIndex((candidate) => candidate.id === message.id) === index
+            }),
+          )
+          // Transfer connected WS clients to the replacement so broadcasts
+          // from the new runtime reach them without a reconnect round-trip.
+          for (const client of previous.clients) {
+            replacement.clients.add(client)
+          }
+          previous.clients.clear()
         }
-        previous.clients.clear()
-      }
-      // sessionEventHandlers is keyed by `name`, so the replacement that
-      // reuses the same slot naturally keeps prior subscribers attached. Swap
-      // the routable slot before awaiting teardown so a concurrent send cannot
-      // enter the provider runtime that is being retired.
-      sessions.set(name, replacement)
-      schedulePersistedSessionsWrite()
-      if (
-        replacement.kind === 'stream' &&
-        !replacement.currentQueuedMessage &&
-        (replacement.pendingDirectSendMessages.length > 0 || replacement.messageQueue.size > 0)
-      ) {
-        scheduleQueuedMessageDrain(replacement, { force: true })
-      }
-      if (previous && previous.kind === 'stream') {
-        // Keep the old provider alive until the replacement is fully built and
-        // its replay/queue state has moved. The slot already points at the new
-        // runtime, so messages arriving during asynchronous teardown are sent
-        // to the replacement instead of being lost with the old provider.
-        await teardownProviderSession(previous, `Provider swap on session "${name}"`)
-      }
-      return replacement
+        // sessionEventHandlers is keyed by `name`, so the replacement that
+        // reuses the same slot naturally keeps prior subscribers attached. Swap
+        // the routable slot before awaiting teardown so a concurrent send cannot
+        // enter the provider runtime that is being retired.
+        sessions.set(name, replacement)
+        schedulePersistedSessionsWrite()
+        if (
+          replacement.kind === 'stream' &&
+          !replacement.currentQueuedMessage &&
+          (replacement.pendingDirectSendMessages.length > 0 || replacement.messageQueue.size > 0)
+        ) {
+          scheduleQueuedMessageDrain(replacement, { force: true })
+        }
+        if (previous && previous.kind === 'stream') {
+          // Keep the old provider alive until the replacement is fully built and
+          // its replay/queue state has moved. The slot already points at the new
+          // runtime, so messages arriving during asynchronous teardown are sent
+          // to the replacement instead of being lost with the old provider.
+          await teardownProviderSession(previous, `Provider swap on session "${name}"`)
+        }
+        return replacement
+      })
     },
 
     updateCommanderSessionRuntimeSettings(name, settings) {
@@ -398,6 +434,7 @@ export function createCommanderSessionsInterface(
       session.effort = settings.effort
       session.adaptiveThinking = settings.adaptiveThinking
       session.maxThinkingTokens = settings.maxThinkingTokens
+      delete (session.providerContext as { effort?: unknown } | undefined)?.effort
       const persistedProviderContext = sanitizeProviderContextForPersistence(session.providerContext, {
         effort: settings.effort,
         adaptiveThinking: settings.adaptiveThinking,

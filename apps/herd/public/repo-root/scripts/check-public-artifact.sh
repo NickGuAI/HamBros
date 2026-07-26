@@ -49,23 +49,32 @@ required_paths=(
   "docs/getting-started/quickstart.md"
   "apps/herd"
   "apps/herd/.env.example"
+  "apps/herd/Dockerfile"
+  "apps/herd/Dockerfile.dockerignore"
   "apps/herd/install.sh"
   "apps/herd/package.json"
   "apps/herd/public/install.sh"
   "apps/herd/public/repo-root/LICENSE"
+  "apps/herd/railway.json"
   "apps/herd/runtime/defaults/global-rules/USER.md"
   "apps/herd/runtime/defaults/global-rules/WORKSPACE.md"
   "apps/herd/runtime/defaults/global-rules/SKILLS_INDEX.md"
+  "apps/herd/runtime/defaults/agent-skills/commander-ops/commander-memory-cleanup/SKILL.md"
+  "apps/herd/runtime/defaults/agent-skills/commander-ops/context-rot-cleanup/SKILL.md"
   "apps/herd/runtime/defaults/shared-knowledge/DOCTRINES.md"
   "apps/herd/runtime/defaults/shared-knowledge/COMMANDER_GUIDE.md"
   "apps/herd/runtime/defaults/shared-knowledge/LEARNINGS.md"
   "agent-skills/commander-ops/write-new-skill/SKILL.md"
   "agent-skills/commander-ops/commander-memory-cleanup/SKILL.md"
   "agent-skills/commander-ops/context-rot-cleanup/SKILL.md"
+  "agent-skills/gehirn-skills/add-machine/SKILL.md"
+  "agent-skills/gehirn-skills/commander-create-wizard/SKILL.md"
+  "agent-skills/gehirn-skills/create-automation/SKILL.md"
   "packages/herd-cli/package.json"
   "operations/deploy/ec2/install-ec2.sh"
   "operations/deploy/ec2/herd.service"
   "operations/deploy/ec2/smoke-test.sh"
+  "operations/deploy/railway/smoke-test.sh"
 )
 
 for path in "${required_paths[@]}"; do
@@ -74,6 +83,104 @@ for path in "${required_paths[@]}"; do
     LEAK_COUNT=$((LEAK_COUNT + 1))
   fi
 done
+
+if ! grep -Fq 'HERD_BOOTSTRAP_MASTER_KEY' "$ROOT/apps/herd/.env.example" \
+  || grep -Fq 'ALLOW_DEFAULT_MASTER_KEY' "$ROOT/apps/herd/.env.example"; then
+  red "public environment example does not preserve the injected, fresh-only bootstrap contract"
+  LEAK_COUNT=$((LEAK_COUNT + 1))
+fi
+
+if ! node - \
+  "$ROOT/apps/herd/Dockerfile" \
+  "$ROOT/apps/herd/Dockerfile.dockerignore" \
+  "$ROOT/apps/herd/railway.json" <<'NODE'
+const fs = require('node:fs')
+
+const [, , dockerfilePath, dockerignorePath, railwayPath] = process.argv
+const dockerfile = fs.readFileSync(dockerfilePath, 'utf8')
+const dockerignoreRules = fs.readFileSync(dockerignorePath, 'utf8')
+  .split(/\r?\n/u)
+  .map((line) => line.trim())
+  .filter((line) => line.length > 0 && !line.startsWith('#'))
+const railway = JSON.parse(fs.readFileSync(railwayPath, 'utf8'))
+const requiredDockerFragments = [
+  'COPY packages/transcription/package.json ./packages/transcription/package.json',
+  'COPY packages/transcription ./packages/transcription',
+  'COPY --from=build /workspace/packages/transcription ./packages/transcription',
+  'ENV HERD_DATA_DIR=/data/.herd',
+  'ENV HERD_PROVIDER_EXECUTION_MODE=daemon-only',
+  'ENTRYPOINT ["/sbin/tini", "-g", "--"]',
+]
+if (!requiredDockerFragments.every((fragment) => dockerfile.includes(fragment))) {
+  process.exit(1)
+}
+const requiredDockerignoreRules = [
+  '.factory/**',
+  '.wide-research/**',
+  '.cocoindex_code/**',
+  '.playwright-cli/**',
+  '.worktrees/**',
+  '.claude/worktrees/**',
+  '.general-env',
+  '.*-env',
+  '**/.*-env',
+  '**/.env',
+  '**/.env.*',
+  '**/.npmrc',
+  '**/auth.json',
+  '**/credentials.json',
+  '**/*.pem',
+  '**/*.key',
+  'apps/prep/server/**',
+  'shared_infras/database/**',
+  '**/data',
+  '**/data/**',
+  '**/.herd/**',
+  '**/.herd.json',
+  '**/.herd.json',
+  '**/*.sqlite',
+  '**/*.sqlite.bak.*',
+  '**/*.sqlite-*',
+  '**/*.db.bak.*',
+  '**/node_modules',
+  '**/node_modules/**',
+  '**/.pnpm-store/**',
+  '**/.turbo/**',
+  '**/.next/**',
+  '**/dist/**',
+  '**/dist-server/**',
+  '**/coverage/**',
+  '**/.vercel/**',
+]
+if (
+  !requiredDockerignoreRules.every((rule) => dockerignoreRules.includes(rule))
+  || dockerignoreRules.some((rule) => rule.startsWith('!'))
+) {
+  process.exit(1)
+}
+if (
+  railway.build?.dockerfilePath !== '/apps/herd/Dockerfile'
+  || !railway.build?.watchPatterns?.includes('/packages/transcription/**')
+  || railway.deploy?.numReplicas !== 1
+  || railway.deploy?.overlapSeconds !== 0
+  || railway.deploy?.drainingSeconds !== 30
+  || railway.deploy?.requiredMountPath !== '/data/.herd'
+  || railway.deploy?.healthcheckPath !== '/api/health'
+  || Object.hasOwn(railway.deploy ?? {}, 'startCommand')
+) {
+  process.exit(1)
+}
+NODE
+then
+  red "Railway production-image contract is incomplete or stale"
+  LEAK_COUNT=$((LEAK_COUNT + 1))
+fi
+
+if ! grep -Fqx 'apps/herd/data/' "$ROOT/.gitignore" \
+  || ! grep -Fqx '.*-env' "$ROOT/.gitignore"; then
+  red "public repository must ignore the Railway build-context sentinel locations"
+  LEAK_COUNT=$((LEAK_COUNT + 1))
+fi
 
 if [ ! -f "$ROOT/package.json" ] || ! EXPECTED_RELEASE_VERSION="$(read_release_version)"; then
   red "package.json must declare a valid semantic release version"
@@ -232,7 +339,7 @@ old_product_hits="$(
     --include='*.txt' \
     --include='*.example' \
     --include='.env.example' \
-    "$ROOT/README.md" "$ROOT/CHANGELOG.md" "$ROOT/docs" "$ROOT/apps/herd" "$ROOT/packages" 2>/dev/null \
+    "$ROOT/README.md" "$ROOT/CHANGELOG.md" "$ROOT/docs" "$ROOT/apps/herd" "$ROOT/packages" "$ROOT/agent-skills" 2>/dev/null \
     | grep -v '/node_modules/' \
     | grep -v '/dist/' \
     | grep -v '/dist-server/' \

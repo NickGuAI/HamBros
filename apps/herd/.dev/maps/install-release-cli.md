@@ -22,8 +22,8 @@ and public Herd release in agreement.
 - `operations/sops/SOP-15-release-herd.md`
 - `operations/sops/scripts/sop-15-sync-herd.sh`
 - `operations/sops/scripts/check-herd-cleanliness.sh`
-- `operations/deploy/ec2/Caddyfile`
-- `operations/deploy/ec2/hervald.service`
+- `operations/deploy/ec2/README.md`
+- `operations/deploy/ec2/herd.service`
 
 ## Owned State/Data
 

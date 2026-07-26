@@ -22,6 +22,12 @@ export const API_KEY_SCOPES = [
 
 export type ApiKeyScope = (typeof API_KEY_SCOPES)[number]
 
+export const API_KEY_PURPOSES = ['bootstrap', 'permanent'] as const
+
+export type ApiKeyPurpose = (typeof API_KEY_PURPOSES)[number]
+
+const API_KEY_RECORD_SCHEMA_VERSION = 1
+
 export const DEFAULT_BOOTSTRAP_MASTER_KEY_SCOPES: readonly ApiKeyScope[] = [
   ...API_KEY_SCOPES,
 ]
@@ -35,6 +41,7 @@ export interface ApiKeyRecord {
   name: string
   keyHash: string
   prefix: string
+  purpose: ApiKeyPurpose
   createdBy: string
   createdAt: string
   expiresAt?: string | null
@@ -45,6 +52,7 @@ export interface ApiKeyRecord {
 export interface CreateApiKeyInput {
   name: string
   scopes: readonly string[]
+  purpose: ApiKeyPurpose
   createdBy: string
   now?: Date
   expiresAt?: Date | null
@@ -68,6 +76,8 @@ export type ApiKeyVerificationResult =
 export interface ApiKeyStoreLike {
   hasAnyKeys(): Promise<boolean>
   createKey?(input: CreateApiKeyInput): Promise<CreatedApiKey>
+  listKeys?(): Promise<ApiKeyRecord[]>
+  revokeKey?(id: string): Promise<boolean>
   verifyKey(
     rawKey: string,
     options?: {
@@ -80,7 +90,14 @@ export interface ApiKeyStoreLike {
 
 interface PersistedApiKeyCollection {
   schemaVersion?: number
+  apiKeyRecordSchemaVersion?: number
+  bootstrapInitializedAt?: string
   keys: ApiKeyRecord[]
+}
+
+interface ParsedApiKeyCollection {
+  collection: PersistedApiKeyCollection
+  needsMigration: boolean
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -91,7 +108,43 @@ function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === 'string')
 }
 
-function isApiKeyRecord(value: unknown): value is ApiKeyRecord {
+export function isApiKeyPurpose(value: unknown): value is ApiKeyPurpose {
+  return typeof value === 'string' && API_KEY_PURPOSES.includes(value as ApiKeyPurpose)
+}
+
+function hasLegacyBootstrapTtl(
+  value: Omit<ApiKeyRecord, 'purpose'> & { purpose?: unknown },
+): boolean {
+  if (typeof value.expiresAt !== 'string') {
+    return false
+  }
+  const createdAtMs = Date.parse(value.createdAt)
+  const expiresAtMs = Date.parse(value.expiresAt)
+  return Number.isFinite(createdAtMs)
+    && Number.isFinite(expiresAtMs)
+    && expiresAtMs - createdAtMs === DEFAULT_BOOTSTRAP_MASTER_KEY_TTL_MS
+}
+
+function hasLegacyBootstrapEvidence(
+  value: Omit<ApiKeyRecord, 'purpose'> & { purpose?: unknown },
+): boolean {
+  // Legacy API-created keys always received the `hmrb_` prefix from
+  // createRawApiKey(), including keys created while authenticated by another
+  // API key (whose synthetic creator email was also `system`). Historical
+  // bootstrap keys instead kept the caller-provided secret prefix. The first
+  // generation used `Master Key` without an expiry; its successor used
+  // `Bootstrap Master Key` with the fixed 24-hour bootstrap TTL. Require the
+  // complete historical shape so an ambiguous legacy record remains permanent
+  // rather than regaining temporary bootstrap semantics during upgrade.
+  return value.createdBy === 'system'
+    && !value.prefix.startsWith('hmrb_')
+    && (
+      (value.name === 'Master Key' && value.expiresAt == null)
+      || (value.name === 'Bootstrap Master Key' && hasLegacyBootstrapTtl(value))
+    )
+}
+
+function hasApiKeyRecordShape(value: unknown): value is Omit<ApiKeyRecord, 'purpose'> & { purpose?: unknown } {
   if (!isObject(value)) {
     return false
   }
@@ -111,6 +164,27 @@ function isApiKeyRecord(value: unknown): value is ApiKeyRecord {
     (value.lastUsedAt === null || typeof value.lastUsedAt === 'string') &&
     isStringArray(value.scopes)
   )
+}
+
+function toApiKeyRecord(value: unknown, allowLegacyPurposeInference: boolean): ApiKeyRecord | null {
+  if (!hasApiKeyRecordShape(value)) {
+    return null
+  }
+
+  if (isApiKeyPurpose(value.purpose)) {
+    return value as ApiKeyRecord
+  }
+
+  if (value.purpose !== undefined || !allowLegacyPurposeInference) {
+    return null
+  }
+
+  // One-time legacy migration only. Runtime behavior must use the persisted
+  // purpose and must never re-infer it from creator identity alone.
+  return {
+    ...value,
+    purpose: hasLegacyBootstrapEvidence(value) ? 'bootstrap' : 'permanent',
+  }
 }
 
 function secureStringEqual(left: string, right: string): boolean {
@@ -149,17 +223,50 @@ function bootstrapMasterKeyExpiresAt(createdAt: string, now: Date): string {
   return new Date(baseMs + DEFAULT_BOOTSTRAP_MASTER_KEY_TTL_MS).toISOString()
 }
 
-function toPersistedCollection(value: unknown): PersistedApiKeyCollection {
+function toPersistedCollection(value: unknown): ParsedApiKeyCollection {
   if (
     isObject(value) &&
     Array.isArray(value.keys)
   ) {
+    const recordSchemaVersion = value.apiKeyRecordSchemaVersion
+    if (
+      recordSchemaVersion !== undefined
+      && recordSchemaVersion !== API_KEY_RECORD_SCHEMA_VERSION
+    ) {
+      throw new Error(`Unsupported API key record schema version: ${String(recordSchemaVersion)}`)
+    }
+
+    const needsMigration = recordSchemaVersion === undefined
+    const keys = value.keys
+      .map((item) => toApiKeyRecord(item, needsMigration))
+      .filter((item): item is ApiKeyRecord => item !== null)
+
+    if (!needsMigration && keys.length !== value.keys.length) {
+      throw new Error('API key store contains a record without a valid explicit purpose')
+    }
+
     return {
-      keys: value.keys.filter((item): item is ApiKeyRecord => isApiKeyRecord(item)),
+      needsMigration,
+      collection: {
+        apiKeyRecordSchemaVersion: API_KEY_RECORD_SCHEMA_VERSION,
+        ...(
+          typeof value.bootstrapInitializedAt === 'string'
+          && value.bootstrapInitializedAt.trim().length > 0
+            ? { bootstrapInitializedAt: value.bootstrapInitializedAt }
+            : {}
+        ),
+        keys,
+      },
     }
   }
 
-  return { keys: [] }
+  return {
+    needsMigration: true,
+    collection: {
+      apiKeyRecordSchemaVersion: API_KEY_RECORD_SCHEMA_VERSION,
+      keys: [],
+    },
+  }
 }
 
 function createRawApiKey(): string {
@@ -210,12 +317,8 @@ function isExpired(expiresAt: string | null | undefined, nowMs: number): boolean
   return nowMs >= expiresAtMs
 }
 
-function isExpiredSystemBootstrapRecord(record: ApiKeyRecord, nowMs: number): boolean {
-  return record.createdBy === 'system' && isExpired(record.expiresAt, nowMs)
-}
-
-function canSeedDefaultKeyFromRecords(records: readonly ApiKeyRecord[], nowMs: number): boolean {
-  return records.every((record) => isExpiredSystemBootstrapRecord(record, nowMs))
+function isExpiredBootstrapRecord(record: ApiKeyRecord, nowMs: number): boolean {
+  return record.purpose === 'bootstrap' && isExpired(record.expiresAt, nowMs)
 }
 
 export class ApiKeyJsonStore implements ApiKeyStoreLike {
@@ -237,9 +340,8 @@ export class ApiKeyJsonStore implements ApiKeyStoreLike {
     return records.length > 0
   }
 
-  async canSeedDefaultKey(now = new Date()): Promise<boolean> {
-    const records = await this.readRecordsConsistent()
-    return canSeedDefaultKeyFromRecords(records, now.getTime())
+  async canSeedDefaultKey(): Promise<boolean> {
+    return this.withMutationLock(async () => (await this.readCollection()) === null)
   }
 
   async createKey(input: CreateApiKeyInput): Promise<CreatedApiKey> {
@@ -250,6 +352,7 @@ export class ApiKeyJsonStore implements ApiKeyStoreLike {
       name: input.name.trim(),
       keyHash: hashApiKey(rawKey),
       prefix: toKeyPrefix(rawKey),
+      purpose: input.purpose,
       createdBy: input.createdBy.trim(),
       createdAt: nowIso,
       expiresAt: input.expiresAt ? input.expiresAt.toISOString() : null,
@@ -270,12 +373,14 @@ export class ApiKeyJsonStore implements ApiKeyStoreLike {
   }
 
   /**
-   * Seeds a caller-provided bootstrap master key when no keys exist.
-   * Returns the raw key if seeded, or null if keys already exist.
+   * Seeds a caller-provided bootstrap master key only when the keystore file
+   * has never existed. A persisted empty, expired, or revoked store is already
+   * initialized and must never recreate bootstrap access.
    */
   async seedDefaultKey(rawKey: string, label = 'Master Key', now = new Date()): Promise<string | null> {
     return this.withMutationLock(async () => {
-      const records = await this.readRecords()
+      const collection = await this.readCollection()
+      const records = collection?.keys ?? []
       const nowMs = now.getTime()
       const defaultKeyHash = hashApiKey(rawKey)
       const matchingRecord = records.find((record) =>
@@ -283,43 +388,62 @@ export class ApiKeyJsonStore implements ApiKeyStoreLike {
       )
 
       if (matchingRecord) {
-        if (isExpiredSystemBootstrapRecord(matchingRecord, nowMs)) {
+        if (isExpiredBootstrapRecord(matchingRecord, nowMs)) {
+          if (collection && !collection.bootstrapInitializedAt) {
+            await this.writeCollection({
+              ...collection,
+              bootstrapInitializedAt: now.toISOString(),
+            })
+          }
           return null
         }
 
         const nextScopes = mergeBootstrapMasterKeyScopes(matchingRecord.scopes)
         const nextExpiresAt = matchingRecord.expiresAt
           ?? bootstrapMasterKeyExpiresAt(matchingRecord.createdAt, now)
-        if (
-          matchingRecord.createdBy === 'system'
+        const shouldRefreshRecord = matchingRecord.purpose === 'bootstrap'
           && (
             !hasSameScopes(matchingRecord.scopes, nextScopes)
             || matchingRecord.expiresAt !== nextExpiresAt
           )
-        ) {
-          await this.writeRecords(
-            records.map((record) =>
-              record.id === matchingRecord.id
-                ? {
-                    ...record,
-                    scopes: nextScopes,
-                    expiresAt: nextExpiresAt,
-                  }
-                : record,
-            ),
-          )
+        if (shouldRefreshRecord || !collection?.bootstrapInitializedAt) {
+          const nextRecords = shouldRefreshRecord
+            ? records.map((record) =>
+                record.id === matchingRecord.id
+                  ? {
+                      ...record,
+                      scopes: nextScopes,
+                      expiresAt: nextExpiresAt,
+                    }
+                  : record,
+              )
+            : records
+          await this.writeCollection({
+            bootstrapInitializedAt: collection?.bootstrapInitializedAt ?? now.toISOString(),
+            keys: nextRecords,
+          })
         }
         return null
       }
 
-      // Double-check inside lock to avoid races.
-      if (!canSeedDefaultKeyFromRecords(records, nowMs)) return null
+      // File existence, not current record contents, defines whether bootstrap
+      // initialization has already been consumed.
+      if (collection !== null) {
+        if (!collection.bootstrapInitializedAt) {
+          await this.writeCollection({
+            ...collection,
+            bootstrapInitializedAt: now.toISOString(),
+          })
+        }
+        return null
+      }
 
       const record: ApiKeyRecord = {
         id: randomUUID(),
         name: label,
         keyHash: hashApiKey(rawKey),
-        prefix: rawKey.slice(0, 9),
+        prefix: `boot_${defaultKeyHash.slice(0, 4)}`,
+        purpose: 'bootstrap',
         createdBy: 'system',
         createdAt: now.toISOString(),
         expiresAt: bootstrapMasterKeyExpiresAt(now.toISOString(), now),
@@ -327,8 +451,10 @@ export class ApiKeyJsonStore implements ApiKeyStoreLike {
         scopes: [...DEFAULT_BOOTSTRAP_MASTER_KEY_SCOPES],
       }
 
-      records.push(record)
-      await this.writeRecords(records)
+      await this.writeCollection({
+        bootstrapInitializedAt: now.toISOString(),
+        keys: [record],
+      })
       return rawKey
     })
   }
@@ -435,8 +561,7 @@ export class ApiKeyJsonStore implements ApiKeyStoreLike {
   }
 
   private async readRecordsConsistent(): Promise<ApiKeyRecord[]> {
-    await this.mutationQueue
-    return this.readRecords()
+    return this.withMutationLock(() => this.readRecords())
   }
 
   private withMutationLock<T>(operation: () => Promise<T>): Promise<T> {
@@ -506,17 +631,40 @@ export class ApiKeyJsonStore implements ApiKeyStoreLike {
   }
 
   private async readRecords(): Promise<ApiKeyRecord[]> {
+    return (await this.readCollection())?.keys ?? []
+  }
+
+  private async readCollection(): Promise<PersistedApiKeyCollection | null> {
     const parsed = await readJsonFileFailClosed(this.filePath)
     if (parsed === null) {
-      return []
+      return null
     }
-    return toPersistedCollection(parsed).keys
+    const { collection, needsMigration } = toPersistedCollection(parsed)
+    if (needsMigration) {
+      await this.writeCollection(collection, { backup: true })
+    }
+    return collection
   }
 
   private async writeRecords(records: ApiKeyRecord[]): Promise<void> {
-    const payload: PersistedApiKeyCollection = {
+    const existing = await this.readCollection()
+    await this.writeCollection({
+      bootstrapInitializedAt: existing?.bootstrapInitializedAt ?? new Date().toISOString(),
       keys: records,
-    }
-    await writeJsonFileAtomically(this.filePath, withJsonStoreSchema(payload), { trailingNewline: true })
+    })
+  }
+
+  private async writeCollection(
+    payload: PersistedApiKeyCollection,
+    options: { backup?: boolean } = {},
+  ): Promise<void> {
+    await writeJsonFileAtomically(
+      this.filePath,
+      withJsonStoreSchema({
+        ...payload,
+        apiKeyRecordSchemaVersion: API_KEY_RECORD_SCHEMA_VERSION,
+      }),
+      { trailingNewline: true, backup: options.backup },
+    )
   }
 }

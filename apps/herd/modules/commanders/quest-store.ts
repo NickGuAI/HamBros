@@ -1,8 +1,10 @@
 import { randomUUID } from 'node:crypto'
+import { rm } from 'node:fs/promises'
 import path from 'node:path'
 import { readJsonFileFailClosed, writeJsonFileAtomically } from '../json-file.js'
 import { withJsonStoreSchema } from '../json-store-schema.js'
 import { resolveCommanderDataDir } from './paths.js'
+import { withCommanderMutation } from './child-mutation-coordinator.js'
 import type { AutomationQuestEventBus } from '../automations/quest-event-bus.js'
 
 export type CommanderQuestStatus = 'pending' | 'active' | 'blocked' | 'done' | 'failed'
@@ -296,6 +298,12 @@ function parsePersistedQuests(raw: unknown): PersistedCommanderQuests {
   return { quests }
 }
 
+export function isPersistedCommanderQuestsValid(raw: unknown): boolean {
+  return isObject(raw)
+    && Array.isArray(raw.quests)
+    && raw.quests.every((entry) => parseQuest(entry) !== null)
+}
+
 function cloneQuest(quest: CommanderQuest): CommanderQuest {
   return {
     ...quest,
@@ -323,6 +331,7 @@ export function defaultQuestStoreDataDir(): string {
 
 export class QuestStore {
   private readonly dataDir: string
+  private readonly lifecycleScope: string
   private readonly eventBus?: AutomationQuestEventBus
   private mutationQueue: Promise<void> = Promise.resolve()
 
@@ -331,16 +340,19 @@ export class QuestStore {
       | string
       | {
         dataDir?: string
+        lifecycleScope?: string
         eventBus?: AutomationQuestEventBus
       } = defaultQuestStoreDataDir(),
   ) {
     if (typeof config === 'string') {
       this.dataDir = path.resolve(config)
+      this.lifecycleScope = this.dataDir
       this.eventBus = undefined
       return
     }
 
     this.dataDir = path.resolve(config.dataDir ?? defaultQuestStoreDataDir())
+    this.lifecycleScope = path.resolve(config.lifecycleScope ?? this.dataDir)
     this.eventBus = config.eventBus
   }
 
@@ -770,6 +782,12 @@ export class QuestStore {
     })
   }
 
+  /** Removes the commander-owned quest directory during parent deletion. */
+  async deleteForCommander(commanderId: string): Promise<void> {
+    const filePath = this.resolveCommanderFilePath(commanderId)
+    await rm(path.dirname(filePath), { recursive: true, force: true })
+  }
+
   private resolveCommanderFilePath(commanderId: string): string {
     const safeCommanderId = asTrimmedString(commanderId)
     if (!safeCommanderId) {
@@ -797,11 +815,13 @@ export class QuestStore {
   }
 
   private async writeQuestsForCommander(commanderId: string, quests: CommanderQuest[]): Promise<void> {
-    const filePath = this.resolveCommanderFilePath(commanderId)
-    await writeJsonFileAtomically(
-      filePath,
-      withJsonStoreSchema({ quests: sortQuests(quests) }) satisfies PersistedCommanderQuests,
-    )
+    await withCommanderMutation(commanderId, this.lifecycleScope, async () => {
+      const filePath = this.resolveCommanderFilePath(commanderId)
+      await writeJsonFileAtomically(
+        filePath,
+        withJsonStoreSchema({ quests: sortQuests(quests) }) satisfies PersistedCommanderQuests,
+      )
+    })
   }
 
   private async claimLocked(

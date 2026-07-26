@@ -20,9 +20,10 @@ export function createAutomationsEventBusFoundation(context: ModuleRuntimeContex
 export function createAutomationsFoundation(context: ModuleRuntimeContext): null {
   const { capabilities, internalToken, options } = context
   const commanderDataDir = capabilities.consume('commanders.data-dir', 'automations')
-  const automationStore = new AutomationStore()
+  const automationStore = new AutomationStore({ commanderDataDir })
   const automationExecutor = new AutomationExecutor({
     store: automationStore,
+    commanderDataDir,
     internalToken,
   })
   const automationScheduler = new AutomationScheduler({

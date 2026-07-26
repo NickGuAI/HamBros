@@ -14,6 +14,7 @@ import {
   type SkillPackageDetail,
 } from '../skills/package-discovery.js'
 import { resolveCommanderPaths } from './paths.js'
+import { withCommanderMutation } from './child-mutation-coordinator.js'
 import type {
   CommanderPackageAutomation,
   CommanderPackageSkill,
@@ -582,26 +583,29 @@ export async function installCommanderBundleSkills(
   commanderId: string,
   commanderBasePath: string,
   skillBindings: readonly CommanderTemplateSkillBinding[],
+  lifecycleScope = commanderBasePath,
 ): Promise<void> {
-  const { skillsRoot } = resolveCommanderPaths(commanderId, commanderBasePath)
-  await mkdir(skillsRoot, { recursive: true })
+  await withCommanderMutation(commanderId, lifecycleScope, async () => {
+    const { skillsRoot } = resolveCommanderPaths(commanderId, commanderBasePath)
+    await mkdir(skillsRoot, { recursive: true })
 
-  for (const binding of skillBindings) {
-    if (!binding.bundle) {
-      continue
-    }
-
-    const targetRoot = path.join(skillsRoot, binding.bundle.dirName)
-    for (const file of binding.bundle.files) {
-      const target = path.join(targetRoot, file.path)
-      const relative = path.relative(targetRoot, target)
-      if (relative.startsWith('..') || path.isAbsolute(relative)) {
-        throw new Error(`Unsafe skill bundle file path: ${file.path}`)
+    for (const binding of skillBindings) {
+      if (!binding.bundle) {
+        continue
       }
-      await mkdir(path.dirname(target), { recursive: true })
-      await writeFile(target, Buffer.from(file.contentBase64, 'base64'))
+
+      const targetRoot = path.join(skillsRoot, binding.bundle.dirName)
+      for (const file of binding.bundle.files) {
+        const target = path.join(targetRoot, file.path)
+        const relative = path.relative(targetRoot, target)
+        if (relative.startsWith('..') || path.isAbsolute(relative)) {
+          throw new Error(`Unsafe skill bundle file path: ${file.path}`)
+        }
+        await mkdir(path.dirname(target), { recursive: true })
+        await writeFile(target, Buffer.from(file.contentBase64, 'base64'))
+      }
     }
-  }
+  })
 }
 
 export function buildImportedCommanderBundleAutomationInput(args: {

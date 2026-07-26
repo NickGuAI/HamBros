@@ -4,6 +4,7 @@ import type { AutomationScheduler } from '../../automations/scheduler.js'
 import type { AutomationStore, CreateAutomationInput } from '../../automations/store.js'
 import type { Automation } from '../../automations/types.js'
 import { resolveCommanderPaths } from '../paths.js'
+import { withCommanderMutation } from '../child-mutation-coordinator.js'
 import { COMMANDER_WORKFLOW_FILE } from '../workflow.js'
 
 export const BENCHMARK_COMMANDER_TEMPLATE_ID = 'benchmark'
@@ -28,7 +29,7 @@ export interface BenchmarkCommanderBootstrapResult {
 
 export interface BenchmarkCommanderAutomationSeedOptions {
   commanderId: string
-  host: string
+  executionMachineId: string
   cwd: string
   model?: string | null
   automationStore: AutomationStore
@@ -114,7 +115,7 @@ function buildBenchmarkCommanderFiles(cwd: string): Record<string, string> {
 
 export function buildBenchmarkCommanderDefaultAutomations(input: {
   commanderId: string
-  host: string
+  executionMachineId: string
   cwd: string
   model?: string | null
 }): CreateAutomationInput[] {
@@ -123,7 +124,7 @@ export function buildBenchmarkCommanderDefaultAutomations(input: {
     parentCommanderId: input.commanderId,
     agentType: 'codex' as const,
     permissionMode: 'default' as const,
-    machine: input.host,
+    machine: input.executionMachineId,
     workDir: input.cwd,
     ...(input.model ? { model: input.model } : {}),
     sessionType: 'stream' as const,
@@ -198,7 +199,7 @@ export async function seedBenchmarkCommanderDefaultAutomations(
 
   const definitions = buildBenchmarkCommanderDefaultAutomations({
     commanderId: options.commanderId,
-    host: options.host,
+    executionMachineId: options.executionMachineId,
     cwd: options.cwd,
     model: options.model,
   })
@@ -263,22 +264,25 @@ export async function bootstrapBenchmarkCommanderFiles(
   commanderId: string,
   cwd: string,
   basePath?: string,
+  lifecycleScope = basePath ?? resolveCommanderPaths(commanderId).dataDir,
 ): Promise<BenchmarkCommanderBootstrapResult> {
-  const { commanderRoot } = resolveCommanderPaths(commanderId, basePath)
-  await mkdir(commanderRoot, { recursive: true })
+  return withCommanderMutation(commanderId, lifecycleScope, async () => {
+    const { commanderRoot } = resolveCommanderPaths(commanderId, basePath)
+    await mkdir(commanderRoot, { recursive: true })
 
-  const written: string[] = []
-  const skipped: string[] = []
-  for (const [relativePath, content] of Object.entries(buildBenchmarkCommanderFiles(cwd))) {
-    const didWrite = await writeFileIfMissing(path.join(commanderRoot, relativePath), content)
-    if (didWrite) {
-      written.push(relativePath)
-    } else {
-      skipped.push(relativePath)
+    const written: string[] = []
+    const skipped: string[] = []
+    for (const [relativePath, content] of Object.entries(buildBenchmarkCommanderFiles(cwd))) {
+      const didWrite = await writeFileIfMissing(path.join(commanderRoot, relativePath), content)
+      if (didWrite) {
+        written.push(relativePath)
+      } else {
+        skipped.push(relativePath)
+      }
     }
-  }
 
-  return { written, skipped }
+    return { written, skipped }
+  })
 }
 
 export function isBenchmarkCommanderMarker(value: unknown): boolean {

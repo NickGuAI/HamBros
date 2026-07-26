@@ -44,9 +44,11 @@ function Loading() {
 
 function AppFrame({
   signOut,
+  replaceApiKey,
   user,
 }: {
   signOut: () => void
+  replaceApiKey?: (apiKey: string) => void
   user?: {
     name?: string | null
     email?: string | null
@@ -58,7 +60,7 @@ function AppFrame({
       <ThemeProvider>
         <FontScaleRoot />
         <BrowserRouter>
-          <AuthProvider signOut={signOut} user={user}>
+          <AuthProvider signOut={signOut} replaceApiKey={replaceApiKey} user={user}>
             <AuthenticatedAppRouter componentBindings={moduleComponentBindings} />
           </AuthProvider>
         </BrowserRouter>
@@ -248,6 +250,15 @@ export default function App() {
     setApiKeyState(trimmed)
   }
 
+  function handleApiKeyReplace(key: string) {
+    const trimmed = key.trim()
+    if (!trimmed) return
+    localStorage.setItem(API_KEY_STORAGE, trimmed)
+    setAuthMode('api-key')
+    setAccessTokenResolver(() => Promise.resolve(trimmed))
+    setApiKeyState(trimmed)
+  }
+
   const handleSignOut = useCallback(() => {
     localStorage.removeItem(API_KEY_STORAGE)
     clearStoredInstanceUrl()
@@ -277,14 +288,14 @@ export default function App() {
 
   // API key auth: bypass Auth0, use stored key for all requests
   if (apiKey) {
-    return <AppFrame signOut={handleSignOut} />
+    return <AppFrame signOut={handleSignOut} replaceApiKey={handleApiKeyReplace} />
   }
 
   // Capacitor: Auth0 checkSession hangs in WebView (iframe/cookie restrictions).
   // Skip Auth0 and use API key only.
   if (!auth0Enabled || isCapacitorNative()) {
     if (apiKey) {
-      return <AppFrame signOut={handleSignOut} />
+      return <AppFrame signOut={handleSignOut} replaceApiKey={handleApiKeyReplace} />
     }
     return (
       <QueryClientProvider client={queryClient}>

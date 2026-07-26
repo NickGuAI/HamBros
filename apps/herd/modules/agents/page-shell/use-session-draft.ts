@@ -7,10 +7,12 @@ import {
 
 const DRAFT_STORAGE_PREFIX = 'herd:draft:'
 const DRAFT_IMAGES_STORAGE_PREFIX = 'herd:draft-images:'
+const DRAFT_MODE_STORAGE_PREFIX = 'herd:draft-mode:'
 const DRAFT_MAX_BYTES = 50 * 1024
 const DRAFT_IMAGES_MAX_BYTES = 12 * 1024 * 1024
 const DRAFT_SAVE_DEBOUNCE_MS = 500
 const DRAFT_SAVED_LABEL_MS = 2000
+export type SessionDraftMode = 'quick' | 'markdown'
 
 export function buildSessionDraftStorageKey(sessionName: string): string {
   return `${DRAFT_STORAGE_PREFIX}${sessionName}`
@@ -20,9 +22,32 @@ export function buildSessionDraftImagesStorageKey(sessionName: string): string {
   return `${DRAFT_IMAGES_STORAGE_PREFIX}${sessionName}`
 }
 
+export function buildSessionDraftModeStorageKey(sessionName: string): string {
+  return `${DRAFT_MODE_STORAGE_PREFIX}${sessionName}`
+}
+
 export interface SessionDraftImage {
   mediaType: string
   data: string
+}
+
+interface SessionDraftOptions {
+  variant?: 'desktop' | 'mobile'
+}
+
+function normalizeDraftMode(value: unknown): SessionDraftMode {
+  return value === 'markdown' ? 'markdown' : 'quick'
+}
+
+function getTextareaMaxHeight(textarea: HTMLTextAreaElement, mode: SessionDraftMode, variant: 'desktop' | 'mobile'): number {
+  const compactMaxHeight = variant === 'mobile' ? 148 : 120
+  if (mode === 'quick') {
+    return compactMaxHeight
+  }
+
+  const pane = textarea.closest<HTMLElement>('[data-composer-resize-root], .session-view-overlay, .mobile-session-shell, .hervald-chat-pane')
+  const paneHeight = pane?.getBoundingClientRect().height || window.innerHeight || 800
+  return Math.max(compactMaxHeight, Math.round(paneHeight * 0.45))
 }
 
 function normalizeDraftImages(value: unknown): SessionDraftImage[] {
@@ -58,13 +83,15 @@ function normalizeDraftImages(value: unknown): SessionDraftImage[] {
   return images
 }
 
-export function useSessionDraft(sessionName: string) {
+export function useSessionDraft(sessionName: string, options: SessionDraftOptions = {}) {
   const [inputText, setInputTextState] = useState('')
+  const [draftMode, setDraftModeState] = useState<SessionDraftMode>('quick')
   const [pendingImages, setPendingImagesState] = useState<SessionDraftImage[]>([])
   const [showDraftSaved, setShowDraftSaved] = useState(false)
 
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const latestInputTextRef = useRef('')
+  const latestDraftModeRef = useRef<SessionDraftMode>('quick')
   const latestPendingImagesRef = useRef<SessionDraftImage[]>([])
   const draftSaveTimerRef = useRef<number | null>(null)
   const draftSavedIndicatorTimerRef = useRef<number | null>(null)
@@ -72,6 +99,7 @@ export function useSessionDraft(sessionName: string) {
 
   const draftStorageKey = useMemo(() => buildSessionDraftStorageKey(sessionName), [sessionName])
   const draftImagesStorageKey = useMemo(() => buildSessionDraftImagesStorageKey(sessionName), [sessionName])
+  const draftModeStorageKey = useMemo(() => buildSessionDraftModeStorageKey(sessionName), [sessionName])
 
   const setInputText = useCallback((nextInputText: SetStateAction<string>) => {
     const resolvedInputText = typeof nextInputText === 'function'
@@ -92,13 +120,26 @@ export function useSessionDraft(sessionName: string) {
     setPendingImagesState(normalizedPendingImages)
   }, [])
 
+  const setDraftMode = useCallback((nextDraftMode: SetStateAction<SessionDraftMode>) => {
+    const resolvedDraftMode = typeof nextDraftMode === 'function'
+      ? (nextDraftMode as (previousDraftMode: SessionDraftMode) => SessionDraftMode)(latestDraftModeRef.current)
+      : nextDraftMode
+    const normalizedMode = normalizeDraftMode(resolvedDraftMode)
+
+    latestDraftModeRef.current = normalizedMode
+    setDraftModeState(normalizedMode)
+  }, [])
+
   const resizeTextarea = useCallback(() => {
     const textarea = textareaRef.current
     if (!textarea) return
 
+    const variant = options.variant === 'mobile' ? 'mobile' : 'desktop'
+    const maxHeight = getTextareaMaxHeight(textarea, latestDraftModeRef.current, variant)
     textarea.style.height = 'auto'
-    textarea.style.height = `${Math.min(textarea.scrollHeight, 120)}px`
-  }, [])
+    textarea.style.maxHeight = `${maxHeight}px`
+    textarea.style.height = `${Math.min(textarea.scrollHeight, maxHeight)}px`
+  }, [options.variant])
 
   const clearDraftSavedIndicatorTimer = useCallback(() => {
     if (draftSavedIndicatorTimerRef.current !== null) {
@@ -123,7 +164,7 @@ export function useSessionDraft(sessionName: string) {
     }, DRAFT_SAVED_LABEL_MS)
   }, [clearDraftSavedIndicatorTimer])
 
-  const persistDraft = useCallback((value: string, images: SessionDraftImage[], showIndicator = true) => {
+  const persistDraft = useCallback((value: string, images: SessionDraftImage[], mode: SessionDraftMode, showIndicator = true) => {
     let persistedSomething = false
     try {
       if (!value) {
@@ -154,6 +195,17 @@ export function useSessionDraft(sessionName: string) {
       // Ignore localStorage errors (quota, private mode, etc.)
     }
 
+    try {
+      if (mode === 'markdown') {
+        localStorage.setItem(draftModeStorageKey, mode)
+        persistedSomething = true
+      } else {
+        localStorage.removeItem(draftModeStorageKey)
+      }
+    } catch {
+      // Ignore localStorage errors (quota, private mode, etc.)
+    }
+
     if (showIndicator) {
       if (persistedSomething) {
         showDraftSavedIndicator()
@@ -161,7 +213,7 @@ export function useSessionDraft(sessionName: string) {
         setShowDraftSaved(false)
       }
     }
-  }, [draftImagesStorageKey, draftStorageKey, showDraftSavedIndicator])
+  }, [draftImagesStorageKey, draftModeStorageKey, draftStorageKey, showDraftSavedIndicator])
 
   const focusTextarea = useCallback(() => {
     requestAnimationFrame(() => {
@@ -172,31 +224,37 @@ export function useSessionDraft(sessionName: string) {
 
   const clearDraft = useCallback(() => {
     latestInputTextRef.current = ''
+    latestDraftModeRef.current = 'quick'
     latestPendingImagesRef.current = []
     clearDraftSaveTimer()
     clearDraftSavedIndicatorTimer()
     try {
       localStorage.removeItem(draftStorageKey)
       localStorage.removeItem(draftImagesStorageKey)
+      localStorage.removeItem(draftModeStorageKey)
     } catch {
       // Ignore localStorage errors.
     }
     setInputTextState('')
+    setDraftModeState('quick')
     setPendingImagesState([])
     setShowDraftSaved(false)
     requestAnimationFrame(() => {
       resizeTextarea()
     })
-  }, [clearDraftSaveTimer, clearDraftSavedIndicatorTimer, draftImagesStorageKey, draftStorageKey, resizeTextarea])
+  }, [clearDraftSaveTimer, clearDraftSavedIndicatorTimer, draftImagesStorageKey, draftModeStorageKey, draftStorageKey, resizeTextarea])
 
-  const restoreDraft = useCallback((value: string, images: SessionDraftImage[]) => {
+  const restoreDraft = useCallback((value: string, images: SessionDraftImage[], mode: SessionDraftMode = 'quick') => {
     const normalizedImages = normalizeDraftImages(images)
+    const normalizedMode = normalizeDraftMode(mode)
     latestInputTextRef.current = value
+    latestDraftModeRef.current = normalizedMode
     latestPendingImagesRef.current = normalizedImages
     clearDraftSaveTimer()
     clearDraftSavedIndicatorTimer()
-    persistDraft(value, normalizedImages, false)
+    persistDraft(value, normalizedImages, normalizedMode, false)
     setInputTextState(value)
+    setDraftModeState(normalizedMode)
     setPendingImagesState(normalizedImages)
     setShowDraftSaved(false)
     requestAnimationFrame(() => {
@@ -206,13 +264,14 @@ export function useSessionDraft(sessionName: string) {
 
   useEffect(() => {
     resizeTextarea()
-  }, [inputText, resizeTextarea])
+  }, [draftMode, inputText, resizeTextarea])
 
   useLayoutEffect(() => {
     const previousInput = latestInputTextRef.current
     setShowDraftSaved(false)
 
     let restoredDraft = ''
+    let restoredMode: SessionDraftMode = 'quick'
     let restoredImages: SessionDraftImage[] = []
     try {
       restoredDraft = localStorage.getItem(draftStorageKey) ?? ''
@@ -227,18 +286,26 @@ export function useSessionDraft(sessionName: string) {
     } catch {
       restoredImages = []
     }
+    try {
+      restoredMode = normalizeDraftMode(localStorage.getItem(draftModeStorageKey))
+    } catch {
+      restoredMode = 'quick'
+    }
 
     const previousImages = latestPendingImagesRef.current
     const imagesUnchanged = JSON.stringify(restoredImages) === JSON.stringify(previousImages)
-    skipDraftSaveCountRef.current = restoredDraft === previousInput && imagesUnchanged ? 1 : 2
+    const modeUnchanged = restoredMode === latestDraftModeRef.current
+    skipDraftSaveCountRef.current = restoredDraft === previousInput && imagesUnchanged && modeUnchanged ? 1 : 2
     latestInputTextRef.current = restoredDraft
+    latestDraftModeRef.current = restoredMode
     latestPendingImagesRef.current = restoredImages
     setInputTextState(restoredDraft)
+    setDraftModeState(restoredMode)
     setPendingImagesState(restoredImages)
     requestAnimationFrame(() => {
       resizeTextarea()
     })
-  }, [draftImagesStorageKey, draftStorageKey, resizeTextarea])
+  }, [draftImagesStorageKey, draftModeStorageKey, draftStorageKey, resizeTextarea])
 
   useEffect(() => {
     if (skipDraftSaveCountRef.current > 0) {
@@ -249,17 +316,17 @@ export function useSessionDraft(sessionName: string) {
     clearDraftSaveTimer()
     draftSaveTimerRef.current = window.setTimeout(() => {
       draftSaveTimerRef.current = null
-      persistDraft(inputText, pendingImages)
+      persistDraft(inputText, pendingImages, draftMode)
     }, DRAFT_SAVE_DEBOUNCE_MS)
 
     return () => {
       clearDraftSaveTimer()
     }
-  }, [clearDraftSaveTimer, inputText, pendingImages, persistDraft])
+  }, [clearDraftSaveTimer, draftMode, inputText, pendingImages, persistDraft])
 
   const flushLatestDraft = useCallback(() => {
     clearDraftSaveTimer()
-    persistDraft(latestInputTextRef.current, latestPendingImagesRef.current, false)
+    persistDraft(latestInputTextRef.current, latestPendingImagesRef.current, latestDraftModeRef.current, false)
   }, [clearDraftSaveTimer, persistDraft])
 
   useLayoutEffect(() => {
@@ -286,10 +353,13 @@ export function useSessionDraft(sessionName: string) {
   return {
     inputText,
     latestInputTextRef,
+    draftMode,
+    latestDraftModeRef,
     pendingImages,
     latestPendingImagesRef,
     resizeTextarea,
     setInputText,
+    setDraftMode,
     setPendingImages,
     showDraftSaved,
     focusTextarea,

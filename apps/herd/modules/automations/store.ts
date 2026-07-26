@@ -4,9 +4,14 @@ import path from 'node:path'
 import { parseProviderId } from '../agents/providers/registry.js'
 import type { AgentType } from '../agents/types.js'
 import { resolveAutomationsDataDir } from '../data-dir.js'
+import { resolveCommanderDataDir } from '../commanders/paths.js'
 import { quarantineJsonFile } from '../json-file.js'
 import { withJsonStoreSchema } from '../json-store-schema.js'
 import { resolveFounderOperatorId } from './resolve-founder-operator.js'
+import {
+  withCommanderChildCreation,
+  withCommanderMutations,
+} from '../commanders/child-mutation-coordinator.js'
 import type {
   Automation,
   AutomationExecutionSource,
@@ -76,6 +81,7 @@ export interface UpdateAutomationInput {
 
 export interface AutomationStoreOptions {
   dirPath?: string
+  commanderDataDir?: string
 }
 
 interface AutomationFilter {
@@ -291,12 +297,44 @@ function normalizeAutomation(raw: unknown): Automation | null {
   }
 }
 
+export function isPersistedAutomationValid(raw: unknown): boolean {
+  if (!isObject(raw)) {
+    return false
+  }
+  const normalized = normalizeAutomation(raw)
+  if (!normalized) {
+    return false
+  }
+  if (
+    raw.skills !== undefined
+    && (!Array.isArray(raw.skills) || raw.skills.length !== normalized.skills.length)
+  ) {
+    return false
+  }
+  if (
+    raw.history !== undefined
+    && (
+      !Array.isArray(raw.history)
+      || raw.history.length > HISTORY_CAP
+      || raw.history.length !== (normalized.history ?? []).length
+    )
+  ) {
+    return false
+  }
+  return raw.observations === undefined
+    || (
+      Array.isArray(raw.observations)
+      && raw.observations.length === (normalized.observations ?? []).length
+    )
+}
+
 export function defaultAutomationStoreDir(): string {
   return resolveAutomationsDataDir()
 }
 
 export class AutomationStore {
   private readonly dirPath: string
+  private readonly commanderDataDir: string
   private loaded = false
   private loadPromise: Promise<void> | null = null
   private mutationQueue: Promise<void> = Promise.resolve()
@@ -304,6 +342,7 @@ export class AutomationStore {
 
   constructor(options: AutomationStoreOptions = {}) {
     this.dirPath = path.resolve(options.dirPath ?? defaultAutomationStoreDir())
+    this.commanderDataDir = path.resolve(options.commanderDataDir ?? resolveCommanderDataDir())
   }
 
   async ensureLoaded(): Promise<void> {
@@ -353,7 +392,7 @@ export class AutomationStore {
   }
 
   async create(input: CreateAutomationInput): Promise<Automation> {
-    return this.withMutationLock(async () => {
+    const create = () => this.withMutationLock(async () => {
       await this.ensureLoaded()
       const operatorId = input.operatorId ?? await resolveFounderOperatorId()
       const now = new Date().toISOString()
@@ -367,7 +406,7 @@ export class AutomationStore {
         parentCommanderId: input.parentCommanderId ?? null,
         name: input.name,
         trigger: input.trigger,
-        ...(input.schedule ? { schedule: input.schedule } : {}),
+        ...(input.schedule?.trim() ? { schedule: input.schedule.trim() } : {}),
         ...(input.questTrigger ? { questTrigger: input.questTrigger } : {}),
         instruction: input.instruction,
         agentType: input.agentType,
@@ -398,15 +437,36 @@ export class AutomationStore {
       this.automations.set(automation.id, automation)
       return cloneAutomation(automation)
     })
+    return input.parentCommanderId
+      ? withCommanderChildCreation(input.parentCommanderId, this.commanderDataDir, create)
+      : create()
   }
 
   async update(automationId: string, update: UpdateAutomationInput): Promise<Automation | null> {
-    return this.withMutationLock(async () => {
+    for (;;) {
       await this.ensureLoaded()
-      const current = this.automations.get(automationId)
-      if (!current) {
+      const observed = this.automations.get(automationId)
+      if (!observed) {
         return null
       }
+      const observedParentCommanderId = observed.parentCommanderId ?? null
+      const nextParentCommanderId = Object.prototype.hasOwnProperty.call(update, 'parentCommanderId')
+        ? update.parentCommanderId ?? null
+        : observedParentCommanderId
+      let parentChangedBeforeCommit = false
+      const result = await withCommanderMutations(
+        [observedParentCommanderId ?? '', nextParentCommanderId ?? ''],
+        this.commanderDataDir,
+        () => this.withMutationLock(async () => {
+          await this.ensureLoaded()
+          const current = this.automations.get(automationId)
+          if (!current) {
+            return null
+          }
+          if ((current.parentCommanderId ?? null) !== observedParentCommanderId) {
+            parentChangedBeforeCommit = true
+            return null
+          }
       const next: Automation = cloneAutomation(current)
       if (update.operatorId) next.operatorId = update.operatorId
       if (Object.prototype.hasOwnProperty.call(update, 'parentCommanderId')) {
@@ -482,16 +542,36 @@ export class AutomationStore {
       await this.writeAutomation(next)
       this.automations.set(next.id, next)
       return cloneAutomation(next)
-    })
+        }),
+      )
+      if (!parentChangedBeforeCommit) {
+        return result
+      }
+    }
   }
 
   async appendHistory(automationId: string, entry: AutomationHistoryEntry): Promise<Automation | null> {
-    return this.withMutationLock(async () => {
+    for (;;) {
       await this.ensureLoaded()
-      const current = this.automations.get(automationId)
-      if (!current) {
+      const observed = this.automations.get(automationId)
+      if (!observed) {
         return null
       }
+      const observedParentCommanderId = observed.parentCommanderId ?? null
+      let parentChangedBeforeCommit = false
+      const result = await withCommanderMutations(
+        [observedParentCommanderId ?? ''],
+        this.commanderDataDir,
+        () => this.withMutationLock(async () => {
+          await this.ensureLoaded()
+          const current = this.automations.get(automationId)
+          if (!current) {
+            return null
+          }
+          if ((current.parentCommanderId ?? null) !== observedParentCommanderId) {
+            parentChangedBeforeCommit = true
+            return null
+          }
       const totalRuns = (current.totalRuns ?? 0) + 1
       const history = [entry, ...(current.history ?? [])].slice(0, HISTORY_CAP)
       const nextStatus = current.maxRuns && totalRuns >= current.maxRuns
@@ -508,7 +588,12 @@ export class AutomationStore {
       await this.writeAutomation(next)
       this.automations.set(next.id, next)
       return cloneAutomation(next)
-    })
+        }),
+      )
+      if (!parentChangedBeforeCommit) {
+        return result
+      }
+    }
   }
 
   async listHistory(
@@ -529,20 +614,40 @@ export class AutomationStore {
   }
 
   async delete(automationId: string, options: { removeFiles?: boolean } = {}): Promise<boolean> {
-    return this.withMutationLock(async () => {
+    for (;;) {
       await this.ensureLoaded()
-      const current = this.automations.get(automationId)
-      if (!current) {
+      const observed = this.automations.get(automationId)
+      if (!observed) {
         return false
       }
-      await rm(this.resolveAutomationFilePath(automationId), { force: true })
-      if (options.removeFiles !== false) {
-        const outputDir = current.outputDir ?? path.join(this.dirPath, automationId)
-        await rm(outputDir, { recursive: true, force: true })
+      const observedParentCommanderId = observed.parentCommanderId ?? null
+      let parentChangedBeforeCommit = false
+      const deleted = await withCommanderMutations(
+        [observedParentCommanderId ?? ''],
+        this.commanderDataDir,
+        () => this.withMutationLock(async () => {
+          await this.ensureLoaded()
+          const current = this.automations.get(automationId)
+          if (!current) {
+            return false
+          }
+          if ((current.parentCommanderId ?? null) !== observedParentCommanderId) {
+            parentChangedBeforeCommit = true
+            return false
+          }
+          await rm(this.resolveAutomationFilePath(automationId), { force: true })
+          if (options.removeFiles !== false) {
+            const outputDir = current.outputDir ?? path.join(this.dirPath, automationId)
+            await rm(outputDir, { recursive: true, force: true })
+          }
+          this.automations.delete(automationId)
+          return true
+        }),
+      )
+      if (!parentChangedBeforeCommit) {
+        return deleted
       }
-      this.automations.delete(automationId)
-      return true
-    })
+    }
   }
 
   async readMemory(automationId: string): Promise<string | null> {
@@ -561,13 +666,34 @@ export class AutomationStore {
   }
 
   async writeMemory(automationId: string, content: string): Promise<boolean> {
-    const automation = await this.get(automationId)
-    if (!automation?.memoryPath) {
-      return false
+    for (;;) {
+      const observed = await this.get(automationId)
+      if (!observed?.memoryPath) {
+        return false
+      }
+      const observedParentCommanderId = observed.parentCommanderId ?? null
+      let parentChangedBeforeCommit = false
+      const result = await withCommanderMutations(
+        [observedParentCommanderId ?? ''],
+        this.commanderDataDir,
+        async () => {
+          const current = await this.get(automationId)
+          if (!current?.memoryPath) {
+            return false
+          }
+          if ((current.parentCommanderId ?? null) !== observedParentCommanderId) {
+            parentChangedBeforeCommit = true
+            return false
+          }
+          await mkdir(path.dirname(current.memoryPath), { recursive: true })
+          await writeFile(current.memoryPath, content, 'utf8')
+          return true
+        },
+      )
+      if (!parentChangedBeforeCommit) {
+        return result
+      }
     }
-    await mkdir(path.dirname(automation.memoryPath), { recursive: true })
-    await writeFile(automation.memoryPath, content, 'utf8')
-    return true
   }
 
   async readRunReport(automationId: string, timestampKey: string): Promise<string | null> {

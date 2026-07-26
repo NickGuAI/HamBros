@@ -1,12 +1,21 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
+  useFinishOnboarding,
   useCreateFounderOrgSetup,
   useOnboardingStatus,
   useSeedGaiaCommander,
   useSeedStarterWorkforce,
   useSkipStarterWorkforce,
+  verifyPermanentApiKey,
 } from '@modules/onboarding/hooks/useFounderOnboarding'
+import {
+  useApiKeyScopeCatalog,
+  useCreateApiKey,
+  useRevokeApiKey,
+  type CreatedApiKey,
+} from '@/hooks/use-api-keys'
+import { useAuth } from '@/contexts/AuthContext'
 import {
   DEFAULT_FOUNDER_ORG_SETUP_FORM_VALUES,
   validateFounderOrgSetupFormValues,
@@ -170,15 +179,22 @@ function SectionActions({
 
 export function FounderOrgSetupPage() {
   const navigate = useNavigate()
+  const auth = useAuth()
   const onboarding = useOnboardingStatus()
   const createFounderOrg = useCreateFounderOrgSetup()
   const seedGaia = useSeedGaiaCommander()
   const seedStarterWorkforce = useSeedStarterWorkforce()
   const skipStarterWorkforce = useSkipStarterWorkforce()
+  const apiKeyScopeCatalog = useApiKeyScopeCatalog()
+  const createApiKey = useCreateApiKey()
+  const revokeApiKey = useRevokeApiKey()
+  const finishOnboarding = useFinishOnboarding()
   const submissionLockRef = useRef(false)
   const seedGaiaLockRef = useRef(false)
   const seedStarterWorkforceLockRef = useRef(false)
   const skipStarterWorkforceLockRef = useRef(false)
+  const credentialActionLockRef = useRef(false)
+  const finishLockRef = useRef(false)
   const defaultsAppliedRef = useRef(false)
   const hasEditedRef = useRef(false)
   const [activeStepId, setActiveStepId] = useState<OnboardingStepId | null>(null)
@@ -187,6 +203,8 @@ export function FounderOrgSetupPage() {
   )
   const [errors, setErrors] = useState<FounderOrgSetupValidationErrors>({})
   const [actionError, setActionError] = useState<string | null>(null)
+  const [createdPermanentKey, setCreatedPermanentKey] = useState<CreatedApiKey | null>(null)
+  const [keyCopied, setKeyCopied] = useState(false)
 
   const status = onboarding.data
   const steps = status?.steps ?? []
@@ -310,10 +328,93 @@ export function FounderOrgSetupPage() {
     }
   }
 
+  async function handleCreatePermanentKey() {
+    if (credentialActionLockRef.current) return
+    const scopes = apiKeyScopeCatalog.data?.defaultBootstrapScopes ?? []
+    if (scopes.length === 0) {
+      setActionError('The API key scope catalog is not ready. Retry after it loads.')
+      return
+    }
+    credentialActionLockRef.current = true
+    setActionError(null)
+    setKeyCopied(false)
+    try {
+      const created = await createApiKey.mutateAsync({
+        name: 'Permanent Admin Key',
+        scopes,
+      })
+      setCreatedPermanentKey(created)
+    } catch (error) {
+      setActionError(formatSetupError(error))
+    } finally {
+      credentialActionLockRef.current = false
+    }
+  }
+
+  async function handleCopyPermanentKey() {
+    if (!createdPermanentKey) return
+    try {
+      await navigator.clipboard.writeText(createdPermanentKey.key)
+      setKeyCopied(true)
+    } catch {
+      setActionError('Copy failed. Select the revealed key and save it manually.')
+    }
+  }
+
+  async function handleUsePermanentKey() {
+    if (!createdPermanentKey || credentialActionLockRef.current) return
+    credentialActionLockRef.current = true
+    setActionError(null)
+    try {
+      await verifyPermanentApiKey(createdPermanentKey.key)
+      if (status?.credentials.authenticatedAs === 'bootstrap' && !auth?.replaceApiKey) {
+        throw new Error('This browser cannot switch credentials. Sign in with the permanent key before revoking bootstrap access.')
+      }
+      auth?.replaceApiKey?.(createdPermanentKey.key)
+      await onboarding.refetch()
+    } catch (error) {
+      setActionError(formatSetupError(error))
+    } finally {
+      credentialActionLockRef.current = false
+    }
+  }
+
+  async function handleRevokeBootstrapKeys() {
+    if (credentialActionLockRef.current || !status?.credentials.canRevokeBootstrap) return
+    credentialActionLockRef.current = true
+    setActionError(null)
+    try {
+      for (const key of status.credentials.activeBootstrapKeys) {
+        await revokeApiKey.mutateAsync(key.id)
+      }
+      await onboarding.refetch()
+    } catch (error) {
+      setActionError(formatSetupError(error))
+    } finally {
+      credentialActionLockRef.current = false
+    }
+  }
+
+  async function handleFinishOnboarding() {
+    if (finishLockRef.current || !status?.credentials.ready) return
+    finishLockRef.current = true
+    setActionError(null)
+    try {
+      const result = await finishOnboarding.mutateAsync()
+      navigate(result.launchTarget, { replace: true })
+    } catch (error) {
+      setActionError(formatSetupError(error))
+    } finally {
+      finishLockRef.current = false
+    }
+  }
+
   const isSubmitting = createFounderOrg.isPending || submissionLockRef.current
   const isGaiaPending = seedGaia.isPending || seedGaiaLockRef.current
   const isStarterWorkforcePending = seedStarterWorkforce.isPending || seedStarterWorkforceLockRef.current
   const isSkipStarterWorkforcePending = skipStarterWorkforce.isPending || skipStarterWorkforceLockRef.current
+  const isCredentialPending = createApiKey.isPending || revokeApiKey.isPending || credentialActionLockRef.current
+  const isFinishPending = finishOnboarding.isPending || finishLockRef.current
 
   if (onboarding.isLoading && !status) {
     return (
@@ -910,6 +1011,26 @@ export function FounderOrgSetupPage() {
               <p>
                 Provider and machine readiness is reported by the backend. Missing auth can be completed now or later from settings.
               </p>
+              {status?.providerExecution ? (
+                <section
+                  className="hv-onboarding-readiness-section"
+                  aria-label="Provider execution mode"
+                  data-testid="provider-execution-readiness"
+                >
+                  <div className="hv-onboarding-readiness-heading">
+                    <h3>Execution mode</h3>
+                    <span>{status.providerExecution.mode}</span>
+                  </div>
+                  <p>{status.providerExecution.summary}</p>
+                  {status.providerExecution.daemonRequired ? (
+                    <p>
+                      {status.providerExecution.connectedDaemonCount} connected ·{' '}
+                      {status.providerExecution.providerReadyDaemonCount} provider-ready daemon
+                      {status.providerExecution.providerReadyDaemonCount === 1 ? '' : 's'}
+                    </p>
+                  ) : null}
+                </section>
+              ) : null}
               <section
                 className="hv-onboarding-readiness-section"
                 aria-label="Provider readiness"
@@ -946,7 +1067,80 @@ export function FounderOrgSetupPage() {
               </section>
               <SectionActions
                 onBack={() => setActiveStepId(previousStep?.id ?? 'gaia')}
+                onNext={() => setActiveStepId('credentials')}
+              />
+            </>
+          ) : null}
+
+          {currentStepId === 'credentials' ? (
+            <>
+              <h2>Replace bootstrap access</h2>
+              <p>{status?.credentials.summary}</p>
+              <section className="hv-onboarding-readiness-section" data-testid="credential-lifecycle-section">
+                <div className="hv-onboarding-readiness-heading">
+                  <h3>Permanent API key</h3>
+                  <span>{status?.credentials.state ?? 'missing'}</span>
+                </div>
+                <p>
+                  Create the permanent admin key, save its one-time value, verify this browser with it,
+                  and only then revoke the temporary bootstrap key.
+                </p>
+                {!createdPermanentKey && !status?.credentials.ready ? (
+                  <button
+                    type="button"
+                    className="hv-onboarding-button hv-onboarding-button-primary"
+                    onClick={handleCreatePermanentKey}
+                    disabled={isCredentialPending || apiKeyScopeCatalog.isLoading}
+                    data-testid="create-permanent-key"
+                  >
+                    {createApiKey.isPending ? 'Creating...' : 'Create permanent admin key'}
+                  </button>
+                ) : null}
+                {createdPermanentKey ? (
+                  <div className="hv-onboarding-receipt" data-testid="permanent-key-reveal">
+                    <p><strong>Save this key now. It is shown only once.</strong></p>
+                    <code style={{ overflowWrap: 'anywhere' }}>{createdPermanentKey.key}</code>
+                    <div className="hv-onboarding-action-group">
+                      <button
+                        type="button"
+                        className="hv-onboarding-button hv-onboarding-button-ghost"
+                        onClick={handleCopyPermanentKey}
+                        data-testid="copy-permanent-key"
+                      >
+                        {keyCopied ? 'Copied' : 'Copy key'}
+                      </button>
+                      <button
+                        type="button"
+                        className="hv-onboarding-button hv-onboarding-button-primary"
+                        onClick={handleUsePermanentKey}
+                        disabled={isCredentialPending}
+                        data-testid="use-permanent-key"
+                      >
+                        Verify and use permanent key
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+                {(status?.credentials.activeBootstrapKeys.length ?? 0) > 0 ? (
+                  <button
+                    type="button"
+                    className="hv-onboarding-button hv-onboarding-button-primary"
+                    onClick={handleRevokeBootstrapKeys}
+                    disabled={isCredentialPending || !status?.credentials.canRevokeBootstrap}
+                    data-testid="revoke-bootstrap-keys"
+                  >
+                    Revoke {status?.credentials.activeBootstrapKeys.length ?? 0} bootstrap key
+                    {(status?.credentials.activeBootstrapKeys.length ?? 0) === 1 ? '' : 's'}
+                  </button>
+                ) : null}
+              </section>
+              {actionError ? <div className="hv-onboarding-error" role="alert">{actionError}</div> : null}
+              <SectionActions
+                onBack={() => setActiveStepId(previousStep?.id ?? 'providers-machines')}
                 onNext={() => setActiveStepId('launch')}
+                nextDisabled={!status?.credentials.ready || isCredentialPending}
+                nextLabel={status?.credentials.ready ? 'Continue' : 'Complete credential rotation'}
+                nextTestId="credential-lifecycle-continue"
               />
             </>
           ) : null}
@@ -955,7 +1149,7 @@ export function FounderOrgSetupPage() {
             <>
               <h2>Ready to launch</h2>
               <p>
-                This receipt is the browser side of the terminal setup guide. Keep the bootstrap key local and rotate it after setup.
+                This receipt confirms that permanent access is active and temporary bootstrap access is gone.
               </p>
               <div className="hv-onboarding-receipt" data-testid="onboarding-receipt">
                 {[
@@ -976,8 +1170,9 @@ export function FounderOrgSetupPage() {
               </div>
               <SectionActions
                 onBack={() => setActiveStepId(previousStep?.id ?? 'providers-machines')}
-                onNext={() => navigate(status?.launchTarget ?? '/org', { replace: true })}
-                nextLabel="Open command room"
+                onNext={handleFinishOnboarding}
+                nextDisabled={!status?.credentials.ready || isFinishPending}
+                nextLabel={isFinishPending ? 'Finishing...' : 'Open command room'}
                 nextTestId="onboarding-launch-submit"
               />
             </>

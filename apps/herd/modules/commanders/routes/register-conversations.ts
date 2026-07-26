@@ -17,6 +17,7 @@ import { getCachedProviderModelsForValidation } from '../../agents/providers/mod
 import {
   getAgentEffortLevels,
   getAgentEffortLevelsForModel,
+  getDefaultAgentEffortForModel,
   parseOptionalAgentEffort,
   parseStoredAgentEffort,
 } from '../../agents/effort.js'
@@ -32,6 +33,7 @@ import {
 } from '../../workspace/context.js'
 import { toWorkspaceError } from '../../workspace/resolver.js'
 import type { AgentType } from '../../agents/types.js'
+import { isProviderLaunchError } from '../../agents/session/machine-launch.js'
 import {
   conversationNamesEqual,
   normalizeConversationName,
@@ -45,6 +47,7 @@ import {
 import type { CommanderChannelMeta } from '../store.js'
 import type { Conversation } from '../conversation-store.js'
 import { enforceCommanderCostCap } from '../cost-control.js'
+import { resolveConversationCredentialSelectionMode } from '../conversation-credential-selection.js'
 import {
   ConversationProviderSwapConflictError,
   ConversationProviderSwapUnavailableError,
@@ -57,7 +60,6 @@ import {
   type ConversationSpawnOptions,
   updateCommanderDerivedState,
   buildConversationSessionName,
-  canConversationSelectCredentialPool,
 } from './conversation-runtime.js'
 import {
   buildConversationSummaryDTO,
@@ -307,6 +309,8 @@ type ConversationBootstrapResult =
   | {
     ok: false
     error: string
+    status?: number
+    code?: string
   }
 
 interface ConversationBootstrapLaunch {
@@ -434,7 +438,12 @@ function launchConversationBootstrap(
         detail,
         context.now().toISOString(),
       )
-      return { ok: false, error: detail }
+      return {
+        ok: false,
+        error: detail,
+        ...(isProviderLaunchError(error) ? { status: error.statusCode } : {}),
+        ...(isProviderLaunchError(error) && error.code ? { code: error.code } : {}),
+      }
     }
   })()
 
@@ -756,7 +765,10 @@ export function registerConversationRoutes(
     const selectedAgentType = requestedAgentType ?? commander.agentType ?? resolveDefaultProviderId()
     if (
       requestedCredentialPoolId.value
-      && !canConversationSelectCredentialPool(selectedAgentType, commander.host)
+      && resolveConversationCredentialSelectionMode(
+        selectedAgentType,
+        commander.executionMachineId,
+      ) !== 'per-conversation'
     ) {
       res.status(400).json({
         error: 'credentialPoolId is not supported for local Claude conversations; select the global Claude credential in Settings',
@@ -830,13 +842,11 @@ export function registerConversationRoutes(
       return
     }
     const hasEffortField = Object.prototype.hasOwnProperty.call(req.body ?? {}, 'effort')
-    const modelDefaultEffort = parseOptionalAgentEffort(selectedAgentType, selectedModel?.defaultEffort)
-    const providerDefaultEffort = parseOptionalAgentEffort(selectedAgentType, selectedDefaults.effort)
-    const defaultEffort = modelDefaultEffort && selectedEffortLevels.includes(modelDefaultEffort)
-      ? modelDefaultEffort
-      : providerDefaultEffort && selectedEffortLevels.includes(providerDefaultEffort)
-        ? providerDefaultEffort
-        : parseOptionalAgentEffort(selectedAgentType, selectedEffortLevels[0]) ?? undefined
+    const defaultEffort = getDefaultAgentEffortForModel(
+      selectedAgentType,
+      selectedModel,
+      selectedDefaults.effort,
+    )
     const commanderProviderContext = sameCommanderProvider
       ? commander.providerContext as { effort?: unknown; adaptiveThinking?: unknown; maxThinkingTokens?: unknown } | undefined
       : undefined
@@ -1065,10 +1075,10 @@ export function registerConversationRoutes(
       return
     }
     const liveSession = getLiveConversationSession(context, conversation)
-    const credentialSelectionAllowed = canConversationSelectCredentialPool(
+    const credentialSelectionAllowed = resolveConversationCredentialSelectionMode(
       nextAgentType,
-      liveSession?.host ?? commander?.host,
-    )
+      liveSession?.host ?? commander?.executionMachineId,
+    ) === 'per-conversation'
     if (credentialPoolIdField.provided && !credentialSelectionAllowed) {
       res.status(400).json({
         error: 'credentialPoolId is not supported for local Claude conversations; select the global Claude credential in Settings',
@@ -1192,14 +1202,10 @@ export function registerConversationRoutes(
       ?? conversation.effort
       ?? parseStoredAgentEffort(nextAgentType, storedProviderContext?.effort)
       ?? undefined
-    const modelDefaultEffort = parseOptionalAgentEffort(nextAgentType, modelOption?.defaultEffort)
-    const providerDefaultEffort = parseOptionalAgentEffort(nextAgentType, providerDefaults.effort)
-    const defaultEffort = (
-      modelDefaultEffort && supportedEffortLevels.includes(modelDefaultEffort)
-        ? modelDefaultEffort
-        : providerDefaultEffort && supportedEffortLevels.includes(providerDefaultEffort)
-          ? providerDefaultEffort
-          : parseOptionalAgentEffort(nextAgentType, supportedEffortLevels[0]) ?? undefined
+    const defaultEffort = getDefaultAgentEffortForModel(
+      nextAgentType,
+      modelOption,
+      providerDefaults.effort,
     )
     const nextEffort = modelSupportsEffort
       ? effortField.provided
@@ -1251,6 +1257,13 @@ export function registerConversationRoutes(
         }
         if (error instanceof ConversationProviderSwapUnavailableError) {
           res.status(503).json({ error: error.message })
+          return
+        }
+        if (isProviderLaunchError(error)) {
+          res.status(error.statusCode).json({
+            error: error.message,
+            ...(error.code ? { code: error.code } : {}),
+          })
           return
         }
         throw error
@@ -1429,10 +1442,10 @@ export function registerConversationRoutes(
         res.status(400).json({ error: `Unknown provider: ${agentType}` })
         return
       }
-      const credentialPoolId = canConversationSelectCredentialPool(
+      const credentialPoolId = resolveConversationCredentialSelectionMode(
         agentType,
-        liveSession?.host ?? commander?.host,
-      )
+        liveSession?.host ?? commander?.executionMachineId,
+      ) === 'per-conversation'
         ? liveSession?.agentType === agentType
           ? liveSession.credentialPoolId
           : conversation.agentType === agentType
@@ -1501,13 +1514,11 @@ export function registerConversationRoutes(
         })
         return
       }
-      const modelDefaultEffort = parseOptionalAgentEffort(agentType, modelOption?.defaultEffort)
-      const providerDefaultEffort = parseOptionalAgentEffort(agentType, providerDefaults.effort)
-      const defaultEffort = modelDefaultEffort && supportedEffortLevels.includes(modelDefaultEffort)
-        ? modelDefaultEffort
-        : providerDefaultEffort && supportedEffortLevels.includes(providerDefaultEffort)
-          ? providerDefaultEffort
-          : parseOptionalAgentEffort(agentType, supportedEffortLevels[0]) ?? undefined
+      const defaultEffort = getDefaultAgentEffortForModel(
+        agentType,
+        modelOption,
+        providerDefaults.effort,
+      )
       const effort = modelSupportsEffort ? parsedEffort ?? defaultEffort : undefined
 
       const hasAdaptiveThinkingField = Object.prototype.hasOwnProperty.call(body, 'adaptiveThinking')
@@ -1555,7 +1566,10 @@ export function registerConversationRoutes(
         return
       }
       if (!fastResult.ok) {
-        res.status(503).json({ error: fastResult.error })
+        res.status(fastResult.status ?? 503).json({
+          error: fastResult.error,
+          ...(fastResult.code ? { code: fastResult.code } : {}),
+        })
         return
       }
 
@@ -1563,7 +1577,10 @@ export function registerConversationRoutes(
         conversation: await withLiveSession(context, fastResult.conversation),
       })
     } catch (error) {
-      res.status(503).json({ error: errorMessage(error) })
+      res.status(isProviderLaunchError(error) ? error.statusCode : 503).json({
+        error: errorMessage(error),
+        ...(isProviderLaunchError(error) && error.code ? { code: error.code } : {}),
+      })
     }
   })
 
@@ -1763,7 +1780,10 @@ export function registerConversationRoutes(
         return
       }
       if (!fastResult.ok) {
-        res.status(503).json({ error: fastResult.error })
+        res.status(fastResult.status ?? 503).json({
+          error: fastResult.error,
+          ...(fastResult.code ? { code: fastResult.code } : {}),
+        })
         return
       }
 

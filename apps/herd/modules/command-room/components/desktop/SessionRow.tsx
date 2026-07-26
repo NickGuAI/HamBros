@@ -11,18 +11,22 @@
  */
 import type { SessionCreator } from '@/types'
 import { AgentAvatar, Icon, STATE_COLOR } from '@modules/components/hervald'
+import type { ConversationCredentialSelectionModes } from '@modules/commanders/conversation-credential-selection.js'
 
 const ACTIVE_STATES = new Set(['active', 'connected', 'running'])
 
 export interface Commander {
   id: string
   name: string
+  /** Kept for identity lookup; archived commanders stay out of navigation. */
+  archived?: boolean
   // Used by AgentAvatar for the initial-letter fallback when no avatar image
   // is set. Hosts from `useCommander` supply this as their real host name
   // (e.g. the machine nickname); display pages pass it through so the letter
   // matches what the user sees in the row title.
   displayName?: string
   host?: string
+  credentialSelectionModes?: ConversationCredentialSelectionModes
   status: string
   description?: string
   iconName?: string

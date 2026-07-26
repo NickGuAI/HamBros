@@ -17,9 +17,9 @@ import {
   type ClaudeMaxThinkingTokens,
 } from '@modules/claude-max-thinking-tokens.js'
 import {
-  canSelectConversationCredential,
   CredentialPoolSelect,
 } from './CredentialPoolSelect'
+import type { ConversationCredentialSelectionModes } from '@modules/commanders/conversation-credential-selection.js'
 
 export interface CreateConversationReasoningConfig {
   effort?: AgentEffortLevel
@@ -39,14 +39,14 @@ function resolveInitialAgentType(
 
 export function CreateConversationPanel({
   commanderName,
-  commanderHost,
+  credentialSelectionModes,
   onCreateChat,
   createChatPending = false,
   defaultAgentType,
   providerOptions = [],
 }: {
   commanderName: string
-  commanderHost?: string | null
+  credentialSelectionModes?: ConversationCredentialSelectionModes
   onCreateChat?: (
     agentType: AgentType,
     model: string | null,
@@ -67,7 +67,7 @@ export function CreateConversationPanel({
   const [model, setModel] = useState<string | null>(null)
   const [credentialPoolId, setCredentialPoolId] = useState<string | null>(null)
   const initialProviderControls = getProviderControlDefaults(null)
-  const [effort, setEffort] = useState<AgentEffortLevel>(initialProviderControls.effort)
+  const [effort, setEffort] = useState<AgentEffortLevel | ''>('')
   const [adaptiveThinking, setAdaptiveThinking] = useState<ClaudeAdaptiveThinkingMode>(
     initialProviderControls.adaptiveThinking,
   )
@@ -79,7 +79,10 @@ export function CreateConversationPanel({
     () => providerOptions.find((provider) => provider.id === agentType) ?? null,
     [agentType, providerOptions],
   )
-  const credentialSelectionAllowed = canSelectConversationCredential(agentType, commanderHost)
+  const credentialSelectionMode = agentType
+    ? credentialSelectionModes?.[agentType] ?? 'none'
+    : 'none'
+  const credentialSelectionAllowed = credentialSelectionMode === 'per-conversation'
   const selectedCredentialPoolId = credentialSelectionAllowed ? credentialPoolId : null
   const modelCredentialPoolId = activeProvider?.modelCatalogScope === 'provider'
     ? undefined
@@ -96,6 +99,11 @@ export function CreateConversationPanel({
   const effortOptions = useMemo(() => {
     return agentType ? getAgentEffortLevelsForModel(agentType, activeModel) : []
   }, [activeModel, agentType])
+  const defaultEffort = getDefaultAgentEffortForModel(
+    agentType ?? '',
+    activeModel,
+    activeProvider?.defaults?.effort,
+  )
   const supportsEffort = capabilities?.supportsEffort === true && effortOptions.length > 0
   const supportsAdaptiveThinking = capabilities?.supportsAdaptiveThinking === true
     && activeModel?.supportsAdaptiveThinking !== false
@@ -134,18 +142,11 @@ export function CreateConversationPanel({
 
   useEffect(() => {
     const defaults = getProviderControlDefaults(activeProvider)
-    const modelDefaultEffort = activeModel?.defaultEffort as AgentEffortLevel | undefined
-    setEffort(
-      modelDefaultEffort && effortOptions.includes(modelDefaultEffort)
-        ? modelDefaultEffort
-        : effortOptions.includes(defaults.effort)
-          ? defaults.effort
-          : effortOptions[0] ?? defaults.effort,
-    )
+    setEffort(defaultEffort ?? '')
     setAdaptiveThinking(defaults.adaptiveThinking)
     setMaxThinkingTokens(String(defaults.maxThinkingTokens))
     setReasoningError(null)
-  }, [activeModel, activeProvider, effortOptions])
+  }, [activeProvider, defaultEffort])
 
   function buildReasoningConfig(): CreateConversationReasoningConfig | null {
     const submittedEffort = effortOptions.includes(effort)
@@ -187,7 +188,11 @@ export function CreateConversationPanel({
     const nextModels = nextProvider?.availableModels ?? []
     const nextDefaults = getProviderControlDefaults(nextProvider)
     const nextDefaultModel = nextModels.find((option) => option.default) ?? nextModels[0]
-    setEffort(getDefaultAgentEffortForModel(nextAgentType, nextDefaultModel) ?? nextDefaults.effort)
+    setEffort(getDefaultAgentEffortForModel(
+      nextAgentType,
+      nextDefaultModel,
+      nextProvider?.defaults?.effort,
+    ) ?? '')
     setAdaptiveThinking(nextDefaults.adaptiveThinking)
     setMaxThinkingTokens(String(nextDefaults.maxThinkingTokens))
     if (model && !nextModels.some((option) => option.id === model)) {
@@ -205,12 +210,12 @@ export function CreateConversationPanel({
       : availableModels.find((option) => option.default) ?? availableModels[0]
     setModel(nextModelId)
     const nextDefaultEffort = getDefaultAgentEffortForModel(agentType ?? '', nextModel)
-    if (nextDefaultEffort) {
-      setEffort((current) => {
-        const nextLevels = getAgentEffortLevelsForModel(agentType ?? '', nextModel)
-        return nextLevels.includes(current) ? current : nextDefaultEffort
-      })
-    }
+    setEffort((current) => {
+      const nextLevels = getAgentEffortLevelsForModel(agentType ?? '', nextModel)
+      return nextDefaultEffort && current && nextLevels.includes(current)
+        ? current
+        : nextDefaultEffort ?? ''
+    })
   }
 
   return (
@@ -307,7 +312,7 @@ export function CreateConversationPanel({
               <span>Credential</span>
               <CredentialPoolSelect
                 provider={agentType}
-                host={commanderHost}
+                credentialSelectionMode={credentialSelectionMode}
                 value={selectedCredentialPoolId}
                 onChange={setCredentialPoolId}
                 disabled={!onCreateChat || createChatPending}
@@ -443,7 +448,7 @@ export function CreateConversationPanel({
                   className="font-body"
                   data-testid="create-chat-effort-select"
                   value={effort}
-                  onChange={(event) => setEffort(event.target.value as AgentEffortLevel)}
+                  onChange={(event) => setEffort(event.target.value as AgentEffortLevel | '')}
                   disabled={disabled}
                   style={{
                     background: 'transparent',
@@ -454,6 +459,7 @@ export function CreateConversationPanel({
                     cursor: disabled ? 'not-allowed' : 'pointer',
                   }}
                 >
+                  {!defaultEffort ? <option value="">Provider default</option> : null}
                   {effortOptions.map((level) => (
                     <option key={level} value={level}>{level}</option>
                   ))}

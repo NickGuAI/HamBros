@@ -18,6 +18,7 @@ import type {
   ConversationSurface,
 } from '@gehirn/herd-cli/session-contract'
 import type { WorkspaceContextPayload } from '@modules/workspace/types'
+import type { ConversationCredentialSelectionModes } from '@modules/commanders/conversation-credential-selection.js'
 
 const CONVERSATIONS_POLL_INTERVAL_MS = 5000
 const CONVERSATIONS_LIST_STALE_MS = 30_000
@@ -78,6 +79,7 @@ export interface ConversationRuntimeSettingsValues {
 }
 
 export interface ConversationRuntimeSettings {
+  credentialSelectionModes: ConversationCredentialSelectionModes
   current: ConversationRuntimeSettingsValues
   supported: {
     agentType: true

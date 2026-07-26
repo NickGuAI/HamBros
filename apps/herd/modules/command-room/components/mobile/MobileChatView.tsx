@@ -726,7 +726,7 @@ export function MobileChatView({
           >
             <CreateConversationPanel
               commanderName={commander.name}
-              commanderHost={commander.host}
+              credentialSelectionModes={commander.credentialSelectionModes}
               onCreateChat={(nextAgentType, nextModel, reasoningConfig, credentialPoolId) => {
                 void handleCreateConversation(
                   nextAgentType,

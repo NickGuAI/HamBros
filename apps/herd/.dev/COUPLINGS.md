@@ -57,7 +57,10 @@ command-room/CommandRoom.tsx
   -> approvals + automations + quests
 ```
 
-Command Room stores browser preferences only. Durable data lives in:
+Command Room and its shared components own browser-local presentation and draft
+state only. That includes per-session composer text/images/mode in
+`localStorage` and the in-progress QuestBoard form in `sessionStorage`. Durable
+data lives in:
 
 - commanders: `apps/herd/modules/commanders/conversation-store.ts`,
   `modules/commanders/store.ts`, `modules/commanders/quest-store.ts`.
@@ -77,6 +80,110 @@ Conversation-bound chat and standalone agent chat use different send lanes:
 - standalone sessions: `/api/agents/sessions/:name/send`,
   `/api/agents/sessions/:name/ws`, and queue endpoints under
   `apps/herd/modules/agents/`.
+
+## Shared Session Composer
+
+```text
+desktop/mobile session shell
+  -> SessionComposer.tsx
+  -> use-session-draft.ts
+  -> per-session text + images + quick/markdown mode in localStorage
+  -> send or queue callbacks owned by the embedding surface
+```
+
+The shared composer owns presentation and draft persistence, not backend
+sendability. Its `disabled`, `sendReady`, queue snapshot, and callbacks come
+from the embedding session or conversation surface.
+
+Behavior contract:
+
+- quick mode: Enter sends, Shift+Enter inserts a newline, and Tab queues when
+  queueing is available;
+- Markdown mode: Enter inserts a newline, Cmd/Ctrl+Enter sends, and Tab queues;
+- Cmd/Ctrl+Shift+M toggles modes, multiline paste promotes quick to Markdown,
+  and IME composition must never send or queue;
+- the draft mode persists per session and clearing a draft restores quick mode;
+- Markdown height follows the owning pane while quick mode keeps the desktop or
+  mobile compact cap.
+
+Risk: forking key or draft behavior in a shell creates desktop/mobile drift.
+Change `SessionComposer.tsx` and `use-session-draft.ts` once, then prove both
+variants through the shared component tests.
+
+## Automation Control And Runtime
+
+```text
+global automations page / commander Command Room / mobile surface
+  -> commanders/components/AutomationPanel.tsx
+  -> automations/hooks/useAutomations.ts
+  -> commander compatibility routes + automation routes
+  -> automations store + scheduler
+  -> cron-validation.server.ts
+  -> pinned node-cron semantic validator
+```
+
+`AutomationPanel` is the shared list/detail implementation. Scope selects
+global or commander data; presentation selects default, mobile-list, or
+single-pane behavior. Default presentation swaps list to detail below `md` and
+keeps the split layout at `md` and above. Explicit mobile-list and single-pane
+embeddings use full-swap navigation.
+
+The browser may keep incomplete cron drafts local, but complete expressions are
+authoritatively accepted or rejected by the server. The server guard bounds
+range expansion and rejects zero-step input before `node-cron`; `node-cron`
+still owns cron grammar. Startup must isolate an invalid persisted schedule so
+valid jobs and repair APIs remain available.
+
+Risk: duplicating list/detail state in a consumer or promoting browser cron
+parsing to semantic authority causes surface drift. Risk: letting one invalid
+persisted record abort scheduler registration makes the repair route
+unreachable.
+
+## Quest Artifacts, Workspace References, And Task Lifecycle
+
+```text
+task_lifecycle.py create/move
+  -> ~/tasks/{proposed,active,completed}/<task>/
+  -> index.html + index.json + rewritten task/quest references
+
+create-quests / herd quests artifact add|remove
+  -> explicit {type, label, href} on quest PATCH
+  -> QuestBoard always-visible artifact chip
+  -> file artifact: POST /api/workspace/resolve-reference
+  -> ephemeral read-only Workspace target
+  -> tree/file/raw reads allowed; all mutations denied
+```
+
+Contract owners:
+
+- artifact href shape: `apps/herd/modules/commanders/quest-artifact-href.ts`
+  and `packages/herd-cli/src/quests.ts`;
+- artifact storage/update: commander quest routes/store;
+- file opening and authorization: Workspace resolver/routes;
+- task folder state, indexes, and reference rewrites:
+  `ai-state/claude/skills/task-system-maintenance/scripts/task_lifecycle.py`;
+- task-to-quest creation workflow:
+  `ai-state/claude/skills/create-quests/SKILL.md`.
+
+File artifacts are intentionally not converted into a second durable Workspace
+registration. Reference resolution mints an ephemeral `readOnly: true` target,
+expands local or remote `~/`, and authorizes against configured lifecycle roots.
+The public response must not expose raw host roots. All seven target/file/git
+Workspace mutations use the shared writable-target guard, and git
+initialization repeats the guard at the service boundary. Workspace preferences
+are not target-scoped and do not use this guard.
+
+Risk: treating artifact labels or path conventions as type authority bypasses
+the explicit contract. Risk: moving a task folder without rewriting quest
+artifact hrefs breaks the backlink. Risk: guarding only editor controls leaves
+write routes or git initialization available against a read-only target.
+
+Task-folder lifecycle (`proposed`, `active`, `completed`) and quest lifecycle
+(`pending`, `active`, `blocked`, `done`, `failed`) are separate state machines.
+Their relationship is the explicit file artifact, not a shared name, prose
+mention, or inferred path. A quest status change does not move a task folder;
+`task_lifecycle.py move` owns that transition and the required reference/index
+rewrite.
 
 ## Channel Conversation Surface
 
@@ -135,7 +242,8 @@ Primary files:
 - `apps/herd/modules/agents/adapters/codex/`
 - `apps/herd/modules/agents/adapters/gemini/`
 - `apps/herd/modules/agents/adapters/opencode/`
-- `apps/herd/modules/agents/providers/provider-context-migration.ts`
+- `apps/herd/modules/agents/providers/provider-context-normalization.ts`
+- `apps/herd/modules/agents/providers/provider-session-context.ts`
 - `apps/herd/modules/commanders/components/ProviderModelSelect.tsx`
 
 Risk: provider registry metadata can change without changing live runtime
@@ -163,8 +271,8 @@ Primary files:
 - `packages/herd-cli/src/doctor.ts`
 - `apps/herd/docs/reference/cli.md`
 - `operations/sops/SOP-15-release-herd.md`
-- `operations/deploy/ec2/Caddyfile`
-- `operations/deploy/ec2/hervald.service`
+- `operations/deploy/ec2/README.md`
+- `operations/deploy/ec2/herd.service`
 
 Risk: a change can work on EC2 but miss the public Herd release mirror, or work
 in managed launch but fail in foreground CLI startup.

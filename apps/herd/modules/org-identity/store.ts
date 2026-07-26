@@ -55,6 +55,15 @@ function parsePersistedOrgIdentity(raw: unknown): OrgIdentity {
   }
 }
 
+export function isPersistedOrgIdentityValid(raw: unknown): boolean {
+  try {
+    parsePersistedOrgIdentity(raw)
+    return true
+  } catch {
+    return false
+  }
+}
+
 function createDefaultOrgIdentity(): OrgIdentity {
   const now = new Date().toISOString()
   return {

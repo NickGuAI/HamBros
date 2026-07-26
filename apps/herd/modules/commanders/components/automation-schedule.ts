@@ -1,3 +1,5 @@
+import { splitAutomationCronExpressionFields } from '../../automations/cron-validation'
+
 export type AutomationCadence =
   | 'every-15-minutes'
   | 'hourly'
@@ -135,8 +137,7 @@ function describeCronDay(dayOfWeek: string): string | null {
 }
 
 export function describeAutomationSchedule(expression: string): string {
-  const normalizedExpression = expression.trim().replace(/\s+/g, ' ')
-  const parts = normalizedExpression.split(' ')
+  const parts = splitAutomationCronExpressionFields(expression)
   if (parts.length !== 5) {
     return expression
   }

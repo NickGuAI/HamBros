@@ -2,9 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useProviderModels } from '@/hooks/use-providers'
 import type { AgentType, ProviderModelOption, ProviderRegistryEntry } from '@/types'
 import {
-  getAgentEffortLevels,
   getAgentEffortLevelsForModel,
-  getDefaultAgentEffort,
+  getDefaultAgentEffortForModel,
   type AgentEffortLevel,
 } from '@modules/agents/effort.js'
 import {
@@ -31,24 +30,16 @@ export interface ConversationRuntimeSettingsDraft {
   maxThinkingTokens: number | null
 }
 
-function resolveConversationTargetHost(
-  conversation: ConversationRecord | null | undefined,
-  commanderHost?: string | null,
-): string | undefined {
-  return conversation?.liveSession?.host?.trim() || commanderHost?.trim() || undefined
-}
-
 function toDraft(
   conversation: ConversationRecord | null | undefined,
-  commanderHost?: string | null,
 ): ConversationRuntimeSettingsDraft | null {
-  const current = conversation?.runtimeSettings?.current
-  if (!current) {
+  const settings = conversation?.runtimeSettings
+  const current = settings?.current
+  if (!settings || !current) {
     return null
   }
-  const host = resolveConversationTargetHost(conversation, commanderHost)
-  const credentialSelectionAllowed = current.agentType === 'codex'
-    || (current.agentType === 'claude' && Boolean(host && host !== 'local'))
+  const credentialSelectionAllowed =
+    settings.credentialSelectionModes?.[current.agentType] === 'per-conversation'
   return {
     ...current,
     credentialPoolId: credentialSelectionAllowed
@@ -57,10 +48,6 @@ function toDraft(
         ?? null
       : null,
   }
-}
-
-function isAgentEffortLevel(agentType: AgentType, value: string): value is AgentEffortLevel {
-  return getAgentEffortLevels(agentType).includes(value as AgentEffortLevel)
 }
 
 function getModelEffortLevels(
@@ -79,16 +66,7 @@ function resolveModelEffort(
   if (provider?.uiCapabilities.supportsEffort !== true || allowedLevels.length === 0) {
     return null
   }
-  const candidates = [
-    model?.defaultEffort,
-    provider.defaults.effort,
-    getDefaultAgentEffort(agentType),
-  ]
-  return candidates.find((value): value is AgentEffortLevel => (
-    Boolean(value)
-    && isAgentEffortLevel(agentType, value as string)
-    && allowedLevels.includes(value as AgentEffortLevel)
-  )) ?? allowedLevels[0] ?? null
+  return getDefaultAgentEffortForModel(agentType, model, provider.defaults.effort) ?? null
 }
 
 function mergeModelOptions(
@@ -111,18 +89,23 @@ function mergeModelOptions(
 export function useConversationRuntimeSettings(
   conversation: ConversationRecord | null | undefined,
   providers: readonly ProviderRegistryEntry[],
-  commanderHost?: string | null,
 ) {
   const settings = conversation?.runtimeSettings
+  const credentialSelectionModesKey = Object.entries(
+    settings?.credentialSelectionModes ?? {},
+  )
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([provider, mode]) => `${provider}:${mode}`)
+    .join('|')
   const [draft, setDraft] = useState<ConversationRuntimeSettingsDraft | null>(() => (
-    toDraft(conversation, commanderHost)
+    toDraft(conversation)
   ))
 
   useEffect(() => {
-    setDraft(toDraft(conversation, commanderHost))
+    setDraft(toDraft(conversation))
   }, [
-    commanderHost,
     conversation?.id,
+    credentialSelectionModesKey,
     settings?.current.adaptiveThinking,
     settings?.current.agentType,
     settings?.current.effort,
@@ -141,14 +124,13 @@ export function useConversationRuntimeSettings(
   }, [providers, settings?.options.agentType])
 
   const selectedProvider = providerOptions.find((provider) => provider.id === draft?.agentType) ?? null
-  const targetHost = resolveConversationTargetHost(conversation, commanderHost)
-  const credentialSelectionAllowed = draft?.agentType === 'codex'
-    || (draft?.agentType === 'claude' && Boolean(targetHost && targetHost !== 'local'))
-  const currentCredentialSelectionAllowed = settings?.current.agentType === 'codex'
-    || (
-      settings?.current.agentType === 'claude'
-      && Boolean(targetHost && targetHost !== 'local')
-    )
+  const credentialSelectionMode = draft?.agentType
+    ? settings?.credentialSelectionModes?.[draft.agentType] ?? 'none'
+    : 'none'
+  const credentialSelectionAllowed = credentialSelectionMode === 'per-conversation'
+  const currentCredentialSelectionAllowed = settings
+    ? settings.credentialSelectionModes?.[settings.current.agentType] === 'per-conversation'
+    : false
   const currentCredentialPoolId = currentCredentialSelectionAllowed
     ? conversation?.liveSession?.credentialPoolId
       ?? conversation?.credentialPoolId
@@ -364,7 +346,7 @@ export function useConversationRuntimeSettings(
 
   return {
     settings,
-    targetHost,
+    credentialSelectionMode,
     draft,
     providerOptions,
     selectedProvider,
@@ -390,7 +372,8 @@ export function useConversationRuntimeSettings(
     setAgentType,
     setModel,
     setCredentialPoolId,
-    setEffort: (effort: AgentEffortLevel) => setDraft((current) => current ? { ...current, effort } : current),
+    setEffort: (effort: AgentEffortLevel) =>
+      setDraft((current) => current ? { ...current, effort } : current),
     setAdaptiveThinking: (adaptiveThinking: ClaudeAdaptiveThinkingMode) =>
       setDraft((current) => current ? { ...current, adaptiveThinking } : current),
     setMaxThinkingTokens: (maxThinkingTokens: number) =>

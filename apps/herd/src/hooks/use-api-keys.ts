@@ -6,6 +6,7 @@ export interface ApiKeyView {
   id: string
   name: string
   prefix: string
+  purpose: 'bootstrap' | 'permanent'
   createdBy: string
   createdAt: string
   expiresAt: string | null

@@ -40,6 +40,7 @@ export const HERD_MODULE_GRAPH = [
         'agents.approval-sessions-interface',
         'agents.session-websocket',
         'agents.machine-command-executor',
+        'agents.provider-execution',
         'agents.runtime',
         'agents.machines',
         'agents.world-state',
@@ -450,6 +451,7 @@ export const HERD_MODULE_GRAPH = [
       modules: ['agents', 'automations', 'commanders', 'operators', 'org', 'org-identity'],
       capabilities: [
         'agents.provider-registry',
+        'agents.provider-execution',
         'automations.scheduler',
         'automations.scheduler-initialized',
         'automations.store',
@@ -465,6 +467,7 @@ export const HERD_MODULE_GRAPH = [
       provides: ['onboarding.founder-setup-ui', 'onboarding.status'],
       consumes: [
         'agents.provider-registry',
+        'agents.provider-execution',
         'automations.scheduler',
         'automations.scheduler-initialized',
         'automations.store',

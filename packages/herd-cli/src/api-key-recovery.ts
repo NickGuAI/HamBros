@@ -2,7 +2,7 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 import { defaultConfigPath, normalizeEndpoint } from './config.js'
 
-export const DEFAULT_MASTER_KEY_OPT_IN_ENV = 'HERD_ALLOW_DEFAULT_MASTER_KEY'
+export const BOOTSTRAP_MASTER_KEY_ENV = 'HERD_BOOTSTRAP_MASTER_KEY'
 
 export function defaultKeystorePath(env: NodeJS.ProcessEnv = process.env): string {
   const configured = env.HERD_DATA_DIR?.trim()
@@ -25,6 +25,7 @@ export function formatStoredApiKeyUnauthorizedMessage(input: {
   return [
     `Stored API key in ${configPath} was rejected by ${endpoint} (401 Unauthorized).`,
     `The Herd keystore is likely empty or rotated: ${keystorePath}.`,
-    `On the server host, restore that file or restart the Herd installer once with ${DEFAULT_MASTER_KEY_OPT_IN_ENV}=1 so it can print a new bootstrap key and refresh the local CLI config.`,
+    'Restore the keystore or configure this CLI with a valid permanent API key.',
+    `Bootstrap access cannot be recreated after keystore initialization; on a genuinely fresh server only, set ${BOOTSTRAP_MASTER_KEY_ENV} to an operator-generated secret of at least 32 bytes before first boot.`,
   ].join(' ')
 }

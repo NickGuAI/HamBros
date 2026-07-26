@@ -1,5 +1,6 @@
 import path from 'node:path'
 import { parseSessionId } from '../route-parsers.js'
+import { parseMachinePlacement } from '../../agents/session/input.js'
 import { parseEvalAdapterDescriptor } from '../../eval/adapter-preflight.js'
 import type { CommanderRoutesContext } from './types.js'
 
@@ -39,6 +40,11 @@ export function registerWorkerRoutes(
     const rawBody = req.body && typeof req.body === 'object' && !Array.isArray(req.body)
       ? req.body as Record<string, unknown>
       : null
+    const activeSessionName = context.activeCommanderSessions.get(commanderId)?.sessionName
+    const liveExecutionMachineId = activeSessionName
+      ? context.sessionsInterface.getSession(activeSessionName)?.host
+      : undefined
+    const defaultExecutionMachineId = liveExecutionMachineId ?? commander.executionMachineId
     let bodyForDispatch: unknown = req.body
     if (rawBody && Object.prototype.hasOwnProperty.call(rawBody, 'evalAdapter')) {
       const adapter = parseEvalAdapterDescriptor(rawBody.evalAdapter)
@@ -53,14 +59,32 @@ export function registerWorkerRoutes(
         return
       }
 
-      const effectiveHost = typeof rawBody.host === 'string' && rawBody.host.trim().length > 0
-        ? rawBody.host.trim()
-        : commander.host
+      const rawMachineId = rawBody.machineId
+      const rawLegacyHost = rawBody.host
+      const placement = parseMachinePlacement(
+        typeof rawMachineId === 'string' && rawMachineId.trim().length === 0
+          ? undefined
+          : rawMachineId,
+        typeof rawLegacyHost === 'string' && rawLegacyHost.trim().length === 0
+          ? undefined
+          : rawLegacyHost,
+      )
+      if (!placement.ok) {
+        res.status(400).json({ error: placement.error })
+        return
+      }
+      const effectiveMachineId = placement.machineId ?? defaultExecutionMachineId
       const effectiveCwd = typeof rawBody.cwd === 'string' && rawBody.cwd.trim().length > 0
         ? rawBody.cwd.trim()
         : commander.cwd
       if (!effectiveCwd || !path.isAbsolute(effectiveCwd)) {
         res.status(400).json({ error: 'Eval worker cwd must be an absolute adapter root' })
+        return
+      }
+      if (!effectiveMachineId) {
+        res.status(400).json({
+          error: 'Eval workers require an explicit machineId (or legacy host) or commander executionMachineId',
+        })
         return
       }
       if (path.normalize(effectiveCwd) !== adapter.adapterRoot) {
@@ -69,7 +93,7 @@ export function registerWorkerRoutes(
       }
 
       const preflight = await context.evalAdapterPreflight.check({
-        machineId: effectiveHost,
+        machineId: effectiveMachineId,
         adapterRoot: adapter.adapterRoot,
         adapterModule: adapter.adapterModule,
       })
@@ -78,10 +102,15 @@ export function registerWorkerRoutes(
         return
       }
 
-      const { evalAdapter: _evalAdapter, ...dispatchFields } = rawBody
+      const {
+        evalAdapter: _evalAdapter,
+        host: _legacyHost,
+        machineId: _machineId,
+        ...dispatchFields
+      } = rawBody
       bodyForDispatch = {
         ...dispatchFields,
-        host: preflight.machineId,
+        machineId: preflight.machineId,
         cwd: preflight.adapterRoot,
       }
     }
@@ -101,8 +130,9 @@ export function registerWorkerRoutes(
                 ),
                 ...(
                   !Object.prototype.hasOwnProperty.call(bodyForDispatch, 'host')
-                  && commander.host !== undefined
-                    ? { host: commander.host }
+                  && !Object.prototype.hasOwnProperty.call(bodyForDispatch, 'machineId')
+                  && defaultExecutionMachineId !== undefined
+                    ? { host: defaultExecutionMachineId }
                     : {}
                 ),
                 ...(

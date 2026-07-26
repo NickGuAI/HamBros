@@ -24,6 +24,7 @@ This is the complete grouped map for public Herd product docs.
 - [operate/credential-pools.md](operate/credential-pools.md)
 - [operate/machines.md](operate/machines.md)
 - [operate/hardening.md](operate/hardening.md)
+- [operate/railway.md](operate/railway.md)
 - [operate/enterprise-ec2.md](operate/enterprise-ec2.md)
 - [operate/uninstall.md](operate/uninstall.md)
 - [operate/workspace.md](operate/workspace.md)

@@ -12,7 +12,7 @@ import {
   parseClaudeMaxThinkingTokens,
   parseOptionalClaudePermissionMode,
   parseCwd,
-  parseOptionalHost,
+  parseMachinePlacement,
   parseOptionalModel,
   parseOptionalTask,
   parseSessionName,
@@ -33,12 +33,18 @@ import {
   unsupportedProviderPermissionModeError,
   type ProviderCreateOptions,
 } from './providers/provider-adapter.js'
+import { withCommanderRuntimeLaunch } from '../commanders/package-lifecycle-state.js'
+import { resolveCommanderDataDir } from '../commanders/paths.js'
 import { getProvider, resolveProviderIdForRequest } from './providers/registry.js'
 import { getCachedProviderModelsForValidation } from './providers/model-discovery.js'
 import {
   findProviderModelOption,
   validateModelForAgentType,
 } from './providers/validate-model.js'
+import {
+  isProviderLaunchError,
+  type MachineLaunchResolution,
+} from './session/machine-launch.js'
 import type {
   ActiveSkillInvocation,
   AgentType,
@@ -58,6 +64,7 @@ export const COMMANDER_WORKER_LAUNCH_BODY_KEYS = new Set([
   'cwd',
   'effort',
   'host',
+  'machineId',
   'maxThinkingTokens',
   'model',
   'name',
@@ -122,6 +129,7 @@ export type WorkerLaunchSessionResult =
   | { ok: false; status: number; body: Record<string, unknown> }
 
 export interface WorkerLaunchSessionDeps {
+  commanderLifecycleScope?: string
   createProviderStreamSession(
     sessionName: string,
     mode: ClaudePermissionMode,
@@ -138,10 +146,7 @@ export interface WorkerLaunchSessionDeps {
   ): Promise<{ ok: true } | { ok: false; status: number; error: string }>
   resolveMachine(
     requestedHost: string | undefined,
-  ): Promise<
-    | { ok: true; machine: MachineConfig | undefined }
-    | { ok: false; status: number; error: string }
-  >
+  ): Promise<MachineLaunchResolution>
   schedulePersistedSessionsWrite(): void
   sessions: Map<string, AnySession>
   teardownProviderSession?(session: StreamSession, reason: string): Promise<void>
@@ -289,10 +294,11 @@ export function parseWorkerLaunchRequest(
     return { ok: false, status: 400, body: { error: 'Invalid cwd: must be an absolute path' } }
   }
 
-  const requestedHost = parseOptionalHost(body.host)
-  if (requestedHost === null) {
-    return { ok: false, status: 400, body: { error: 'Invalid host: expected machine ID string' } }
+  const placement = parseMachinePlacement(body.machineId, body.host)
+  if (!placement.ok) {
+    return { ok: false, status: 400, body: { error: placement.error } }
   }
+  const requestedHost = placement.machineId
 
   const providerResolution = resolveProviderIdForRequest(body.agentType, {
     defaultProviderId: options.sourceDefaults?.agentType,
@@ -462,7 +468,14 @@ export async function launchProviderWorkerSession(
 
   const resolvedMachine = await deps.resolveMachine(request.requestedHost)
   if (!resolvedMachine.ok) {
-    return { ok: false, status: resolvedMachine.status, body: { error: resolvedMachine.error } }
+    return {
+      ok: false,
+      status: resolvedMachine.status,
+      body: {
+        ...(resolvedMachine.code ? { code: resolvedMachine.code } : {}),
+        error: resolvedMachine.error,
+      },
+    }
   }
   const machine = resolvedMachine.machine
   const daemonReadiness = await deps.resolveDaemonLaunchReadiness?.(machine, request.agentType)
@@ -480,7 +493,8 @@ export async function launchProviderWorkerSession(
     return { ok: false, status: 400, body: { error: options.missingCwdError } }
   }
 
-  try {
+  const launch = async (): Promise<WorkerLaunchSessionResult> => {
+    try {
     const session = await deps.createProviderStreamSession(
       request.sessionName,
       request.mode,
@@ -522,24 +536,46 @@ export async function launchProviderWorkerSession(
     deps.sessions.set(request.sessionName, session)
     deps.schedulePersistedSessionsWrite()
     return { ok: true, session }
-  } catch (err) {
-    if (err instanceof ProviderAuthRequiredError) {
-      return {
-        ok: false,
-        status: 424,
-        body: {
-          code: 'AUTH_REQUIRED',
-          provider: err.provider,
-          status: err.snapshot.status,
-          authMethod: err.snapshot.authMethod,
-          scopeId: err.snapshot.scopeId,
-          host: err.snapshot.host,
-          reauthUrl: err.snapshot.reauthUrl,
-          error: err.message,
-        },
+    } catch (err) {
+      if (err instanceof ProviderAuthRequiredError) {
+        return {
+          ok: false,
+          status: 424,
+          body: {
+            code: 'AUTH_REQUIRED',
+            provider: err.provider,
+            status: err.snapshot.status,
+            authMethod: err.snapshot.authMethod,
+            scopeId: err.snapshot.scopeId,
+            host: err.snapshot.host,
+            reauthUrl: err.snapshot.reauthUrl,
+            error: err.message,
+          },
+        }
       }
+      if (isProviderLaunchError(err)) {
+        return {
+          ok: false,
+          status: err.statusCode,
+          body: {
+            ...(err.code ? { code: err.code } : {}),
+            error: err.message,
+          },
+        }
+      }
+      const message = err instanceof Error ? err.message : 'Failed to create stream session'
+      return { ok: false, status: 500, body: { error: message } }
     }
-    const message = err instanceof Error ? err.message : 'Failed to create stream session'
-    return { ok: false, status: 500, body: { error: message } }
   }
+
+  const commanderId = request.creator.kind === 'commander'
+    ? request.creator.id?.trim()
+    : undefined
+  return commanderId
+    ? withCommanderRuntimeLaunch(
+        commanderId,
+        deps.commanderLifecycleScope ?? resolveCommanderDataDir(),
+        launch,
+      )
+    : launch()
 }

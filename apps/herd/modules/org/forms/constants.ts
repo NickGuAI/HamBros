@@ -13,7 +13,6 @@ import type {
 
 export const DEFAULT_NEW_AUTOMATION_TRIGGER: NewAutomationTrigger = 'schedule'
 export const DEFAULT_NEW_AUTOMATION_CADENCE_PRESET: NewAutomationCadencePreset = 'every-5-minutes'
-export const CRON_SEGMENT_PATTERN = /^\s*\S+(?:\s+\S+){4}\s*$/
 
 function toAgentOption(provider: Pick<ProviderRegistryEntry, 'id' | 'label'>): OrgFormOption<OrgAgentType> {
   return {

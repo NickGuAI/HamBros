@@ -76,6 +76,13 @@ import {
   signalProviderProcess,
   waitForProviderProcessExit,
 } from '../provider-process.js'
+import {
+  assertProviderExecutionAllowed,
+  DEFAULT_PROVIDER_EXECUTION_MODE,
+  type ProviderExecutionMode,
+} from '../provider-execution-mode.js'
+import { withCommanderRuntimeLaunch } from '../../commanders/package-lifecycle-state.js'
+import { resolveCommanderDataDir } from '../../commanders/paths.js'
 
 type ProviderStreamSessionOptions = Omit<
   ProviderCreateOptions,
@@ -103,6 +110,7 @@ interface ProviderRuntimeApprovalQueue {
 }
 
 interface ProviderSessionRuntimeDeps {
+  commanderDataDir?: string
   sessions: Map<string, AnySession>
   completedSessions: Map<string, CompletedSession>
   exitedStreamSessions: Map<string, ExitedStreamSessionState>
@@ -110,6 +118,7 @@ interface ProviderSessionRuntimeDeps {
   providerAuthStore: ProviderAuthStore
   questStore?: QuestStore
   daemonRegistry: MachineDaemonRegistry
+  providerExecutionMode?: ProviderExecutionMode
   approvalQueue: ProviderRuntimeApprovalQueue
   wsKeepAliveIntervalMs: number
   codexTurnWatchdogTimeoutMs: number
@@ -736,69 +745,101 @@ export function createProviderSessionRuntime(
     agentType: AgentType = 'claude',
     sessionOptions: ProviderStreamSessionOptions = {},
   ): Promise<StreamSession> {
+    assertProviderExecutionAllowed(
+      deps.providerExecutionMode ?? DEFAULT_PROVIDER_EXECUTION_MODE,
+      machine,
+    )
     const provider = getProvider(agentType)
     if (!provider) {
       throw new Error(`Unknown provider: ${agentType}`)
     }
 
-    const releaseSpawn = await beginLocalClaudeSpawn(agentType, machine)
-    try {
-      const providerAuth = await prepareSessionProviderAuth(
-        agentType,
-        machine,
-        sessionOptions.creator,
-        sessionOptions.resumeProviderContext,
-        sessionOptions.credentialPoolId,
-        sessionOptions.credentialPoolMode,
-      )
-      const providerSessionOptions = { ...sessionOptions }
-      delete providerSessionOptions.env
-      const mergedProviderAuth = sessionOptions.env
-        ? {
-            ...providerAuth,
-            env: {
-              ...(providerAuth.env ?? {}),
-              ...sessionOptions.env,
-            },
-          }
-        : providerAuth
+    const create = async (): Promise<StreamSession> => {
+      const releaseSpawn = await beginLocalClaudeSpawn(agentType, machine)
+      try {
+        const providerAuth = await prepareSessionProviderAuth(
+          agentType,
+          machine,
+          sessionOptions.creator,
+          sessionOptions.resumeProviderContext,
+          sessionOptions.credentialPoolId,
+          sessionOptions.credentialPoolMode,
+        )
+        const providerSessionOptions = { ...sessionOptions }
+        delete providerSessionOptions.env
+        const mergedProviderAuth = sessionOptions.env
+          ? {
+              ...providerAuth,
+              env: {
+                ...(providerAuth.env ?? {}),
+                ...sessionOptions.env,
+              },
+            }
+          : providerAuth
 
-      return await provider.create({
-        sessionName,
-        mode,
-        task,
-        cwd,
-        machine,
-        ...providerSessionOptions,
-        providerAuth: mergedProviderAuth,
-      }, getProviderSessionDeps(agentType))
-    } finally {
-      setImmediate(releaseSpawn)
+        return await provider.create({
+          sessionName,
+          mode,
+          task,
+          cwd,
+          machine,
+          ...providerSessionOptions,
+          providerAuth: mergedProviderAuth,
+        }, getProviderSessionDeps(agentType))
+      } finally {
+        setImmediate(releaseSpawn)
+      }
     }
+    const commanderId = sessionOptions.creator?.kind === 'commander'
+      ? sessionOptions.creator.id?.trim()
+      : undefined
+    return commanderId
+      ? withCommanderRuntimeLaunch(
+          commanderId,
+          deps.commanderDataDir ?? resolveCommanderDataDir(),
+          create,
+        )
+      : create()
   }
 
   async function restoreProviderStreamSession(
     entry: PersistedStreamSession,
     machine: MachineConfig | undefined,
   ): Promise<StreamSession> {
+    assertProviderExecutionAllowed(
+      deps.providerExecutionMode ?? DEFAULT_PROVIDER_EXECUTION_MODE,
+      machine,
+    )
     const provider = getProvider(entry.agentType)
     if (!provider) {
       throw new Error(`Unknown provider: ${entry.agentType}`)
     }
-    const releaseSpawn = await beginLocalClaudeSpawn(entry.agentType, machine)
-    try {
-      const providerAuth = await prepareSessionProviderAuth(
-        entry.agentType,
-        machine,
-        entry.creator,
-        entry.providerContext,
-        entry.credentialPoolId,
-        entry.credentialPoolMode,
-      )
-      return await provider.restore(entry, machine, getProviderSessionDeps(entry.agentType), providerAuth)
-    } finally {
-      setImmediate(releaseSpawn)
+    const restore = async (): Promise<StreamSession> => {
+      const releaseSpawn = await beginLocalClaudeSpawn(entry.agentType, machine)
+      try {
+        const providerAuth = await prepareSessionProviderAuth(
+          entry.agentType,
+          machine,
+          entry.creator,
+          entry.providerContext,
+          entry.credentialPoolId,
+          entry.credentialPoolMode,
+        )
+        return await provider.restore(entry, machine, getProviderSessionDeps(entry.agentType), providerAuth)
+      } finally {
+        setImmediate(releaseSpawn)
+      }
     }
+    const commanderId = entry.creator?.kind === 'commander'
+      ? entry.creator.id?.trim()
+      : undefined
+    return commanderId
+      ? withCommanderRuntimeLaunch(
+          commanderId,
+          deps.commanderDataDir ?? resolveCommanderDataDir(),
+          restore,
+        )
+      : restore()
   }
 
   async function teardownProviderSession(

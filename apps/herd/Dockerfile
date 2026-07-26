@@ -15,6 +15,7 @@ COPY packages/auth-providers/package.json ./packages/auth-providers/package.json
 COPY packages/herd-cli/package.json ./packages/herd-cli/package.json
 COPY packages/sse-streaming/package.json ./packages/sse-streaming/package.json
 COPY packages/telemetry/package.json ./packages/telemetry/package.json
+COPY packages/transcription/package.json ./packages/transcription/package.json
 COPY packages/tsconfig/package.json ./packages/tsconfig/package.json
 
 RUN pnpm install --filter herd... --frozen-lockfile
@@ -25,6 +26,7 @@ COPY packages/auth-providers ./packages/auth-providers
 COPY packages/herd-cli ./packages/herd-cli
 COPY packages/sse-streaming ./packages/sse-streaming
 COPY packages/telemetry ./packages/telemetry
+COPY packages/transcription ./packages/transcription
 COPY packages/tsconfig ./packages/tsconfig
 
 RUN pnpm --filter herd run build
@@ -36,8 +38,10 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=20001
 ENV HERD_DATA_DIR=/data/.herd
+ENV HERD_PROVIDER_EXECUTION_MODE=daemon-only
 
-RUN mkdir -p /data/.herd
+RUN apk add --no-cache tini \
+  && mkdir -p /data/.herd
 
 COPY --from=build /workspace/package.json ./package.json
 COPY --from=build /workspace/pnpm-lock.yaml ./pnpm-lock.yaml
@@ -49,10 +53,14 @@ COPY --from=build /workspace/packages/auth-providers ./packages/auth-providers
 COPY --from=build /workspace/packages/herd-cli ./packages/herd-cli
 COPY --from=build /workspace/packages/sse-streaming ./packages/sse-streaming
 COPY --from=build /workspace/packages/telemetry ./packages/telemetry
+COPY --from=build /workspace/packages/transcription ./packages/transcription
 COPY --from=build /workspace/packages/tsconfig ./packages/tsconfig
 
 WORKDIR /app/apps/herd
 
 EXPOSE 20001
 
+STOPSIGNAL SIGTERM
+
+ENTRYPOINT ["/sbin/tini", "-g", "--"]
 CMD ["node", "dist-server/server/index.js"]

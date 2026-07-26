@@ -10,6 +10,7 @@
       "/packages/herd-cli/**",
       "/packages/sse-streaming/**",
       "/packages/telemetry/**",
+      "/packages/transcription/**",
       "/packages/tsconfig/**",
       "/package.json",
       "/pnpm-lock.yaml",
@@ -17,7 +18,9 @@
     ]
   },
   "deploy": {
-    "startCommand": "node dist-server/server/index.js",
+    "numReplicas": 1,
+    "overlapSeconds": 0,
+    "drainingSeconds": 30,
     "healthcheckPath": "/api/health",
     "healthcheckTimeout": 300,
     "requiredMountPath": "/data/.herd",

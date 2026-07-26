@@ -1,5 +1,6 @@
 import { mkdir } from 'node:fs/promises'
-import { resolveCommanderPaths } from './paths.js'
+import { resolveCommanderDataDir, resolveCommanderPaths } from './paths.js'
+import { withCommanderMutation } from './child-mutation-coordinator.js'
 import {
   SubagentHandoff,
   type SubagentResult,
@@ -60,6 +61,7 @@ export interface CommanderSubagentLifecycleEvent {
 export interface CommanderManagerOptions {
   agentSessions?: CommanderAgentSessionTool
   onSubagentLifecycleEvent?: (event: CommanderSubagentLifecycleEvent) => void
+  lifecycleScope?: string
 }
 
 /**
@@ -73,6 +75,7 @@ export class CommanderManager {
   private readonly commanderPaths: ReturnType<typeof resolveCommanderPaths>
   private readonly agentSessions: CommanderAgentSessionTool
   private readonly onSubagentLifecycleEvent?: (event: CommanderSubagentLifecycleEvent) => void
+  private readonly lifecycleScope: string
 
   constructor(
     private readonly commanderId: string,
@@ -84,16 +87,19 @@ export class CommanderManager {
     this.commanderPaths = resolveCommanderPaths(commanderId, basePath)
     this.agentSessions = options.agentSessions ?? new AgentSessionClient()
     this.onSubagentLifecycleEvent = options.onSubagentLifecycleEvent
+    this.lifecycleScope = options.lifecycleScope ?? basePath ?? resolveCommanderDataDir()
   }
 
   /** Initialize the commander — ensure the remaining primitive storage roots exist. */
   async init(options: CommanderInitOptions = {}): Promise<Commander> {
     if (!options.skipScaffold) {
-      await Promise.all([
-        mkdir(this.commanderPaths.memoryRoot, { recursive: true }),
-        mkdir(this.commanderPaths.skillsRoot, { recursive: true }),
-        this.workingMemory.ensure(),
-      ])
+      await withCommanderMutation(this.commanderId, this.lifecycleScope, () => (
+        Promise.all([
+          mkdir(this.commanderPaths.memoryRoot, { recursive: true }),
+          mkdir(this.commanderPaths.skillsRoot, { recursive: true }),
+          this.workingMemory.ensure(),
+        ])
+      ))
     }
     return { id: this.commanderId }
   }

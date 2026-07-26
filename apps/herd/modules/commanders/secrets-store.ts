@@ -2,11 +2,12 @@ import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes }
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { resolveCommanderDataDir, resolveCommanderPaths } from './paths.js'
+import { withCommanderMutation } from './child-mutation-coordinator.js'
 
 const COMMANDER_SECRETS_VERSION = 1
 const MASTER_KEY_ENV = 'HERD_MASTER_KEY'
 
-interface EncryptedCommanderSecretsFile {
+export interface EncryptedCommanderSecretsFile {
   version: number
   iv: string
   authTag: string
@@ -23,11 +24,24 @@ interface PlainCommanderSecretsFile {
   secrets: Record<string, CommanderSecretEntry>
 }
 
+export type CommanderSecretsEncryptionReadinessCode =
+  | 'ready'
+  | 'store-invalid'
+  | 'key-missing'
+  | 'key-invalid'
+  | 'decryption-failed'
+
+export interface CommanderSecretsEncryptionReadiness {
+  ready: boolean
+  code: CommanderSecretsEncryptionReadinessCode
+  error: string | null
+}
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function isEncryptedCommanderSecretsFile(value: unknown): value is EncryptedCommanderSecretsFile {
+export function isEncryptedCommanderSecretsFile(value: unknown): value is EncryptedCommanderSecretsFile {
   return (
     isObject(value)
     && value.version === COMMANDER_SECRETS_VERSION
@@ -76,6 +90,24 @@ async function readOrCreateCommanderSecretsKey(
   keyFilePath = defaultCommanderSecretsKeyPath(),
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<Buffer> {
+  const existing = await resolveExistingCommanderSecretsKey(keyFilePath, env)
+  if (existing) {
+    return existing
+  }
+
+  const generated = randomBytes(32)
+  await mkdir(path.dirname(keyFilePath), { recursive: true, mode: 0o700 })
+  await writeFile(keyFilePath, `${generated.toString('base64')}\n`, {
+    encoding: 'utf8',
+    mode: 0o600,
+  })
+  return generated
+}
+
+async function resolveExistingCommanderSecretsKey(
+  keyFilePath = defaultCommanderSecretsKeyPath(),
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<Buffer | null> {
   const envValue = env[MASTER_KEY_ENV]?.trim()
   if (envValue) {
     return normalizeEncryptionKey(envValue)
@@ -93,14 +125,7 @@ async function readOrCreateCommanderSecretsKey(
       throw error
     }
   }
-
-  const generated = randomBytes(32)
-  await mkdir(path.dirname(keyFilePath), { recursive: true, mode: 0o700 })
-  await writeFile(keyFilePath, `${generated.toString('base64')}\n`, {
-    encoding: 'utf8',
-    mode: 0o600,
-  })
-  return generated
+  return null
 }
 
 function deriveCommanderSecretsKey(masterKey: Buffer, commanderId: string): Buffer {
@@ -212,6 +237,63 @@ export class CommanderSecretsStore {
     })
   }
 
+  /**
+   * Verifies an existing commander ciphertext/key pair without creating or
+   * rotating a key. The result is sanitized for readiness and startup logs.
+   */
+  async inspectEncryptionReadiness(
+    commanderId: string,
+  ): Promise<CommanderSecretsEncryptionReadiness> {
+    const filePath = this.secretsPath(commanderId)
+    let parsed: EncryptedCommanderSecretsFile
+    try {
+      const raw = await readFile(filePath, 'utf8')
+      const candidate = JSON.parse(raw) as unknown
+      if (!isEncryptedCommanderSecretsFile(candidate)) {
+        throw new Error('Invalid encrypted commander secrets record')
+      }
+      parsed = candidate
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return { ready: true, code: 'ready', error: null }
+      }
+      return {
+        ready: false,
+        code: 'store-invalid',
+        error: 'Commander secrets store is unreadable or does not match the required shape.',
+      }
+    }
+
+    let masterKey: Buffer | null
+    try {
+      masterKey = await resolveExistingCommanderSecretsKey(this.keyFilePath, this.env)
+    } catch {
+      return {
+        ready: false,
+        code: 'key-invalid',
+        error: 'Commander secrets encryption key is invalid or unreadable.',
+      }
+    }
+    if (!masterKey) {
+      return {
+        ready: false,
+        code: 'key-missing',
+        error: 'Commander secrets encryption key is missing for persisted ciphertext.',
+      }
+    }
+
+    try {
+      decryptPlainSecrets(parsed, deriveCommanderSecretsKey(masterKey, commanderId))
+    } catch {
+      return {
+        ready: false,
+        code: 'decryption-failed',
+        error: 'Commander secrets cannot be decrypted with the configured encryption key.',
+      }
+    }
+    return { ready: true, code: 'ready', error: null }
+  }
+
   private secretsPath(commanderId: string): string {
     return path.join(resolveCommanderPaths(commanderId, this.dataDir).commanderRoot, 'secrets.enc')
   }
@@ -233,10 +315,11 @@ export class CommanderSecretsStore {
       throw new Error(`Invalid commander secrets file: ${filePath}`)
     }
 
-    const key = deriveCommanderSecretsKey(
-      await readOrCreateCommanderSecretsKey(this.keyFilePath, this.env),
-      commanderId,
-    )
+    const masterKey = await resolveExistingCommanderSecretsKey(this.keyFilePath, this.env)
+    if (!masterKey) {
+      throw new Error('Commander secrets encryption key is missing for persisted ciphertext')
+    }
+    const key = deriveCommanderSecretsKey(masterKey, commanderId)
     return decryptPlainSecrets(parsed, key)
   }
 
@@ -244,16 +327,18 @@ export class CommanderSecretsStore {
     commanderId: string,
     plain: PlainCommanderSecretsFile,
   ): Promise<void> {
-    const filePath = this.secretsPath(commanderId)
-    const key = deriveCommanderSecretsKey(
-      await readOrCreateCommanderSecretsKey(this.keyFilePath, this.env),
-      commanderId,
-    )
-    const encrypted = encryptPlainSecrets(plain, key, new Date().toISOString())
-    await mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 })
-    await writeFile(filePath, `${JSON.stringify(encrypted, null, 2)}\n`, {
-      encoding: 'utf8',
-      mode: 0o600,
+    await withCommanderMutation(commanderId, this.dataDir, async () => {
+      const filePath = this.secretsPath(commanderId)
+      const key = deriveCommanderSecretsKey(
+        await readOrCreateCommanderSecretsKey(this.keyFilePath, this.env),
+        commanderId,
+      )
+      const encrypted = encryptPlainSecrets(plain, key, new Date().toISOString())
+      await mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 })
+      await writeFile(filePath, `${JSON.stringify(encrypted, null, 2)}\n`, {
+        encoding: 'utf8',
+        mode: 0o600,
+      })
     })
   }
 

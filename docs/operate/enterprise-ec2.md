@@ -76,7 +76,7 @@ sudo systemctl is-active herd
 Use the Herd update command:
 
 ```bash
-herd update --tag v0.0.8-beta
+herd update --tag v0.0.9-beta
 ```
 
 Omit `--tag` only when the host can reach the release remote and should choose

@@ -1,25 +1,25 @@
 import { access, readFile } from 'node:fs/promises'
-import { homedir } from 'node:os'
 import path from 'node:path'
-import { discoverAgentSkillPackageDirs } from '../skills/skill-roots.js'
+import { discoverSkillDirectorySources } from '../skills/skill-roots.js'
 
 const SKILL_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/
 
-const CLAUDE_SKILLS_DIR = path.join(homedir(), '.claude', 'skills')
-
-async function discoverAgentSkillPaths(): Promise<string[]> {
-  return discoverAgentSkillPackageDirs()
-}
-
 async function getSkillSearchPaths(commanderSkillsDir?: string): Promise<string[]> {
   const paths: string[] = []
-
-  if (commanderSkillsDir) {
-    paths.push(commanderSkillsDir)
+  const pushUnique = (candidate: string): void => {
+    const resolved = path.resolve(candidate)
+    if (!paths.includes(resolved)) {
+      paths.push(resolved)
+    }
   }
 
-  paths.push(CLAUDE_SKILLS_DIR)
-  paths.push(...await discoverAgentSkillPaths())
+  if (commanderSkillsDir) {
+    pushUnique(commanderSkillsDir)
+  }
+
+  for (const source of await discoverSkillDirectorySources()) {
+    pushUnique(source.dir)
+  }
 
   return paths
 }

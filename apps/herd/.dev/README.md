@@ -1,8 +1,9 @@
 # Herd .dev Context
 
 This directory is the code-grounded maintenance map for Herd. Use it before
-changing runtime sessions, Command Room, installer/release/CLI behavior,
-providers, or mobile/desktop UI.
+changing runtime sessions, Command Room, the shared session composer,
+automations, quest/task artifacts, installer/release/CLI behavior, providers,
+or mobile/desktop UI.
 
 It is not a second source of truth. The source of truth remains the code and
 docs cited in each file.
@@ -62,6 +63,26 @@ docs cited in each file.
   approvals, automations, and settings:
   `apps/herd/modules/command-room/components/CommandRoom.tsx`,
   `apps/herd/docs/module-index.xml`.
+- Desktop and mobile session surfaces share one composer and one per-session
+  draft owner. Quick and Markdown modes, keyboard semantics, draft-mode
+  persistence, IME guards, queueing, and responsive height all meet in
+  `apps/herd/modules/agents/components/SessionComposer.tsx` and
+  `apps/herd/modules/agents/page-shell/use-session-draft.ts`.
+- Automation list/detail behavior is shared across the global page, commander
+  Command Room, and mobile surfaces through
+  `apps/herd/modules/commanders/components/AutomationPanel.tsx`. Cron
+  grammar belongs to pinned `node-cron`; the server-owned resource guard and
+  scheduler isolation live in
+  `apps/herd/modules/automations/cron-validation.server.ts` and
+  `apps/herd/modules/automations/scheduler.ts`.
+- Quest artifacts are explicit `{ type, label, href }` records. File artifacts
+  cross into Workspace through authenticated, ephemeral, read-only targets;
+  all seven target/file/git mutation routes must retain the shared
+  writable-target guard in
+  `apps/herd/modules/workspace/routes.ts` and
+  `apps/herd/modules/workspace/resolver.ts`. Task lifecycle moves must
+  rewrite those file references through
+  `ai-state/claude/skills/task-system-maintenance/scripts/task_lifecycle.py`.
 - Channel-impacting changes are cross-surface changes even when the edited file
   is not under `modules/channels/*`. Session create/resume, queue/send,
   conversation read models, transcript projection, shared chat rendering, and
@@ -94,8 +115,13 @@ Update this directory when any of these change:
   control/query routes.
 - Persisted-session restore, transcript replay fallback, `runtime_state_json`
   payload shape, or agents route startup gates.
-- Command Room routing, chat/composer behavior, conversation websocket behavior,
-  workspace context, or queue behavior.
+- Command Room routing, shared composer mode/key behavior, conversation
+  websocket behavior, workspace context, or queue behavior.
+- Automation list/detail presentation, filtering, editing, run history, cron
+  validation, scheduler registration, or persisted-schedule recovery.
+- Quest artifact contracts, artifact href validation, Workspace reference
+  resolution/read-only enforcement, quest CLI artifact commands, or
+  `~/tasks` lifecycle create/move/index/reference rewriting.
 - Channel provider adapters, channel bindings, surface binding resolution,
   inbound external messages, automatic outbound replies, channel-visible
   transcripts, or channel management UI.

@@ -3,6 +3,7 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 import {
   discoverSkillDirectorySources,
+  isBundledAgentSkillPath,
   resolveDirectSkillDirCandidates,
   type SkillDirectorySource,
 } from './skill-roots.js'
@@ -66,6 +67,13 @@ export class SkillPackageConflictError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'SkillPackageConflictError'
+  }
+}
+
+export class ReadOnlySkillPackageError extends Error {
+  constructor(skillName: string) {
+    super(`Skill "${skillName}" is app-owned and read-only`)
+    this.name = 'ReadOnlySkillPackageError'
   }
 }
 
@@ -536,6 +544,9 @@ export async function deleteSkillPackage(name: string): Promise<SkillPackageDeta
   const skill = await getSkillPackageDetail(name)
   if (!skill) {
     return null
+  }
+  if (await isBundledAgentSkillPath(skill.directory)) {
+    throw new ReadOnlySkillPackageError(skill.dirName)
   }
 
   await rm(skill.directory, { recursive: true, force: true })

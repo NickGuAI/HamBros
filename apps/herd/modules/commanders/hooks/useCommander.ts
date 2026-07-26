@@ -6,6 +6,7 @@ import type { ClaudeAdaptiveThinkingMode } from '../../claude-adaptive-thinking.
 import type { AgentEffortLevel } from '../../agents/effort.js'
 import type { ClaudeMaxThinkingTokens } from '../../claude-max-thinking-tokens.js'
 import type { CommanderPortraitStyleId } from '../portrait-styles'
+import type { ConversationCredentialSelectionModes } from '../conversation-credential-selection.js'
 
 export const COMMANDERS_QUERY_KEY = ['commanders', 'sessions'] as const
 export const GLOBAL_COMMANDER_ID = '__global__'
@@ -41,6 +42,8 @@ export interface CommanderUiFields {
 export interface CommanderSession {
   id: string
   host: string
+  executionMachineId?: string
+  credentialSelectionModes: ConversationCredentialSelectionModes
   /** Human-readable label set at creation time; falls back to host when absent */
   displayName?: string
   pid: number | null
@@ -64,6 +67,8 @@ export interface CommanderSession {
   scheduleCount: number
   totalCostUsd: number
   monthlyCostUsd?: number
+  archived?: boolean
+  archivedAt?: string
   /** From `.memory/profile.json` — border / chat accent / tone */
   ui?: CommanderUiFields | null
   /** Present when `profile.json` references an on-disk avatar image */
@@ -103,6 +108,7 @@ export interface CommanderCronTask {
 
 export interface CommanderCreateInput {
   host: string
+  executionMachineId?: string
   displayName?: string
   agentType?: CommanderAgentType
   model?: string | null

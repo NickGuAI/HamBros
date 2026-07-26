@@ -2174,7 +2174,7 @@
     flex: 1;
     min-height: 40px;
     max-height: 120px;
-    padding: 8px 0;
+    padding: 8px 32px 8px 0;
     background: transparent;
     border: none;
     border-radius: 0;
@@ -2189,6 +2189,10 @@
   }
   .hervald-session-composer .input-field::placeholder { color: var(--msg-text-muted); }
   .hervald-session-composer .input-field:focus { color: var(--hv-fg); }
+  .hervald-session-composer--markdown .input-field {
+    max-height: 45vh;
+    overflow-y: auto;
+  }
 
   /*
    * iOS Safari auto-zooms into any form control whose computed font-size is
@@ -2374,8 +2378,38 @@
   }
   .hervald-session-composer .composer-field-stack {
     display: flex;
+    position: relative;
     align-items: stretch;
     min-height: 40px;
+  }
+  .hervald-session-composer .composer-mode-toggle {
+    position: absolute;
+    top: 6px;
+    right: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    border: 1px solid transparent;
+    border-radius: var(--hv-radius-carved-sm);
+    background: transparent;
+    color: var(--msg-text-muted);
+    font-family: var(--hv-font-mono);
+    font-size: 15px;
+    line-height: 1;
+    cursor: pointer;
+    transition: color 0.2s ease, border-color 0.2s ease, background-color 0.2s ease;
+  }
+  .hervald-session-composer .composer-mode-toggle:hover:not(:disabled),
+  .hervald-session-composer .composer-mode-toggle--active {
+    border-color: var(--hv-border-hair);
+    background: var(--hv-chat-card-muted, var(--hv-ink-wash-01));
+    color: var(--hv-fg);
+  }
+  .hervald-session-composer .composer-mode-toggle:disabled {
+    cursor: not-allowed;
+    opacity: 0.4;
   }
   .hervald-session-composer .composer-queueing-overlay {
     display: flex;
@@ -2515,9 +2549,16 @@
   .hervald-session-composer--mobile .input-field {
     min-height: 32px;
     max-height: 148px;
-    padding: 2px 0 6px;
+    padding: 2px 30px 6px 0;
     line-height: 1.45;
     overflow-y: auto;
+  }
+  .hervald-session-composer--mobile .composer-mode-toggle {
+    top: 0;
+    right: 0;
+    width: 26px;
+    height: 26px;
+    border-radius: 999px;
   }
   .hervald-session-composer--mobile .composer-add-btn,
   .hervald-session-composer--mobile .composer-queue-keycap,

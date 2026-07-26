@@ -287,6 +287,21 @@ export async function fetchWorkspacePathResolution(
   )
 }
 
+export async function resolveWorkspaceReference(input: {
+  path: string
+  commanderId?: string | null
+  conversationId?: string | null
+  sessionName?: string | null
+  hostHint?: string | null
+  pathHint?: string | null
+}): Promise<WorkspacePathResolution> {
+  return fetchJson<WorkspacePathResolution>('/api/workspace/resolve-reference', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(input),
+  })
+}
+
 async function fetchWorkspaceFilePreview(
   source: WorkspaceSource,
   relativePath: string,

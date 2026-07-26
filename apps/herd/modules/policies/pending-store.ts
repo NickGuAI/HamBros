@@ -266,6 +266,18 @@ function normalizeSnapshot(raw: unknown): PersistedPendingSnapshot {
   }
 }
 
+export function isPersistedPendingSnapshotValid(raw: unknown): boolean {
+  if (!isRecord(raw) || raw.version !== 1) {
+    return false
+  }
+  const entries = Array.isArray(raw.approvals)
+    ? raw.approvals
+    : Array.isArray(raw.pending)
+      ? raw.pending
+      : null
+  return entries !== null && entries.every((entry) => normalizePendingApproval(entry) !== null)
+}
+
 function defaultOutcome(
   decision: PendingApprovalResolution,
   options?: { timedOut?: boolean },

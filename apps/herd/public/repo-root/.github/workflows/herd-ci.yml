@@ -70,3 +70,16 @@ jobs:
 
       - name: Run EC2 deploy lane smoke
         run: bash operations/deploy/ec2/smoke-test.sh --container
+
+  railway-production-image:
+    name: Railway production image lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout public artifact
+        uses: actions/checkout@v4
+
+      - name: Build and exercise the exact Railway image
+        run: bash operations/deploy/railway/smoke-test.sh

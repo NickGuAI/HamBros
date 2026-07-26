@@ -36,7 +36,11 @@ pnpm --filter herd exec vitest run \
   modules/agents/__tests__/routes-session-control.test.ts \
   modules/agents/__tests__/websocket.test.ts
 
-pnpm --filter @gehirn/herd-cli test -- up.test.ts doctor.test.ts workers.test.ts session.test.ts
+pnpm --filter @gehirn/herd-cli exec vitest run \
+  src/__tests__/up.test.ts \
+  src/__tests__/doctor.test.ts \
+  src/__tests__/workers.test.ts \
+  src/__tests__/session.test.ts
 pnpm --filter herd run db:ready -- --source-root ~/.herd --db ~/.herd/herd.sqlite
 ```
 

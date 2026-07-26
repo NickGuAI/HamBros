@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { resolveCommanderDataDir } from './paths.js'
+import { withCommanderMutation } from './child-mutation-coordinator.js'
 
 export type HeartbeatLogOutcome = 'ok' | 'no-quests' | 'error' | 'skipped'
 
@@ -31,6 +32,7 @@ interface HeartbeatLogFile {
 
 export interface HeartbeatLogOptions {
   dataDir?: string
+  lifecycleScope?: string
   maxEntries?: number
 }
 
@@ -119,35 +121,39 @@ function isNodeErrorWithCode(error: unknown, code: string): error is NodeJS.Errn
 export class HeartbeatLog {
   private readonly dataDir: string
   private readonly maxEntries: number
+  private readonly lifecycleScope: string
   private mutationQueue: Promise<void> = Promise.resolve()
 
   constructor(options: HeartbeatLogOptions = {}) {
     this.dataDir = path.resolve(options.dataDir ?? resolveCommanderDataDir())
+    this.lifecycleScope = path.resolve(options.lifecycleScope ?? this.dataDir)
     this.maxEntries = Number.isFinite(options.maxEntries) && Number(options.maxEntries) > 0
       ? Math.floor(Number(options.maxEntries))
       : DEFAULT_MAX_ENTRIES
   }
 
   async append(commanderId: string, input: HeartbeatLogAppendInput): Promise<HeartbeatLogEntry> {
-    return this.withMutationLock(async () => {
-      const filePath = this.resolveFilePath(commanderId)
-      const current = await this.readFromDisk(filePath)
-      const nextEntry: HeartbeatLogEntry = {
-        id: input.id?.trim() || randomUUID(),
-        firedAt: input.firedAt,
-        questCount: Math.max(0, Math.floor(input.questCount)),
-        ...(input.claimedQuestId?.trim() ? { claimedQuestId: input.claimedQuestId.trim() } : {}),
-        ...(input.claimedQuestInstruction?.trim()
-          ? { claimedQuestInstruction: input.claimedQuestInstruction.trim() }
-          : {}),
-        outcome: input.outcome,
-        ...(input.errorMessage?.trim() ? { errorMessage: input.errorMessage.trim() } : {}),
-      }
+    return this.withMutationLock(() => (
+      withCommanderMutation(commanderId, this.lifecycleScope, async () => {
+        const filePath = this.resolveFilePath(commanderId)
+        const current = await this.readFromDisk(filePath)
+        const nextEntry: HeartbeatLogEntry = {
+          id: input.id?.trim() || randomUUID(),
+          firedAt: input.firedAt,
+          questCount: Math.max(0, Math.floor(input.questCount)),
+          ...(input.claimedQuestId?.trim() ? { claimedQuestId: input.claimedQuestId.trim() } : {}),
+          ...(input.claimedQuestInstruction?.trim()
+            ? { claimedQuestInstruction: input.claimedQuestInstruction.trim() }
+            : {}),
+          outcome: input.outcome,
+          ...(input.errorMessage?.trim() ? { errorMessage: input.errorMessage.trim() } : {}),
+        }
 
-      const entries = [nextEntry, ...current.entries].slice(0, this.maxEntries)
-      await this.writeToDisk(filePath, { entries })
-      return cloneEntry(nextEntry)
-    })
+        const entries = [nextEntry, ...current.entries].slice(0, this.maxEntries)
+        await this.writeToDisk(filePath, { entries })
+        return cloneEntry(nextEntry)
+      })
+    ))
   }
 
   async read(commanderId: string, limit = this.maxEntries): Promise<HeartbeatLogEntry[]> {
@@ -160,6 +166,12 @@ export class HeartbeatLog {
     return payload.entries
       .slice(0, Math.min(normalizedLimit, this.maxEntries))
       .map((entry) => cloneEntry(entry))
+  }
+
+  /** Removes the commander-owned heartbeat directory during parent deletion. */
+  async deleteForCommander(commanderId: string): Promise<void> {
+    const filePath = this.resolveFilePath(commanderId)
+    await rm(path.dirname(filePath), { recursive: true, force: true })
   }
 
   private withMutationLock<T>(operation: () => Promise<T>): Promise<T> {

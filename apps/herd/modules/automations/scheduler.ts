@@ -2,6 +2,7 @@ import cron from 'node-cron'
 import { resolveCommanderPaths } from '../commanders/paths.js'
 import { AutomationQuestEventBus, type AutomationQuestCompletedEvent } from './quest-event-bus.js'
 import { AutomationExecutor, type AutomationExecutionResult } from './executor.js'
+import { isAutomationCronValidationBounded } from './cron-validation.server.js'
 import { resolveSkill } from './skills.js'
 import {
   AutomationStore,
@@ -103,7 +104,7 @@ export class AutomationScheduler {
     const automations = await this.store.list()
     for (const automation of automations) {
       if (automation.trigger === 'schedule' && canBeScheduled(automation.status)) {
-        this.registerJob(automation)
+        this.registerPersistedJob(automation)
       }
     }
     this.questUnsubscribe?.()
@@ -121,29 +122,73 @@ export class AutomationScheduler {
   }
 
   isCronExpressionValid(expression: string): boolean {
-    return this.scheduler.validate(expression)
+    return isAutomationCronValidationBounded(expression) && this.scheduler.validate(expression)
   }
 
   async createAutomation(input: CreateAutomationInput): Promise<Automation> {
-    this.assertValidInput(input)
-    await this.assertParentCommanderExists(input.parentCommanderId)
-    await this.assertSkillsExist(input.skills ?? [], input.parentCommanderId ?? undefined)
-    const created = await this.store.create(input)
+    const createInput = input.schedule === undefined
+      ? input
+      : { ...input, schedule: input.schedule.trim() }
+    this.assertValidInput(createInput)
+    await this.assertParentCommanderExists(createInput.parentCommanderId)
+    await this.assertSkillsExist(createInput.skills ?? [], createInput.parentCommanderId ?? undefined)
+    const created = await this.store.create(createInput)
     if (created.trigger === 'schedule' && canBeScheduled(created.status)) {
       this.registerJob(created)
     }
     return created
   }
 
+  async ensureAutomationScheduled(automationId: string): Promise<void> {
+    const automation = await this.store.get(automationId)
+    if (!automation) {
+      this.unregisterJob(automationId)
+      return
+    }
+    if (automation.trigger !== 'schedule' || !canBeScheduled(automation.status)) {
+      this.unregisterJob(automationId)
+      return
+    }
+    if (!this.activeJobs.has(automationId)) {
+      this.registerPersistedJob(automation)
+    }
+  }
+
   async updateAutomation(automationId: string, patch: UpdateAutomationInput): Promise<Automation | null> {
-    if (patch.trigger === 'schedule' && patch.schedule) {
-      this.assertValidExpression(patch.schedule)
+    const existing = await this.store.get(automationId)
+    if (!existing) {
+      return null
     }
-    if (patch.skills) {
-      const existing = await this.store.get(automationId)
-      await this.assertSkillsExist(patch.skills, patch.parentCommanderId ?? existing?.parentCommanderId ?? undefined)
+    const update = Object.prototype.hasOwnProperty.call(patch, 'schedule') && patch.schedule !== undefined
+      ? { ...patch, schedule: patch.schedule.trim() }
+      : patch
+    const hasScheduleUpdate = Object.prototype.hasOwnProperty.call(update, 'schedule')
+    if (hasScheduleUpdate && update.schedule) {
+      this.assertValidExpression(update.schedule)
     }
-    const updated = await this.store.update(automationId, patch)
+    const nextTrigger = update.trigger ?? existing.trigger
+    const nextStatus = update.status ?? existing.status
+    const nextSchedule = Object.prototype.hasOwnProperty.call(update, 'schedule')
+      ? update.schedule ?? ''
+      : existing.schedule
+    if (nextTrigger === 'schedule') {
+      if (!nextSchedule) {
+        throw new InvalidAutomationCronExpressionError('(missing schedule)')
+      }
+      if (
+        !hasScheduleUpdate
+        && (
+          Object.prototype.hasOwnProperty.call(update, 'trigger')
+          || canBeScheduled(nextStatus)
+        )
+      ) {
+        this.assertValidExpression(nextSchedule)
+      }
+    }
+    if (update.skills) {
+      await this.assertSkillsExist(update.skills, update.parentCommanderId ?? existing?.parentCommanderId ?? undefined)
+    }
+    const updated = await this.store.update(automationId, update)
     if (!updated) {
       return null
     }
@@ -214,7 +259,7 @@ export class AutomationScheduler {
   }
 
   private assertValidExpression(expression: string): void {
-    if (!this.scheduler.validate(expression)) {
+    if (!this.isCronExpressionValid(expression)) {
       throw new InvalidAutomationCronExpressionError(expression)
     }
   }
@@ -248,6 +293,7 @@ export class AutomationScheduler {
     if (!automation.schedule) {
       return
     }
+    this.assertValidExpression(automation.schedule)
     this.unregisterJob(automation.id)
     this.activeJobs.set(
       automation.id,
@@ -262,6 +308,19 @@ export class AutomationScheduler {
         },
       ),
     )
+  }
+
+  private registerPersistedJob(automation: Automation): void {
+    try {
+      this.registerJob(automation)
+    } catch (error) {
+      if (!(error instanceof InvalidAutomationCronExpressionError)) {
+        throw error
+      }
+      console.warn(
+        `[automations] Skipping invalid persisted schedule for ${automation.id}: ${automation.schedule ?? '(missing schedule)'}`,
+      )
+    }
   }
 
   private unregisterJob(automationId: string): void {

@@ -2,6 +2,8 @@ import { access, mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { resolveCommanderPaths } from '../paths.js'
+import { resolveCommanderDataDir } from '../paths.js'
+import { withCommanderMutation } from '../child-mutation-coordinator.js'
 import {
   COMMANDER_WORKFLOW_FILE,
   REMOVED_COMMANDER_FRONTMATTER_KEYS,
@@ -134,24 +136,27 @@ export async function scaffoldCommanderWorkflow(
   commanderId: string,
   input: Omit<CommanderWorkflowTemplateInput, 'commanderId'>,
   basePath?: string,
+  lifecycleScope = basePath ?? resolveCommanderDataDir(),
 ): Promise<string> {
-  const { commanderRoot, dataDir } = resolveCommanderPaths(commanderId, basePath)
-  await mkdir(commanderRoot, { recursive: true })
+  return withCommanderMutation(commanderId, lifecycleScope, async () => {
+    const { commanderRoot, dataDir } = resolveCommanderPaths(commanderId, basePath)
+    await mkdir(commanderRoot, { recursive: true })
 
-  const workflowPath = path.join(commanderRoot, COMMANDER_WORKFLOW_FILE)
-  try {
-    await access(workflowPath)
-    return workflowPath
-  } catch {
-    const template = await ensureCommanderWorkflowTemplate(dataDir)
-    const rendered = renderCommanderWorkflow(template, {
-      commanderId,
-      cwd: input.cwd,
-      displayName: input.displayName,
-    })
-    await writeFile(workflowPath, rendered, 'utf8')
-    return workflowPath
-  }
+    const workflowPath = path.join(commanderRoot, COMMANDER_WORKFLOW_FILE)
+    try {
+      await access(workflowPath)
+      return workflowPath
+    } catch {
+      const template = await ensureCommanderWorkflowTemplate(dataDir)
+      const rendered = renderCommanderWorkflow(template, {
+        commanderId,
+        cwd: input.cwd,
+        displayName: input.displayName,
+      })
+      await writeFile(workflowPath, rendered, 'utf8')
+      return workflowPath
+    }
+  })
 }
 
 export async function mergeIdentityOperatingStyleIntoCommanderWorkflow(
@@ -161,29 +166,34 @@ export async function mergeIdentityOperatingStyleIntoCommanderWorkflow(
     cwd?: string
     displayName?: string
     basePath?: string
+    lifecycleScope?: string
   } = {},
 ): Promise<{ workflowPath: string; updated: boolean }> {
-  const workflowPath = await scaffoldCommanderWorkflow(
-    commanderId,
-    {
+  const lifecycleScope = options.lifecycleScope ?? options.basePath ?? resolveCommanderDataDir()
+  return withCommanderMutation(commanderId, lifecycleScope, async () => {
+    const workflowPath = await scaffoldCommanderWorkflow(
+      commanderId,
+      {
+        cwd: options.cwd,
+        displayName: options.displayName,
+      },
+      options.basePath,
+      lifecycleScope,
+    )
+    const current = await readFile(workflowPath, 'utf8')
+    const rendered = renderCommanderWorkflow(current, {
+      commanderId,
       cwd: options.cwd,
       displayName: options.displayName,
-    },
-    options.basePath,
-  )
-  const current = await readFile(workflowPath, 'utf8')
-  const rendered = renderCommanderWorkflow(current, {
-    commanderId,
-    cwd: options.cwd,
-    displayName: options.displayName,
-  })
-  const next = mergeIdentityOperatingStyleIntoCommanderWorkflowContent(rendered, identityOperatingStyle)
-  if (next === current) {
-    return { workflowPath, updated: false }
-  }
+    })
+    const next = mergeIdentityOperatingStyleIntoCommanderWorkflowContent(rendered, identityOperatingStyle)
+    if (next === current) {
+      return { workflowPath, updated: false }
+    }
 
-  await writeFile(workflowPath, next, 'utf8')
-  return { workflowPath, updated: true }
+    await writeFile(workflowPath, next, 'utf8')
+    return { workflowPath, updated: true }
+  })
 }
 
 export async function readCommanderWorkflowMarkdown(
@@ -197,4 +207,21 @@ export async function readCommanderWorkflowMarkdown(
   } catch {
     return null
   }
+}
+
+export async function writeCommanderWorkflowMarkdown(
+  commanderId: string,
+  markdown: string,
+  basePath?: string,
+  lifecycleScope = basePath ?? resolveCommanderDataDir(),
+): Promise<void> {
+  await withCommanderMutation(commanderId, lifecycleScope, async () => {
+    const { commanderRoot } = resolveCommanderPaths(commanderId, basePath)
+    await mkdir(commanderRoot, { recursive: true })
+    await writeFile(
+      path.join(commanderRoot, COMMANDER_WORKFLOW_FILE),
+      `${markdown.trimEnd()}\n`,
+      'utf8',
+    )
+  })
 }

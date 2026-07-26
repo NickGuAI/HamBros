@@ -1,6 +1,8 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { resolveModuleDataDir } from '../data-dir.js'
+import { withCommanderMutations } from '../commanders/child-mutation-coordinator.js'
+import { resolveCommanderDataDir } from '../commanders/paths.js'
 import type {
   WorkspaceMachineDescriptor,
   WorkspacePanelDefault,
@@ -120,12 +122,37 @@ export function defaultWorkspaceDataDir(env: NodeJS.ProcessEnv = process.env): s
   return resolveModuleDataDir('workspace', env)
 }
 
+export interface WorkspaceTargetStoreOptions {
+  commanderDataDir?: string
+}
+
+export interface SaveWorkspaceTargetOptions {
+  ownerCommanderId?: string | null
+}
+
+function targetCommanderIds(
+  key: string,
+  target: WorkspaceTargetDescriptor | undefined,
+  explicitOwnerCommanderId?: string | null,
+): string[] {
+  return [...new Set([
+    keyCommanderId(key),
+    target?.commanderId,
+    explicitOwnerCommanderId ?? undefined,
+  ].map((value) => value?.trim()).filter((value): value is string => Boolean(value)))]
+}
+
 export class WorkspaceTargetStore {
   private mutationQueue: Promise<void> = Promise.resolve()
   private readonly filePath: string
+  private readonly commanderDataDir: string
 
-  constructor(filePath = path.join(defaultWorkspaceDataDir(), 'conversation-targets.json')) {
+  constructor(
+    filePath = path.join(defaultWorkspaceDataDir(), 'conversation-targets.json'),
+    options: WorkspaceTargetStoreOptions = {},
+  ) {
     this.filePath = path.resolve(filePath)
+    this.commanderDataDir = path.resolve(options.commanderDataDir ?? resolveCommanderDataDir())
   }
 
   async getByConversation(conversationId: string): Promise<WorkspaceTargetDescriptor | null> {
@@ -146,26 +173,50 @@ export class WorkspaceTargetStore {
   async saveForConversation(
     conversationId: string,
     target: WorkspaceTargetDescriptor,
+    options: SaveWorkspaceTargetOptions = {},
   ): Promise<WorkspaceTargetDescriptor> {
     return this.saveForKey(`conversation:${conversationId}`, {
       ...target,
       conversationId,
-    })
+    }, options)
   }
 
   async saveForKey(
     key: string,
     target: WorkspaceTargetDescriptor,
+    options: SaveWorkspaceTargetOptions = {},
   ): Promise<WorkspaceTargetDescriptor> {
-    return this.withMutationLock(async () => {
-      const targets = await this.readTargets()
-      const nextTarget = {
-        ...target,
+    const nextTarget = { ...target }
+    while (true) {
+      const observedTargets = await this.withMutationLock(() => this.readTargets())
+      const commanderIds = [...new Set([
+        ...targetCommanderIds(key, observedTargets[key], options.ownerCommanderId),
+        ...targetCommanderIds(key, nextTarget, options.ownerCommanderId),
+      ])]
+      let ownerChanged = false
+      const saved = await withCommanderMutations(
+        commanderIds,
+        this.commanderDataDir,
+        () => this.withMutationLock(async () => {
+          const targets = await this.readTargets()
+          const currentCommanderIds = targetCommanderIds(
+            key,
+            targets[key],
+            options.ownerCommanderId,
+          )
+          if (currentCommanderIds.some((commanderId) => !commanderIds.includes(commanderId))) {
+            ownerChanged = true
+            return null
+          }
+          targets[key] = nextTarget
+          await this.writeTargets(targets)
+          return { ...nextTarget }
+        }),
+      )
+      if (!ownerChanged && saved) {
+        return saved
       }
-      targets[key] = nextTarget
-      await this.writeTargets(targets)
-      return { ...nextTarget }
-    })
+    }
   }
 
   private async readTargets(): Promise<Record<string, WorkspaceTargetDescriptor>> {

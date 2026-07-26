@@ -7,8 +7,8 @@
 | `apps/herd/install.sh` | Local/public installer, hermetic Node/pnpm setup, build, and `db:ready`. |
 | `apps/herd/server/routes/install-script.ts` | Serves the public `/install.sh` installer route. |
 | `operations/deploy/ec2/install-ec2.sh` | EC2 deploy/install path and service setup. |
-| `operations/deploy/ec2/Caddyfile` | Split-shell reverse proxy for static shell, API, `/v1/*`, and `/install.sh`. |
-| `operations/deploy/ec2/hervald.service` | systemd service command/env for the private API process. |
+| `operations/deploy/ec2/README.md` | Direct-ALB topology, port contract, install, verification, restart, upgrade, and backup runbook. |
+| `operations/deploy/ec2/herd.service` | systemd service command/env for the production Node listener. |
 | `operations/scripts/launch_herd.sh` | Managed launch path; runs build and SQLite readiness before serving. |
 | `apps/herd/server/index.ts` | Server boot fail-closed DB readiness guard. |
 | `apps/herd/docs/troubleshoot.md` | Operator remediation for DB readiness/migration failures. |
@@ -33,8 +33,25 @@
 | `packages/herd-cli/src/doctor.ts` | Local readiness report. |
 | `packages/herd-cli/src/session.ts` | Session list/info/register/heartbeat/events/unregister. |
 | `packages/herd-cli/src/workers.ts` | Worker list/status/dispatch/send/kill/cleanup. |
+| `packages/herd-cli/src/quests.ts` | Quest create/claim/note/terminal-state commands, explicit artifact add/remove, and machine-readable `QUEST_CLAIM_HANDOFF`. |
 | `packages/herd-cli/src/session-contract.ts` | Shared session/worker contract helpers. |
 | `apps/herd/docs/reference/cli.md` | Operator-facing CLI reference. |
+
+## Quest Artifacts And Task Lifecycle
+
+| Source | Why it matters |
+|---|---|
+| `apps/herd/modules/commanders/quest-artifact-href.ts` | Shared UI/server artifact href validation for file, URL, GitHub issue, and GitHub PR types. |
+| `apps/herd/modules/commanders/components/QuestBoard.tsx` | Always-visible artifact chips, add/remove UI, and read-only file preview entrypoint. |
+| `apps/herd/modules/workspace/routes.ts` | Authenticated reference resolution and the central writable-target gate on every mutation route. |
+| `apps/herd/modules/workspace/resolver.ts` | Path containment and read-only workspace invariant. |
+| `apps/herd/modules/workspace/git.ts` | Defense-in-depth read-only check for git initialization. |
+| `packages/herd-cli/src/quests.ts` | CLI artifact create/add/remove behavior and safe replacement of legacy invalid hrefs. |
+| `ai-state/claude/skills/create-quests/SKILL.md` | Creates quest briefs and attaches explicit task artifacts. |
+| `ai-state/claude/skills/task-system-maintenance/scripts/task_lifecycle.py` | Deterministic task create/move, index regeneration, and task/quest reference rewriting. |
+| `ai-state/claude/skills/task-system-maintenance/scripts/audit.py` | Staleness and backlink audit using explicit file artifacts. |
+| `agent-skills/pkos/task-system-maintenance/` | GehirnSkills submodule counterpart; keep behavior and contract tests aligned with the tracked runtime copy. |
+| `apps/herd/.dev/playbooks/quest-task-artifact-change.md` | Cross-module review order and contrarian checks for quest/task artifact changes. |
 
 ## Channels
 

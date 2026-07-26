@@ -2,6 +2,10 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { resolveHerdDataDir } from '../data-dir.js'
+import {
+  withCommanderChildCreation,
+} from '../commanders/child-mutation-coordinator.js'
+import { resolveCommanderDataDir } from '../commanders/paths.js'
 import type {
   CommanderChannelBinding,
   CommanderChannelBindingConfig,
@@ -35,6 +39,10 @@ export interface UpdateCommanderChannelBindingInput {
   displayName?: string
   enabled?: boolean
   config?: CommanderChannelBindingConfig
+}
+
+export interface CommanderChannelBindingStoreOptions {
+  lifecycleScope?: string
 }
 
 export class CommanderChannelValidationError extends Error {
@@ -121,6 +129,14 @@ function parsePersistedBinding(raw: unknown): CommanderChannelBinding | null {
   }
 }
 
+export function isPersistedCommanderChannelBindingsValid(raw: unknown): boolean {
+  return (
+    isObject(raw)
+    && Array.isArray(raw.bindings)
+    && raw.bindings.every((binding) => parsePersistedBinding(binding) !== null)
+  )
+}
+
 function cloneBinding(binding: CommanderChannelBinding): CommanderChannelBinding {
   return {
     ...binding,
@@ -134,12 +150,17 @@ export function defaultCommanderChannelBindingStorePath(env: NodeJS.ProcessEnv =
 
 export class CommanderChannelBindingStore {
   private readonly filePath: string
+  private readonly lifecycleScope: string
   private bindingsById: Map<string, CommanderChannelBinding> | null = null
   private loadPromise: Promise<void> | null = null
   private mutationQueue: Promise<void> = Promise.resolve()
 
-  constructor(filePath: string = defaultCommanderChannelBindingStorePath()) {
+  constructor(
+    filePath: string = defaultCommanderChannelBindingStorePath(),
+    options: CommanderChannelBindingStoreOptions = {},
+  ) {
     this.filePath = path.resolve(filePath)
+    this.lifecycleScope = path.resolve(options.lifecycleScope ?? resolveCommanderDataDir())
   }
 
   async listByCommander(commanderId: string): Promise<CommanderChannelBinding[]> {
@@ -176,36 +197,39 @@ export class CommanderChannelBindingStore {
   }
 
   async create(input: CreateCommanderChannelBindingInput): Promise<CommanderChannelBinding> {
-    return this.withMutationLock(async () => {
-      await this.ensureLoaded()
-      const now = new Date().toISOString()
-      const binding: CommanderChannelBinding = {
-        id: randomUUID(),
-        commanderId: parseNonEmptyString(input.commanderId, 'commanderId'),
-        provider: parseProvider(input.provider),
-        accountId: parseNonEmptyString(input.accountId, 'accountId'),
-        displayName: parseNonEmptyString(input.displayName, 'displayName'),
-        enabled: parseEnabled(input.enabled),
-        config: parseConfig(input.config),
-        createdAt: now,
-        updatedAt: now,
-      }
+    const commanderId = parseNonEmptyString(input.commanderId, 'commanderId')
+    return withCommanderChildCreation(commanderId, this.lifecycleScope, () => (
+      this.withMutationLock(async () => {
+        await this.ensureLoaded()
+        const now = new Date().toISOString()
+        const binding: CommanderChannelBinding = {
+          id: randomUUID(),
+          commanderId,
+          provider: parseProvider(input.provider),
+          accountId: parseNonEmptyString(input.accountId, 'accountId'),
+          displayName: parseNonEmptyString(input.displayName, 'displayName'),
+          enabled: parseEnabled(input.enabled),
+          config: parseConfig(input.config),
+          createdAt: now,
+          updatedAt: now,
+        }
 
-      const duplicate = [...this.bindings().values()].find((existing) => (
-        existing.commanderId === binding.commanderId
-        && existing.provider === binding.provider
-        && existing.accountId === binding.accountId
-      ))
-      if (duplicate) {
-        throw new CommanderChannelBindingConflictError(
-          `Channel binding already exists for ${binding.commanderId}/${binding.provider}/${binding.accountId}`,
-        )
-      }
+        const duplicate = [...this.bindings().values()].find((existing) => (
+          existing.commanderId === binding.commanderId
+          && existing.provider === binding.provider
+          && existing.accountId === binding.accountId
+        ))
+        if (duplicate) {
+          throw new CommanderChannelBindingConflictError(
+            `Channel binding already exists for ${binding.commanderId}/${binding.provider}/${binding.accountId}`,
+          )
+        }
 
-      this.bindings().set(binding.id, cloneBinding(binding))
-      await this.writeToDisk()
-      return cloneBinding(binding)
-    })
+        this.bindings().set(binding.id, cloneBinding(binding))
+        await this.writeToDisk()
+        return cloneBinding(binding)
+      })
+    ))
   }
 
   async update(
@@ -213,42 +237,84 @@ export class CommanderChannelBindingStore {
     bindingId: string,
     input: UpdateCommanderChannelBindingInput,
   ): Promise<CommanderChannelBinding | null> {
-    return this.withMutationLock(async () => {
-      await this.ensureLoaded()
-      const existing = this.bindings().get(parseNonEmptyString(bindingId, 'bindingId'))
-      if (!existing || existing.commanderId !== parseNonEmptyString(commanderId, 'commanderId')) {
-        return null
-      }
+    const normalizedCommanderId = parseNonEmptyString(commanderId, 'commanderId')
+    const normalizedBindingId = parseNonEmptyString(bindingId, 'bindingId')
+    await this.ensureLoaded()
+    const observed = this.bindings().get(normalizedBindingId)
+    if (!observed || observed.commanderId !== normalizedCommanderId) {
+      return null
+    }
 
-      const next: CommanderChannelBinding = {
-        ...existing,
-        displayName: input.displayName !== undefined
-          ? parseNonEmptyString(input.displayName, 'displayName')
-          : existing.displayName,
-        enabled: input.enabled !== undefined ? input.enabled === true : existing.enabled,
-        config: input.config !== undefined ? parseConfig(input.config) : { ...existing.config },
-        updatedAt: new Date().toISOString(),
-      }
+    return withCommanderChildCreation(normalizedCommanderId, this.lifecycleScope, () => (
+      this.withMutationLock(async () => {
+        const existing = this.bindings().get(normalizedBindingId)
+        if (!existing || existing.commanderId !== normalizedCommanderId) {
+          return null
+        }
 
-      this.bindings().set(next.id, cloneBinding(next))
-      await this.writeToDisk()
-      return cloneBinding(next)
-    })
+        const next: CommanderChannelBinding = {
+          ...existing,
+          displayName: input.displayName !== undefined
+            ? parseNonEmptyString(input.displayName, 'displayName')
+            : existing.displayName,
+          enabled: input.enabled !== undefined ? input.enabled === true : existing.enabled,
+          config: input.config !== undefined ? parseConfig(input.config) : { ...existing.config },
+          updatedAt: new Date().toISOString(),
+        }
+
+        this.bindings().set(next.id, cloneBinding(next))
+        await this.writeToDisk()
+        return cloneBinding(next)
+      })
+    ))
   }
 
   async delete(commanderId: string, bindingId: string): Promise<boolean> {
-    return this.withMutationLock(async () => {
-      await this.ensureLoaded()
-      const normalizedBindingId = parseNonEmptyString(bindingId, 'bindingId')
-      const existing = this.bindings().get(normalizedBindingId)
-      if (!existing || existing.commanderId !== parseNonEmptyString(commanderId, 'commanderId')) {
-        return false
-      }
+    const normalizedCommanderId = parseNonEmptyString(commanderId, 'commanderId')
+    const normalizedBindingId = parseNonEmptyString(bindingId, 'bindingId')
+    await this.ensureLoaded()
+    const observed = this.bindings().get(normalizedBindingId)
+    if (!observed || observed.commanderId !== normalizedCommanderId) {
+      return false
+    }
 
-      this.bindings().delete(normalizedBindingId)
-      await this.writeToDisk()
-      return true
-    })
+    return withCommanderChildCreation(normalizedCommanderId, this.lifecycleScope, () => (
+      this.withMutationLock(async () => {
+        const existing = this.bindings().get(normalizedBindingId)
+        if (!existing || existing.commanderId !== normalizedCommanderId) {
+          return false
+        }
+
+        this.bindings().delete(normalizedBindingId)
+        await this.writeToDisk()
+        return true
+      })
+    ))
+  }
+
+  async deleteForCommander(commanderId: string): Promise<number> {
+    const normalizedCommanderId = parseNonEmptyString(commanderId, 'commanderId')
+    await this.ensureLoaded()
+    if (![...this.bindings().values()].some((binding) => (
+      binding.commanderId === normalizedCommanderId
+    ))) {
+      return 0
+    }
+
+    return withCommanderChildCreation(normalizedCommanderId, this.lifecycleScope, () => (
+      this.withMutationLock(async () => {
+        const bindingIds = [...this.bindings().values()]
+          .filter((binding) => binding.commanderId === normalizedCommanderId)
+          .map((binding) => binding.id)
+        for (const bindingId of bindingIds) {
+          this.bindings().delete(bindingId)
+        }
+        if (bindingIds.length > 0) {
+          await this.writeToDisk()
+        }
+        return bindingIds.length
+      })
+    ))
   }
 
   private bindings(): Map<string, CommanderChannelBinding> {

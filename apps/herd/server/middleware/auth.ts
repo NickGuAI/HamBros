@@ -105,6 +105,7 @@ export async function authorizeApiKeyRequest(
           source: 'managed-store',
           keyId: verification.record.id,
           keyPrefix: verification.record.prefix,
+          keyPurpose: verification.record.purpose,
           scopes: verification.record.scopes,
         },
       },

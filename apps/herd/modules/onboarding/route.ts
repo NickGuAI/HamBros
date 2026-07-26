@@ -1,23 +1,27 @@
 import type { AuthUser } from '@gehirn/auth-providers'
-import { Router, type Request } from 'express'
+import { Router, type Request, type RequestHandler, type Response } from 'express'
 import type { ApiKeyStoreLike } from '../../server/api-keys/store.js'
 import { combinedAuth } from '../../server/middleware/combined-auth.js'
 import type { ProviderRegistryCapability } from '../../server/module-runtime-capabilities.js'
+import type { ProviderExecutionCapability } from '../agents/provider-execution-mode.js'
 import type { AutomationScheduler } from '../automations/scheduler.js'
 import type { AutomationStore } from '../automations/store.js'
 import type { ConversationStore } from '../commanders/conversation-store.js'
 import type { CommanderSessionStore } from '../commanders/store.js'
+import type { loadCommanderPackage } from '../commanders/packages/registry.js'
 import type { OperatorStore } from '../operators/store.js'
 import { OrgIdentityStore } from '../org-identity/store.js'
 import {
-  buildStarterWorkforceStatus,
   buildOnboardingStatus,
   gaiaCommanderExists,
   seedGaiaCommander,
   seedStarterWorkforce,
   skipStarterWorkforce,
+  StarterWorkforcePreflightError,
   type OnboardingShellRunner,
 } from './status.js'
+import type { resolveSkill } from '../automations/skills.js'
+import type { OnboardingCredentialAuth } from './contracts.js'
 
 export interface OnboardingRouterOptions {
   apiKeyStore?: ApiKeyStoreLike
@@ -28,13 +32,19 @@ export interface OnboardingRouterOptions {
   internalToken?: string
   operatorStore: Pick<OperatorStore, 'getFounder'>
   orgIdentityStore?: OrgIdentityStore
-  sessionStore: Pick<CommanderSessionStore, 'list' | 'create' | 'update' | 'delete'>
+  sessionStore: Pick<
+    CommanderSessionStore,
+    'list' | 'get' | 'create' | 'update' | 'delete' | 'restoreAfterFailedCleanup'
+  >
   conversationStore?: Pick<ConversationStore, 'listByCommander' | 'getActiveChatForCommander' | 'ensureDefaultConversation' | 'delete'>
-  automationStore?: Pick<AutomationStore, 'create' | 'delete'>
+  automationStore?: Pick<AutomationStore, 'create' | 'delete' | 'list'>
   automationScheduler?: Pick<AutomationScheduler, 'createAutomation' | 'deleteAutomation'>
   automationSchedulerInitialized?: Promise<void>
+  resolveAutomationSkill?: typeof resolveSkill
+  loadStarterPackage?: typeof loadCommanderPackage
   commanderDataDir: string
   providerRegistry: ProviderRegistryCapability
+  providerExecution: ProviderExecutionCapability
   shellRunner?: OnboardingShellRunner
   env?: NodeJS.ProcessEnv
 }
@@ -75,6 +85,43 @@ function resolvePublicBaseUrl(req: Request, env: NodeJS.ProcessEnv | undefined):
   return `${protocol}://${host}`
 }
 
+type OnboardingAsyncHandler = (req: Request, res: Response) => Promise<void>
+
+function controlledOnboardingRoute(
+  action: string,
+  handler: OnboardingAsyncHandler,
+  options: { starterWorkforceInstall?: boolean } = {},
+): RequestHandler {
+  return async (req, res) => {
+    try {
+      await handler(req, res)
+    } catch (error) {
+      if (options.starterWorkforceInstall && error instanceof StarterWorkforcePreflightError) {
+        res.status(409).json({
+          code: 'STARTER_WORKFORCE_PREFLIGHT_FAILED',
+          error: error.message,
+          missingPackageIds: error.missingPackageIds,
+          missingSkillIds: error.missingSkillIds,
+        })
+        return
+      }
+
+      console.error(`[onboarding] ${action} failed:`, error)
+      if (options.starterWorkforceInstall) {
+        res.status(500).json({
+          code: 'STARTER_WORKFORCE_INSTALL_FAILED',
+          error: 'Starter workforce installation failed. Review the server logs, correct the failure, and retry.',
+        })
+        return
+      }
+      res.status(500).json({
+        code: 'ONBOARDING_REQUEST_FAILED',
+        error: 'Onboarding request failed. Review the server logs, correct the failure, and retry.',
+      })
+    }
+  }
+}
+
 export function createOnboardingRouter(options: OnboardingRouterOptions): Router {
   const router = Router()
   const orgIdentityStore = options.orgIdentityStore ?? new OrgIdentityStore()
@@ -101,6 +148,22 @@ export function createOnboardingRouter(options: OnboardingRouterOptions): Router
     internalToken: options.internalToken,
   })
 
+  function authenticatedCredential(req: Request): OnboardingCredentialAuth {
+    if (req.authMode === 'auth0') {
+      return 'auth0'
+    }
+    const purpose = req.user?.metadata?.keyPurpose
+    return purpose === 'bootstrap' || purpose === 'permanent' ? purpose : 'unknown'
+  }
+
+  function authenticatedCanManageApiKeys(req: Request): boolean {
+    if (req.authMode === 'auth0') {
+      return true
+    }
+    const scopes = req.user?.metadata?.scopes
+    return Array.isArray(scopes) && scopes.includes('agents:admin')
+  }
+
   async function status(req: Request) {
     return buildOnboardingStatus({
       user: req.user,
@@ -108,19 +171,25 @@ export function createOnboardingRouter(options: OnboardingRouterOptions): Router
       orgIdentityStore,
       sessionStore: options.sessionStore,
       conversationStore: options.conversationStore,
+      automationStore: options.automationStore,
       commanderDataDir: options.commanderDataDir,
       publicBaseUrl: resolvePublicBaseUrl(req, options.env),
       providers: options.providerRegistry.listProviders(),
+      providerExecution: options.providerExecution,
+      apiKeyStore: options.apiKeyStore,
+      authenticatedCredential: authenticatedCredential(req),
+      authenticatedCanManageApiKeys: authenticatedCanManageApiKeys(req),
       env: options.env,
       shellRunner: options.shellRunner,
+      loadStarterPackage: options.loadStarterPackage,
     })
   }
 
-  router.get('/status', requireReadAccess, async (req, res) => {
+  router.get('/status', requireReadAccess, controlledOnboardingRoute('Status request', async (req, res) => {
     res.json(await status(req))
-  })
+  }))
 
-  router.post('/actions/seed-gaia', requireWriteAccess, async (req, res) => {
+  router.post('/actions/seed-gaia', requireWriteAccess, controlledOnboardingRoute('Gaia install', async (req, res) => {
     const existedBefore = await gaiaCommanderExists({
       sessionStore: options.sessionStore,
       commanderDataDir: options.commanderDataDir,
@@ -133,6 +202,7 @@ export function createOnboardingRouter(options: OnboardingRouterOptions): Router
       conversationStore: options.conversationStore,
       commanderDataDir: options.commanderDataDir,
       providers: options.providerRegistry.listProviders(),
+      providerExecution: options.providerExecution,
       env: options.env,
       shellRunner: options.shellRunner,
     })
@@ -140,60 +210,72 @@ export function createOnboardingRouter(options: OnboardingRouterOptions): Router
       gaia,
       status: await status(req),
     })
-  })
+  }))
 
-  router.post('/actions/seed-starter-workforce', requireWriteAccess, async (req, res) => {
-    const before = await buildStarterWorkforceStatus({
-      sessionStore: options.sessionStore,
-      commanderDataDir: options.commanderDataDir,
-    })
-    const installedBefore = before.totalCount > 0 &&
-      before.installedCount === before.totalCount
-    const starterWorkforce = await seedStarterWorkforce({
-      user: req.user,
-      operatorStore: options.operatorStore,
-      orgIdentityStore,
-      sessionStore: options.sessionStore,
-      conversationStore: options.conversationStore,
-      automationStore: options.automationStore,
-      automationScheduler: options.automationScheduler,
-      automationSchedulerInitialized: options.automationSchedulerInitialized,
-      commanderDataDir: options.commanderDataDir,
-      providers: options.providerRegistry.listProviders(),
-      env: options.env,
-      shellRunner: options.shellRunner,
-    })
-    res.status(installedBefore ? 200 : 201).json({
-      starterWorkforce,
-      status: await status(req),
-    })
-  })
+  router.post('/actions/seed-starter-workforce', requireWriteAccess, controlledOnboardingRoute(
+    'Starter workforce install',
+    async (req, res) => {
+      const result = await seedStarterWorkforce({
+        user: req.user,
+        operatorStore: options.operatorStore,
+        orgIdentityStore,
+        sessionStore: options.sessionStore,
+        conversationStore: options.conversationStore,
+        automationStore: options.automationStore,
+        automationScheduler: options.automationScheduler,
+        automationSchedulerInitialized: options.automationSchedulerInitialized,
+        resolveAutomationSkill: options.resolveAutomationSkill,
+        loadStarterPackage: options.loadStarterPackage,
+        commanderDataDir: options.commanderDataDir,
+        providers: options.providerRegistry.listProviders(),
+        providerExecution: options.providerExecution,
+        env: options.env,
+        shellRunner: options.shellRunner,
+      })
+      res.status(result.createdAny ? 201 : 200).json({
+        starterWorkforce: result.starterWorkforce,
+        status: await status(req),
+      })
+    },
+    { starterWorkforceInstall: true },
+  ))
 
-  router.post('/actions/skip-starter-workforce', requireWriteAccess, async (req, res) => {
+  router.post('/actions/skip-starter-workforce', requireWriteAccess, controlledOnboardingRoute('Starter workforce skip', async (req, res) => {
     const starterWorkforce = await skipStarterWorkforce({
       user: req.user,
       operatorStore: options.operatorStore,
       orgIdentityStore,
       sessionStore: options.sessionStore,
       conversationStore: options.conversationStore,
+      automationStore: options.automationStore,
       commanderDataDir: options.commanderDataDir,
       providers: options.providerRegistry.listProviders(),
+      providerExecution: options.providerExecution,
       env: options.env,
       shellRunner: options.shellRunner,
+      loadStarterPackage: options.loadStarterPackage,
     })
     res.json({
       starterWorkforce,
       status: await status(req),
     })
-  })
+  }))
 
-  router.post('/actions/finish', requireWriteAccess, async (req, res) => {
+  router.post('/actions/finish', requireWriteAccess, controlledOnboardingRoute('Finish request', async (req, res) => {
     const current = await status(req)
+    if (!current.credentials.ready) {
+      res.status(409).json({
+        code: 'CREDENTIAL_LIFECYCLE_INCOMPLETE',
+        error: current.credentials.summary,
+        status: current,
+      })
+      return
+    }
     res.json({
       launchTarget: current.launchTarget,
       status: current,
     })
-  })
+  }))
 
   return router
 }

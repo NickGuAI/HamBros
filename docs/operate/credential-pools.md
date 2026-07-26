@@ -69,6 +69,9 @@ credential** dropdown lists the ready accounts and marks exactly one account
 `GLOBAL ACTIVE`. Selecting another account changes the host-global account for
 all local Claude conversations. Local conversation create/runtime payloads do
 not accept `credentialPoolId`; legacy stored values are ignored as selectors.
+Conversation clients enforce this through the backend-projected
+`credentialSelectionModes` contract and never classify commander identity
+`host` as execution placement.
 
 Codex and remote Claude remain isolated execution lanes. Their applicable
 conversation/session credential selection is preserved because those runtimes

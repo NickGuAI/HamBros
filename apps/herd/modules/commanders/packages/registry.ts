@@ -68,6 +68,13 @@ interface RawAutomationEntry {
 
 const modulePackagesDir = path.dirname(fileURLToPath(import.meta.url))
 
+export class CommanderBundledPackagesRootNotFoundError extends Error {
+  constructor(public readonly candidates: readonly string[]) {
+    super(`Commander bundled packages root not found: ${candidates.join(', ')}`)
+    this.name = 'CommanderBundledPackagesRootNotFoundError'
+  }
+}
+
 function uniquePaths(paths: string[]): string[] {
   return [...new Set(paths)]
 }
@@ -104,7 +111,7 @@ export async function resolveBundledPackagesRoot(
       // Try the next known runtime location.
     }
   }
-  throw new Error(`Commander bundled packages root not found: ${candidates.join(', ')}`)
+  throw new CommanderBundledPackagesRootNotFoundError(candidates)
 }
 
 export const STARTER_COMMANDER_PACKAGE_IDS = [
@@ -112,6 +119,29 @@ export const STARTER_COMMANDER_PACKAGE_IDS = [
   'research-intelligence-analyst',
   'general-assistant',
 ] as const
+
+export type StarterCommanderPackageId = typeof STARTER_COMMANDER_PACKAGE_IDS[number]
+
+export const STARTER_COMMANDER_PACKAGE_STATUS_DEFAULTS: Readonly<Record<
+  StarterCommanderPackageId,
+  Pick<CommanderPackageDefinition, 'displayName' | 'role' | 'summary'>
+>> = {
+  'engineering-manager': {
+    displayName: 'Asina',
+    role: 'Engineering Manager',
+    summary: 'Owns issue triage, code investigation, implementation planning, review follow-through, and release reliability.',
+  },
+  'research-intelligence-analyst': {
+    displayName: 'Einstein',
+    role: 'Research Intelligence Analyst',
+    summary: 'Runs web research, knowledge search, AI-for-science synthesis, report generation, and domain distillation.',
+  },
+  'general-assistant': {
+    displayName: 'Alfred',
+    role: 'General Assistant',
+    summary: 'Handles meeting prep, scheduling support, daily assistance, inbox/doc triage, and lightweight follow-through.',
+  },
+}
 
 function requireString(value: unknown, field: string, packageDir: string): string {
   if (typeof value === 'string' && value.trim()) {

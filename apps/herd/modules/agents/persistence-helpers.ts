@@ -84,6 +84,14 @@ export interface PersistenceHelpersContext {
   exitedStreamSessions: Map<string, ExitedStreamSessionState>
   applyStreamUsageEvent: ApplyStreamUsageEvent
   restoreProviderSession: ProviderSessionRestorer
+  commanderLifecycleScope?: string
+  shouldRestoreSession?(
+    entry: PersistedStreamSession,
+  ): boolean | Promise<boolean>
+  shouldAutoRestoreSession?(
+    entry: PersistedStreamSession,
+    machine?: MachineConfig,
+  ): boolean
   restoreCredentialPoolRecovery?(session: StreamSession): void
   teardownProviderSession: ProviderSessionTeardown
   isExitedSessionResumeAvailable(
@@ -143,6 +151,9 @@ export function createPersistenceHelpers(
     exitedStreamSessions,
     applyStreamUsageEvent,
     restoreProviderSession,
+    commanderLifecycleScope,
+    shouldRestoreSession,
+    shouldAutoRestoreSession,
     restoreCredentialPoolRecovery,
     teardownProviderSession,
     isExitedSessionResumeAvailable,
@@ -207,6 +218,9 @@ export function createPersistenceHelpers(
       machineRegistry,
       applyUsageEvent: applyStreamUsageEvent,
       restoreProviderSession,
+      commanderLifecycleScope,
+      shouldRestoreSession,
+      shouldAutoRestoreSession,
       restoreCredentialPoolRecovery,
     })
   }

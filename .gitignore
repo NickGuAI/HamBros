@@ -2,11 +2,14 @@ node_modules/
 .pnpm-store/
 .turbo/
 .DS_Store
+.general-env
+.*-env
 
 apps/herd/.env
 apps/herd/node_modules/
 apps/herd/dist/
 apps/herd/dist-server/
+apps/herd/data/
 apps/herd/data/api-keys/
 apps/herd/data/commanders/
 apps/herd/data/telemetry/

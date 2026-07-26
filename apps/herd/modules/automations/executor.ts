@@ -6,9 +6,10 @@ import {
   type AgentSessionCreateInput,
   type AgentSessionMonitorOptions,
 } from '@gehirn/ai-services'
-import { resolveCommanderPaths } from '../commanders/paths.js'
+import { withCommanderRuntimeLaunch } from '../commanders/package-lifecycle-state.js'
+import { resolveCommanderDataDir, resolveCommanderPaths } from '../commanders/paths.js'
 import { AutomationStore, type UpdateAutomationInput } from './store.js'
-import { resolveSkills } from './skills.js'
+import { isValidSkillName, resolveSkills } from './skills.js'
 import type {
   Automation,
   AutomationExecutionSource,
@@ -33,6 +34,7 @@ export interface AutomationExecutionResult {
 
 export interface AutomationExecutorOptions {
   store?: AutomationStore
+  commanderDataDir?: string
   now?: () => Date
   monitorOptions?: AgentSessionMonitorOptions
   agentSessionFactory?: () => AgentSessionClientLike
@@ -223,7 +225,21 @@ async function assembleAutomationPrompt(
   const commanderSkillsDir = automation.parentCommanderId
     ? resolveCommanderPaths(automation.parentCommanderId).skillsRoot
     : undefined
-  const resolvedSkills = await resolveSkills(automation.skills, commanderSkillsDir)
+  const configuredSkills = [...new Set(
+    automation.skills
+      .map((skill) => skill.trim())
+      .filter((skill) => skill.length > 0),
+  )]
+  const validConfiguredSkills = configuredSkills.filter(isValidSkillName)
+  const invalidSkillCount = configuredSkills.length - validConfiguredSkills.length
+  const resolvedSkills = await resolveSkills(validConfiguredSkills, commanderSkillsDir)
+  const missingSkills = validConfiguredSkills.filter((skill) => !resolvedSkills.has(skill))
+  if (invalidSkillCount > 0) {
+    missingSkills.push(`${invalidSkillCount} invalid skill name${invalidSkillCount === 1 ? '' : 's'}`)
+  }
+  if (missingSkills.length > 0) {
+    throw new Error(`Configured automation skills are unavailable: ${missingSkills.join(', ')}`)
+  }
   const skillSections = resolvedSkills.size === 0
     ? 'No special skills configured.'
     : [...resolvedSkills.entries()]
@@ -285,6 +301,7 @@ async function assembleAutomationPrompt(
 
 export class AutomationExecutor {
   private readonly store: AutomationStore
+  private readonly commanderDataDir: string
   private readonly now: () => Date
   private readonly monitorOptions?: AgentSessionMonitorOptions
   private readonly agentSessionFactory: () => AgentSessionClientLike
@@ -292,6 +309,7 @@ export class AutomationExecutor {
 
   constructor(options: AutomationExecutorOptions = {}) {
     this.store = options.store ?? new AutomationStore()
+    this.commanderDataDir = path.resolve(options.commanderDataDir ?? resolveCommanderDataDir())
     this.now = options.now ?? (() => new Date())
     this.monitorOptions = options.monitorOptions
     this.agentSessionFactory = options.agentSessionFactory ?? defaultAgentSessionFactory(options.internalToken)
@@ -339,7 +357,6 @@ export class AutomationExecutor {
     const runFile = path.join(outputDir, 'runs', `${runTimestampKey}.md`)
     const runJsonPath = this.store.resolveRunJsonPath(automation, runTimestampKey)
     const memoryContent = (await this.store.readMemory(automation.id)) ?? ''
-    const prompt = await assembleAutomationPrompt(automation, memoryContent, startedAtDate, runFile)
 
     let sessionId = ''
     let client: AgentSessionClientLike | null = null
@@ -355,28 +372,61 @@ export class AutomationExecutor {
         // Best-effort cleanup.
       }
     }
-    const writeRunMetadata = async (metadata: AutomationRunMetadata): Promise<void> => {
-      await mkdir(path.dirname(runJsonPath), { recursive: true })
-      await writeFile(runJsonPath, `${JSON.stringify(metadata, null, 2)}\n`, 'utf8')
+    const writeRunMetadata = async (metadata: AutomationRunMetadata): Promise<boolean> => {
+      for (;;) {
+        const current = await this.store.get(automation.id)
+        if (!current) {
+          return false
+        }
+        const parentCommanderId = current.parentCommanderId?.trim()
+        const write = async (): Promise<boolean> => {
+          const revalidated = await this.store.get(automation.id)
+          if (!revalidated || revalidated.parentCommanderId?.trim() !== parentCommanderId) {
+            return false
+          }
+          await mkdir(path.dirname(runJsonPath), { recursive: true })
+          await writeFile(runJsonPath, `${JSON.stringify(metadata, null, 2)}\n`, 'utf8')
+          return true
+        }
+        if (!parentCommanderId) {
+          return write()
+        }
+        const written = await withCommanderRuntimeLaunch(
+          parentCommanderId,
+          this.commanderDataDir,
+          write,
+        )
+        if (written) {
+          return true
+        }
+      }
     }
 
     try {
+      const prompt = await assembleAutomationPrompt(automation, memoryContent, startedAtDate, runFile)
       client = this.agentSessionFactory()
-      const created = await client.createSession({
-        name: resolveSessionName(automation.name, startedAtDate),
-        task: prompt,
-        agentType: automation.agentType,
-        cwd: automation.workDir ?? process.cwd(),
-        host: automation.machine,
-        mode: automation.permissionMode,
-        transportType: automation.sessionType ?? 'stream',
-        sessionType: 'automation',
-        creator: {
-          kind: 'automation',
-          id: automation.id,
-        },
-        model: automation.model,
-      })
+      const createSession = () => client!.createSession({
+          name: resolveSessionName(automation.name, startedAtDate),
+          task: prompt,
+          agentType: automation.agentType,
+          cwd: automation.workDir ?? process.cwd(),
+          host: automation.machine,
+          mode: automation.permissionMode,
+          transportType: automation.sessionType ?? 'stream',
+          sessionType: 'automation',
+          creator: {
+            kind: 'automation',
+            id: automation.id,
+          },
+          model: automation.model,
+        })
+      const created = automation.parentCommanderId
+        ? await withCommanderRuntimeLaunch(
+            automation.parentCommanderId,
+            this.commanderDataDir,
+            createSession,
+          )
+        : await createSession()
       sessionId = created.sessionId
 
       const completion = await client.monitorSession(sessionId, this.monitorOptions)

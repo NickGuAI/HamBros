@@ -1,6 +1,5 @@
 import {
   CADENCE_PRESET_TO_CRON,
-  CRON_SEGMENT_PATTERN,
   DEFAULT_NEW_AUTOMATION_CADENCE_PRESET,
   DEFAULT_NEW_AUTOMATION_TRIGGER,
   listSupportedAutomationProviders,
@@ -8,6 +7,7 @@ import {
   NEW_AUTOMATION_TRIGGER_OPTIONS,
 } from './constants.js'
 import type { ProviderRegistryEntry } from '@/types'
+import { isAutomationCronExpressionComplete } from '../../automations/cron-validation.js'
 import type {
   NewAutomationCadencePreset,
   NewAutomationCommander,
@@ -65,7 +65,7 @@ export function createDefaultNewAutomationWizardValues(
 }
 
 export function looksLikeCronExpression(expression: string): boolean {
-  return CRON_SEGMENT_PATTERN.test(expression)
+  return isAutomationCronExpressionComplete(expression)
 }
 
 export function buildAutomationScheduleFromPreset(
@@ -111,7 +111,7 @@ export function validateNewAutomationWizardStep(
         if (!trimmedCron) {
           errors.cron = 'Cron expression is required.'
         } else if (!looksLikeCronExpression(trimmedCron)) {
-          errors.cron = 'Cron expression must contain exactly five fields.'
+          errors.cron = 'Cron expression must contain at least five fields.'
         }
       }
     }

@@ -384,9 +384,9 @@ function createBenchmarkCommanderPayload(options: BootstrapOptions): Record<stri
     displayName: 'Benchmark Commander',
     agentType: 'codex',
     host: options.host,
+    executionMachineId: options.host,
     model: options.model,
     cwd: options.adapterRoot,
-    persona: 'Evaluation commander who runs reproducible agent benchmarks, selects safe runner/auth modes, dispatches benchmark workers, records telemetry, and reports score deltas without modifying product code.',
     heartbeat: {
       intervalMs: 1800000,
       messageTemplate: 'Check the benchmark queue, active eval workers, latest run manifests, and auth-doctor status. Report regressions or dispatch the next scheduled benchmark.',
@@ -488,14 +488,12 @@ async function runBootstrap(
   }
 
   const commanderId = readStringProperty(result.data, ['id', 'commanderId'])
-  const sessionId = readStringProperty(result.data, ['sessionId', 'sessionName'])
-  if (!commanderId || !sessionId) {
-    stderr.write('Eval bootstrap response was malformed: expected commander and session ids.\n')
+  if (!commanderId) {
+    stderr.write('Eval bootstrap response was malformed: expected a commander id.\n')
     return 1
   }
 
   stdout.write(`Benchmark commander: ${commanderId}\n`)
-  stdout.write(`Session: ${sessionId}\n`)
   return 0
 }
 

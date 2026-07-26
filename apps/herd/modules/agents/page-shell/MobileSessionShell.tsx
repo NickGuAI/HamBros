@@ -39,10 +39,7 @@ import {
 import type { MsgItem } from '@modules/agents/messages/model'
 import type { ClaudeAdaptiveThinkingMode } from '@modules/claude-adaptive-thinking.js'
 import { useConversationRuntimeSettings } from '@modules/conversation/hooks/use-conversation-runtime-settings'
-import {
-  canSelectConversationCredential,
-  CredentialPoolSelect,
-} from '@modules/conversation/components/CredentialPoolSelect'
+import { CredentialPoolSelect } from '@modules/conversation/components/CredentialPoolSelect'
 import type {
   ConversationRecord,
   ConversationRuntimeSettingsUpdate,
@@ -287,7 +284,6 @@ export function MobileSessionShell({
   const runtimeSettings = useConversationRuntimeSettings(
     conversation,
     providerOptions,
-    sessionHost,
   )
   const conversationName = conversation?.name?.trim() || (conversation ? `chat ${conversation.id.slice(0, 8)}` : '')
   const lifecycleAction = resolveConversationLifecycleAction(conversation)
@@ -560,6 +556,7 @@ export function MobileSessionShell({
         rootClassName,
       )}
       data-testid={dataTestId ?? 'mobile-session-shell'}
+      data-composer-resize-root="mobile-session-shell"
     >
       <header
         className={cn(
@@ -882,15 +879,12 @@ export function MobileSessionShell({
                                 ))}
                               </select>
                             </label>
-                            {canSelectConversationCredential(
-                              runtimeSettings.draft?.agentType,
-                              runtimeSettings.targetHost,
-                            ) ? (
+                            {runtimeSettings.credentialSelectionMode === 'per-conversation' ? (
                               <label className="grid gap-1 px-3 text-[10px] uppercase tracking-[0.08em] text-sumi-diluted">
                                 <span>Credential</span>
                                 <CredentialPoolSelect
                                   provider={runtimeSettings.draft?.agentType}
-                                  host={runtimeSettings.targetHost}
+                                  credentialSelectionMode={runtimeSettings.credentialSelectionMode}
                                   value={runtimeSettings.selectedCredentialPoolId}
                                   currentCredentialPoolId={runtimeSettings.currentCredentialPoolId}
                                   onChange={runtimeSettings.setCredentialPoolId}

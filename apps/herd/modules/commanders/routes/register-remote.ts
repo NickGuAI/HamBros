@@ -17,6 +17,8 @@ import {
 } from '../store.js'
 import { scaffoldCommanderWorkflow } from '../templates/workflow.js'
 import type { CommanderRoutesContext } from './types.js'
+import { beginCommanderProvisioning } from '../child-mutation-coordinator.js'
+import { deleteCommanderStateOwned } from '../commander-deletion.js'
 
 export function registerRemoteRoutes(
   router: import('express').Router,
@@ -48,6 +50,7 @@ export function registerRemoteRoutes(
       const syncToken = randomUUID()
       const updated = await context.sessionStore.update(commanderId, (current) => ({
         ...current,
+        executionMachineId: machineId,
         remoteOrigin: {
           machineId,
           label,
@@ -67,6 +70,7 @@ export function registerRemoteRoutes(
     const session: CommanderSession = {
       id: randomUUID(),
       host: label,
+      executionMachineId: machineId,
       state: 'idle',
       created: context.now().toISOString(),
       agentType: 'claude',
@@ -82,34 +86,91 @@ export function registerRemoteRoutes(
       },
     }
 
+    const lease = await beginCommanderProvisioning(
+      session.id,
+      context.commanderDataDir,
+      async () => Boolean(await context.sessionStore.get(session.id)),
+    )
+    if (!lease) {
+      res.status(409).json({ error: `Commander "${session.id}" cannot be provisioned` })
+      return
+    }
+
+    let deleted = false
+    let createdCommanderId: string | null = null
     try {
-      const created = await context.sessionStore.create(session)
-      await context.ensureDefaultConversation(created, { surface: 'api' })
-      try {
+      const created = await lease.runOwned(async () => {
+        const provisioned = await context.sessionStore.create(session)
+        await context.ensureDefaultConversation(provisioned, { surface: 'api' })
         await scaffoldCommanderWorkflow(
-          created.id,
+          provisioned.id,
           { displayName },
           context.commanderBasePath,
+          context.commanderDataDir,
         )
-      } catch (scaffoldError) {
-        await context.sessionStore.delete(created.id).catch(() => {})
-        throw scaffoldError
-      }
-      try {
-        await setCommanderDisplayName(context.commanderDataDir, created.id, displayName)
-      } catch (error) {
-        if (!(error instanceof UnknownCommanderError)) {
-          console.warn(
-            `[commanders] Failed to persist display name for "${created.id}":`,
-            error,
-          )
+        try {
+          await setCommanderDisplayName(context.commanderDataDir, provisioned.id, displayName)
+        } catch (error) {
+          if (!(error instanceof UnknownCommanderError)) {
+            console.warn(
+              `[commanders] Failed to persist display name for "${provisioned.id}":`,
+              error,
+            )
+          }
         }
-      }
-      res.status(201).json({ commanderId: created.id, syncToken })
+        return provisioned
+      })
+      createdCommanderId = created.id
+      lease.complete({ deleted: false })
     } catch (error) {
+      let rollback: Awaited<ReturnType<typeof deleteCommanderStateOwned>>
+      try {
+        rollback = await lease.runOwned(async () => {
+          const [conversations, automations] = await Promise.all([
+            context.conversationStore.listByCommander(session.id),
+            context.automationStore.list({ parentCommanderId: session.id }),
+          ])
+          return deleteCommanderStateOwned({
+            commanderId: session.id,
+            commanderDataDir: context.commanderDataDir,
+            commanderBasePath: context.commanderBasePath,
+            sessionStore: context.sessionStore,
+            channelBindingStore: context.channelBindingStore,
+            questStore: context.questStore,
+            heartbeatLog: context.heartbeatLog,
+            allowMissingSession: true,
+            deleteChildren: async () => {
+              for (const { id } of [...automations].reverse()) {
+                if (context.automationScheduler) {
+                  await context.automationScheduler.deleteAutomation(id)
+                } else {
+                  await context.automationStore.delete(id, { removeFiles: true })
+                }
+              }
+              for (const { id } of conversations) {
+                await context.conversationStore.delete(id)
+              }
+            },
+          })
+        })
+      } catch (rollbackError) {
+        rollback = { deleted: false, error: rollbackError }
+      }
+      deleted = rollback.deleted
+      lease.complete({ deleted })
+      if (!rollback.deleted) {
+        console.warn(
+          `[commanders] Failed to fully roll back remote commander "${session.id}":`,
+          rollback.error,
+        )
+      }
       res.status(500).json({
         error: error instanceof Error ? error.message : 'Failed to register remote commander',
       })
+      return
+    } finally {
+      lease.complete({ deleted })
     }
+    res.status(201).json({ commanderId: createdCommanderId!, syncToken })
   })
 }

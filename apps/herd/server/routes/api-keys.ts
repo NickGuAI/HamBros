@@ -4,6 +4,7 @@ import {
   ApiKeyJsonStore,
   DEFAULT_BOOTSTRAP_MASTER_KEY_SCOPES,
   isApiKeyScope,
+  type ApiKeyPurpose,
   type ApiKeyScope,
 } from '../api-keys/store.js'
 import {
@@ -19,6 +20,7 @@ interface ApiKeyView {
   id: string
   name: string
   prefix: string
+  purpose: ApiKeyPurpose
   createdBy: string
   createdAt: string
   expiresAt: string | null
@@ -43,6 +45,7 @@ function toApiKeyView(record: Awaited<ReturnType<ApiKeyJsonStore['listKeys']>>[n
     id: record.id,
     name: record.name,
     prefix: record.prefix,
+    purpose: record.purpose,
     createdBy: record.createdBy,
     createdAt: record.createdAt,
     expiresAt: record.expiresAt ?? null,
@@ -238,6 +241,7 @@ export function createApiKeysRouter(options: ApiKeysRouterOptions = {}): Router 
       const created = await store.createKey({
         name,
         scopes,
+        purpose: 'permanent',
         createdBy: req.user?.email ?? req.user?.id ?? 'unknown',
         now: requestNow,
         expiresAt,
@@ -280,6 +284,7 @@ export function createApiKeysRouter(options: ApiKeysRouterOptions = {}): Router 
       const created = await store.createKey({
         name,
         scopes,
+        purpose: 'permanent',
         createdBy: req.user?.email ?? req.user?.id ?? 'unknown',
         now: requestNow,
         expiresAt,

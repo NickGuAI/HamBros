@@ -21,6 +21,7 @@ import type {
   QuestArtifactType,
 } from './quest-store.js'
 import type { GitHubIssueUrlParts } from './routes/types.js'
+import { isValidQuestArtifactHref } from './quest-artifact-href.js'
 
 const SESSION_ID_PATTERN = /^[a-zA-Z0-9_-]+$/
 const HOST_PATTERN = /^[a-zA-Z0-9_-]+$/
@@ -566,7 +567,7 @@ export function parseQuestArtifacts(raw: unknown): QuestArtifact[] | null {
     const type = parseQuestArtifactType(entry.type)
     const label = parseMessage(entry.label)
     const href = parseMessage(entry.href)
-    if (!type || !label || !href) {
+    if (!type || !label || !href || !isValidQuestArtifactHref(type, href)) {
       return null
     }
 

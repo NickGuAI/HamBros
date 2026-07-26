@@ -8,6 +8,32 @@ continues to be the GitHub release body; this file ships in the public artifact.
 
 - No unreleased changes.
 
+## v0.0.9-beta — 2026-07-26
+
+- Added a two-mode session composer. Quick mode keeps Enter-to-send, while
+  Markdown mode supports multiline editing, explicit send shortcuts, durable
+  per-session drafts, attachments, and paste-driven mode promotion.
+- Rebuilt automations as a responsive master/detail workspace with shared
+  global and commander views, safer draft handling, and server-authoritative
+  cron validation.
+- Made quest artifacts first-class task references across the UI, API, and CLI.
+  Task lifecycle operations now preserve explicit backlinks across hosts, and
+  artifact-backed workspaces are enforced as read-only.
+- Bundled the default automation housekeeping skills and starter workforce so
+  fresh installations can complete founder onboarding without depending on an
+  internal skills checkout.
+- Added the Railway production deployment lane with daemon-only provider
+  execution by default, durable-volume readiness checks, restart persistence,
+  bootstrap non-recreation, SQLite upgrade coverage, and graceful shutdown.
+- Made credential selection placement-owned: local Claude credentials are
+  managed globally, while Codex and eligible remote credentials remain
+  conversation-selectable. Codex effort options now come from live model
+  capabilities instead of hard-coded defaults.
+- Added Claude Opus 5 to the provider catalogue, bundled the
+  `growth-analytics` skill, and removed the retired Composio MCP default.
+- Hardened first-run transactions, durable JSON-store writes, archived
+  commander filtering, workspace boundaries, and release/install readiness.
+
 ## v0.0.8-beta — 2026-07-18
 
 - Relicensed the current public release line under GNU AGPLv3

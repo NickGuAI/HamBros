@@ -51,6 +51,7 @@ export type OnboardingStepId =
   | 'gaia'
   | 'starter-workforce'
   | 'providers-machines'
+  | 'credentials'
   | 'launch'
 
 export type OnboardingStepState = 'complete' | 'current' | 'pending' | 'warning'
@@ -88,6 +89,36 @@ export interface MachineOnboardingReadiness {
   state: OnboardingReadinessState
   envFile: string | null
   cwd: string | null
+  summary: string
+}
+
+export interface ProviderExecutionOnboardingStatus {
+  mode: 'host-or-daemon' | 'daemon-only'
+  hostExecutionAllowed: boolean
+  daemonRequired: boolean
+  state: OnboardingReadinessState
+  registeredDaemonCount: number
+  connectedDaemonCount: number
+  providerReadyDaemonCount: number
+  readyProviderIds: string[]
+  summary: string
+}
+
+export type OnboardingCredentialAuth = 'bootstrap' | 'permanent' | 'auth0' | 'unknown'
+
+export interface OnboardingBootstrapKeyStatus {
+  id: string
+  name: string
+  expiresAt: string | null
+}
+
+export interface OnboardingCredentialStatus {
+  ready: boolean
+  state: OnboardingReadinessState
+  activePermanentKeyCount: number
+  activeBootstrapKeys: OnboardingBootstrapKeyStatus[]
+  authenticatedAs: OnboardingCredentialAuth
+  canRevokeBootstrap: boolean
   summary: string
 }
 
@@ -142,6 +173,8 @@ export interface OnboardingStatus {
   starterWorkforce: StarterWorkforceOnboardingStatus
   providers: ProviderOnboardingReadiness[]
   machines: MachineOnboardingReadiness[]
+  providerExecution: ProviderExecutionOnboardingStatus
+  credentials: OnboardingCredentialStatus
   receipt: OnboardingReceipt
   timeToFirstReply: OnboardingFirstReplyMetric
   launchTarget: string
@@ -159,6 +192,11 @@ export interface SeedStarterWorkforceOnboardingResponse {
 
 export interface SkipStarterWorkforceOnboardingResponse {
   starterWorkforce: StarterWorkforceOnboardingStatus
+  status: OnboardingStatus
+}
+
+export interface FinishOnboardingResponse {
+  launchTarget: string
   status: OnboardingStatus
 }
 

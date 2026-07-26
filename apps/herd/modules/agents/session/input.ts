@@ -257,6 +257,40 @@ export function parseOptionalHost(rawHost: unknown): string | null | undefined {
   return trimmed
 }
 
+export type MachinePlacementParseResult =
+  | { ok: true; machineId: string | undefined }
+  | { ok: false; error: string }
+
+/**
+ * Parse explicit execution placement from an API request.
+ *
+ * `machineId` is the first-class field. `host` remains a compatibility alias
+ * for older clients, but the two may never silently disagree: placement is a
+ * machine identity, not a connection endpoint or commander identity field.
+ */
+export function parseMachinePlacement(
+  rawMachineId: unknown,
+  rawLegacyHost: unknown,
+): MachinePlacementParseResult {
+  const machineId = parseOptionalHost(rawMachineId)
+  if (machineId === null) {
+    return { ok: false, error: 'Invalid machineId: expected registered machine ID string' }
+  }
+
+  const legacyHost = parseOptionalHost(rawLegacyHost)
+  if (legacyHost === null) {
+    return { ok: false, error: 'Invalid host: expected machine ID string' }
+  }
+  if (machineId && legacyHost && machineId !== legacyHost) {
+    return {
+      ok: false,
+      error: 'machineId and host must identify the same machine when both are provided',
+    }
+  }
+
+  return { ok: true, machineId: machineId ?? legacyHost }
+}
+
 export function parseSessionTransportType(raw: unknown): Exclude<SessionTransportType, 'external'> {
   if (raw === 'stream') return 'stream'
   return 'pty'

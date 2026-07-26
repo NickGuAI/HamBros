@@ -9,6 +9,7 @@ import {
   getSkillArchive,
   getSkillExportPreview,
   getSkillPackageDetail,
+  ReadOnlySkillPackageError,
   SkillPackageConflictError,
   type SkillInfo,
 } from './package-discovery.js'
@@ -155,6 +156,10 @@ export function createSkillsRouter(options: SkillsRouterOptions = {}): Router {
       }
       res.json({ deleted: true, skill: deleted })
     } catch (err) {
+      if (err instanceof ReadOnlySkillPackageError) {
+        res.status(403).json({ error: err.message })
+        return
+      }
       res.status(500).json({ error: 'Failed to delete skill package', detail: String(err) })
     }
   })

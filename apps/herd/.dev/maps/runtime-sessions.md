@@ -9,7 +9,7 @@ state/actions to UI, API, and CLI consumers.
 
 - `apps/herd/server/db/schema.ts`
 - `apps/herd/server/db/readiness.ts`
-- `apps/herd/server/db/migration.ts`
+- `apps/herd/server/db/migrations.ts`
 - `apps/herd/tools/db-ready.ts`
 - `apps/herd/tools/migrate-sqlite.ts`
 - `apps/herd/modules/agents/session/sqlite-runtime-store.ts`
@@ -124,7 +124,11 @@ pnpm --filter herd exec vitest run \
   modules/agents/__tests__/queue-state.test.ts \
   modules/agents/__tests__/queue-mutation.test.ts
 
-pnpm --filter @gehirn/herd-cli test -- up.test.ts doctor.test.ts workers.test.ts session.test.ts
+pnpm --filter @gehirn/herd-cli exec vitest run \
+  src/__tests__/up.test.ts \
+  src/__tests__/doctor.test.ts \
+  src/__tests__/workers.test.ts \
+  src/__tests__/session.test.ts
 pnpm --filter herd run db:ready -- --source-root ~/.herd --db ~/.herd/herd.sqlite
 ```
 

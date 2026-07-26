@@ -22,6 +22,7 @@ import type { ChannelAdapter, ChannelInboundEvent } from '../../channels/types.j
 import type { Conversation } from '../conversation-store.js'
 import type { CommanderChannelMeta } from '../store.js'
 import type { CommanderRoutesContext } from './types.js'
+import { CommanderCleanupInProgressError } from '../child-mutation-coordinator.js'
 
 interface ChannelMessageIdempotencyInput {
   provider: string
@@ -344,12 +345,22 @@ export function registerChannelRoutes(
           accountId: event.accountId,
           rawSourceId: event.rawSourceId,
         }
-        await recordChannelInboundFate(context, resolved.conversation.id, {
-          ...orphanDeliveryIdentity,
-          clientSendId: channelClientSendId(orphanDeliveryIdentity, Boolean(explicitRawSourceId), context.now()),
-          fate: 'ingest-failed',
-          error: `Channel surface is bound to deleted commander "${resolved.conversation.commanderId}"`,
-        })
+        try {
+          await recordChannelInboundFate(context, resolved.conversation.id, {
+            ...orphanDeliveryIdentity,
+            clientSendId: channelClientSendId(orphanDeliveryIdentity, Boolean(explicitRawSourceId), context.now()),
+            fate: 'ingest-failed',
+            error: `Channel surface is bound to deleted commander "${resolved.conversation.commanderId}"`,
+          })
+        } catch (error) {
+          // Explicit commander deletion has already archived the conversation
+          // and tombstoned its mutation boundary. The inbound fate is optional
+          // diagnostic state; rejecting that write is the expected safe result
+          // and must not turn the controlled orphan response into a 500.
+          if (!(error instanceof CommanderCleanupInProgressError)) {
+            throw error
+          }
+        }
         if (resolved.conversation.status !== 'archived') {
           await stopConversationSession(context, resolved.conversation, 'archived').catch((cleanupError) => {
             console.warn(
@@ -532,6 +543,7 @@ export function registerChannelRoutes(
           commanderId: commander.id,
           conversationId: resolved.conversation.id,
           sessionKey: channelMeta.sessionKey,
+          ...(delivered.code ? { code: delivered.code } : {}),
           error: delivered.error,
         })
         return

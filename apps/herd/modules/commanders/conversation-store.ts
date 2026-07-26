@@ -42,6 +42,7 @@ import {
 } from '../agents/providers/provider-context-normalization.js'
 import { quarantineJsonFile, writeJsonFileAtomically } from '../json-file.js'
 import { withJsonStoreSchema } from '../json-store-schema.js'
+import { withCommanderChildCreation } from './child-mutation-coordinator.js'
 
 const CONVERSATION_STATUSES = new Set<Conversation['status']>([
   'active',
@@ -721,58 +722,85 @@ export class ConversationStore {
   async create(
     input: Omit<Conversation, 'id' | 'name'> & { id?: string; name?: string },
   ): Promise<Conversation> {
-    return this.withMutationLock(async () => {
-      await this.ensureLoaded()
-      const id = input.id?.trim() || randomUUID()
-      if (this.items().has(id)) {
-        throw new Error(`Conversation "${id}" already exists`)
-      }
+    return withCommanderChildCreation(input.commanderId, this.dataDir, () => (
+      this.withMutationLock(async () => {
+        await this.ensureLoaded()
+        const id = input.id?.trim() || randomUUID()
+        if (this.items().has(id)) {
+          throw new Error(`Conversation "${id}" already exists`)
+        }
 
-      const name = this.resolveConversationName(input.commanderId, input.name)
-      this.assertConversationNameAvailable(input.commanderId, name)
+        const name = this.resolveConversationName(input.commanderId, input.name)
+        this.assertConversationNameAvailable(input.commanderId, name)
 
-      const normalized = normalizeConversation({
-        ...input,
-        id,
-        name,
+        const normalized = normalizeConversation({
+          ...input,
+          id,
+          name,
+        })
+        this.items().set(id, cloneConversation(normalized))
+        await this.writeConversation(normalized)
+        return cloneConversation(normalized)
       })
-      this.items().set(id, cloneConversation(normalized))
-      await this.writeConversation(normalized)
-      return cloneConversation(normalized)
-    })
+    ))
   }
 
   async update(
     conversationId: string,
     mutate: (current: Conversation) => Conversation,
   ): Promise<Conversation | null> {
-    return this.withMutationLock(async () => {
-      await this.ensureLoaded()
-      const existing = this.items().get(conversationId)
-      if (!existing) {
-        return null
-      }
+    await this.ensureLoaded()
+    const observed = this.items().get(conversationId)
+    if (!observed) {
+      return null
+    }
 
-      const next = normalizeConversation(mutate(cloneConversation(existing)))
-      this.assertConversationNameAvailable(next.commanderId, next.name, conversationId)
-      this.items().set(conversationId, cloneConversation(next))
-      await this.writeConversation(next)
-      return cloneConversation(next)
-    })
+    return withCommanderChildCreation(observed.commanderId, this.dataDir, () => (
+      this.withMutationLock(async () => {
+        await this.ensureLoaded()
+        const existing = this.items().get(conversationId)
+        if (!existing) {
+          return null
+        }
+        if (existing.commanderId !== observed.commanderId) {
+          throw new Error(`Conversation "${conversationId}" changed commander during update`)
+        }
+
+        const next = normalizeConversation(mutate(cloneConversation(existing)))
+        if (next.commanderId !== existing.commanderId) {
+          throw new Error('Conversation commanderId cannot be changed by update')
+        }
+        this.assertConversationNameAvailable(next.commanderId, next.name, conversationId)
+        this.items().set(conversationId, cloneConversation(next))
+        await this.writeConversation(next)
+        return cloneConversation(next)
+      })
+    ))
   }
 
   async delete(conversationId: string): Promise<Conversation | null> {
-    return this.withMutationLock(async () => {
-      await this.ensureLoaded()
-      const existing = this.items().get(conversationId)
-      if (!existing) {
-        return null
-      }
+    await this.ensureLoaded()
+    const observed = this.items().get(conversationId)
+    if (!observed) {
+      return null
+    }
 
-      this.items().delete(conversationId)
-      await this.deleteConversationFile(existing)
-      return cloneConversation(existing)
-    })
+    return withCommanderChildCreation(observed.commanderId, this.dataDir, () => (
+      this.withMutationLock(async () => {
+        await this.ensureLoaded()
+        const existing = this.items().get(conversationId)
+        if (!existing) {
+          return null
+        }
+        if (existing.commanderId !== observed.commanderId) {
+          throw new Error(`Conversation "${conversationId}" changed commander during delete`)
+        }
+
+        this.items().delete(conversationId)
+        await this.deleteConversationFile(existing)
+        return cloneConversation(existing)
+      })
+    ))
   }
 
   /**

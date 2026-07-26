@@ -326,7 +326,7 @@ clone_and_exec_installer() {
   fi
 
   REPO_URL="${HERD_REPO_URL:-${HERVALD_REPO_URL:-https://github.com/NickGuAI/Herd.git}}"
-  REPO_REF="${HERD_REPO_REF:-${HERVALD_REPO_REF:-v0.0.8-beta}}"
+  REPO_REF="${HERD_REPO_REF:-${HERVALD_REPO_REF:-v0.0.9-beta}}"
   checkout_override="${HERD_CHECKOUT_DIR:-${HERVALD_CHECKOUT_DIR:-}}"
   CHECKOUT_DIR="${checkout_override:-$default_checkout}"
   ARCHIVE_URL="$(repo_archive_url "$REPO_URL" "$REPO_REF" || true)"
@@ -391,6 +391,7 @@ PROVIDER_BIN_DIR="$PROVIDER_TOOLS_HOME/bin"
 RUNTIME_DEFAULTS_DIR="$APP_DIR/runtime/defaults"
 APP_PATH_FILE="$DATA_DIR/app-path"
 BOOTSTRAP_KEY_FILE="$DATA_DIR/bootstrap-key.txt"
+API_KEY_STORE_FILE="$DATA_DIR/api-keys/keys.json"
 INSTALL_STARTED_AT_FILE="$DATA_DIR/install-started-at.json"
 BOOTSTRAP_LOG_DIR="$DATA_DIR/logs"
 BOOTSTRAP_LOG_FILE="$BOOTSTRAP_LOG_DIR/first-boot.log"
@@ -539,7 +540,6 @@ configure_environment() {
   else
     ok ".env already present"
   fi
-  ensure_default_master_key_env
 }
 
 build_herd() {
@@ -576,19 +576,6 @@ ensure_json_stores_control_plane() {
     "$PNPM_BIN" --dir "$REPO_ROOT" --filter herd run store:ready -- --source-root "$DATA_DIR"; then
     fail "JSON data stores are not ready. Resolve the store:ready error above, then rerun install.sh."
   fi
-}
-
-ensure_default_master_key_env() {
-  local env_file="$APP_DIR/.env"
-
-  [ -f "$env_file" ] || return 0
-  if grep -Eq '^[[:space:]]*HERD_ALLOW_DEFAULT_MASTER_KEY=' "$env_file"; then
-    ok "bootstrap API-key sign-in already configured in $env_file"
-    return 0
-  fi
-
-  printf '\nHERD_ALLOW_DEFAULT_MASTER_KEY=1\n' >> "$env_file"
-  ok "enabled bootstrap API-key sign-in in $env_file"
 }
 
 seed_runtime_defaults() {
@@ -1242,17 +1229,160 @@ read_bootstrap_key() {
   return 0
 }
 
+bootstrap_key_can_resume_first_boot() {
+  "$NODE_BIN" - "$BOOTSTRAP_KEY_FILE" "$API_KEY_STORE_FILE" <<'NODE'
+  const { createHash } = require('node:crypto')
+  const { readFileSync } = require('node:fs')
+
+  const [, , bootstrapKeyPath, apiKeyStorePath] = process.argv
+  try {
+    const bootstrapKey = readFileSync(bootstrapKeyPath, 'utf8').replace(/[\r\n]/gu, '')
+    const collection = JSON.parse(readFileSync(apiKeyStorePath, 'utf8'))
+    if (!collection || typeof collection !== 'object' || !Array.isArray(collection.keys)) {
+      process.exit(2)
+    }
+
+    const apiKeyRecordSchemaVersion = collection.apiKeyRecordSchemaVersion
+    if (apiKeyRecordSchemaVersion !== undefined && apiKeyRecordSchemaVersion !== 1) {
+      process.exit(2)
+    }
+
+    const isRecord = (record) => (
+      record
+      && typeof record === 'object'
+      && ['id', 'name', 'keyHash', 'prefix', 'createdBy', 'createdAt']
+        .every((field) => typeof record[field] === 'string')
+      && (
+        record.expiresAt === undefined
+        || record.expiresAt === null
+        || typeof record.expiresAt === 'string'
+      )
+      && (record.lastUsedAt === null || typeof record.lastUsedAt === 'string')
+      && Array.isArray(record.scopes)
+      && record.scopes.every((scope) => typeof scope === 'string')
+    )
+    const hasLegacyBootstrapTtl = (record) => {
+      if (typeof record.expiresAt !== 'string') {
+        return false
+      }
+      const createdAtMs = Date.parse(record.createdAt)
+      const expiresAtMs = Date.parse(record.expiresAt)
+      return Number.isFinite(createdAtMs)
+        && Number.isFinite(expiresAtMs)
+        && expiresAtMs - createdAtMs === 24 * 60 * 60 * 1000
+    }
+    const hasLegacyBootstrapEvidence = (record) => (
+      record.createdBy === 'system'
+      && !record.prefix.startsWith('hmrb_')
+      && (
+        (record.name === 'Master Key' && record.expiresAt == null)
+        || (record.name === 'Bootstrap Master Key' && hasLegacyBootstrapTtl(record))
+      )
+    )
+    const allowLegacyPurposeInference = apiKeyRecordSchemaVersion === undefined
+    const classifyPurpose = (record) => {
+      if (!isRecord(record)) {
+        throw new Error('invalid API key record')
+      }
+      if (record.purpose === 'bootstrap' || record.purpose === 'permanent') {
+        return record.purpose
+      }
+      if (record.purpose !== undefined || !allowLegacyPurposeInference) {
+        throw new Error('invalid API key purpose')
+      }
+
+      // Keep installer retries aligned with the one-time migration in
+      // server/api-keys/store.ts. Ambiguous legacy records are permanent so a
+      // plaintext file cannot regain bootstrap authority during an upgrade.
+      return hasLegacyBootstrapEvidence(record) ? 'bootstrap' : 'permanent'
+    }
+    const classifiedRecords = collection.keys.map((record) => ({
+      record,
+      purpose: classifyPurpose(record),
+    }))
+
+    const now = Date.now()
+    const isActive = (record) => {
+      if (!record.expiresAt) {
+        return true
+      }
+      const expiresAt = Date.parse(record.expiresAt)
+      return Number.isFinite(expiresAt) && expiresAt > now
+    }
+    const keyHash = createHash('sha256').update(bootstrapKey).digest('hex')
+    const hasActivePermanentKey = classifiedRecords.some(({ record, purpose }) => (
+      purpose === 'permanent' && isActive(record)
+    ))
+    const hasMatchingBootstrapKey = classifiedRecords.some(({ record, purpose }) => (
+      purpose === 'bootstrap'
+      && record.keyHash === keyHash
+      && isActive(record)
+    ))
+
+    process.exit(!hasActivePermanentKey && hasMatchingBootstrapKey ? 0 : 1)
+  } catch {
+    process.exit(2)
+  }
+NODE
+}
+
+prepare_bootstrap_key() {
+  local bootstrap_resume_status
+
+  if [ -e "$API_KEY_STORE_FILE" ]; then
+    if [ -e "$BOOTSTRAP_KEY_FILE" ]; then
+      if bootstrap_key_can_resume_first_boot; then
+        read_bootstrap_key \
+          || fail "The resumable first-boot key file could not be read: $BOOTSTRAP_KEY_FILE"
+        ok "resuming the unfinished first boot with its existing bootstrap key"
+        return 0
+      else
+        bootstrap_resume_status=$?
+        if [ "$bootstrap_resume_status" -eq 2 ]; then
+          fail "Cannot safely inspect the API-key keystore at $API_KEY_STORE_FILE; repair it before rerunning the installer."
+        fi
+      fi
+
+      rm -f -- "$BOOTSTRAP_KEY_FILE"
+      ok "discarded a plaintext bootstrap key that is no longer the only active access path"
+    fi
+    INSTALL_BOOTSTRAP_KEY=""
+    ok "API-key keystore already initialized; bootstrap access will not be recreated"
+    return 0
+  fi
+
+  if read_bootstrap_key; then
+    ok "using the existing local bootstrap key file"
+    return 0
+  fi
+
+  local bootstrap_key
+  bootstrap_key="$("$NODE_BIN" -e "process.stdout.write(require('node:crypto').randomBytes(48).toString('base64url'))")"
+  [ -n "$bootstrap_key" ] || fail "Could not generate the first-boot bootstrap key."
+
+  mkdir -p "$(dirname "$BOOTSTRAP_KEY_FILE")"
+  (umask 077 && printf '%s\n' "$bootstrap_key" > "$BOOTSTRAP_KEY_FILE")
+  chmod 600 "$BOOTSTRAP_KEY_FILE"
+  INSTALL_BOOTSTRAP_KEY="$bootstrap_key"
+  ok "created a local first-boot bootstrap key file with mode 0600"
+}
+
 start_first_boot() {
   local port="$1"
   local login_url="http://localhost:${port}/welcome"
+  local -a bootstrap_env=()
 
   INSTALL_LOGIN_URL="$login_url"
   step "Starting ${PRODUCT_NAME} for first boot"
   mkdir -p "$BOOTSTRAP_LOG_DIR"
-  rm -f "$BOOTSTRAP_KEY_FILE" "$BOOTSTRAP_LOG_FILE"
+  rm -f "$BOOTSTRAP_LOG_FILE"
+  prepare_bootstrap_key
+  if [[ -n "$INSTALL_BOOTSTRAP_KEY" ]]; then
+    bootstrap_env=(HERD_BOOTSTRAP_MASTER_KEY="$INSTALL_BOOTSTRAP_KEY")
+  fi
 
   if auth0_enabled; then
-    env HERD_ALLOW_DEFAULT_MASTER_KEY=1 "$SHIM_PATH" up >"$BOOTSTRAP_LOG_FILE" 2>&1 &
+    env "${bootstrap_env[@]}" "$SHIM_PATH" up >"$BOOTSTRAP_LOG_FILE" 2>&1 &
   else
     env \
       -u AUTH0_DOMAIN \
@@ -1261,7 +1391,7 @@ start_first_boot() {
       -u VITE_AUTH0_DOMAIN \
       -u VITE_AUTH0_AUDIENCE \
       -u VITE_AUTH0_CLIENT_ID \
-      HERD_ALLOW_DEFAULT_MASTER_KEY=1 \
+      "${bootstrap_env[@]}" \
       "$SHIM_PATH" up >"$BOOTSTRAP_LOG_FILE" 2>&1 &
   fi
   local boot_pid=$!
@@ -1274,22 +1404,14 @@ start_first_boot() {
   fi
 
   ok "${PRODUCT_NAME} is running at ${login_url}"
-
-  for _ in {1..20}; do
-    if read_bootstrap_key; then
-      printf '\n%s\n' "${GREEN}${PRODUCT_NAME} is ready.${NC}"
-      return 0
-    fi
-    sleep 0.25
-  done
-
-  warn "The server is healthy, but no bootstrap key file was found."
+  printf '\n%s\n' "${GREEN}${PRODUCT_NAME} is ready.${NC}"
 }
 
 configure_cli_from_first_boot() {
   local port="$1"
   local endpoint="http://localhost:${port}"
   local config_path="$HOME/.herd.json"
+  local config_action="configured"
 
   step "Configuring local herd CLI"
 
@@ -1299,8 +1421,11 @@ configure_cli_from_first_boot() {
       ok "$INSTALL_CLI_CONFIG_STATUS"
       return 0
     fi
+    fail "Cannot configure the local CLI because this keystore is already initialized and bootstrap access cannot be recreated. Restore the existing CLI config or onboard with a valid permanent API key."
+  fi
 
-    fail "Cannot configure the local CLI because no bootstrap API key was generated. Inspect $INSTALL_LOG_FILE"
+  if [[ -f "$config_path" ]]; then
+    config_action="refreshed"
   fi
 
   "$SHIM_PATH" onboard \
@@ -1311,7 +1436,7 @@ configure_cli_from_first_boot() {
     --skip-founder-operator \
     --skip-tailscale
 
-  INSTALL_CLI_CONFIG_STATUS="configured: $config_path"
+  INSTALL_CLI_CONFIG_STATUS="$config_action: $config_path"
   ok "$INSTALL_CLI_CONFIG_STATUS"
 }
 
@@ -1329,10 +1454,10 @@ print_install_receipt() {
   print_receipt_line "Account" "local bootstrap admin"
   print_receipt_line "Password" "not used"
   if [[ -n "$INSTALL_BOOTSTRAP_KEY" ]]; then
-    print_receipt_line "Bootstrap API key" "$INSTALL_BOOTSTRAP_KEY"
+    print_receipt_line "Bootstrap access" "stored locally; expires within 24 hours"
     print_receipt_line "Key file" "$INSTALL_KEY_FILE"
   else
-    print_receipt_line "Bootstrap API key" "not found; inspect $INSTALL_LOG_FILE"
+    print_receipt_line "Bootstrap access" "not recreated for the existing keystore"
   fi
   print_receipt_line "CLI" "$SHIM_PATH"
   print_receipt_line "CLI config" "$INSTALL_CLI_CONFIG_STATUS"
@@ -1444,9 +1569,13 @@ print_configuration_saved_summary
 print_install_receipt
 
 printf "\n${GREEN}Next:${NC}\n"
+if [[ -n "$INSTALL_BOOTSTRAP_KEY" ]]; then
+  printf "  1. Sign in with the bootstrap key stored in %s.\n" "$INSTALL_KEY_FILE"
+else
+  printf "  1. Sign in with the existing permanent API key or the already-configured local CLI.\n"
+fi
 if [[ "$INSTALL_AUTOSTART_STATUS" == installed:* ]]; then
-  printf "  1. Sign in with the bootstrap key shown above.\n"
-  printf "  2. Complete browser onboarding within 24 hours, then create a permanent API key in Settings and rotate or revoke the expiring bootstrap key.\n"
+  printf "  2. Complete browser onboarding within 24 hours, create a permanent API key, revoke the bootstrap key, then delete %s.\n" "$INSTALL_KEY_FILE"
   if [[ "$(uname -s)" == "Darwin" ]]; then
     printf "  3. Herd now auto-starts at login via launchd.\n"
     printf "     Reload after config changes with:\n"
@@ -1458,8 +1587,7 @@ if [[ "$INSTALL_AUTOSTART_STATUS" == installed:* ]]; then
   fi
   printf "  4. Run ${CYAN}herd doctor${NC} after provider authentication if you want a readiness report.\n"
 else
-  printf "  1. Sign in with the bootstrap key shown above.\n"
-  printf "  2. Complete browser onboarding within 24 hours, then create a permanent API key in Settings and rotate or revoke the expiring bootstrap key.\n"
+  printf "  2. Complete browser onboarding within 24 hours, create a permanent API key, revoke the bootstrap key, then delete %s.\n" "$INSTALL_KEY_FILE"
   printf "  3. The server is already running in the background.\n"
   printf "     Restart later with ${CYAN}herd up${NC} (or ${CYAN}herd up --dev${NC} for hot reload).\n"
   printf "  4. Run ${CYAN}herd doctor${NC} after provider authentication if you want a readiness report.\n"

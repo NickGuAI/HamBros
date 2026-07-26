@@ -26,10 +26,7 @@ import { SessionCard } from '@modules/agents/page-shell/SessionCard'
 import { ModalFormContainer } from '@modules/components/ModalFormContainer'
 import type { ClaudeAdaptiveThinkingMode } from '@modules/claude-adaptive-thinking.js'
 import { useConversationRuntimeSettings } from '@modules/conversation/hooks/use-conversation-runtime-settings'
-import {
-  canSelectConversationCredential,
-  CredentialPoolSelect,
-} from '@modules/conversation/components/CredentialPoolSelect'
+import { CredentialPoolSelect } from '@modules/conversation/components/CredentialPoolSelect'
 import type {
   ConversationRecord,
   ConversationRuntimeSettingsUpdate,
@@ -506,7 +503,6 @@ function resolveConversationLifecycleAction(conversation: ConversationRecord): '
 
 interface ConversationChatRowProps {
   conversation: ConversationRecord
-  commanderHost?: string | null
   selected: boolean
   approvalCount?: number
   onSelect?: (id: string) => void
@@ -755,7 +751,6 @@ function CommanderTeamDropdown({
  */
 function ConversationChatRow({
   conversation,
-  commanderHost,
   selected,
   approvalCount = 0,
   onSelect,
@@ -782,7 +777,6 @@ function ConversationChatRow({
   const runtimeSettings = useConversationRuntimeSettings(
     conversation,
     providerOptions,
-    commanderHost,
   )
   const canShowRuntimeSettings = Boolean(conversation.runtimeSettings && onUpdateRuntimeSettings)
   const conversationName = typeof conversation.name === 'string' ? conversation.name : ''
@@ -1138,15 +1132,12 @@ function ConversationChatRow({
                               ))}
                             </select>
                           </label>
-                          {canSelectConversationCredential(
-                            runtimeSettings.draft?.agentType,
-                            runtimeSettings.targetHost,
-                          ) ? (
+                          {runtimeSettings.credentialSelectionMode === 'per-conversation' ? (
                             <label style={chatSettingsLabelStyle}>
                               <span>Credential</span>
                               <CredentialPoolSelect
                                 provider={runtimeSettings.draft?.agentType}
-                                host={runtimeSettings.targetHost}
+                                credentialSelectionMode={runtimeSettings.credentialSelectionMode}
                                 value={runtimeSettings.selectedCredentialPoolId}
                                 currentCredentialPoolId={runtimeSettings.currentCredentialPoolId}
                                 onChange={runtimeSettings.setCredentialPoolId}
@@ -1177,10 +1168,15 @@ function ConversationChatRow({
                               <select
                                 data-testid="commander-chat-effort-select"
                                 value={runtimeSettings.draft?.effort ?? ''}
-                                onChange={(event) => runtimeSettings.setEffort(event.target.value as AgentEffortLevel)}
+                                onChange={(event) => runtimeSettings.setEffort(
+                                  event.target.value as AgentEffortLevel,
+                                )}
                                 disabled={providerBusy || !runtimeSettings.settings?.allowed}
                                 style={chatSettingsSelectStyle}
                               >
+                                {runtimeSettings.draft?.effort === null
+                                  ? <option value="">Provider default</option>
+                                  : null}
                                 {runtimeSettings.effortOptions.map((effort) => (
                                   <option key={effort} value={effort}>{effort}</option>
                                 ))}
@@ -1585,7 +1581,6 @@ export function SessionsColumn({
                       <ConversationChatRow
                         key={conversation.id}
                         conversation={conversation}
-                        commanderHost={c.host}
                         selected={selectedChatId === conversation.id}
                         approvalCount={
                           approvals.filter((approval) => approvalMatchesConversationRow(approval, conversation)).length

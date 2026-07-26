@@ -103,6 +103,15 @@ function parsePersistedOperator(raw: unknown): Operator {
   })
 }
 
+export function isPersistedOperatorValid(raw: unknown): boolean {
+  try {
+    parsePersistedOperator(raw)
+    return true
+  } catch {
+    return false
+  }
+}
+
 interface RawOperatorRead {
   operator: Operator
   rawEmail: string | null

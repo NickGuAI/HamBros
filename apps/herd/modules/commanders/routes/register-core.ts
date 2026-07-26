@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { readFile, rm } from 'node:fs/promises'
 import path from 'node:path'
 import { GEMINI_IMAGE_GENERATION_PROVIDER_ID } from '../../../server/api-keys/provider-secrets-store.js'
 import {
@@ -9,6 +9,7 @@ import {
 import { DEFAULT_CLAUDE_ADAPTIVE_THINKING_MODE } from '../../claude-adaptive-thinking.js'
 import { DEFAULT_CLAUDE_MAX_THINKING_TOKENS } from '../../claude-max-thinking-tokens.js'
 import { appendClaudeReasoningPolicy } from '../../agents/adapters/claude/reasoning-policy.js'
+import { isProviderLaunchError } from '../../agents/session/machine-launch.js'
 import { COMMANDER_STARTUP_USER_EVENT_SUBTYPE } from '../../agents/user-event-subtypes.js'
 import { buildCommandRoomLaunchTarget } from '../../command-room/route-metadata.js'
 import {
@@ -20,10 +21,19 @@ import {
   readCommanderUiProfile,
   resolveCommanderAvatarPath,
   sanitizeUiProfile,
+  writeCommanderAvatarBytes,
   writeCommanderUiProfile,
   type CommanderUiProfile,
 } from '../commander-profile.js'
 import { ensureCommanderVisualProfile } from '../commander-visual-profile.js'
+import {
+  beginCommanderProvisioning,
+  captureCommanderChildMutationVersion,
+} from '../child-mutation-coordinator.js'
+import {
+  deleteCommanderStateOwned,
+  deleteCommanderStateWithLease,
+} from '../commander-deletion.js'
 import {
   createDefaultHeartbeatConfig,
   mergeHeartbeatConfig,
@@ -32,11 +42,12 @@ import {
 import { CommanderManager } from '../manager.js'
 import {
   deleteCommanderDisplayName,
-  withNamesLock,
+  mutateCommanderDisplayName,
 } from '../names-lock.js'
 import { resolveCommanderNamesPath, resolveCommanderPaths } from '../paths.js'
 import {
   parseHost,
+  parseMachineId,
   parseMessage,
   parseMessageMode,
   parseOptionalCommanderAgentType,
@@ -54,6 +65,7 @@ import {
   parseCommanderPortraitStyleId,
 } from '../portrait-styles.js'
 import {
+  buildDefaultCommanderConversationId,
   DEFAULT_COMMANDER_CONTEXT_MODE,
   type CommanderContextMode,
   type CommanderSession,
@@ -80,6 +92,7 @@ import {
   mergeIdentityOperatingStyleIntoCommanderWorkflow,
   readCommanderWorkflowMarkdown,
   scaffoldCommanderWorkflow,
+  writeCommanderWorkflowMarkdown,
 } from '../templates/workflow.js'
 import { findCommanderArchetype } from '../templates/archetypes.js'
 import {
@@ -103,7 +116,6 @@ import {
 } from '../memory/module.js'
 import type { CommanderRoutesContext, CommanderRuntime, StreamEvent } from './types.js'
 import { resolveCommanderWorkflow } from '../workflow-resolution.js'
-import { COMMANDER_WORKFLOW_FILE } from '../workflow.js'
 import {
   appendGaiaOpsSkillGuide,
   buildGaiaOpsEnvWithMetadata,
@@ -189,6 +201,7 @@ interface CommanderTemplatePackage {
   commander: {
     id?: string
     host?: string
+    executionMachineId?: string
     displayName: string
     agentType?: AgentType
     model?: string | null
@@ -447,7 +460,7 @@ async function upsertCommanderDisplayName(
   displayName: string,
 ): Promise<void> {
   const normalizedDisplayName = normalizeCommanderDisplayName(displayName)
-  await withNamesLock(dataDir, (names) => {
+  await mutateCommanderDisplayName(dataDir, commanderId, (names) => {
     const duplicateEntry = Object.entries(names).find(([existingCommanderId, existingDisplayName]) => (
       existingCommanderId !== commanderId
       && normalizeCommanderDisplayName(existingDisplayName) === normalizedDisplayName
@@ -457,17 +470,6 @@ async function upsertCommanderDisplayName(
     }
     names[commanderId] = displayName
   })
-}
-
-function avatarExtensionForMimeType(mimeType: string): string {
-  const extMap: Record<string, string> = {
-    'image/jpeg': '.jpg',
-    'image/png': '.png',
-    'image/webp': '.webp',
-    'image/gif': '.gif',
-  }
-
-  return extMap[mimeType] ?? '.bin'
 }
 
 function sanitizeAvatarGenerationError(error: unknown): string {
@@ -482,26 +484,6 @@ function sanitizeAvatarGenerationError(error: unknown): string {
     .trim()
 
   return sanitized || fallback
-}
-
-async function writeCommanderAvatarBytes(
-  commanderId: string,
-  basePath: string,
-  bytes: Uint8Array,
-  mimeType: string,
-  profilePatch: Partial<CommanderUiProfile> = {},
-): Promise<void> {
-  const avatarFileName = `avatar${avatarExtensionForMimeType(mimeType)}`
-  const { commanderRoot } = resolveCommanderPaths(commanderId, basePath)
-  await mkdir(commanderRoot, { recursive: true })
-  await writeFile(path.join(commanderRoot, avatarFileName), bytes)
-
-  const existing = await readCommanderUiProfile(commanderId, basePath)
-  await writeCommanderUiProfile(commanderId, basePath, {
-    ...ensureCommanderVisualProfile(existing),
-    ...profilePatch,
-    avatar: avatarFileName,
-  } satisfies CommanderUiProfile)
 }
 
 export function registerCoreRoutes(
@@ -667,7 +649,77 @@ export function registerCoreRoutes(
     }
   }
 
-  const persistCreatedCommander = async (
+  const rollbackProvisionedCommanderOwned = async (commanderId: string) => {
+    const [conversations, automations] = await Promise.all([
+      context.conversationStore.listByCommander(commanderId),
+      context.automationStore.list({ parentCommanderId: commanderId }),
+    ])
+    return deleteCommanderStateOwned({
+      commanderId,
+      commanderDataDir: context.commanderDataDir,
+      commanderBasePath: context.commanderBasePath,
+      sessionStore: context.sessionStore,
+      channelBindingStore: context.channelBindingStore,
+      questStore: context.questStore,
+      heartbeatLog: context.heartbeatLog,
+      allowMissingSession: true,
+      deleteChildren: async () => {
+        for (const { id } of [...automations].reverse()) {
+          if (context.automationScheduler) {
+            await context.automationScheduler.deleteAutomation(id)
+          } else {
+            await context.automationStore.delete(id, { removeFiles: true })
+          }
+        }
+        for (const { id } of conversations) {
+          await context.conversationStore.delete(id)
+        }
+      },
+    })
+  }
+
+  const withProvisionedCommander = async <T>(
+    commanderId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> => {
+    const lease = await beginCommanderProvisioning(
+      commanderId,
+      context.commanderDataDir,
+      async () => Boolean(await context.sessionStore.get(commanderId)),
+    )
+    if (!lease) {
+      throw new Error(`Commander "${commanderId}" cannot be provisioned in its current lifecycle state`)
+    }
+
+    let deleted = false
+    try {
+      const result = await lease.runOwned(operation)
+      lease.complete({ deleted: false })
+      return result
+    } catch (error) {
+      let rollback: Awaited<ReturnType<typeof rollbackProvisionedCommanderOwned>>
+      try {
+        rollback = await lease.runOwned(
+          () => rollbackProvisionedCommanderOwned(commanderId),
+        )
+      } catch (rollbackError) {
+        rollback = { deleted: false, error: rollbackError }
+      }
+      deleted = rollback.deleted
+      lease.complete({ deleted })
+      if (!rollback.deleted) {
+        console.warn(
+          `[commanders] Failed to fully roll back provisioned commander "${commanderId}":`,
+          rollback.error,
+        )
+      }
+      throw error
+    } finally {
+      lease.complete({ deleted })
+    }
+  }
+
+  const persistCreatedCommanderOwned = async (
     session: CommanderSession,
     displayName: string,
     options: {
@@ -682,79 +734,61 @@ export function registerCoreRoutes(
       ...session,
       heartbeat,
     })
-    let defaultConversationId: string | null = null
-    let seededAutomationIds: string[] = []
+    await context.ensureDefaultConversation(created, {
+      surface: 'ui',
+      currentTask: null,
+    })
 
-    const rollbackCreatedCommander = async (): Promise<void> => {
-      for (const automationId of seededAutomationIds) {
-        if (context.automationScheduler) {
-          await context.automationScheduler.deleteAutomation(automationId).catch(() => {})
-        } else {
-          await context.automationStore.delete(automationId, { removeFiles: true }).catch(() => {})
-        }
+    if (options.bootstrapBenchmark) {
+      if (!created.cwd || !path.isAbsolute(created.cwd)) {
+        throw new Error('Benchmark commander cwd must be an absolute adapter root')
       }
-      if (defaultConversationId) {
-        await context.conversationStore.delete(defaultConversationId).catch(() => {})
-      }
-      await context.sessionStore.delete(created.id).catch(() => {})
-      const { commanderRoot } = resolveCommanderPaths(created.id, context.commanderBasePath)
-      await rm(commanderRoot, { recursive: true, force: true }).catch(() => {})
-    }
-
-    try {
-      const defaultConversation = await context.ensureDefaultConversation(created, {
-        surface: 'ui',
-        currentTask: null,
-      })
-      defaultConversationId = defaultConversation.id
-
-      if (options.bootstrapBenchmark) {
-        if (!created.cwd || !path.isAbsolute(created.cwd)) {
-          throw new Error('Benchmark commander cwd must be an absolute adapter root')
-        }
-        await bootstrapBenchmarkCommanderFiles(created.id, created.cwd, context.commanderBasePath)
-        const automationSeed = await seedBenchmarkCommanderDefaultAutomations({
-          commanderId: created.id,
-          host: created.host,
-          cwd: created.cwd,
-          model: created.model,
-          automationStore: context.automationStore,
-          automationScheduler: context.automationScheduler,
-          automationSchedulerInitialized: context.automationSchedulerInitialized,
-        })
-        seededAutomationIds = automationSeed.created
-      } else {
-        await scaffoldCommanderWorkflow(
-          created.id,
-          {
-            cwd: created.cwd,
-            displayName,
-          },
-          context.commanderBasePath,
-        )
-      }
-      if (options.identityOperatingStyle) {
-        await mergeIdentityOperatingStyleIntoCommanderWorkflow(
-          created.id,
-          options.identityOperatingStyle,
-          {
-            cwd: created.cwd,
-            displayName,
-            basePath: context.commanderBasePath,
-          },
-        )
-      }
-
-      await upsertCommanderDisplayName(context.commanderDataDir, created.id, displayName)
-      await writeCommanderUiProfile(
+      await bootstrapBenchmarkCommanderFiles(
         created.id,
+        created.cwd,
         context.commanderBasePath,
-        ensureCommanderVisualProfile(options.uiProfile),
+        context.commanderDataDir,
       )
-    } catch (error) {
-      await rollbackCreatedCommander()
-      throw error
+      await seedBenchmarkCommanderDefaultAutomations({
+        commanderId: created.id,
+        executionMachineId: created.executionMachineId!,
+        cwd: created.cwd,
+        model: created.model,
+        automationStore: context.automationStore,
+        automationScheduler: context.automationScheduler,
+        automationSchedulerInitialized: context.automationSchedulerInitialized,
+      })
+    } else {
+      await scaffoldCommanderWorkflow(
+        created.id,
+        {
+          cwd: created.cwd,
+          displayName,
+        },
+        context.commanderBasePath,
+        context.commanderDataDir,
+      )
     }
+    if (options.identityOperatingStyle) {
+      await mergeIdentityOperatingStyleIntoCommanderWorkflow(
+        created.id,
+        options.identityOperatingStyle,
+        {
+          cwd: created.cwd,
+          displayName,
+          basePath: context.commanderBasePath,
+          lifecycleScope: context.commanderDataDir,
+        },
+      )
+    }
+
+    await upsertCommanderDisplayName(context.commanderDataDir, created.id, displayName)
+    await writeCommanderUiProfile(
+      created.id,
+      context.commanderBasePath,
+      ensureCommanderVisualProfile(options.uiProfile),
+      context.commanderDataDir,
+    )
 
     const stats = await context.getCommanderSessionStats(created.id)
     const base = await toCommanderSessionResponse(created, context.conversationStore, undefined, stats, {
@@ -786,7 +820,10 @@ export function registerCoreRoutes(
       ...publicDefinition,
       installState: await getCommanderPackageInstallState(definition, {
         sessionStore: context.sessionStore,
+        conversationStore: context.conversationStore,
+        automationStore: context.automationStore,
         commanderDataDir: context.commanderDataDir,
+        commanderBasePath: context.commanderBasePath,
       }),
     }
   }
@@ -949,6 +986,8 @@ export function registerCoreRoutes(
       context.commanderBasePath,
       file.buffer,
       file.mimetype,
+      {},
+      context.commanderDataDir,
     )
 
     res.json({ avatarUrl: `/api/commanders/${encodeURIComponent(commanderId)}/avatar` })
@@ -1028,6 +1067,7 @@ export function registerCoreRoutes(
         avatarBytes,
         'image/png',
         { portraitStyleId },
+        context.commanderDataDir,
       )
     } catch {
       res.status(500).json({ error: 'Failed to write generated avatar' })
@@ -1086,7 +1126,12 @@ export function registerCoreRoutes(
       ...(req.body?.speakingTone !== undefined ? { speakingTone } : {}),
       ...(portraitStyleProvided && portraitStyleId ? { portraitStyleId } : {}),
     })
-    await writeCommanderUiProfile(commanderId, context.commanderBasePath, merged)
+    await writeCommanderUiProfile(
+      commanderId,
+      context.commanderBasePath,
+      merged,
+      context.commanderDataDir,
+    )
 
     if (effortProvided) {
       await context.sessionStore.update(commanderId, (current) => ({
@@ -1177,6 +1222,13 @@ export function registerCoreRoutes(
     }
     const sessionName = `${WIZARD_SESSION_PREFIX}${randomUUID().split('-').join('')}`
     const cwd = parseMessage(req.body?.cwd) ?? undefined
+    const machineId = req.body?.machineId === undefined || req.body?.machineId === null
+      ? undefined
+      : parseMachineId(req.body.machineId) ?? undefined
+    if (req.body?.machineId !== undefined && req.body?.machineId !== null && !machineId) {
+      res.status(400).json({ error: 'machineId must be a valid machine ID when provided' })
+      return
+    }
     const wizardAuthHeaders = resolveWizardAuthHeaders(req)
     const systemPrompt = buildCommanderWizardSystemPrompt({
       apiBaseUrl: resolveWizardApiBaseUrl(req),
@@ -1191,6 +1243,7 @@ export function registerCoreRoutes(
         effort: effortResolution.effort,
         omitEffort: effortResolution.omitEffort,
         cwd,
+        machineId,
         maxTurns: context.runtimeConfig.defaults.maxTurns,
       })
       const sent = await context.sessionsInterface.sendToSession(
@@ -1213,7 +1266,13 @@ export function registerCoreRoutes(
       })
     } catch (error) {
       context.sessionsInterface.deleteSession(sessionName)
-      res.status(500).json({
+      const status = isProviderLaunchError(error)
+        ? error.statusCode
+        : 500
+      res.status(status).json({
+        ...(isProviderLaunchError(error) && error.code
+          ? { code: error.code }
+          : {}),
         error: error instanceof Error ? error.message : 'Failed to start commander wizard',
       })
     }
@@ -1223,6 +1282,18 @@ export function registerCoreRoutes(
     const host = parseHost(req.body?.host)
     if (!host) {
       res.status(400).json({ error: 'Invalid host' })
+      return
+    }
+    const executionMachineId = req.body?.executionMachineId === undefined
+      || req.body?.executionMachineId === null
+      ? undefined
+      : parseMachineId(req.body.executionMachineId)
+    if (
+      req.body?.executionMachineId !== undefined
+      && req.body?.executionMachineId !== null
+      && !executionMachineId
+    ) {
+      res.status(400).json({ error: 'executionMachineId must be a valid machine ID when provided' })
       return
     }
 
@@ -1378,6 +1449,7 @@ export function registerCoreRoutes(
     const session: CommanderSession = {
       id: randomUUID(),
       host,
+      ...(executionMachineId ? { executionMachineId } : {}),
       avatarSeed,
       state: 'idle',
       created: context.now().toISOString(),
@@ -1399,8 +1471,14 @@ export function registerCoreRoutes(
         res.status(503).json({ error: 'Eval adapter preflight is not configured' })
         return
       }
+      if (!executionMachineId) {
+        res.status(400).json({
+          error: 'Benchmark commanders require an explicit executionMachineId for adapter preflight',
+        })
+        return
+      }
       const preflight = await context.evalAdapterPreflight.check({
-        machineId: host,
+        machineId: executionMachineId,
         adapterRoot: cwd!,
       })
       if (!preflight.ok) {
@@ -1410,11 +1488,14 @@ export function registerCoreRoutes(
     }
 
     try {
-      const created = await persistCreatedCommander(session, displayName, {
-        heartbeat,
-        identityOperatingStyle,
-        bootstrapBenchmark: isBenchmarkCreate,
-      })
+      const created = await withProvisionedCommander(
+        session.id,
+        () => persistCreatedCommanderOwned(session, displayName, {
+          heartbeat,
+          identityOperatingStyle,
+          bootstrapBenchmark: isBenchmarkCreate,
+        }),
+      )
       res.status(201).json(
         displayName !== created.host
           ? { ...created, displayName }
@@ -1466,6 +1547,7 @@ export function registerCoreRoutes(
         commander: {
           id: session.id,
           host: session.host,
+          ...(session.executionMachineId ? { executionMachineId: session.executionMachineId } : {}),
           displayName,
           ...(session.agentType ? { agentType: session.agentType } : {}),
           ...(session.model !== undefined ? { model: session.model } : {}),
@@ -1509,6 +1591,18 @@ export function registerCoreRoutes(
     const sourceDisplayName = parseMessage(commander.displayName)
     if (!sourceDisplayName) {
       res.status(400).json({ error: 'commander.displayName is required' })
+      return
+    }
+    const importedExecutionMachineId = commander.executionMachineId === undefined
+      || commander.executionMachineId === null
+      ? undefined
+      : parseMachineId(commander.executionMachineId)
+    if (
+      commander.executionMachineId !== undefined
+      && commander.executionMachineId !== null
+      && !importedExecutionMachineId
+    ) {
+      res.status(400).json({ error: 'commander.executionMachineId must be a valid machine ID when provided' })
       return
     }
 
@@ -1627,6 +1721,7 @@ export function registerCoreRoutes(
     const session: CommanderSession = {
       id: randomUUID(),
       host,
+      ...(importedExecutionMachineId ? { executionMachineId: importedExecutionMachineId } : {}),
       state: 'idle',
       created: context.now().toISOString(),
       agentType: importedAgentType,
@@ -1640,61 +1735,69 @@ export function registerCoreRoutes(
       ...(sourceCommanderId ? { templateId: sourceCommanderId } : {}),
     }
 
-    const createdAutomationIds: string[] = []
-
     try {
-      const created = await persistCreatedCommander(session, displayName, {
-        uiProfile: importedProfile,
-      })
-      if (commanderMd !== null) {
-        const { commanderRoot } = resolveCommanderPaths(session.id, context.commanderBasePath)
-        await mkdir(commanderRoot, { recursive: true })
-        await writeFile(
-          path.join(commanderRoot, COMMANDER_WORKFLOW_FILE),
-          `${commanderMd.trimEnd()}\n`,
-          'utf8',
-        )
-      }
-      if (identityOperatingStyle) {
-        await mergeIdentityOperatingStyleIntoCommanderWorkflow(
-          session.id,
-          identityOperatingStyle,
-          {
-            cwd: session.cwd,
-            displayName,
-            basePath: context.commanderBasePath,
-          },
-        )
-      }
-
-      if (memoryMd !== undefined) {
-        const applied = await applyRemoteMemorySnapshot(
-          session.id,
-          0,
-          memoryMd,
-          context.commanderBasePath,
-        )
-        if (applied.status !== 'applied') {
-          throw new Error('Memory snapshot could not be applied to imported commander')
-        }
-      }
-
-      await installCommanderBundleSkills(session.id, context.commanderBasePath, parsedSkillBindings.value)
-      if (parsedAutomations.value.length > 0) {
-        await context.automationSchedulerInitialized
-      }
-      for (const automation of parsedAutomations.value) {
-        const input = buildImportedCommanderBundleAutomationInput({
-          sourceCommanderId,
-          commanderId: session.id,
-          defaultAgentType: importedAgentType,
-          automation,
+      const created = await withProvisionedCommander(session.id, async () => {
+        const provisioned = await persistCreatedCommanderOwned(session, displayName, {
+          uiProfile: importedProfile,
         })
-        const createdAutomation = context.automationScheduler
-          ? await context.automationScheduler.createAutomation(input)
-          : await context.automationStore.create(input)
-        createdAutomationIds.push(createdAutomation.id)
-      }
+        if (commanderMd !== null) {
+          await writeCommanderWorkflowMarkdown(
+            session.id,
+            commanderMd,
+            context.commanderBasePath,
+            context.commanderDataDir,
+          )
+        }
+        if (identityOperatingStyle) {
+          await mergeIdentityOperatingStyleIntoCommanderWorkflow(
+            session.id,
+            identityOperatingStyle,
+            {
+              cwd: session.cwd,
+              displayName,
+              basePath: context.commanderBasePath,
+              lifecycleScope: context.commanderDataDir,
+            },
+          )
+        }
+
+        if (memoryMd !== undefined) {
+          const applied = await applyRemoteMemorySnapshot(
+            session.id,
+            0,
+            memoryMd,
+            context.commanderBasePath,
+            context.commanderDataDir,
+          )
+          if (applied.status !== 'applied') {
+            throw new Error('Memory snapshot could not be applied to imported commander')
+          }
+        }
+
+        await installCommanderBundleSkills(
+          session.id,
+          context.commanderBasePath,
+          parsedSkillBindings.value,
+          context.commanderDataDir,
+        )
+        if (parsedAutomations.value.length > 0) {
+          await context.automationSchedulerInitialized
+        }
+        for (const automation of parsedAutomations.value) {
+          const input = buildImportedCommanderBundleAutomationInput({
+            sourceCommanderId,
+            commanderId: session.id,
+            defaultAgentType: importedAgentType,
+            automation,
+          })
+          if (context.automationScheduler) {
+            await context.automationScheduler.createAutomation(input)
+          } else {
+            await context.automationStore.create(input)
+          }
+        }
+        return provisioned
+      })
 
       res.status(201).json({
         ...created,
@@ -1702,17 +1805,6 @@ export function registerCoreRoutes(
         url: buildCommandRoomLaunchTarget({ commanderId: session.id }).path,
       })
     } catch (error) {
-      for (const automationId of createdAutomationIds) {
-        if (context.automationScheduler) {
-          await context.automationScheduler.deleteAutomation(automationId).catch(() => {})
-        } else {
-          await context.automationStore.delete(automationId, { removeFiles: true }).catch(() => {})
-        }
-      }
-      await context.sessionStore.delete(session.id).catch(() => {})
-      await deleteCommanderDisplayName(context.commanderDataDir, session.id).catch(() => {})
-      const { commanderRoot } = resolveCommanderPaths(session.id, context.commanderBasePath)
-      await rm(commanderRoot, { recursive: true, force: true }).catch(() => {})
       if (error instanceof DuplicateCommanderDisplayNameError) {
         res.status(409).json({ error: error.message })
         return
@@ -1771,6 +1863,7 @@ export function registerCoreRoutes(
     const session: CommanderSession = {
       id: randomUUID(),
       host,
+      ...(source.executionMachineId ? { executionMachineId: source.executionMachineId } : {}),
       avatarSeed: source.avatarSeed,
       state: 'idle',
       created: context.now().toISOString(),
@@ -1790,18 +1883,20 @@ export function registerCoreRoutes(
     try {
       const sourceProfile = await readCommanderUiProfile(sourceCommanderId, context.commanderBasePath)
       const sourceCommanderMd = await readCommanderWorkflowMarkdown(sourceCommanderId, context.commanderBasePath)
-      const created = await persistCreatedCommander(session, displayName, {
-        uiProfile: sourceProfile,
+      const created = await withProvisionedCommander(session.id, async () => {
+        const provisioned = await persistCreatedCommanderOwned(session, displayName, {
+          uiProfile: sourceProfile,
+        })
+        if (sourceCommanderMd !== null) {
+          await writeCommanderWorkflowMarkdown(
+            session.id,
+            sourceCommanderMd,
+            context.commanderBasePath,
+            context.commanderDataDir,
+          )
+        }
+        return provisioned
       })
-      if (sourceCommanderMd !== null) {
-        const { commanderRoot } = resolveCommanderPaths(session.id, context.commanderBasePath)
-        await mkdir(commanderRoot, { recursive: true })
-        await writeFile(
-          path.join(commanderRoot, COMMANDER_WORKFLOW_FILE),
-          `${sourceCommanderMd.trimEnd()}\n`,
-          'utf8',
-        )
-      }
       res.status(201).json(
         displayName !== created.host
           ? { ...created, displayName }
@@ -1834,6 +1929,7 @@ export function registerCoreRoutes(
     const modelProvided = req.body?.model !== undefined
     const effortProvided = req.body?.effort !== undefined
     const cwdProvided = req.body?.cwd !== undefined
+    const executionMachineIdProvided = req.body?.executionMachineId !== undefined
     const maxTurnsProvided = req.body?.maxTurns !== undefined
     const contextModeProvided = req.body?.contextMode !== undefined
     const portraitStyleProvided = req.body?.portraitStyleId !== undefined
@@ -1844,6 +1940,7 @@ export function registerCoreRoutes(
       && !modelProvided
       && !effortProvided
       && !cwdProvided
+      && !executionMachineIdProvided
       && !maxTurnsProvided
       && !contextModeProvided
       && !portraitStyleProvided
@@ -1920,6 +2017,18 @@ export function registerCoreRoutes(
       res.status(400).json({ error: 'cwd must be a string when provided' })
       return
     }
+    const executionMachineId = !executionMachineIdProvided
+      || req.body?.executionMachineId === null
+      ? undefined
+      : parseMachineId(req.body.executionMachineId) ?? undefined
+    if (
+      executionMachineIdProvided
+      && req.body?.executionMachineId !== null
+      && !executionMachineId
+    ) {
+      res.status(400).json({ error: 'executionMachineId must be a valid machine ID or null' })
+      return
+    }
 
     const session = await context.sessionStore.get(commanderId)
     if (!session) {
@@ -1971,6 +2080,7 @@ export function registerCoreRoutes(
           ? { effort: effortResolution.effort }
           : {}),
         ...(cwdProvided ? { cwd } : {}),
+        ...(executionMachineIdProvided ? { executionMachineId } : {}),
         ...(maxTurnsProvided && parsedMaxTurns.value !== undefined ? { maxTurns: parsedMaxTurns.value } : {}),
         ...(contextModeProvided && parsedContextMode.value !== undefined ? { contextMode: parsedContextMode.value } : {}),
         ...(contextModeProvided && nextContextMode === 'thin' ? { contextConfig: undefined } : {}),
@@ -2007,6 +2117,7 @@ export function registerCoreRoutes(
           ...(existingProfile ?? {}),
           portraitStyleId,
         }),
+        context.commanderDataDir,
       )
     }
 
@@ -2018,10 +2129,7 @@ export function registerCoreRoutes(
       }
     }
 
-    res.json({
-      ...updated,
-      displayName: nextDisplayName,
-    })
+    res.json(await buildCommanderApiResponse(updated, nextDisplayName))
   })
 
   const startCommanderRoute = async (
@@ -2126,6 +2234,7 @@ export function registerCoreRoutes(
         context.commanderBasePath,
         {
           onSubagentLifecycleEvent: (event) => context.onSubagentLifecycleEvent(commanderId, event),
+          lifecycleScope: context.commanderDataDir,
         },
       )
       await manager.init()
@@ -2193,6 +2302,7 @@ export function registerCoreRoutes(
         effort: effortResolution.effort,
         omitEffort: effortResolution.omitEffort,
         cwd: started.cwd ?? undefined,
+        machineId: started.executionMachineId,
         maxTurns: built.maxTurns,
         ...(gaiaOpsEnv ? {
           env: gaiaOpsEnv.env,
@@ -2324,7 +2434,13 @@ export function registerCoreRoutes(
       } catch (rollbackError) {
         console.error(`[commanders] Failed to roll back start for "${commanderId}":`, rollbackError)
       }
-      res.status(500).json({
+      const status = isProviderLaunchError(error)
+        ? error.statusCode
+        : 500
+      res.status(status).json({
+        ...(isProviderLaunchError(error) && error.code
+          ? { code: error.code }
+          : {}),
         error: error instanceof Error ? error.message : 'Failed to start commander',
       })
     }
@@ -2525,66 +2641,127 @@ export function registerCoreRoutes(
       return
     }
 
-    const conversations = await context.conversationStore.listByCommander(commanderId)
-    const activeLiveConversation = conversations.find((conversation) => (
-      conversation.status === 'active'
-      && Boolean(getLiveConversationSession(context, conversation))
-    ))
-    if (activeLiveConversation) {
-      res.status(409).json({
-        error: `Commander "${commanderId}" has an active live conversation "${activeLiveConversation.id}". Stop it before deleting.`,
+    // Archive the current children normally, then turn a final generation +
+    // child-state observation into the exclusive deletion lease. A child or
+    // metadata writer racing that observation invalidates it and is swept on
+    // the next attempt; a writer queued after lease acquisition is rejected
+    // when the parent tombstone commits.
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const currentSession = await context.sessionStore.get(commanderId)
+      if (!currentSession) {
+        res.status(404).json({ error: `Commander "${commanderId}" not found` })
+        return
+      }
+      if (isProtectedSystemCommander(currentSession)) {
+        res.status(403).json({ error: `Commander "${commanderId}" is a system commander and cannot be deleted.` })
+        return
+      }
+      if (currentSession.state === 'running') {
+        res.status(409).json({
+          error: `Commander "${commanderId}" is running. Stop it before deleting.`,
+        })
+        return
+      }
+
+      const conversations = await context.conversationStore.listByCommander(commanderId)
+      const activeLiveConversation = conversations.find((conversation) => (
+        conversation.status === 'active'
+        && Boolean(getLiveConversationSession(context, conversation))
+      ))
+      if (activeLiveConversation) {
+        res.status(409).json({
+          error: `Commander "${commanderId}" has an active live conversation "${activeLiveConversation.id}". Stop it before deleting.`,
+        })
+        return
+      }
+
+      try {
+        for (const conversation of conversations) {
+          if (conversation.status !== 'archived') {
+            await stopConversationSession(context, conversation, 'archived')
+          }
+        }
+      } catch (error) {
+        res.status(500).json({
+          error: error instanceof Error
+            ? error.message
+            : `Failed to archive conversations for commander "${commanderId}"`,
+        })
+        return
+      }
+
+      const observedMutationVersion = captureCommanderChildMutationVersion(
+        commanderId,
+        context.commanderDataDir,
+      )
+      const [finalSession, finalConversations, finalAutomations] = await Promise.all([
+        context.sessionStore.get(commanderId),
+        context.conversationStore.listByCommander(commanderId),
+        context.automationStore.list({ parentCommanderId: commanderId }),
+      ])
+      if (!finalSession) {
+        res.status(404).json({ error: `Commander "${commanderId}" not found` })
+        return
+      }
+      if (finalSession.state === 'running') {
+        res.status(409).json({
+          error: `Commander "${commanderId}" is running. Stop it before deleting.`,
+        })
+        return
+      }
+      if (finalConversations.some((conversation) => conversation.status !== 'archived')) {
+        continue
+      }
+
+      context.heartbeatManager.stopForCommander(commanderId)
+      const deletion = await deleteCommanderStateWithLease({
+        commanderId,
+        commanderDataDir: context.commanderDataDir,
+        commanderBasePath: context.commanderBasePath,
+        observedMutationVersion,
+        sessionStore: context.sessionStore,
+        questStore: context.questStore,
+        heartbeatLog: context.heartbeatLog,
+        deleteChildren: async () => {
+          for (const automation of [...finalAutomations].reverse()) {
+            if (context.automationScheduler) {
+              await context.automationScheduler.deleteAutomation(automation.id)
+            } else {
+              await context.automationStore.delete(automation.id, { removeFiles: true })
+            }
+          }
+        },
       })
+      if (!deletion.leaseAcquired) {
+        continue
+      }
+      if (!deletion.deleted) {
+        res.status(500).json({
+          error: deletion.error instanceof Error
+            ? deletion.error.message
+            : `Failed to delete commander "${commanderId}"`,
+        })
+        return
+      }
+
+      const runtime = context.runtimes.get(commanderId)
+      if (runtime) {
+        if (runtime.collectTimer) {
+          clearTimeout(runtime.collectTimer)
+          runtime.collectTimer = null
+        }
+        runtime.pendingCollect = []
+        runtime.unsubscribeEvents?.()
+        context.runtimes.delete(commanderId)
+      }
+      context.activeCommanderSessions.delete(commanderId)
+      res.status(204).send()
       return
     }
 
-    context.heartbeatManager.stopForCommander(commanderId)
-
-    // Cascade-archive every conversation owned by this commander BEFORE the
-    // commander row itself is removed. Otherwise inbound channel webhooks can
-    // hit the orphan conversation later and crash on the missing-commander
-    // path. See codex-review P1 on PR #1279 (comment 3174814198).
-    for (const conversation of conversations) {
-      try {
-        await stopConversationSession(context, conversation, 'archived')
-      } catch (error) {
-        console.warn(
-          `[commanders] Failed to archive conversation "${conversation.id}" during commander delete "${commanderId}":`,
-          error,
-        )
-      }
-    }
-
-    const runtime = context.runtimes.get(commanderId)
-    if (runtime) {
-      if (runtime.collectTimer) {
-        clearTimeout(runtime.collectTimer)
-        runtime.collectTimer = null
-      }
-      runtime.pendingCollect = []
-      runtime.unsubscribeEvents?.()
-      context.runtimes.delete(commanderId)
-    }
-    context.activeCommanderSessions.delete(commanderId)
-
-    await context.sessionStore.delete(commanderId)
-    try {
-      await deleteCommanderDisplayName(context.commanderDataDir, commanderId)
-    } catch (error) {
-      console.warn(
-        `[commanders] Failed to remove display name for "${commanderId}":`,
-        error,
-      )
-    }
-    try {
-      const { commanderRoot } = resolveCommanderPaths(commanderId, context.commanderBasePath)
-      await rm(commanderRoot, { recursive: true, force: true })
-    } catch (error) {
-      console.warn(
-        `[commanders] Failed to remove commander root for "${commanderId}":`,
-        error,
-      )
-    }
-    res.status(204).send()
+    res.status(409).json({
+      error: `Commander "${commanderId}" changed repeatedly while deletion was being prepared.`,
+    })
   })
 
   router.patch('/:id/heartbeat', context.requireWriteAccess, async (req, res) => {

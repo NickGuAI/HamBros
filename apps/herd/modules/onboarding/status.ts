@@ -5,14 +5,24 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 import { isDeepStrictEqual, promisify } from 'node:util'
 import type { AuthUser } from '@gehirn/auth-providers'
+import {
+  DEFAULT_BOOTSTRAP_MASTER_KEY_SCOPES,
+  type ApiKeyRecord,
+  type ApiKeyStoreLike,
+} from '../../server/api-keys/store.js'
 import { DEFAULT_CLAUDE_EFFORT_LEVEL } from '../claude-effort.js'
 import { createMachineRegistryStore } from '../agents/machines.js'
+import {
+  type ProviderExecutionCapability,
+  type ProviderExecutionReadiness,
+} from '../agents/provider-execution-mode.js'
 import { mapStreamEventsToMessages } from '../agents/messages/history.js'
 import { resolveDefaultProviderId } from '../agents/providers/registry.js'
 import { readTranscriptHeadPage } from '../agents/transcript-store.js'
 import type { ProviderAdapter } from '../agents/providers/provider-adapter.js'
 import type { AutomationScheduler } from '../automations/scheduler.js'
 import type { AutomationStore } from '../automations/store.js'
+import { resolveSkill } from '../automations/skills.js'
 import { createDefaultHeartbeatConfig } from '../commanders/heartbeat.js'
 import {
   readCommanderDisplayNames,
@@ -35,14 +45,22 @@ import { createFounderBootstrapCandidate } from '../operators/founder-bootstrap.
 import type { OperatorStore } from '../operators/store.js'
 import { OrgIdentityStore } from '../org-identity/store.js'
 import {
+  CommanderBundledPackagesRootNotFoundError,
   STARTER_COMMANDER_PACKAGE_IDS,
+  STARTER_COMMANDER_PACKAGE_STATUS_DEFAULTS,
   loadCommanderPackage,
 } from '../commanders/packages/registry.js'
 import { buildCommandRoomLaunchTarget } from '../command-room/route-metadata.js'
 import type { CommanderPackageDefinition } from '../commanders/packages/types.js'
 import {
+  cleanupCommanderPackageInstall,
+  CommanderPackageRollbackError,
   getCommanderPackageInstallState,
   installCommanderPackage,
+  runInCommanderPackageTransaction,
+  type CommanderPackageCleanupFailure,
+  type CommanderPackageCleanupReceipt,
+  type CommanderPackageTransaction,
 } from '../commanders/packages/install.js'
 import {
   DEFAULT_FOUNDER_ORG_SETUP_FORM_VALUES,
@@ -52,6 +70,8 @@ import {
   type FounderSetupStatus,
   type GaiaOnboardingStatus,
   type MachineOnboardingReadiness,
+  type OnboardingCredentialAuth,
+  type OnboardingCredentialStatus,
   type OnboardingReadinessState,
   type OnboardingReceipt,
   type OnboardingFirstReplyMetric,
@@ -59,6 +79,7 @@ import {
   type OnboardingStep,
   type OnboardingStepId,
   type ProviderOnboardingReadiness,
+  type ProviderExecutionOnboardingStatus,
   type StarterCommanderPackageStatus,
   type StarterWorkforceOnboardingStatus,
 } from './contracts.js'
@@ -95,11 +116,72 @@ export interface BuildOnboardingStatusOptions {
   orgIdentityStore?: OrgIdentityStore
   sessionStore: Pick<CommanderSessionStore, 'list'>
   conversationStore?: Pick<ConversationStore, 'listByCommander' | 'getActiveChatForCommander'>
+  automationStore?: Pick<AutomationStore, 'list'>
   commanderDataDir: string
   publicBaseUrl?: string
   providers: readonly ProviderAdapter[]
+  providerExecution: ProviderExecutionCapability
+  apiKeyStore?: ApiKeyStoreLike
+  authenticatedCredential?: OnboardingCredentialAuth
+  authenticatedCanManageApiKeys?: boolean
   env?: NodeJS.ProcessEnv
   shellRunner?: OnboardingShellRunner
+  loadStarterPackage?: typeof loadCommanderPackage
+  packageTransaction?: CommanderPackageTransaction
+}
+
+function isActiveApiKey(record: ApiKeyRecord, nowMs: number): boolean {
+  if (!record.expiresAt) {
+    return true
+  }
+  const expiresAtMs = Date.parse(record.expiresAt)
+  return Number.isFinite(expiresAtMs) && expiresAtMs > nowMs
+}
+
+function isPermanentAdminKey(record: ApiKeyRecord): boolean {
+  if (record.purpose !== 'permanent' || record.expiresAt) {
+    return false
+  }
+  const scopes = new Set(record.scopes)
+  return DEFAULT_BOOTSTRAP_MASTER_KEY_SCOPES.every((scope) => scopes.has(scope))
+}
+
+async function buildCredentialStatus(
+  options: Pick<
+    BuildOnboardingStatusOptions,
+    'apiKeyStore' | 'authenticatedCredential' | 'authenticatedCanManageApiKeys'
+  >,
+): Promise<OnboardingCredentialStatus> {
+  const records = options.apiKeyStore?.listKeys
+    ? await options.apiKeyStore.listKeys()
+    : []
+  const nowMs = Date.now()
+  const activeRecords = records.filter((record) => isActiveApiKey(record, nowMs))
+  const activePermanentKeyCount = activeRecords.filter(isPermanentAdminKey).length
+  const activeBootstrapKeys = activeRecords
+    .filter((record) => record.purpose === 'bootstrap')
+    .map((record) => ({
+      id: record.id,
+      name: record.name,
+      expiresAt: record.expiresAt ?? null,
+    }))
+  const authenticatedAs = options.authenticatedCredential ?? 'unknown'
+  const ready = activePermanentKeyCount > 0 && activeBootstrapKeys.length === 0
+
+  return {
+    ready,
+    state: ready ? 'ready' : activePermanentKeyCount > 0 ? 'warning' : 'missing',
+    activePermanentKeyCount,
+    activeBootstrapKeys,
+    authenticatedAs,
+    canRevokeBootstrap: authenticatedAs === 'auth0'
+      || (authenticatedAs === 'permanent' && options.authenticatedCanManageApiKeys === true),
+    summary: ready
+      ? 'A permanent admin API key is active and bootstrap access is revoked.'
+      : activePermanentKeyCount === 0
+        ? 'Create, save, and verify a non-expiring permanent admin API key before revoking bootstrap access.'
+        : 'Use the permanent admin API key, then revoke every active bootstrap key.',
+  }
 }
 
 export interface SeedGaiaOptions extends BuildOnboardingStatusOptions {
@@ -108,11 +190,60 @@ export interface SeedGaiaOptions extends BuildOnboardingStatusOptions {
 }
 
 export interface SeedStarterWorkforceOptions extends BuildOnboardingStatusOptions {
-  sessionStore: Pick<CommanderSessionStore, 'list' | 'create' | 'delete'>
+  sessionStore: Pick<CommanderSessionStore, 'list' | 'get' | 'create' | 'delete' | 'restoreAfterFailedCleanup'>
   conversationStore?: Pick<ConversationStore, 'listByCommander' | 'getActiveChatForCommander' | 'ensureDefaultConversation' | 'delete'>
-  automationStore?: Pick<AutomationStore, 'create' | 'delete'>
+  automationStore?: Pick<AutomationStore, 'create' | 'delete' | 'list'>
   automationScheduler?: Pick<AutomationScheduler, 'createAutomation' | 'deleteAutomation'>
   automationSchedulerInitialized?: Promise<void>
+  resolveAutomationSkill?: typeof resolveSkill
+}
+
+export class StarterWorkforcePreflightError extends Error {
+  constructor(
+    public readonly missingPackageIds: readonly string[],
+    public readonly missingSkillIds: readonly string[],
+  ) {
+    const details = [
+      missingPackageIds.length > 0
+        ? `missing packages: ${missingPackageIds.join(', ')}`
+        : null,
+      missingSkillIds.length > 0
+        ? `missing skills: ${missingSkillIds.join(', ')}`
+        : null,
+    ].filter((detail): detail is string => Boolean(detail))
+    super(`Starter workforce preflight failed (${details.join('; ')}). Restore the packaged starter assets and retry.`)
+    this.name = 'StarterWorkforcePreflightError'
+  }
+}
+
+export class StarterWorkforceRollbackError extends Error {
+  constructor(
+    cause: unknown,
+    public readonly cleanupFailures: readonly CommanderPackageCleanupFailure[],
+  ) {
+    super(
+      `Starter workforce installation failed and batch rollback could not complete: ${cleanupFailures.map((failure) => `${failure.packageId}: ${failure.operation}`).join(', ')}`,
+      { cause },
+    )
+    this.name = 'StarterWorkforceRollbackError'
+  }
+}
+
+async function loadStarterPackageDefinitions(
+  loader: typeof loadCommanderPackage,
+): Promise<Array<CommanderPackageDefinition | null>> {
+  return Promise.all(STARTER_COMMANDER_PACKAGE_IDS.map(async (packageId) => {
+    try {
+      return await loader(packageId)
+    } catch (error) {
+      const isMissingPath = (error as NodeJS.ErrnoException).code === 'ENOENT'
+      const isMissingBundledRoot = error instanceof CommanderBundledPackagesRootNotFoundError
+      if (isMissingPath || isMissingBundledRoot) {
+        return null
+      }
+      throw error
+    }
+  }))
 }
 
 interface OnboardingState {
@@ -438,8 +569,11 @@ export async function gaiaCommanderExists(
 async function buildGaiaStatus(
   options: Pick<BuildOnboardingStatusOptions, 'sessionStore' | 'conversationStore' | 'commanderDataDir' | 'providers'>,
   providersInput: readonly ProviderOnboardingReadiness[] | Promise<readonly ProviderOnboardingReadiness[]>,
+  gaiaInput?: CommanderSession | null | Promise<CommanderSession | null>,
 ): Promise<GaiaOnboardingStatus> {
-  const gaiaPromise = findGaiaCommander(options)
+  const gaiaPromise = gaiaInput === undefined
+    ? findGaiaCommander(options)
+    : Promise.resolve(gaiaInput)
   const providers = await providersInput
   const gaia = await gaiaPromise
   const defaultProviderId = gaia?.agentType
@@ -485,12 +619,13 @@ async function ensureGaiaCommanderSeedArtifacts(
       cwd,
       displayName: GAIA_DISPLAY_NAME,
       basePath: options.commanderDataDir,
+      lifecycleScope: options.commanderDataDir,
     }),
     setCommanderDisplayName(options.commanderDataDir, commander.id, GAIA_DISPLAY_NAME),
     writeCommanderUiProfile(commander.id, options.commanderDataDir, ensureCommanderVisualProfile({
       avatar: GAIA_COMMANDER_AVATAR_URL,
       speakingTone: GAIA_SPEAKING_TONE,
-    })),
+    }), options.commanderDataDir),
   ]
 
   const results = await Promise.allSettled(sideEffects)
@@ -502,42 +637,82 @@ async function ensureGaiaCommanderSeedArtifacts(
 }
 
 export async function buildStarterWorkforceStatus(
-  options: Pick<BuildOnboardingStatusOptions, 'sessionStore' | 'commanderDataDir'>,
+  options: Pick<
+    BuildOnboardingStatusOptions,
+    | 'sessionStore'
+    | 'conversationStore'
+    | 'automationStore'
+    | 'commanderDataDir'
+    | 'loadStarterPackage'
+    | 'packageTransaction'
+  >,
 ): Promise<StarterWorkforceOnboardingStatus> {
-  const [packages, onboardingState] = await Promise.all([
-    Promise.all(
-      STARTER_COMMANDER_PACKAGE_IDS.map(async (packageId): Promise<StarterCommanderPackageStatus | null> => {
-        const definition = await loadCommanderPackage(packageId)
-        if (!definition) {
-          return null
-        }
-        const installState = await getCommanderPackageInstallState(definition, {
-          sessionStore: options.sessionStore,
-          commanderDataDir: options.commanderDataDir,
-        })
-        return {
-          packageId: definition.id,
-          displayName: definition.displayName,
-          role: definition.role,
-          summary: definition.summary,
-          installed: installState.installed,
-          commanderId: installState.commanderId,
-        }
-      }),
-    ),
+  return runInCommanderPackageTransaction(
+    options.commanderDataDir,
+    options.packageTransaction,
+    (packageTransaction) => buildStarterWorkforceStatusLocked({
+      ...options,
+      packageTransaction,
+    }),
+  )
+}
+
+async function buildStarterWorkforceStatusLocked(
+  options: Pick<
+    BuildOnboardingStatusOptions,
+    | 'sessionStore'
+    | 'conversationStore'
+    | 'automationStore'
+    | 'commanderDataDir'
+    | 'loadStarterPackage'
+    | 'packageTransaction'
+  >,
+): Promise<StarterWorkforceOnboardingStatus> {
+  const loader = options.loadStarterPackage ?? loadCommanderPackage
+  const [definitions, onboardingState] = await Promise.all([
+    loadStarterPackageDefinitions(loader),
     readOnboardingState(options.commanderDataDir),
   ])
-  const visiblePackages = packages.filter((entry): entry is StarterCommanderPackageStatus => Boolean(entry))
-  const installedCount = visiblePackages.filter((entry) => entry.installed).length
-  const installedComplete = visiblePackages.length > 0 && installedCount === visiblePackages.length
+  const packages = await Promise.all(STARTER_COMMANDER_PACKAGE_IDS.map(
+    async (packageId, index): Promise<StarterCommanderPackageStatus> => {
+      const definition = definitions[index]
+      if (!definition) {
+        return {
+          packageId,
+          ...STARTER_COMMANDER_PACKAGE_STATUS_DEFAULTS[packageId],
+          installed: false,
+          commanderId: null,
+        }
+      }
+      const installState = await getCommanderPackageInstallState(definition, {
+        sessionStore: options.sessionStore,
+        conversationStore: options.conversationStore,
+        automationStore: options.automationStore,
+        commanderDataDir: options.commanderDataDir,
+        packageTransaction: options.packageTransaction,
+      })
+      return {
+        packageId: definition.id,
+        displayName: definition.displayName,
+        role: definition.role,
+        summary: definition.summary,
+        installed: installState.installed,
+        commanderId: installState.commanderId,
+      }
+    },
+  ))
+  const definitionsAvailable = definitions.every(Boolean)
+  const installedCount = packages.filter((entry) => entry.installed).length
+  const installedComplete = definitionsAvailable
+    && installedCount === STARTER_COMMANDER_PACKAGE_IDS.length
   const skipped = !installedComplete && onboardingState.starterWorkforceSkipped === true
 
   return {
-    packages: visiblePackages,
+    packages,
     installedCount,
-    totalCount: visiblePackages.length,
+    totalCount: STARTER_COMMANDER_PACKAGE_IDS.length,
     skipped,
-    complete: installedComplete || skipped,
+    complete: definitionsAvailable && (installedComplete || skipped),
   }
 }
 
@@ -611,27 +786,61 @@ async function probeProvider(
 
 async function buildProviderReadiness(
   options: Pick<BuildOnboardingStatusOptions, 'providers' | 'env' | 'shellRunner'>,
+  providerExecution: ProviderExecutionReadiness,
 ): Promise<ProviderOnboardingReadiness[]> {
+  if (providerExecution.mode === 'daemon-only') {
+    return options.providers.map((provider): ProviderOnboardingReadiness => {
+      const installed = providerExecution.daemons.some((daemon) => (
+        daemon.connected && daemon.installedProviderIds.includes(provider.id)
+      ))
+      const ready = providerExecution.readyProviderIds.includes(provider.id)
+      return {
+        id: provider.id,
+        label: provider.label,
+        cliBinaryName: provider.machineAuth?.cliBinaryName ?? null,
+        installed,
+        authConfigured: ready,
+        authMode: ready ? 'unknown' : 'missing',
+        state: ready ? 'ready' : installed ? 'warning' : 'missing',
+        shortAction: ready
+          ? 'Ready on a connected daemon.'
+          : installed
+            ? 'Authenticate this provider on a connected daemon or attach a ready host-managed credential.'
+            : 'Connect a daemon with this provider installed and authenticated.',
+        verificationCommand: null,
+        envSourceKey: null,
+      }
+    })
+  }
   const env = options.env ?? process.env
   const fileEnv = await readLocalEnvValues(env)
   const shellRunner = options.shellRunner ?? defaultShellRunner
   return Promise.all(options.providers.map((provider) => probeProvider(provider, env, fileEnv, shellRunner)))
 }
 
+async function buildProviderExecutionReadiness(
+  options: Pick<BuildOnboardingStatusOptions, 'providerExecution'>,
+): Promise<ProviderExecutionReadiness> {
+  return options.providerExecution.getReadiness()
+}
+
 async function buildMachineReadiness(
   env: NodeJS.ProcessEnv,
+  providerExecution: ProviderExecutionReadiness,
 ): Promise<MachineOnboardingReadiness[]> {
   const registry = createMachineRegistryStore(path.join(resolveHerdDataDir(env), 'machines.json'))
   const machines = await registry.readMachineRegistry()
   const defaultEnvFile = localMachineEnvFile(env)
 
   return machines.map((machine): MachineOnboardingReadiness => {
-    const isLocal = machine.id === 'local' || !machine.host
     const isDaemon = Boolean(machine.daemon)
-    const state: OnboardingReadinessState = isLocal || machine.daemon?.lastSeenAt
-      ? 'ready'
+    const isLocal = !isDaemon && (machine.id === 'local' || !machine.host)
+    const daemonReadiness = providerExecution.daemons.find((daemon) => daemon.machineId === machine.id)
+    const executionDisabled = providerExecution.mode === 'daemon-only' && !isDaemon
+    const state: OnboardingReadinessState = executionDisabled
+      ? 'skipped'
       : isDaemon
-        ? 'warning'
+        ? (daemonReadiness?.connected ? 'ready' : 'warning')
         : 'ready'
     return {
       id: machine.id,
@@ -640,24 +849,98 @@ async function buildMachineReadiness(
       state,
       envFile: machine.envFile ?? (isLocal ? defaultEnvFile : null),
       cwd: machine.cwd ?? null,
-      summary: isLocal
-        ? 'This server can run provider CLIs directly.'
-        : isDaemon
-          ? (machine.daemon?.lastSeenAt ? 'Daemon paired and recently seen.' : 'Daemon pairing exists but is not connected.')
-          : 'Remote SSH machine is registered.',
+      summary: executionDisabled
+        ? 'Provider execution is disabled on this target by daemon-only mode.'
+        : isLocal
+          ? 'This server can run provider CLIs directly.'
+          : isDaemon
+            ? (daemonReadiness?.connected
+              ? `${daemonReadiness.readyProviderIds.length} provider${daemonReadiness.readyProviderIds.length === 1 ? '' : 's'} ready on this connected daemon.`
+              : 'Daemon pairing exists but is not connected.')
+            : 'Remote SSH machine is registered.',
     }
   })
+}
+
+function resolveDaemonOnlyLaunchReadiness(args: {
+  providerExecution: ProviderExecutionReadiness
+  providers: readonly ProviderOnboardingReadiness[]
+  machines: readonly MachineOnboardingReadiness[]
+  providerId: string | null
+  executionMachineId?: string
+}): { ready: boolean; summary: string } {
+  const providerId = args.providerId?.trim()
+  if (!providerId) {
+    return {
+      ready: false,
+      summary: 'Choose a provider before selecting its execution daemon.',
+    }
+  }
+
+  const providerLabel = args.providers.find((provider) => provider.id === providerId)?.label ?? providerId
+  const machineLabel = (machineId: string): string => (
+    args.machines.find((machine) => machine.id === machineId)?.label ?? machineId
+  )
+  const readyDaemons = args.providerExecution.daemons.filter((daemon) => (
+    daemon.connected && daemon.readyProviderIds.some((readyProviderId) => readyProviderId === providerId)
+  ))
+
+  if (args.executionMachineId) {
+    const selectedReady = readyDaemons.some((daemon) => daemon.machineId === args.executionMachineId)
+    return selectedReady
+      ? {
+          ready: true,
+          summary: `${providerLabel} can launch on the selected daemon, ${machineLabel(args.executionMachineId)}.`,
+        }
+      : {
+          ready: false,
+          summary: `The selected daemon, ${machineLabel(args.executionMachineId)}, is not ready to launch ${providerLabel}.`,
+        }
+  }
+
+  if (readyDaemons.length === 1) {
+    return {
+      ready: true,
+      summary: `${providerLabel} can launch on the only provider-ready daemon, ${machineLabel(readyDaemons[0]!.machineId)}.`,
+    }
+  }
+  if (readyDaemons.length > 1) {
+    return {
+      ready: false,
+      summary: `${readyDaemons.length} connected daemons can launch ${providerLabel}. Select and save one execution machine before continuing.`,
+    }
+  }
+  return {
+    ready: false,
+    summary: `Connect a daemon that is ready to launch ${providerLabel}.`,
+  }
 }
 
 function buildSteps(args: {
   founderSetup: FounderSetupStatus
   gaia: GaiaOnboardingStatus
+  gaiaCommander: Pick<CommanderSession, 'agentType' | 'executionMachineId'> | null
   starterWorkforce: StarterWorkforceOnboardingStatus
   providers: readonly ProviderOnboardingReadiness[]
   machines: readonly MachineOnboardingReadiness[]
+  providerExecution: ProviderExecutionReadiness
+  credentials: OnboardingCredentialStatus
 }): { currentStepId: OnboardingStepId; steps: OnboardingStep[] } {
-  const hasProviderReady = args.providers.length === 0 || args.providers.some((provider) => provider.state === 'ready')
-  const hasMachineReady = args.machines.some((machine) => machine.state === 'ready')
+  const daemonOnlyLaunchReadiness = args.providerExecution.mode === 'daemon-only'
+    ? resolveDaemonOnlyLaunchReadiness({
+        providerExecution: args.providerExecution,
+        providers: args.providers,
+        machines: args.machines,
+        providerId: args.gaia.defaultProviderId,
+        executionMachineId: args.gaiaCommander?.executionMachineId,
+      })
+    : null
+  const hasProviderReady = args.providerExecution.mode === 'daemon-only'
+    ? daemonOnlyLaunchReadiness?.ready === true
+    : args.providers.length === 0 || args.providers.some((provider) => provider.state === 'ready')
+  const hasMachineReady = args.providerExecution.mode === 'daemon-only'
+    ? daemonOnlyLaunchReadiness?.ready === true
+    : args.machines.some((machine) => machine.state === 'ready')
   const currentStepId: OnboardingStepId = !args.founderSetup.setupComplete
     ? 'founder-org'
     : !args.gaia.exists
@@ -666,7 +949,9 @@ function buildSteps(args: {
         ? 'starter-workforce'
         : (!hasProviderReady || !hasMachineReady)
           ? 'providers-machines'
-          : 'launch'
+          : !args.credentials.ready
+            ? 'credentials'
+            : 'launch'
 
   const stateFor = (id: OnboardingStepId): OnboardingStep['state'] => {
     if (id === currentStepId) return 'current'
@@ -681,6 +966,10 @@ function buildSteps(args: {
       if (hasProviderReady && hasMachineReady) return 'complete'
       return args.starterWorkforce.complete ? 'warning' : 'pending'
     }
+    if (id === 'credentials') {
+      if (args.credentials.ready) return 'complete'
+      return currentStepId === 'credentials' ? 'current' : 'pending'
+    }
     return currentStepId === 'launch' ? 'current' : 'pending'
   }
 
@@ -689,7 +978,8 @@ function buildSteps(args: {
     { id: 'founder-org', label: 'Founder + organization', state: stateFor('founder-org'), summary: args.founderSetup.setupComplete ? 'Founder profile and organization exist.' : 'Create the first local operator and org identity.' },
     { id: 'gaia', label: 'Gaia commander', state: stateFor('gaia'), summary: args.gaia.exists ? 'Gaia is ready to guide onboarding.' : 'Seed Gaia as the default onboarding commander.' },
     { id: 'starter-workforce', label: 'Starter workforce', state: stateFor('starter-workforce'), summary: args.starterWorkforce.skipped ? 'Starter commanders were skipped for this install.' : args.starterWorkforce.complete ? 'Starter commanders are installed.' : 'Install the bundled engineering, research, and assistant commanders.' },
-    { id: 'providers-machines', label: 'Providers + machines', state: stateFor('providers-machines'), summary: hasProviderReady && hasMachineReady ? 'At least one provider and machine are ready.' : 'Review provider CLI/auth and machine readiness.' },
+    { id: 'providers-machines', label: 'Providers + machines', state: stateFor('providers-machines'), summary: daemonOnlyLaunchReadiness?.summary ?? (hasProviderReady && hasMachineReady ? 'At least one provider and machine are ready.' : 'Review provider CLI/auth and machine readiness.') },
+    { id: 'credentials', label: 'Permanent credential', state: stateFor('credentials'), summary: args.credentials.summary },
     { id: 'launch', label: 'Launch', state: stateFor('launch'), summary: 'Open the org page or command room.' },
   ]
 
@@ -702,6 +992,7 @@ function buildReceipt(args: {
   providers: readonly ProviderOnboardingReadiness[]
   machines: readonly MachineOnboardingReadiness[]
   publicBaseUrl?: string
+  credentials: OnboardingCredentialStatus
 }): OnboardingReceipt {
   const readyProviders = args.providers.filter((provider) => provider.state === 'ready').map((provider) => provider.label)
   const pendingProviders = args.providers.filter((provider) => provider.state !== 'ready').map((provider) => provider.label)
@@ -712,7 +1003,7 @@ function buildReceipt(args: {
 
   return {
     url: buildReceiptUrl(args.publicBaseUrl),
-    account: 'local bootstrap admin',
+    account: args.credentials.ready ? 'permanent API key' : 'temporary bootstrap admin',
     organization: args.founderSetup.defaultValues.orgDisplayName || null,
     founder: args.founderSetup.defaultValues.founderDisplayName || null,
     commander: args.gaia.exists ? args.gaia.displayName : null,
@@ -736,24 +1027,32 @@ function buildReceiptUrl(publicBaseUrl: string | undefined): string {
 export async function buildOnboardingStatus(
   options: BuildOnboardingStatusOptions,
 ): Promise<OnboardingStatus> {
-  const providersPromise = buildProviderReadiness(options)
+  const providerExecution = await buildProviderExecutionReadiness(options)
+  const providersPromise = buildProviderReadiness(options, providerExecution)
   const founderSetupPromise = buildFounderStatus(options)
-  const machinesPromise = buildMachineReadiness(options.env ?? process.env)
-  const gaiaPromise = buildGaiaStatus(options, providersPromise)
+  const machinesPromise = buildMachineReadiness(options.env ?? process.env, providerExecution)
+  const gaiaCommanderPromise = findGaiaCommander(options)
+  const gaiaPromise = buildGaiaStatus(options, providersPromise, gaiaCommanderPromise)
   const starterWorkforcePromise = buildStarterWorkforceStatus(options)
-  const [providers, founderSetup, machines, gaia, starterWorkforce] = await Promise.all([
+  const credentialsPromise = buildCredentialStatus(options)
+  const [providers, founderSetup, machines, gaia, starterWorkforce, credentials, gaiaCommander] = await Promise.all([
     providersPromise,
     founderSetupPromise,
     machinesPromise,
     gaiaPromise,
     starterWorkforcePromise,
+    credentialsPromise,
+    gaiaCommanderPromise,
   ])
   const { currentStepId, steps } = buildSteps({
     founderSetup,
     gaia,
+    gaiaCommander,
     starterWorkforce,
     providers,
     machines,
+    providerExecution,
+    credentials,
   })
   const timeToFirstReply = await recordFirstReplyMetricIfObserved(options, gaia)
 
@@ -765,12 +1064,29 @@ export async function buildOnboardingStatus(
     starterWorkforce,
     providers,
     machines,
+    providerExecution: {
+      mode: providerExecution.mode,
+      hostExecutionAllowed: providerExecution.hostExecutionAllowed,
+      daemonRequired: providerExecution.daemonRequired,
+      state: providerExecution.ready
+        ? 'ready'
+        : providerExecution.registeredDaemonCount > 0
+          ? 'warning'
+          : 'missing',
+      registeredDaemonCount: providerExecution.registeredDaemonCount,
+      connectedDaemonCount: providerExecution.connectedDaemonCount,
+      providerReadyDaemonCount: providerExecution.providerReadyDaemonCount,
+      readyProviderIds: providerExecution.readyProviderIds,
+      summary: providerExecution.summary,
+    } satisfies ProviderExecutionOnboardingStatus,
+    credentials,
     receipt: buildReceipt({
       founderSetup,
       gaia,
       providers,
       machines,
       publicBaseUrl: options.publicBaseUrl,
+      credentials,
     }),
     timeToFirstReply,
     launchTarget: gaia.commanderId && gaia.conversationId
@@ -782,42 +1098,125 @@ export async function buildOnboardingStatus(
   }
 }
 
+export interface SeedStarterWorkforceResult {
+  starterWorkforce: StarterWorkforceOnboardingStatus
+  createdAny: boolean
+}
+
 export async function seedStarterWorkforce(
   options: SeedStarterWorkforceOptions,
-): Promise<StarterWorkforceOnboardingStatus> {
-  const definitions = (await Promise.all(
-    STARTER_COMMANDER_PACKAGE_IDS.map((packageId) => loadCommanderPackage(packageId)),
-  )).filter((definition): definition is CommanderPackageDefinition => Boolean(definition))
+): Promise<SeedStarterWorkforceResult> {
+  return runInCommanderPackageTransaction(
+    options.commanderDataDir,
+    options.packageTransaction,
+    (packageTransaction) => seedStarterWorkforceLocked({
+      ...options,
+      packageTransaction,
+    }),
+  )
+}
 
-  for (const definition of definitions) {
-    await installCommanderPackage(definition, {
-      sessionStore: options.sessionStore,
-      conversationStore: options.conversationStore,
-      automationStore: options.automationStore,
-      automationScheduler: options.automationScheduler,
-      automationSchedulerInitialized: options.automationSchedulerInitialized,
-      commanderDataDir: options.commanderDataDir,
-      now: () => new Date(),
-    })
+async function seedStarterWorkforceLocked(
+  options: SeedStarterWorkforceOptions,
+): Promise<SeedStarterWorkforceResult> {
+  const loadStarterPackage = options.loadStarterPackage ?? loadCommanderPackage
+  const loadedDefinitions = await loadStarterPackageDefinitions(loadStarterPackage)
+  const missingPackageIds = STARTER_COMMANDER_PACKAGE_IDS.filter((_, index) => (
+    !loadedDefinitions[index]
+  ))
+  const definitions = loadedDefinitions.filter(
+    (definition): definition is CommanderPackageDefinition => Boolean(definition),
+  )
+  const requiredSkillIds = definitions.flatMap((definition) => (
+    definition.skills.filter((skill) => skill.required).map((skill) => skill.id)
+  ))
+  const automationSkillIds = definitions.flatMap((definition) => (
+    definition.automations.flatMap((automation) => automation.skills)
+  ))
+  const runtimeSkillIds = [...new Set([
+    ...requiredSkillIds,
+    ...automationSkillIds,
+  ])].sort()
+  const resolveAutomationSkill = options.resolveAutomationSkill ?? resolveSkill
+  const resolvedSkills = await Promise.all(runtimeSkillIds.map(async (skillId) => ({
+    skillId,
+    content: await resolveAutomationSkill(skillId),
+  })))
+  const missingSkillIds = resolvedSkills
+    .filter(({ content }) => !content)
+    .map(({ skillId }) => skillId)
+
+  if (missingPackageIds.length > 0 || missingSkillIds.length > 0) {
+    throw new StarterWorkforcePreflightError(missingPackageIds, missingSkillIds)
+  }
+  if (
+    definitions.some((definition) => definition.automations.length > 0)
+    && !options.automationStore
+  ) {
+    throw new Error('Automation store is required to install the starter workforce')
+  }
+  await options.automationSchedulerInitialized
+
+  const installOptions = {
+    sessionStore: options.sessionStore,
+    conversationStore: options.conversationStore,
+    automationStore: options.automationStore,
+    automationScheduler: options.automationScheduler,
+    automationSchedulerInitialized: options.automationSchedulerInitialized,
+    commanderDataDir: options.commanderDataDir,
+    now: () => new Date(),
+    packageTransaction: options.packageTransaction,
+  }
+  const requestCreatedReceipts: CommanderPackageCleanupReceipt[] = []
+  let createdAny = false
+  try {
+    for (const definition of definitions) {
+      const result = await installCommanderPackage(definition, installOptions)
+      if (result.created && result.cleanupReceipt) {
+        createdAny = true
+        requestCreatedReceipts.push(result.cleanupReceipt)
+      }
+    }
+  } catch (error) {
+    const cleanupFailures = error instanceof CommanderPackageRollbackError
+      ? [...error.cleanupFailures]
+      : []
+    for (const receipt of [...requestCreatedReceipts].reverse()) {
+      cleanupFailures.push(...await cleanupCommanderPackageInstall(receipt, installOptions))
+    }
+    if (cleanupFailures.length > 0) {
+      throw new StarterWorkforceRollbackError(error, cleanupFailures)
+    }
+    throw error
   }
 
   await setStarterWorkforceSkipped(options.commanderDataDir, false)
-  return buildStarterWorkforceStatus(options)
+  return {
+    starterWorkforce: await buildStarterWorkforceStatus(options),
+    createdAny,
+  }
 }
 
 export async function skipStarterWorkforce(
   options: BuildOnboardingStatusOptions,
 ): Promise<StarterWorkforceOnboardingStatus> {
-  await setStarterWorkforceSkipped(options.commanderDataDir, true)
-  return buildStarterWorkforceStatus(options)
+  return runInCommanderPackageTransaction(
+    options.commanderDataDir,
+    options.packageTransaction,
+    async (packageTransaction) => {
+      await setStarterWorkforceSkipped(options.commanderDataDir, true)
+      return buildStarterWorkforceStatus({ ...options, packageTransaction })
+    },
+  )
 }
 
 export async function seedGaiaCommander(options: SeedGaiaOptions): Promise<GaiaOnboardingStatus> {
-  const providersPromise = buildProviderReadiness(options)
+  const providerExecution = await buildProviderExecutionReadiness(options)
+  const providersPromise = buildProviderReadiness(options, providerExecution)
   const existing = await findGaiaCommander(options)
   if (existing) {
     await ensureGaiaCommanderSeedArtifacts(options, existing)
-    return buildGaiaStatus(options, providersPromise)
+    return buildGaiaStatus(options, providersPromise, existing)
   }
   const providers = await providersPromise
 

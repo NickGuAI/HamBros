@@ -14,6 +14,10 @@ import { asClaudeProviderContext } from '../providers/provider-session-context.j
 import { ProviderAuthRequiredError } from '../provider-auth.js'
 import { parseSessionName } from '../session/input.js'
 import {
+  isProviderLaunchError,
+  type MachineLaunchRuntime,
+} from '../session/machine-launch.js'
+import {
   buildPersistedEntryFromExitedSession,
   buildPersistedEntryFromLiveStreamSession,
   snapshotDeletedResumableStreamSession,
@@ -72,7 +76,7 @@ interface SessionControlRouteDeps {
     agentType?: StreamSession['agentType'],
     options?: Omit<ProviderCreateOptions, 'sessionName' | 'mode' | 'task' | 'cwd' | 'machine'>,
   ): Promise<StreamSession>
-  readMachineRegistry(): Promise<MachineConfig[]>
+  resolveProviderLaunchMachine: MachineLaunchRuntime['resolveProviderLaunchMachine']
   readPersistedSessionsState(): Promise<PersistedSessionsState>
   resolveResumableSessionSource(
     sessionName: string,
@@ -542,21 +546,15 @@ export function registerSessionControlRoutes(deps: SessionControlRouteDeps): voi
       return
     }
 
-    let machine: MachineConfig | undefined
-    if (source.host) {
-      try {
-        const machines = await deps.readMachineRegistry()
-        machine = machines.find((entry) => entry.id === source.host)
-      } catch (error) {
-        const message = error instanceof Error ? error.message : 'Failed to read machines registry'
-        res.status(500).json({ error: message })
-        return
-      }
-      if (!machine) {
-        res.status(400).json({ error: `Unknown host machine "${source.host}"` })
-        return
-      }
+    const resolvedMachine = await deps.resolveProviderLaunchMachine(source.host, source.agentType)
+    if (!resolvedMachine.ok) {
+      res.status(resolvedMachine.status).json({
+        ...(resolvedMachine.code ? { code: resolvedMachine.code } : {}),
+        error: resolvedMachine.error,
+      })
+      return
     }
+    const { machine } = resolvedMachine
 
     const sourceProvider = getProvider(source.agentType)
     const sourceResumeId = sourceProvider?.getResumeId(source)
@@ -633,6 +631,13 @@ export function registerSessionControlRoutes(deps: SessionControlRouteDeps): voi
           scopeId: error.snapshot.scopeId,
           host: error.snapshot.host,
           reauthUrl: error.snapshot.reauthUrl,
+          error: error.message,
+        })
+        return
+      }
+      if (isProviderLaunchError(error)) {
+        res.status(error.statusCode).json({
+          ...(error.code ? { code: error.code } : {}),
           error: error.message,
         })
         return

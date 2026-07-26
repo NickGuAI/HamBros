@@ -106,6 +106,8 @@ export interface ProviderModelDiscoveryAdapter {
   catalogScope?: 'provider' | 'credential'
   /** Advanced custom model ids are rejected unless the adapter explicitly opts in. */
   allowCustomModels?: boolean
+  /** Keep successful discovery exact; use registry models only on discovery failure. */
+  authoritativeDynamicModels?: boolean
   /** Keep visible runtime-compatible curated entries that discovery omits. */
   includeUnmatchedCuratedModels?: boolean
 }

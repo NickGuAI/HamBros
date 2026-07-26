@@ -202,25 +202,18 @@ app.get('/api/health', (_req, res) => {
     backgroundRuntimes: backgroundRuntimesEnabled ? 'enabled' : 'disabled',
     database: {
       ready: readyDatabaseReadiness.ready,
-      path: readyDatabaseReadiness.dbPath,
       schemaVersion: readyDatabaseReadiness.schemaVersion,
       requiredSchemaVersion: readyDatabaseReadiness.requiredSchemaVersion,
       migrationStatus: readyDatabaseReadiness.migrationStatus,
     },
     jsonStores: {
       ready: readyJsonStoreReadiness.ready,
-      sourceRoot: readyJsonStoreReadiness.sourceRoot,
       requiredSchemaVersion: readyJsonStoreReadiness.requiredSchemaVersion,
       migrationStatus: readyJsonStoreReadiness.migrationStatus,
       checked: readyJsonStoreReadiness.stores.length,
       quarantined: readyJsonStoreReadiness.stores
         .filter((store) => store.migrationStatus === 'quarantined')
-        .map((store) => ({
-          id: store.id,
-          path: store.path,
-          quarantinePath: store.quarantinePath,
-          error: store.error,
-        })),
+        .length,
     },
     modules: modules.map((m) => m.name),
     memory: {

@@ -1,7 +1,8 @@
 import type { Dirent } from 'node:fs'
 import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises'
 import * as path from 'node:path'
-import { resolveCommanderPaths } from '../paths.js'
+import { resolveCommanderDataDir, resolveCommanderPaths } from '../paths.js'
+import { withCommanderMutation } from '../child-mutation-coordinator.js'
 
 export interface SkillManifest {
   name: string
@@ -51,10 +52,16 @@ const SKILL_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*$/
 
 export class SkillWriter {
   private readonly skillsRoot: string
+  private readonly lifecycleScope: string
 
-  constructor(commanderId: string, basePath?: string) {
+  constructor(
+    private readonly commanderId: string,
+    basePath?: string,
+    lifecycleScope = basePath ?? resolveCommanderDataDir(),
+  ) {
     const resolved = resolveCommanderPaths(commanderId, basePath)
     this.skillsRoot = resolved.skillsRoot
+    this.lifecycleScope = lifecycleScope
   }
 
   async loadSkillManifests(): Promise<SkillManifest[]> {
@@ -88,8 +95,6 @@ export class SkillWriter {
   async createSkill(input: SkillCreateInput): Promise<void> {
     const skillName = this._validateSkillName(input.name)
     const skillPath = this._skillPath(skillName)
-
-    await mkdir(path.dirname(skillPath), { recursive: true })
 
     const content = this._renderSkillDocument({
       manifest: {
@@ -482,15 +487,17 @@ export class SkillWriter {
   }
 
   private async _writeAtomic(filePath: string, content: string): Promise<void> {
-    const dir = path.dirname(filePath)
-    await mkdir(dir, { recursive: true })
+    await withCommanderMutation(this.commanderId, this.lifecycleScope, async () => {
+      const dir = path.dirname(filePath)
+      await mkdir(dir, { recursive: true })
 
-    const tempFilePath = path.join(
-      dir,
-      `SKILL.md.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-    )
+      const tempFilePath = path.join(
+        dir,
+        `SKILL.md.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      )
 
-    await writeFile(tempFilePath, content, 'utf-8')
-    await rename(tempFilePath, filePath)
+      await writeFile(tempFilePath, content, 'utf-8')
+      await rename(tempFilePath, filePath)
+    })
   }
 }

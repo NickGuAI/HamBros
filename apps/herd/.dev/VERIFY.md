@@ -3,14 +3,35 @@
 Run the narrow bundle for the area touched, then run the full gate before
 delivery when the change crosses module or release boundaries.
 
+Fresh worktree prerequisite:
+
+```bash
+pnpm install --frozen-lockfile
+git submodule update --init agent-skills
+pnpm --filter herd run build:deps
+```
+
+Workspace packages expose built entrypoints, so a targeted Vitest command in a
+fresh worktree can fail at module resolution until `build:deps` completes. The
+bundles below are offline; run them with `OPENAI_API_KEY` removed from the
+environment.
+
 ## Cheap Local Checks
 
 ```bash
-pnpm --filter @gehirn/herd-cli test -- up.test.ts doctor.test.ts workers.test.ts session.test.ts
+env -u OPENAI_API_KEY pnpm --filter @gehirn/herd-cli exec vitest run \
+  src/__tests__/up.test.ts \
+  src/__tests__/doctor.test.ts \
+  src/__tests__/workers.test.ts \
+  src/__tests__/session.test.ts
 pnpm --filter herd run db:ready -- --source-root ~/.herd --db ~/.herd/herd.sqlite
 pnpm --filter herd run docs:check
 make -C agent-skills test
 ```
+
+Do not use `pnpm --filter @gehirn/herd-cli test -- <file>` as a focused
+command. That package script already expands to `vitest run`, and the trailing
+file argument does not narrow the suite. Use `exec vitest run <exact-path>`.
 
 No `playwright.config.*` exists under `apps/herd`; use Vitest and manual
 desktop/mobile route checks unless a browser test harness is added later.
@@ -74,6 +95,104 @@ pnpm --filter herd exec vitest run \
 Evidence done: backend-owned action/state guardrails pass, conversation hooks
 mutate expected endpoints, and mobile/desktop shells render without divergent
 state rules.
+
+## Session Composer
+
+Use when touching quick/Markdown mode, keyboard handling, draft persistence,
+textarea sizing, images, queueing, IME handling, or shared transcript Markdown.
+
+```bash
+env -u OPENAI_API_KEY pnpm --filter herd exec vitest run \
+  modules/agents/components/__tests__/SessionComposer.test.tsx \
+  modules/agents/components/session-message-list/__tests__/blocks.test.tsx
+```
+
+Evidence done: quick mode keeps Enter-send and Shift+Enter-newline; Markdown
+mode keeps Enter-newline and Cmd/Ctrl+Enter-send; Tab queues in either mode when
+available; IME cannot submit; multiline paste promotes the mode; per-session
+mode/draft/attachments persist; clearing restores quick mode; and the owning
+pane governs Markdown height. Run the Mobile/desktop UI bundle when layout or a
+consumer changes.
+
+## Automations
+
+Use when touching the shared list/detail panel, global or commander scope,
+responsive presentation, filters/actions, schedule editing, cron validation,
+compatibility routes, scheduler registration, or persisted-job recovery.
+
+```bash
+env -u OPENAI_API_KEY pnpm --filter herd exec vitest run \
+  modules/automations/__tests__/cron-validation-parity.test.ts \
+  modules/automations/__tests__/first-boot.test.ts \
+  modules/automations/__tests__/scheduler-lifecycle.test.ts \
+  modules/automations/__tests__/AutomationsPage.test.tsx \
+  modules/automations/__tests__/MobileAutomations.test.tsx \
+  modules/commanders/components/__tests__/AutomationPanel.test.tsx \
+  modules/commanders/__tests__/routes.test.ts \
+  modules/org/forms/__tests__/helpers.test.ts \
+  modules/org/forms/__tests__/useNewAutomationWizardForm.test.tsx \
+  modules/command-room/components/desktop/__tests__/CommandRoom-context.test.tsx \
+  modules/command-room/__tests__/hervald-routing.test.ts
+```
+
+Evidence done: the default presentation swaps list to detail below `md` and
+keeps the desktop split at `md` and above; mobile-list and single-pane preserve
+full-swap navigation; scope/filter/action wiring stays shared; incomplete cron
+drafts remain local; complete cron input reaches server-authoritative
+validation; invalid input produces compatibility-route `400` responses; and
+one corrupt persisted schedule cannot disable valid jobs or repair APIs.
+
+## Quest Artifacts And Task Lifecycle
+
+Use when touching quest artifact storage/rendering, CLI artifact commands,
+Workspace reference resolution, read-only enforcement, `~/tasks` lifecycle
+operations, generated task indexes, or tracked/installed skill parity.
+
+```bash
+env -u OPENAI_API_KEY pnpm --filter herd exec vitest run \
+  modules/commanders/__tests__/QuestBoard.chips.test.tsx \
+  modules/commanders/__tests__/register-quests.test.ts \
+  modules/commanders/__tests__/route-parsers.test.ts \
+  modules/agents/__tests__/routes-workspace-tilde.test.ts \
+  modules/agents/__tests__/routes-workspace.test.ts \
+  modules/workspace/__tests__/service.test.ts \
+  modules/agents/components/session-message-list/__tests__/blocks.test.tsx
+
+env -u OPENAI_API_KEY pnpm --filter @gehirn/herd-cli exec vitest run \
+  src/__tests__/quests.test.ts
+
+env -u OPENAI_API_KEY PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
+  ai-state/claude/skills/context-explore/tests/test_contract.py \
+  ai-state/claude/skills/create-quests/tests/test_contract.py \
+  ai-state/claude/skills/domain-distill/tests/test_contract.py \
+  ai-state/claude/skills/knowledge-search/tests/test_discovery.py \
+  ai-state/claude/skills/problem-analysis/tests/test_contract.py \
+  ai-state/claude/skills/task-system-maintenance/tests/test_audit.py \
+  ai-state/claude/skills/task-system-maintenance/tests/test_task_lifecycle.py \
+  ai-state/claude/skills/wide-research/tests/test_contract.py
+
+(
+  cd agent-skills
+  env -u OPENAI_API_KEY PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
+    commander-ops/context-explore/tests/test_contract.py \
+    commander-ops/create-quests/tests/test_contract.py \
+    commander-ops/problem-analysis/tests/test_contract.py \
+    integrations/wide-research/tests/test_contract.py \
+    pkos/domain-distill/tests/test_contract.py \
+    pkos/knowledge-search/tests/test_discovery.py \
+    pkos/task-system-maintenance/tests/test_audit.py \
+    pkos/task-system-maintenance/tests/test_task_lifecycle.py
+)
+```
+
+Evidence done: UI/server/CLI href validation agrees; QuestBoard and CLI
+replacement drop unsafe legacy siblings; out-of-workspace local and remote `~/tasks` references
+resolve only through authorized lifecycle roots; file/directory previews are
+read-only; all seven target/file/git Workspace mutation routes reject those
+targets; git initialization repeats the guard; task create/move regenerates indexes and
+rewrites exact task and quest references; machine-readable claim handoff retains
+quest/conversation identity plus artifacts; and the tracked runtime and
+GehirnSkills submodule trees both pass their analogous contract suites.
 
 ## Channels And External Conversation Surfaces
 
@@ -211,7 +330,7 @@ provider context persistence.
 ```bash
 pnpm --filter herd run generate:provider-registry
 pnpm --filter herd exec vitest run \
-  server/__tests__/provider-context-migration.test.ts \
+  server/__tests__/provider-context-normalization.test.ts \
   modules/agents/providers/__tests__/http-router.test.ts \
   modules/agents/providers/__tests__/validate-model.test.ts \
   modules/agents/__tests__/provider-auth.test.ts \
@@ -258,11 +377,19 @@ shared workspace/composer behavior is still covered.
 ## Full Gate
 
 ```bash
-make fmt && make test && make lint
+env -u OPENAI_API_KEY make fmt
+env -u OPENAI_API_KEY make test
+env -u OPENAI_API_KEY make lint
+env -u OPENAI_API_KEY pnpm --filter herd run build
+env -u OPENAI_API_KEY pnpm --filter herd run docs:check
+env -u OPENAI_API_KEY make -C agent-skills test
+git diff --check
 ```
 
 Use this before claiming completion for cross-module, CLI, install, release, or
-user-visible workflow changes.
+user-visible workflow changes. The first three commands are the canonical root
+gate; production build, docs validation, submodule skill validation, and diff
+whitespace complete the release evidence.
 
 ## Manual UI Checks
 

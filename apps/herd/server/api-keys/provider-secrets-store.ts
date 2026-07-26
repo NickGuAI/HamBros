@@ -50,6 +50,20 @@ export interface ProviderSecretsStoreOptions {
   keyFilePath?: string
   encryptionKey?: string | Buffer
   envKeyName?: string
+  env?: NodeJS.ProcessEnv
+}
+
+export type ProviderSecretsEncryptionReadinessCode =
+  | 'ready'
+  | 'store-invalid'
+  | 'key-missing'
+  | 'key-invalid'
+  | 'decryption-failed'
+
+export interface ProviderSecretsEncryptionReadiness {
+  ready: boolean
+  code: ProviderSecretsEncryptionReadinessCode
+  error: string | null
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -84,14 +98,15 @@ function isEncryptedSecretRecord(value: unknown): value is EncryptedSecretRecord
 
 function toPersistedSecretCollection(value: unknown): PersistedSecretCollection {
   if (!isObject(value) || !isObject(value.secrets)) {
-    return { secrets: {} }
+    throw new Error('Provider secrets store does not match the required shape')
   }
 
   const secrets: Record<string, EncryptedSecretRecord> = {}
   for (const [providerId, secret] of Object.entries(value.secrets)) {
-    if (isEncryptedSecretRecord(secret)) {
-      secrets[providerId] = secret
+    if (!isEncryptedSecretRecord(secret)) {
+      throw new Error('Provider secrets store contains an invalid encrypted record')
     }
+    secrets[providerId] = secret
   }
 
   return { secrets }
@@ -171,12 +186,14 @@ export class ProviderSecretsStore
   private readonly keyFilePath: string
   private readonly encryptionKeyInput?: string | Buffer
   private readonly envKeyName: string
+  private readonly env: NodeJS.ProcessEnv
 
   constructor(options: ProviderSecretsStoreOptions = {}) {
     this.filePath = options.filePath ?? defaultProviderSecretStorePath()
     this.keyFilePath = options.keyFilePath ?? defaultProviderSecretKeyPath()
     this.encryptionKeyInput = options.encryptionKey
     this.envKeyName = options.envKeyName ?? DEFAULT_ENV_KEY_NAME
+    this.env = options.env ?? process.env
   }
 
   async getSecretStatus(providerId: string): Promise<ProviderSecretStatus> {
@@ -197,8 +214,12 @@ export class ProviderSecretsStore
       return null
     }
 
-    const encryptionKey = await this.getEncryptionKey()
-    return decryptSecret(secret, encryptionKey)
+    const encryptionKey = await this.getEncryptionKey({ allowCreate: false })
+    const decrypted = decryptSecret(secret, encryptionKey)
+    if (!asNonEmptyString(decrypted)) {
+      throw new Error('Configured provider secret cannot be decrypted with the active encryption key')
+    }
+    return decrypted
   }
 
   async setSecret(
@@ -212,12 +233,13 @@ export class ProviderSecretsStore
       throw new Error('Provider secret must not be empty')
     }
 
-    const nowIso = (options.now ?? new Date()).toISOString()
-    const encryptionKey = await this.getEncryptionKey()
-    const encrypted = encryptSecret(normalizedValue, encryptionKey, nowIso)
-
     await this.withMutationLock(async () => {
       const state = await this.readCollection()
+      const encryptionKey = await this.getEncryptionKey({
+        allowCreate: Object.keys(state.secrets).length === 0,
+      })
+      const nowIso = (options.now ?? new Date()).toISOString()
+      const encrypted = encryptSecret(normalizedValue, encryptionKey, nowIso)
       state.secrets[normalizedProviderId] = encrypted
       await this.writeCollection(state)
     })
@@ -236,6 +258,54 @@ export class ProviderSecretsStore
         status: 'configured',
         updatedAt: secret.updatedAt,
       }))
+  }
+
+  /**
+   * Verifies the persisted ciphertext/key pair without creating or rotating a
+   * key. The result is deliberately sanitized for startup and health logs.
+   */
+  async inspectEncryptionReadiness(): Promise<ProviderSecretsEncryptionReadiness> {
+    let state: PersistedSecretCollection
+    try {
+      state = await this.readCollectionConsistent()
+    } catch {
+      return {
+        ready: false,
+        code: 'store-invalid',
+        error: 'Provider secrets store is unreadable or does not match the required shape.',
+      }
+    }
+
+    let encryptionKey: Buffer | null
+    try {
+      encryptionKey = await this.resolveExistingEncryptionKey()
+    } catch {
+      return {
+        ready: false,
+        code: 'key-invalid',
+        error: 'Provider secrets encryption key is invalid or unreadable.',
+      }
+    }
+
+    const encryptedSecrets = Object.values(state.secrets)
+    if (encryptedSecrets.length === 0) {
+      return { ready: true, code: 'ready', error: null }
+    }
+    if (!encryptionKey) {
+      return {
+        ready: false,
+        code: 'key-missing',
+        error: 'Provider secrets encryption key is missing for persisted ciphertext.',
+      }
+    }
+    if (encryptedSecrets.some((secret) => !asNonEmptyString(decryptSecret(secret, encryptionKey)))) {
+      return {
+        ready: false,
+        code: 'decryption-failed',
+        error: 'Provider secrets cannot be decrypted with the configured encryption key.',
+      }
+    }
+    return { ready: true, code: 'ready', error: null }
   }
 
   private requireProviderId(providerId: string): string {
@@ -260,28 +330,44 @@ export class ProviderSecretsStore
     })
   }
 
-  private getEncryptionKey(): Promise<Buffer> {
+  private async getEncryptionKey(options: { allowCreate: boolean }): Promise<Buffer> {
     if (!this.encryptionKeyPromise) {
-      this.encryptionKeyPromise = this.resolveEncryptionKey()
+      this.encryptionKeyPromise = this.resolveEncryptionKey(options)
     }
-
-    return this.encryptionKeyPromise
+    try {
+      return await this.encryptionKeyPromise
+    } catch (error) {
+      this.encryptionKeyPromise = null
+      throw error
+    }
   }
 
-  private async resolveEncryptionKey(): Promise<Buffer> {
+  private async resolveEncryptionKey(options: { allowCreate: boolean }): Promise<Buffer> {
+    const existing = await this.resolveExistingEncryptionKey()
+    if (existing) {
+      return existing
+    }
+    if (!options.allowCreate) {
+      throw new Error('Provider secrets encryption key is missing for persisted ciphertext')
+    }
+
+    const generated = randomBytes(32)
+    await writeTextFileAtomically(this.keyFilePath, `${generated.toString('base64')}\n`, {
+      mode: 0o600,
+    })
+    return generated
+  }
+
+  private async resolveExistingEncryptionKey(): Promise<Buffer | null> {
     if (this.encryptionKeyInput) {
       return normalizeEncryptionKey(this.encryptionKeyInput)
     }
 
-    const envValue = process.env[this.envKeyName]
+    const envValue = this.env[this.envKeyName]
     if (envValue && envValue.trim().length > 0) {
       return normalizeEncryptionKey(envValue)
     }
 
-    return this.readOrCreateKeyFile()
-  }
-
-  private async readOrCreateKeyFile(): Promise<Buffer> {
     try {
       const existing = await readFile(this.keyFilePath, 'utf8')
       const normalized = existing.trim()
@@ -298,13 +384,8 @@ export class ProviderSecretsStore
       if (code !== 'ENOENT') {
         throw error
       }
+      return null
     }
-
-    const generated = randomBytes(32)
-    await writeTextFileAtomically(this.keyFilePath, `${generated.toString('base64')}\n`, {
-      mode: 0o600,
-    })
-    return generated
   }
 
   private async readCollectionConsistent(): Promise<PersistedSecretCollection> {

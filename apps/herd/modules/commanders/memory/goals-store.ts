@@ -1,6 +1,7 @@
 import { readFile, writeFile } from 'node:fs/promises'
 import * as path from 'node:path'
-import { resolveCommanderPaths } from '../paths.js'
+import { resolveCommanderDataDir, resolveCommanderPaths } from '../paths.js'
+import { withCommanderMutation } from '../child-mutation-coordinator.js'
 import type { GoalEntry } from './types.js'
 
 /**
@@ -21,13 +22,16 @@ import type { GoalEntry } from './types.js'
  */
 export class GoalsStore {
   private readonly goalsPath: string
+  private readonly lifecycleScope: string
 
   constructor(
-    commanderId: string,
+    private readonly commanderId: string,
     basePath?: string,
+    lifecycleScope = basePath ?? resolveCommanderDataDir(),
   ) {
     const { memoryRoot } = resolveCommanderPaths(commanderId, basePath)
     this.goalsPath = path.join(memoryRoot, 'GOALS.md')
+    this.lifecycleScope = lifecycleScope
   }
 
   async read(): Promise<GoalEntry[]> {
@@ -42,7 +46,9 @@ export class GoalsStore {
 
   async write(goals: GoalEntry[]): Promise<void> {
     const content = serializeGoalsMd(goals)
-    await writeFile(this.goalsPath, content, 'utf-8')
+    await withCommanderMutation(this.commanderId, this.lifecycleScope, () => (
+      writeFile(this.goalsPath, content, 'utf-8')
+    ))
   }
 
   /**

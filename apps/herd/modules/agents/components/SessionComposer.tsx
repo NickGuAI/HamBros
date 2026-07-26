@@ -2,6 +2,7 @@ import {
   forwardRef,
   useImperativeHandle,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -26,6 +27,7 @@ import { AddToChatSheet } from './AddToChatSheet'
 import { SkillsPicker } from './SkillsPicker'
 import { QueuePanel } from './QueuePanel'
 import { useSessionDraft } from '../page-shell/use-session-draft'
+import type { SessionDraftMode } from '../page-shell/use-session-draft'
 import type { WorkspaceContextRequest, WorkspacePendingFileAnnotation } from '@modules/workspace/use-workspace'
 import {
   applyComposerAbilitiesToText,
@@ -140,9 +142,13 @@ export const SessionComposer = forwardRef<SessionComposerHandle, SessionComposer
   onSend,
   onQueue,
 }, ref) {
+  const isMobileVariant = variant === 'mobile'
+  const composerHintId = useId()
   const {
     inputText,
     setInputText,
+    draftMode,
+    setDraftMode,
     showDraftSaved,
     focusTextarea,
     textareaRef,
@@ -150,7 +156,7 @@ export const SessionComposer = forwardRef<SessionComposerHandle, SessionComposer
     restoreDraft,
     pendingImages,
     setPendingImages,
-  } = useSessionDraft(sessionName)
+  } = useSessionDraft(sessionName, { variant })
   const [imageError, setImageError] = useState<string | null>(null)
   const [isQueueSubmitPending, setIsQueueSubmitPending] = useState(false)
   const [isSendSubmitPending, setIsSendSubmitPending] = useState(false)
@@ -216,7 +222,6 @@ export const SessionComposer = forwardRef<SessionComposerHandle, SessionComposer
     void preloadOpenAITranscriptionWorklet()
   }, [openAITranscription.isSupported, realtimeTranscriptionConfig?.openaiConfigured])
 
-  const isMobileVariant = variant === 'mobile'
   const queueDraftsSupported = !disabled && typeof onQueue === 'function'
   const totalQueuedCount = getQueuePendingCount(queueSnapshot)
   const queueMaxSize = typeof queueSnapshot?.maxSize === 'number' ? queueSnapshot.maxSize : 0
@@ -247,15 +252,17 @@ export const SessionComposer = forwardRef<SessionComposerHandle, SessionComposer
     : !queueDraftsSupported
       ? 'Queue is only available for stream agent sessions'
       : 'Queue unavailable'
+  const quickModeHint = queueDraftsSupported ? 'Enter send · Tab queue' : 'Enter send'
+  const markdownModeHint = 'Markdown · Enter newline · ⌘Enter send'
   const footerHint = disabled
     ? (disabledMessage ?? 'Composer unavailable')
     : isSendSubmitPending
       ? 'Sending message...'
     : isQueueSubmitPending
       ? 'Queuing message...'
-    : queueDraftsSupported
-      ? 'Enter send · Tab queue'
-      : 'Enter send'
+    : draftMode === 'markdown'
+      ? markdownModeHint
+      : quickModeHint
   const selectedAbilities = composerAbilities.filter((ability) => selectedAbilityIds.includes(ability.id))
   const showSkills = skillsPickerMode !== null
   const composerSettingsLoadError = composerAbilitiesLoadError ?? composerSkillSlotsLoadError
@@ -299,11 +306,12 @@ export const SessionComposer = forwardRef<SessionComposerHandle, SessionComposer
 
   function restoreComposer(snapshot: {
     inputText: string
+    draftMode: SessionDraftMode
     pendingImages: SessionComposerImage[]
     selectedAbilityIds: string[]
     context: SessionComposerContextAttachments
   }) {
-    restoreDraft(snapshot.inputText, snapshot.pendingImages)
+    restoreDraft(snapshot.inputText, snapshot.pendingImages, snapshot.draftMode)
     setImageError(null)
     setSelectedAbilityIds(snapshot.selectedAbilityIds)
     onRestoreContextAttachments?.(snapshot.context)
@@ -360,6 +368,7 @@ export const SessionComposer = forwardRef<SessionComposerHandle, SessionComposer
     const clientSendId = createClientSendId()
     const snapshot = {
       inputText,
+      draftMode,
       pendingImages: images,
       selectedAbilityIds: selectedAbilityIds.slice(),
       context: {
@@ -491,13 +500,16 @@ export const SessionComposer = forwardRef<SessionComposerHandle, SessionComposer
 
   function handleTextareaInput(event: ChangeEvent<HTMLTextAreaElement>) {
     setInputText(event.target.value)
-    const textarea = event.target
-    textarea.style.height = 'auto'
-    textarea.style.height = `${Math.min(textarea.scrollHeight, isMobileVariant ? 148 : 120)}px`
   }
 
   function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (isCompositionShortcutEvent(event)) {
+      return
+    }
+
+    if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === 'm') {
+      event.preventDefault()
+      toggleDraftMode()
       return
     }
 
@@ -507,7 +519,13 @@ export const SessionComposer = forwardRef<SessionComposerHandle, SessionComposer
       return
     }
 
-    if (event.key === 'Enter' && !event.shiftKey) {
+    if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && !event.shiftKey) {
+      event.preventDefault()
+      void handleSend()
+      return
+    }
+
+    if (draftMode === 'quick' && event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault()
       void handleSend()
     }
@@ -527,6 +545,11 @@ export const SessionComposer = forwardRef<SessionComposerHandle, SessionComposer
   }
 
   function handlePaste(event: ClipboardEvent<HTMLTextAreaElement>) {
+    const pastedText = event.clipboardData.getData('text')
+    if (draftMode === 'quick' && /\r\n|\r|\n/u.test(pastedText)) {
+      setDraftMode('markdown')
+    }
+
     const items = event.clipboardData.items
     const imageFiles: File[] = []
     for (const item of items) {
@@ -544,6 +567,11 @@ export const SessionComposer = forwardRef<SessionComposerHandle, SessionComposer
 
     event.preventDefault()
     handleImageFiles(imageFiles)
+  }
+
+  function toggleDraftMode() {
+    setDraftMode((current) => current === 'markdown' ? 'quick' : 'markdown')
+    focusTextarea()
   }
 
   function handleMicToggle() {
@@ -766,24 +794,43 @@ export const SessionComposer = forwardRef<SessionComposerHandle, SessionComposer
     }
 
     return (
-      <textarea
-        ref={textareaRef}
-        className="input-field"
-        rows={1}
-        placeholder={effectivePlaceholder}
-        value={inputText}
-        onChange={handleTextareaInput}
-        onKeyDown={handleKeyDown}
-        onCompositionStart={handleCompositionStart}
-        onCompositionEnd={handleCompositionEnd}
-        onPaste={handlePaste}
-        disabled={disabled}
-      />
+      <>
+        <textarea
+          ref={textareaRef}
+          className="input-field"
+          rows={1}
+          placeholder={effectivePlaceholder}
+          value={inputText}
+          onChange={handleTextareaInput}
+          onKeyDown={handleKeyDown}
+          onCompositionStart={handleCompositionStart}
+          onCompositionEnd={handleCompositionEnd}
+          onPaste={handlePaste}
+          aria-describedby={composerHintId}
+          disabled={disabled}
+        />
+        <button
+          type="button"
+          className={cn('composer-mode-toggle', draftMode === 'markdown' && 'composer-mode-toggle--active')}
+          onClick={toggleDraftMode}
+          aria-label={draftMode === 'markdown' ? 'Switch composer to quick mode' : 'Switch composer to markdown mode'}
+          aria-pressed={draftMode === 'markdown'}
+          aria-keyshortcuts="Meta+Shift+M Control+Shift+M"
+          title={draftMode === 'markdown' ? 'Markdown mode on' : 'Markdown mode'}
+          disabled={disabled}
+        >
+          ¶
+        </button>
+      </>
     )
   }
 
   return (
-    <div className={cn('hervald-session-composer', isMobileVariant && 'hervald-session-composer--mobile')}>
+    <div className={cn(
+      'hervald-session-composer',
+      isMobileVariant && 'hervald-session-composer--mobile',
+      draftMode === 'markdown' && 'hervald-session-composer--markdown',
+    )}>
       <div className="input-bar">
         {hasContextAttachments && (
           <div className="flex flex-wrap gap-1.5 px-1 pb-1">
@@ -1106,7 +1153,7 @@ export const SessionComposer = forwardRef<SessionComposerHandle, SessionComposer
 
         {!isMobileVariant && (
         <div className="composer-footer flex items-center justify-between px-3 pb-1 pt-0.5">
-          <span className="font-mono text-[10px] text-[var(--msg-text-muted)]">
+          <span id={composerHintId} className="font-mono text-[10px] text-[var(--msg-text-muted)]">
             {showDraftSaved ? 'Draft saved · ' : ''}
             {footerHint}
           </span>
@@ -1120,6 +1167,11 @@ export const SessionComposer = forwardRef<SessionComposerHandle, SessionComposer
             </button>
           )}
         </div>
+        )}
+        {isMobileVariant && (
+          <span id={composerHintId} className="sr-only">
+            {footerHint}
+          </span>
         )}
       </div>
 

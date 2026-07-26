@@ -8,6 +8,7 @@ import { getProviderControlDefaults } from '@/hooks/use-providers'
 import type { ClaudeAdaptiveThinkingMode } from '../../../claude-adaptive-thinking.js'
 import {
   getAgentEffortLevelsForModel,
+  getDefaultAgentEffortForModel,
   type AgentEffortLevel,
 } from '../../effort.js'
 import type { ClaudeMaxThinkingTokens } from '../../../claude-max-thinking-tokens.js'
@@ -71,11 +72,11 @@ export function getNormalizedEffort(
   if (effortOptions.includes(effort)) {
     return null
   }
-  const modelDefaultEffort = modelOption?.defaultEffort as AgentEffortLevel | undefined
-  if (modelDefaultEffort && effortOptions.includes(modelDefaultEffort)) {
-    return modelDefaultEffort
-  }
-  return effortOptions.includes(defaultEffort) ? defaultEffort : effortOptions[0] ?? defaultEffort
+  return getDefaultAgentEffortForModel(
+    agentType,
+    modelOption,
+    provider.defaults?.effort,
+  ) ?? null
 }
 
 export function getNormalizedAdaptiveThinking(

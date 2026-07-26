@@ -82,8 +82,25 @@ machine-env wildcard to sshd `AcceptEnv`.
 - If daemon attach fails after a machine was previously paired, check daemon
   status and rotate pairing when the pairing expiry is past.
 
+## Hosted Control-Plane Mode
+
+Set `HERD_PROVIDER_EXECUTION_MODE=daemon-only` when the Herd server should
+coordinate work without launching provider CLIs on its own host or over SSH.
+In this mode, local and SSH launch requests fail with enrollment guidance; a
+connected daemon whose selected provider is installed and authenticated remains
+launchable. When a launch omits `machineId`, Herd selects a daemon only if
+exactly one daemon is ready for that provider. Multiple ready daemons require an
+explicit `machineId`; commander-wide placement is stored as
+`executionMachineId`, never inferred from the commander identity `host`.
+
+This mode does not disable schedulers, channels, or other background control
+plane runtimes. Persisted local and SSH sessions stay recorded but do not
+auto-resume. See [Railway hosted control plane](railway.md) for the full hosted
+deployment and first-boot key contract.
+
 Related docs:
 
 - [Workers concept](../concepts/workers.md)
 - [Hardening](hardening.md)
+- [Railway hosted control plane](railway.md)
 - [Troubleshooting](../troubleshoot.md)

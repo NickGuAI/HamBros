@@ -59,7 +59,7 @@ export interface OrgRouterOptions {
   operatorStore?: BuildOrgTreeDependencies['operatorStore']
   sessionStore?: OrgSessionStore
   automationStore?: BuildOrgTreeDependencies['automationStore']
-  automationScheduler?: Pick<AutomationScheduler, 'createAutomation'>
+  automationScheduler?: Pick<AutomationScheduler, 'createAutomation' | 'ensureAutomationScheduled'>
   automationSchedulerInitialized?: Promise<void>
   conversationStore?: OrgConversationStore
   questStore?: BuildOrgTreeDependencies['questStore']
@@ -355,19 +355,27 @@ export function createOrgRouter(options: OrgRouterOptions = {}): Router {
   }
 
   async function ensureDefaultAutomationsForFounder(founder: Pick<Operator, 'id'>): Promise<void> {
-    const automationStore = await loadResolvedAutomationStore()
-    if (!canSeedDefaultAutomations(automationStore)) {
-      return
-    }
-
     defaultAutomationsPromise ??= (async () => {
+      const automationStore = await loadResolvedAutomationStore()
+      if (!canSeedDefaultAutomations(automationStore)) {
+        return
+      }
+
       await options.automationSchedulerInitialized
       await ensureDefaultOperatorAutomations({
         operatorId: founder.id,
         store: automationStore,
         scheduler: options.automationScheduler,
       })
-    })().finally(() => {
+    })().catch((error: unknown) => {
+      const errorName = error instanceof Error && error.name.trim()
+        ? error.name.trim()
+        : 'UnknownError'
+      console.error(
+        `[org] Default automation reconciliation failed (${errorName}); ` +
+        'founder identity remains available and reconciliation will retry on the next org request.',
+      )
+    }).finally(() => {
       defaultAutomationsPromise = null
     })
 
@@ -425,12 +433,15 @@ export function createOrgRouter(options: OrgRouterOptions = {}): Router {
             currentTask: null,
           })
           : Promise.resolve(),
-        mergeIdentityOperatingStyleIntoCommanderWorkflow(created.id, GAIA_IDENTITY, { basePath: commanderDataDir }),
+        mergeIdentityOperatingStyleIntoCommanderWorkflow(created.id, GAIA_IDENTITY, {
+          basePath: commanderDataDir,
+          lifecycleScope: commanderDataDir,
+        }),
         setCommanderDisplayName(commanderDataDir, created.id, GAIA_DISPLAY_NAME),
         writeCommanderUiProfile(created.id, commanderDataDir, ensureCommanderVisualProfile({
           avatar: GAIA_COMMANDER_AVATAR_URL,
           speakingTone: GAIA_SPEAKING_TONE,
-        })),
+        }), commanderDataDir),
       ]
       const results = await Promise.allSettled(sideEffects)
       for (const result of results) {

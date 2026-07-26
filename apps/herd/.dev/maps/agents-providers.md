@@ -9,7 +9,8 @@ secrets, session creation, and UI/commander provider selection.
 
 - `apps/herd/modules/agents/providers/registry.ts`
 - `apps/herd/modules/agents/providers/provider-adapter.ts`
-- `apps/herd/modules/agents/providers/provider-context-migration.ts`
+- `apps/herd/modules/agents/providers/provider-context-normalization.ts`
+- `apps/herd/modules/agents/providers/provider-session-context.ts`
 - `apps/herd/modules/agents/providers/generate-registry.mjs`
 - `apps/herd/modules/agents/adapters/claude/`
 - `apps/herd/modules/agents/adapters/codex/`
@@ -44,7 +45,7 @@ secrets, session creation, and UI/commander provider selection.
 
 - Command Room and Agents UI provider/model selectors.
 - Commander creation/edit/conversation provider defaults.
-- Runtime session persistence and provider context migration.
+- Runtime session persistence and provider context normalization.
 - API keys/settings for service secrets.
 
 ## Verification Bundle
@@ -52,7 +53,7 @@ secrets, session creation, and UI/commander provider selection.
 ```bash
 pnpm --filter herd run generate:provider-registry
 pnpm --filter herd exec vitest run \
-  server/__tests__/provider-context-migration.test.ts \
+  server/__tests__/provider-context-normalization.test.ts \
   modules/agents/providers/__tests__/http-router.test.ts \
   modules/agents/providers/__tests__/validate-model.test.ts \
   modules/agents/__tests__/provider-auth.test.ts \

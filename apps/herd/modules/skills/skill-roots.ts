@@ -1,10 +1,17 @@
-import { readFile, readdir, stat } from 'node:fs/promises'
+import { readFile, readdir, realpath, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
 
 export const AGENT_SKILLS_DIR_ENV = 'HERD_AGENT_SKILLS_DIR'
 export const DIRECT_SKILLS_DIRS_ENV = 'HERD_DIRECT_SKILLS_DIRS'
 const APP_PATH_FILE = path.join(homedir(), '.herd', 'app-path')
+const BUNDLED_AGENT_SKILLS_RELATIVE_PATH = path.join('runtime', 'defaults', 'agent-skills')
+const BUNDLED_STARTER_SKILLS_RELATIVE_PATH = path.join(
+  'public',
+  'repo-root',
+  'agent-skills',
+  'herd-starter',
+)
 
 export interface SkillDirectorySource {
   dir: string
@@ -63,6 +70,53 @@ async function isDirectory(candidate: string): Promise<boolean> {
   }
 }
 
+export function resolveBundledAgentSkillsDir(cwd: string = process.cwd()): string {
+  return path.resolve(cwd, BUNDLED_AGENT_SKILLS_RELATIVE_PATH)
+}
+
+export function resolveBundledStarterSkillsDir(cwd: string = process.cwd()): string {
+  return path.resolve(cwd, BUNDLED_STARTER_SKILLS_RELATIVE_PATH)
+}
+
+function isPathWithin(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate)
+  return relative === '' || (
+    !path.isAbsolute(relative)
+    && relative !== '..'
+    && !relative.startsWith(`..${path.sep}`)
+  )
+}
+
+export async function isBundledAgentSkillPath(
+  candidate: string,
+  cwd: string = process.cwd(),
+): Promise<boolean> {
+  const bundledRoots = [
+    resolveBundledAgentSkillsDir(cwd),
+    resolveBundledStarterSkillsDir(cwd),
+  ]
+  const resolvedCandidate = path.resolve(candidate)
+  const isLexicallyBundled = bundledRoots.some((root) => isPathWithin(root, resolvedCandidate))
+
+  for (const bundledRoot of bundledRoots) {
+    try {
+      const [canonicalBundledRoot, canonicalCandidate] = await Promise.all([
+        realpath(bundledRoot),
+        realpath(resolvedCandidate),
+      ])
+      if (isPathWithin(canonicalBundledRoot, canonicalCandidate)) {
+        return true
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw error
+      }
+    }
+  }
+
+  return isLexicallyBundled
+}
+
 export async function resolveAgentSkillsDirCandidates(
   cwd: string = process.cwd(),
   env: NodeJS.ProcessEnv = process.env,
@@ -81,6 +135,7 @@ export async function resolveAgentSkillsDirCandidates(
 
   pushUnique(candidates, path.join(homedir(), 'Herd', 'agent-skills'))
   pushUnique(candidates, path.join(homedir(), 'App', 'agent-skills'))
+  pushUnique(candidates, resolveBundledAgentSkillsDir(cwd))
 
   return candidates
 }
@@ -102,19 +157,34 @@ export async function discoverAgentSkillPackageDirs(
   cwd: string = process.cwd(),
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<string[]> {
-  const agentSkillsDir = await resolveAgentSkillsDir(cwd, env)
-  if (!agentSkillsDir) {
-    return []
+  const packageDirs: string[] = []
+  const agentSkillsDirs = await resolveAgentSkillsDirCandidates(cwd, env)
+
+  for (const agentSkillsDir of agentSkillsDirs) {
+    if (!await isDirectory(agentSkillsDir)) {
+      continue
+    }
+
+    try {
+      const entries = await readdir(agentSkillsDir, { withFileTypes: true })
+      const packageNames = entries
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name)
+        .sort()
+      for (const packageName of packageNames) {
+        pushUnique(packageDirs, path.join(agentSkillsDir, packageName))
+      }
+    } catch {
+      // Continue to lower-precedence roots.
+    }
   }
 
-  try {
-    const entries = await readdir(agentSkillsDir, { withFileTypes: true })
-    return entries
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => path.join(agentSkillsDir, entry.name))
-  } catch {
-    return []
+  const starterSkillsDir = resolveBundledStarterSkillsDir(cwd)
+  if (await isDirectory(starterSkillsDir)) {
+    pushUnique(packageDirs, starterSkillsDir)
   }
+
+  return packageDirs
 }
 
 export async function resolveDirectSkillDirCandidates(
@@ -147,9 +217,7 @@ export async function discoverSkillDirectorySources(
   }
 
   for (const packageDir of await discoverAgentSkillPackageDirs(cwd, env)) {
-    if (await isDirectory(packageDir)) {
-      pushUniqueSource(sources, packageDir, path.basename(packageDir))
-    }
+    pushUniqueSource(sources, packageDir, path.basename(packageDir))
   }
 
   return sources

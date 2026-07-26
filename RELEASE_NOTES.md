@@ -1,42 +1,49 @@
-# Herd v0.0.8-beta
+# Herd v0.0.9-beta
 
-Herd `v0.0.8-beta` moves the current public release line to GNU AGPLv3 while
-shipping the provider, conversation, and deployment improvements accumulated
-since `v0.0.7-beta`.
+Herd `v0.0.9-beta` focuses on complete operator workflows: richer session
+composition, safer automation and quest handling, self-contained onboarding,
+and a production-grade hosted deployment path.
 
 ## License
 
-- Herd `v0.0.8-beta` is open source under GNU AGPLv3 (`AGPL-3.0-only`).
+- Herd `v0.0.9-beta` is open source under GNU AGPLv3 (`AGPL-3.0-only`).
 - No license purchase is required for commercial use that complies with the
   AGPL.
 - A separate paid commercial agreement is available for proprietary or other
   non-AGPL use; see
-  [COMMERCIAL-LICENSE.md](https://github.com/NickGuAI/Herd/blob/v0.0.8-beta/COMMERCIAL-LICENSE.md).
+  [COMMERCIAL-LICENSE.md](https://github.com/NickGuAI/Herd/blob/v0.0.9-beta/COMMERCIAL-LICENSE.md).
 - Earlier tagged releases retain the license terms included with those
   releases.
 
 ## Highlights
 
-- One Codex model catalogue now drives conversations and credentials: GPT-5.6
-  SOL, GPT-5.5, GPT-5.4, GPT-5.4 Mini, GPT-5.3 Codex, and GPT-5.3 Codex Spark.
-  Every model exposes `low`, `medium`, `high`, and `max` effort; `ultra` is
-  available only for `gpt-5.6-sol`.
-- Adapter-backed benchmark bootstrap and run commands now require an explicit
-  absolute `--adapter-root`; run also requires a validated `--adapter-module`.
-  The canonical orchestration runner is `herd-orchestrated`.
-- Stronger credential-pool selection, Claude authentication recovery, quota
-  refresh, and conversation resume continuity.
-- More reliable queued and in-flight sends across runtime transitions, with
-  approval-policy context preserved through worker handoffs.
-- Clearer grouping for sub-agent transcript activity.
-- A simplified direct-ALB enterprise EC2 topology: the Node server owns UI,
-  API, and WebSockets on port `20001`, while port `20009` is reserved for the
-  loopback development API.
+- A two-mode session composer combines fast Enter-to-send chat with a durable
+  Markdown editor for multiline work, keyboard shortcuts, attachments, paste
+  promotion, and per-session draft restoration.
+- Automations now use a responsive master/detail workspace across global and
+  commander surfaces, with safer draft behavior and server-authoritative cron
+  validation.
+- Quest artifacts are explicit task references across the UI, API, and CLI.
+  Cross-host task moves retain backlinks, while artifact-backed workspaces stay
+  read-only.
+- Fresh founder onboarding can seed the starter workforce and default
+  housekeeping automations from skills bundled directly in the public
+  artifact.
+- The Railway image now exercises the full production lifecycle: daemon-only
+  provider execution by default, durable state across restart, bootstrap-key
+  non-recreation, SQLite backup/upgrade, and graceful `SIGTERM`.
+- Credential selection is placement-owned. Local Claude credentials are
+  managed globally; Codex and eligible remote credentials remain selectable
+  per conversation. Codex effort choices come from live model capabilities.
+- The provider catalogue adds Claude Opus 5. The public skill bundle adds
+  `growth-analytics`, and the retired Composio MCP default is removed.
 
 ## Upgrade and compatibility
 
+Git checkouts can upgrade in place:
+
 ```bash
-herd update --tag v0.0.8-beta
+herd update --tag v0.0.9-beta
 ```
 
 Fresh installs continue to use:
@@ -45,26 +52,29 @@ Fresh installs continue to use:
 curl -fsSL https://herd.gehirn.ai/install.sh | bash
 ```
 
-- Local Claude credential selection is now managed globally in Settings.
-  Legacy per-conversation local Claude pins are ignored or rejected; Codex and
-  remote-token Claude credentials remain selectable per conversation.
-- Persisted Codex `minimal` and `xhigh` effort values normalize to `low` and
-  `max`. `ultra` is accepted only for `gpt-5.6-sol`.
-- Eval callers must now pass an absolute `--adapter-root` to benchmark
-  commander bootstrap and run commands, pass `--adapter-module` to run, and
-  use `herd-orchestrated` instead of the retired runner identity.
-- Enterprise ALB targets must use port `20001` with `/api/health`; port `20009`
-  is development-only. The EC2 upgrade retires the legacy Herd Caddy site
-  safely, preserving other Caddy sites and restoring its backup on failure.
+- Back up the configured Herd data directory before upgrading. JSON-store and
+  SQLite readiness checks run before the upgraded service is allowed to start.
+- Installer-created archive checkouts can be refreshed by rerunning the pinned
+  installer; durable state remains outside the application checkout.
+- Legacy per-conversation local Claude pins are ignored or rejected. Choose
+  the local Claude credential in Settings; select Codex or eligible remote
+  credentials on the conversation.
+- Cron schedules are now validated by the server. Invalid or incomplete drafts
+  remain local instead of being persisted as runnable jobs.
+- Railway deployments must retain their configured durable volume. Hosted
+  images default to daemon-only provider execution unless the host is
+  intentionally provider-ready.
 
 ## Verification
 
-- Application build and lint.
-- Installer, release-runtime, SQLite-readiness, launch, and SOP-15 contract
-  tests.
-- CLI tests, documentation guardrails, and website tests, lint, and build.
-- Exact GNU AGPLv3 license checksum and canonical-versus-served installer byte
-  parity.
+- Full CLI suite plus installer, release-runtime, JSON-store, SQLite-readiness,
+  and launch contract tests.
+- Application build, documentation checks, public artifact cleanliness, and
+  documentation-link validation.
+- Enterprise EC2 container smoke and exact Railway production-image lifecycle
+  smoke.
+- Exact GNU AGPLv3 license checksum, installer byte parity, and release-version
+  pin checks.
 
 ## Source Traceability
 

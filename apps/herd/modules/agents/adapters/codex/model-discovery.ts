@@ -4,7 +4,6 @@ import type {
   ProviderModelOption,
 } from '../../providers/provider-adapter.js'
 import { CodexSessionRuntime } from './runtime.js'
-import { getCodexModelEffortLevels } from './models.js'
 
 interface CodexModelDiscoveryRuntime {
   ensureConnected(): Promise<void>
@@ -24,6 +23,14 @@ function record(value: unknown): Record<string, unknown> | null {
 
 function text(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined
+}
+
+function reportedEffortLevels(item: Record<string, unknown>): string[] {
+  const entries = Array.isArray(item.supportedReasoningEfforts) ? item.supportedReasoningEfforts : []
+  const levels = entries
+    .map((entry) => text(record(entry)?.reasoningEffort))
+    .filter((level): level is string => Boolean(level))
+  return [...new Set(levels)]
 }
 
 function modelList(payload: unknown): unknown[] {
@@ -73,7 +80,11 @@ export function parseCodexModelList(
     }
     const catalogId = text(item.id)
     const aliases = catalogId && catalogId !== runtimeModel ? [catalogId] : undefined
-    const supportedEffortLevels = getCodexModelEffortLevels(runtimeModel)
+    const supportedEffortLevels = reportedEffortLevels(item)
+    const reportedDefault = text(item.defaultReasoningEffort)
+    const defaultEffort = reportedDefault && supportedEffortLevels.includes(reportedDefault)
+      ? reportedDefault
+      : undefined
     return [{
       id: runtimeModel,
       label: text(item.displayName) ?? runtimeModel,
@@ -82,9 +93,9 @@ export function parseCodexModelList(
       ...(aliases ? { aliases } : {}),
       ...(item.hidden === true ? { hidden: true } : {}),
       resolvedModel: runtimeModel,
-      supportsEffort: true,
+      supportsEffort: supportedEffortLevels.length > 0,
       supportedEffortLevels,
-      defaultEffort: 'max',
+      ...(defaultEffort ? { defaultEffort } : {}),
       runtimeCompatible: true,
     }]
   })

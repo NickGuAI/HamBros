@@ -475,9 +475,11 @@ export async function resolveProviderModels(
           }, { once: true })
         }),
       ]).finally(() => clearTimeout(timeout))
-      const models = applyProviderModelCuration(discovered.models, provider.availableModels, {
-        includeUnmatchedCuratedModels: adapter.includeUnmatchedCuratedModels === true,
-      })
+      const models = adapter.authoritativeDynamicModels === true
+        ? visibleCompatibleModels(discovered.models)
+        : applyProviderModelCuration(discovered.models, provider.availableModels, {
+            includeUnmatchedCuratedModels: adapter.includeUnmatchedCuratedModels === true,
+          })
       if (models.length === 0) {
         throw new Error('Provider model discovery returned no compatible models')
       }

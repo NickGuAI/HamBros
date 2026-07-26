@@ -1,5 +1,5 @@
 import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes } from 'node:crypto'
-import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { readFileSync, statSync } from 'node:fs'
 import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { resolveHerdDataDir } from '../data-dir.js'
@@ -10,7 +10,7 @@ const MASTER_KEY_ENV = 'HERD_MASTER_KEY'
 
 export const HERD_MACHINE_ENV_PREFIX = 'HERD_MACHINE_ENV_'
 
-interface EncryptedMachineEnvRecord {
+export interface EncryptedMachineEnvRecord {
   version: number
   iv: string
   authTag: string
@@ -24,11 +24,29 @@ export interface PreparedMachineLaunchEnvironment {
   sourcedEnvFile?: string
 }
 
+export type MachineCredentialsEncryptionReadinessCode =
+  | 'ready'
+  | 'store-invalid'
+  | 'key-missing'
+  | 'key-invalid'
+  | 'decryption-failed'
+
+export interface MachineCredentialsEncryptionReadiness {
+  ready: boolean
+  code: MachineCredentialsEncryptionReadinessCode
+  error: string | null
+}
+
+export interface MachineCredentialsKeyOptions {
+  keyFilePath?: string
+  env?: NodeJS.ProcessEnv
+}
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
 }
 
-function isEncryptedMachineEnvRecord(value: unknown): value is EncryptedMachineEnvRecord {
+export function isEncryptedMachineEnvRecord(value: unknown): value is EncryptedMachineEnvRecord {
   return (
     isObject(value) &&
     value.version === MACHINE_CREDENTIALS_VERSION &&
@@ -146,10 +164,10 @@ export function defaultMachineCredentialsKeyPath(env: NodeJS.ProcessEnv = proces
   return path.join(resolveHerdDataDir(env), 'master.key')
 }
 
-function readOrCreateMachineCredentialsKeySync(
+function resolveExistingMachineCredentialsKeySync(
   keyFilePath = defaultMachineCredentialsKeyPath(),
   env: NodeJS.ProcessEnv = process.env,
-): Buffer {
+): Buffer | null {
   const envValue = env[MASTER_KEY_ENV]?.trim()
   if (envValue) {
     return normalizeEncryptionKey(envValue)
@@ -172,19 +190,42 @@ function readOrCreateMachineCredentialsKeySync(
     }
   }
 
-  const generated = randomBytes(32)
-  mkdirSync(path.dirname(keyFilePath), { recursive: true, mode: 0o700 })
-  writeFileSync(keyFilePath, `${generated.toString('base64')}\n`, {
-    encoding: 'utf8',
-    mode: 0o600,
-  })
-  return generated
+  return null
+}
+
+function requireExistingMachineCredentialsKeySync(
+  keyFilePath = defaultMachineCredentialsKeyPath(),
+  env: NodeJS.ProcessEnv = process.env,
+): Buffer {
+  const existing = resolveExistingMachineCredentialsKeySync(keyFilePath, env)
+  if (!existing) {
+    throw new Error('Machine credentials encryption key is missing for persisted ciphertext')
+  }
+  return existing
 }
 
 async function readOrCreateMachineCredentialsKey(
   keyFilePath = defaultMachineCredentialsKeyPath(),
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<Buffer> {
+  const existing = await resolveExistingMachineCredentialsKey(keyFilePath, env)
+  if (existing) {
+    return existing
+  }
+
+  const generated = randomBytes(32)
+  await mkdir(path.dirname(keyFilePath), { recursive: true, mode: 0o700 })
+  await writeFile(keyFilePath, `${generated.toString('base64')}\n`, {
+    encoding: 'utf8',
+    mode: 0o600,
+  })
+  return generated
+}
+
+async function resolveExistingMachineCredentialsKey(
+  keyFilePath = defaultMachineCredentialsKeyPath(),
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<Buffer | null> {
   const envValue = env[MASTER_KEY_ENV]?.trim()
   if (envValue) {
     return normalizeEncryptionKey(envValue)
@@ -207,13 +248,7 @@ async function readOrCreateMachineCredentialsKey(
     }
   }
 
-  const generated = randomBytes(32)
-  await mkdir(path.dirname(keyFilePath), { recursive: true, mode: 0o700 })
-  await writeFile(keyFilePath, `${generated.toString('base64')}\n`, {
-    encoding: 'utf8',
-    mode: 0o600,
-  })
-  return generated
+  return null
 }
 
 function encryptedMachineEnvPath(envFilePath: string): string {
@@ -243,13 +278,88 @@ function loadEncryptedEnvEntriesSync(machine: MachineConfig, envFilePath: string
   }
   const plainText = decryptEnvContents(
     parsed,
-    deriveMachineEncryptionKey(readOrCreateMachineCredentialsKeySync(), machine.id),
+    deriveMachineEncryptionKey(requireExistingMachineCredentialsKeySync(), machine.id),
   )
   const entries = parseMachineEnvContents(plainText)
   if (!entries) {
     throw new Error(`Encrypted machine env file is not parseable: ${envFilePath}`)
   }
   return entries
+}
+
+/**
+ * Verifies a persisted machine credential file without creating or rotating a
+ * key. Missing files remain valid because launch-time behavior treats a stale
+ * optional `.enc` registry reference as an empty credential set.
+ */
+export async function inspectMachineCredentialsEncryptionReadiness(
+  machine: MachineConfig,
+  options: MachineCredentialsKeyOptions & { envFilePath?: string } = {},
+): Promise<MachineCredentialsEncryptionReadiness> {
+  const envFilePath = options.envFilePath ?? machine.envFile?.trim()
+  if (!envFilePath || !envFilePath.endsWith('.enc')) {
+    return { ready: true, code: 'ready', error: null }
+  }
+
+  let record: EncryptedMachineEnvRecord
+  try {
+    const raw = await readFile(envFilePath, 'utf8')
+    const parsed = JSON.parse(raw) as unknown
+    if (!isEncryptedMachineEnvRecord(parsed)) {
+      throw new Error('Invalid encrypted machine credentials record')
+    }
+    record = parsed
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      return { ready: true, code: 'ready', error: null }
+    }
+    return {
+      ready: false,
+      code: 'store-invalid',
+      error: 'Machine credentials store is unreadable or does not match the required shape.',
+    }
+  }
+
+  let masterKey: Buffer | null
+  try {
+    masterKey = await resolveExistingMachineCredentialsKey(
+      options.keyFilePath,
+      options.env ?? process.env,
+    )
+  } catch {
+    return {
+      ready: false,
+      code: 'key-invalid',
+      error: 'Machine credentials encryption key is invalid or unreadable.',
+    }
+  }
+  if (!masterKey) {
+    return {
+      ready: false,
+      code: 'key-missing',
+      error: 'Machine credentials encryption key is missing for persisted ciphertext.',
+    }
+  }
+
+  let plainText: string
+  try {
+    plainText = decryptEnvContents(record, deriveMachineEncryptionKey(masterKey, machine.id))
+  } catch {
+    return {
+      ready: false,
+      code: 'decryption-failed',
+      error: 'Machine credentials cannot be decrypted with the configured encryption key.',
+    }
+  }
+  if (!parseMachineEnvContents(plainText)) {
+    return {
+      ready: false,
+      code: 'store-invalid',
+      error: 'Machine credentials decrypted contents do not match the required env-file shape.',
+    }
+  }
+  return { ready: true, code: 'ready', error: null }
 }
 
 function loadPlaintextEnvEntriesSync(envFilePath: string): Record<string, string> | null {
@@ -384,7 +494,11 @@ export function prepareDaemonMachineLaunchEnvironment(
   }
 }
 
-export async function encryptMachineEnvFile(machine: MachineConfig, filePath: string): Promise<string> {
+export async function encryptMachineEnvFile(
+  machine: MachineConfig,
+  filePath: string,
+  keyOptions: MachineCredentialsKeyOptions = {},
+): Promise<string> {
   const contents = await readFile(filePath, 'utf8')
   const parsed = parseMachineEnvContents(contents)
   if (!parsed) {
@@ -392,7 +506,10 @@ export async function encryptMachineEnvFile(machine: MachineConfig, filePath: st
   }
 
   const key = deriveMachineEncryptionKey(
-    await readOrCreateMachineCredentialsKey(),
+    await readOrCreateMachineCredentialsKey(
+      keyOptions.keyFilePath,
+      keyOptions.env ?? process.env,
+    ),
     machine.id,
   )
   const encrypted = encryptEnvContents(contents, key, new Date().toISOString())

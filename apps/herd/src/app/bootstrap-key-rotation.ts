@@ -36,7 +36,7 @@ export function getBootstrapKeyRotationState(
   }
 
   const hasPermanentBootstrapEquivalent = keys.some((key) => (
-    key.createdBy !== 'system' &&
+    key.purpose === 'permanent' &&
     !key.expiresAt &&
     sameScopeSet(key.scopes, bootstrapScopes)
   ))
@@ -51,7 +51,7 @@ export function getBootstrapKeyRotationState(
       expiresAtMs: getExpiryTime(key.expiresAt),
     }))
     .filter(({ key, expiresAtMs }) => (
-      key.createdBy === 'system' &&
+      key.purpose === 'bootstrap' &&
       expiresAtMs !== null &&
       expiresAtMs > nowMs &&
       sameScopeSet(key.scopes, bootstrapScopes)

@@ -19,6 +19,7 @@ import type {
 } from '../types.js'
 import { CommanderChannelBindingConflictError } from '../store.js'
 import type { Conversation } from '../../commanders/conversation-store.js'
+import { withCommanderRuntimeLaunch } from '../../commanders/package-lifecycle-state.js'
 import { parseWhatsAppChannelConfig, type WhatsAppChannelConfig } from './config.js'
 import { BaileysWhatsAppTransport } from './baileys-transport.js'
 import type {
@@ -260,40 +261,60 @@ export class WhatsAppChannelAdapter implements ChannelAdapter<WhatsAppChannelCon
       this.dataDir,
     )
     const challengeId = randomUUID()
-    const session = await this.transport.beginPairing({
-      challengeId,
-      accountId,
-      config,
-      handlers: {
-        onInbound: () => undefined,
-      },
+    const outcome = await withCommanderRuntimeLaunch(input.commanderId, this.dataDir, async () => {
+      let session: WhatsAppPairingSession | null = null
+      try {
+        session = await this.transport.beginPairing({
+          challengeId,
+          accountId,
+          config,
+          handlers: {
+            onInbound: () => undefined,
+          },
+        })
+        const cleanupTimer = this.schedulePairingCleanup(challengeId, session.expiresAt)
+        this.pendingPairings.set(challengeId, {
+          commanderId: input.commanderId,
+          displayName: input.displayName?.trim() || `WhatsApp ${accountId}`,
+          config,
+          session,
+          cleanupTimer,
+        })
+        return {
+          ok: true as const,
+          challenge: {
+            provider: 'whatsapp' as const,
+            commanderId: input.commanderId,
+            kind: session.qrCode ? 'qr' as const : 'connected' as const,
+            id: challengeId,
+            accountId,
+            expiresAt: session.expiresAt,
+            ...(session.qrCode ? { qrCode: session.qrCode } : {}),
+            ...(session.qrDataUrl ? { url: session.qrDataUrl } : {}),
+            instructions: session.qrCode
+              ? 'Open WhatsApp, go to Linked Devices, and scan this QR code.'
+              : 'WhatsApp is already connected for this account.',
+            metadata: {
+              transport: 'baileys',
+              status: session.status,
+              authStateDir: config.baileys.authStateDir,
+            },
+          },
+        }
+      } catch (error) {
+        this.clearPendingPairing(challengeId)
+        await session?.runtime.stop().catch(() => undefined)
+        // The transport may have mutated an existing auth directory before
+        // throwing. Resolve inside the coordinator so the generation advances,
+        // then rethrow after ownership is released; stale cleanup receipts must
+        // never remain valid when rollback cannot prove every side effect gone.
+        return { ok: false as const, error }
+      }
     })
-    const cleanupTimer = this.schedulePairingCleanup(challengeId, session.expiresAt)
-    this.pendingPairings.set(challengeId, {
-      commanderId: input.commanderId,
-      displayName: input.displayName?.trim() || `WhatsApp ${accountId}`,
-      config,
-      session,
-      cleanupTimer,
-    })
-    return {
-      provider: 'whatsapp',
-      commanderId: input.commanderId,
-      kind: session.qrCode ? 'qr' : 'connected',
-      id: challengeId,
-      accountId,
-      expiresAt: session.expiresAt,
-      ...(session.qrCode ? { qrCode: session.qrCode } : {}),
-      ...(session.qrDataUrl ? { url: session.qrDataUrl } : {}),
-      instructions: session.qrCode
-        ? 'Open WhatsApp, go to Linked Devices, and scan this QR code.'
-        : 'WhatsApp is already connected for this account.',
-      metadata: {
-        transport: 'baileys',
-        status: session.status,
-        authStateDir: config.baileys.authStateDir,
-      },
+    if (!outcome.ok) {
+      throw outcome.error
     }
+    return outcome.challenge
   }
 
   async completePairing(

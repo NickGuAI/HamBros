@@ -7,6 +7,7 @@ import {
   resolveCommanderSessionStorePath,
 } from './paths.js'
 import { CommanderSessionStore } from './store.js'
+import { withCommanderMutation } from './child-mutation-coordinator.js'
 
 const namesMutexByPath = new Map<string, Promise<void>>()
 
@@ -133,13 +134,23 @@ export function withNamesLock(
   })
 }
 
+export function mutateCommanderDisplayName(
+  dataDir: string,
+  commanderId: string,
+  mutate: (names: Record<string, string>) => void,
+): Promise<void> {
+  return withCommanderMutation(commanderId, dataDir, () => (
+    withNamesLock(dataDir, mutate)
+  ))
+}
+
 export async function setCommanderDisplayName(
   dataDir: string,
   commanderId: string,
   displayName: string,
 ): Promise<void> {
   await assertRegisteredCommanderId(dataDir, commanderId)
-  await withNamesLock(dataDir, (names) => {
+  await mutateCommanderDisplayName(dataDir, commanderId, (names) => {
     names[commanderId] = displayName
   })
 }

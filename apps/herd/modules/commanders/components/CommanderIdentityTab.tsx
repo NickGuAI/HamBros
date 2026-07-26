@@ -198,10 +198,13 @@ export function CommanderIdentityTab({
   )
   const supportsEffort = currentProvider?.uiCapabilities.supportsEffort === true
     && effortOptions.length > 0
-  const [effort, setEffort] = useState<AgentEffortLevel>(
-    commander.effort
-    ?? getDefaultAgentEffortForModel(commanderAgentType ?? '', commanderModel)
-    ?? providerDefaults.effort,
+  const commanderDefaultEffort = getDefaultAgentEffortForModel(
+    commanderAgentType ?? '',
+    commanderModel,
+    currentProvider?.defaults?.effort,
+  )
+  const [effort, setEffort] = useState<AgentEffortLevel | ''>(
+    commander.effort ?? commanderDefaultEffort ?? '',
   )
   const [adaptiveThinking, setAdaptiveThinking] = useState<ClaudeAdaptiveThinkingMode>(
     commander.adaptiveThinking ?? providerDefaults.adaptiveThinking,
@@ -247,8 +250,7 @@ export function CommanderIdentityTab({
     setEffort(
       commander.effort && effortOptions.includes(commander.effort)
         ? commander.effort
-        : getDefaultAgentEffortForModel(commanderAgentType ?? '', commanderModel)
-          ?? providerDefaults.effort,
+        : commanderDefaultEffort ?? '',
     )
     setAdaptiveThinking(commander.adaptiveThinking ?? providerDefaults.adaptiveThinking)
     setMaxThinkingTokens(String(commander.maxThinkingTokens ?? providerDefaults.maxThinkingTokens))
@@ -282,9 +284,9 @@ export function CommanderIdentityTab({
     detailQuery.data?.runtimeConfig?.defaults.maxTurns,
     commanderAgentType,
     commanderModel,
+    commanderDefaultEffort,
     effortOptions,
     providerDefaults.adaptiveThinking,
-    providerDefaults.effort,
     providerDefaults.maxThinkingTokens,
   ])
 
@@ -345,11 +347,7 @@ export function CommanderIdentityTab({
           ? { fatPinInterval: parsedFatPinInterval }
           : {},
         costCapUsd: parsedCostCapUsd,
-        ...(supportsEffort
-          ? { effort: effortOptions.includes(effort)
-              ? effort
-              : getDefaultAgentEffortForModel(commanderAgentType ?? '', commanderModel) }
-          : {}),
+        ...(supportsEffort && effort && effortOptions.includes(effort) ? { effort } : {}),
         adaptiveThinking,
         maxThinkingTokens: parsedMaxThinkingTokens,
       })
@@ -523,9 +521,10 @@ export function CommanderIdentityTab({
                 <span className="section-title block mb-2">Effort</span>
                 <select
                   value={effort}
-                  onChange={(event) => setEffort(event.target.value as AgentEffortLevel)}
+                  onChange={(event) => setEffort(event.target.value as AgentEffortLevel | '')}
                   className={FIELD_CLASS}
                 >
+                  {!commander.effort && effort === '' ? <option value="">Provider default</option> : null}
                   {effortOptions.map((level) => (
                     <option key={level} value={level}>{level}</option>
                   ))}
@@ -558,7 +557,7 @@ export function CommanderIdentityTab({
             </div>
             <p className={NOTE_CLASS}>
               Global default {runtimeConfig.defaults.maxTurns} turns · limit {runtimeConfig.limits.maxTurns}.
-              Current provider defaults are effort `{providerDefaults.effort}`, adaptive thinking `{providerDefaults.adaptiveThinking}`,
+              Current provider defaults are effort `{commanderDefaultEffort ?? 'provider-managed'}`, adaptive thinking `{providerDefaults.adaptiveThinking}`,
               and {providerDefaults.maxThinkingTokens} thinking tokens. Changes apply to the next compatible provider launch.
             </p>
             {commander.agentType !== 'claude' && (

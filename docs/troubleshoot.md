@@ -81,8 +81,13 @@ pnpm run migrate:sqlite -- \
 Recovery:
 
 - Clear the stored browser key from the landing page or browser storage.
-- Use the newest bootstrap key printed by the running server.
+- Use a preserved permanent admin key, or the original bootstrap value only if
+  this is the same never-initialized store and that bootstrap key is still
+  active. The server never prints or regenerates bootstrap secrets.
 - If Auth0 is configured, complete the hosted sign-in path instead.
+- If every permanent admin key is lost, restore a known-good data-volume backup
+  together with its preserved key. Otherwise, stop and obtain explicit
+  operator authorization before resetting the deployment's durable identity.
 
 ## Provider Auth Is Missing
 

@@ -150,6 +150,10 @@ export function normalizePersistedComposerSkillSlotSettings(value: unknown): Com
   }
 }
 
+export function isPersistedComposerSkillSlotSettingsValid(value: unknown): boolean {
+  return isRecord(value) && !('error' in normalizeSlotArray(value.slots))
+}
+
 export function normalizeComposerSkillSlotSettingsPatch(
   value: unknown,
 ): NormalizedComposerSkillSlotPatch | InvalidComposerSkillSlotPatch {

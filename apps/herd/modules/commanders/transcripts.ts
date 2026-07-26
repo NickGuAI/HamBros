@@ -1,6 +1,7 @@
 import path from 'node:path'
 import { appendFileDurably } from '../durable-file.js'
 import type { CommanderTranscriptAppendInput, CommanderTranscriptAppender } from '../agents/types.js'
+import { withCommanderMutation } from './child-mutation-coordinator.js'
 
 const COMMANDER_TRANSCRIPT_PATH_SEGMENT_PATTERN = /^[a-zA-Z0-9._-]+$/
 
@@ -38,7 +39,9 @@ export function createCommanderTranscriptAppender(dataDir: string): CommanderTra
       const next = previous
         .catch(() => undefined)
         .then(async () => {
-          await appendFileDurably(transcriptPath, line)
+          await withCommanderMutation(input.commanderId, root, () => (
+            appendFileDurably(transcriptPath, line)
+          ))
         })
         .catch((error) => {
           const message = error instanceof Error ? error.message : String(error)

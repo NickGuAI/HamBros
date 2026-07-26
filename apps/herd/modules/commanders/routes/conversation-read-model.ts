@@ -13,8 +13,8 @@ import { getCachedProviderModelsForValidation } from '../../agents/providers/mod
 import { hasNativeProviderResumeIdentifier } from '../../agents/providers/native-resume.js'
 import {
   getAgentEffortLevelsForModel,
+  getDefaultAgentEffortForModel,
   parseStoredAgentEffort,
-  parseOptionalAgentEffort,
   type AgentEffortLevel,
 } from '../../agents/effort.js'
 import {
@@ -33,6 +33,10 @@ import {
 } from '../store.js'
 import type { Conversation } from '../conversation-store.js'
 import type { CommanderRoutesContext } from './types.js'
+import {
+  buildConversationCredentialSelectionModes,
+  type ConversationCredentialSelectionModes,
+} from '../conversation-credential-selection.js'
 import {
   buildConversationSessionName,
   getConversationRuntimeSettingsDisabledReason,
@@ -62,6 +66,7 @@ type ConversationTransportType = 'stream' | 'pty' | 'external' | null
 
 interface LiveConversationSessionLike {
   kind?: string
+  host?: string
   agentType?: AgentType
   model?: string
   effort?: AgentEffortLevel
@@ -146,6 +151,7 @@ export interface ConversationSummaryDTO extends Conversation {
   }
   allowedActions: ConversationAllowedActions
   runtimeSettings: {
+    credentialSelectionModes: ConversationCredentialSelectionModes
     current: {
       agentType: AgentType
       model: string | null
@@ -239,7 +245,14 @@ export function buildConversationSummaryDTO(
   canonicalOrder = 0,
   commander?: Pick<
     CommanderSession,
-    'agentType' | 'model' | 'effort' | 'adaptiveThinking' | 'maxThinkingTokens' | 'providerContext' | 'cwd'
+    | 'agentType'
+    | 'model'
+    | 'effort'
+    | 'adaptiveThinking'
+    | 'maxThinkingTokens'
+    | 'providerContext'
+    | 'cwd'
+    | 'executionMachineId'
   > | null,
 ): ConversationSummaryDTO {
   const liveSession = getLiveConversationSession(context, conversation) as LiveConversationSessionLike | undefined
@@ -277,12 +290,25 @@ export function buildConversationSummaryDTO(
   const effectiveAgentType = liveSession?.agentType
     ?? conversation.agentType
     ?? commanderAgentType
+  const availableAgentTypes = listProviders()
+    .filter((provider) => provider.capabilities.supportsCommanderConversation)
+    .map((provider) => provider.id)
+  const credentialSelectionModes = buildConversationCredentialSelectionModes(
+    availableAgentTypes,
+    liveSession?.host ?? commander?.executionMachineId,
+  )
+  const credentialSelectionMode = credentialSelectionModes[effectiveAgentType] ?? 'none'
   const runtimeProvider = getProvider(effectiveAgentType)
-  const runtimeAccountId = liveSession?.providerAuthSnapshot?.accountId
-    ?? liveSession?.providerAuthSnapshot?.accountEmail
+  const runtimeCredentialPoolId = credentialSelectionMode === 'per-conversation'
+    ? liveSession?.credentialPoolId ?? conversation.credentialPoolId
+    : undefined
+  const runtimeAccountId = credentialSelectionMode === 'per-conversation'
+    ? liveSession?.providerAuthSnapshot?.accountId
+      ?? liveSession?.providerAuthSnapshot?.accountEmail
+    : undefined
   const runtimeModels = runtimeProvider
     ? getCachedProviderModelsForValidation(runtimeProvider, {
-        credentialPoolId: liveSession?.credentialPoolId ?? conversation.credentialPoolId,
+        ...(runtimeCredentialPoolId ? { credentialPoolId: runtimeCredentialPoolId } : {}),
         ...(runtimeAccountId ? { accountId: runtimeAccountId } : {}),
       })
     : null
@@ -347,19 +373,11 @@ export function buildConversationSummaryDTO(
     && !omitEffort
   const supportsAdaptiveThinking = runtimeProvider?.uiCapabilities.supportsAdaptiveThinking === true
     && runtimeModel?.supportsAdaptiveThinking !== false
-  const modelDefaultEffort = parseOptionalAgentEffort(
+  const defaultEffort = getDefaultAgentEffortForModel(
     effectiveAgentType,
-    runtimeModel?.defaultEffort,
-  )
-  const providerDefaultEffort = parseOptionalAgentEffort(
-    effectiveAgentType,
+    runtimeModel,
     runtimeProviderDefaults?.effort,
   )
-  const defaultEffort = modelDefaultEffort && supportedEffortOptions.includes(modelDefaultEffort)
-    ? modelDefaultEffort
-    : providerDefaultEffort && supportedEffortOptions.includes(providerDefaultEffort)
-      ? providerDefaultEffort
-      : supportedEffortOptions[0]
   const persistedEffort = conversation.effort
     ?? parseStoredAgentEffort(effectiveAgentType, persistedProviderContext?.effort)
     ?? (commanderMatchesProvider
@@ -520,6 +538,7 @@ export function buildConversationSummaryDTO(
         },
     allowedActions,
     runtimeSettings: {
+      credentialSelectionModes,
       current: {
         agentType: effectiveAgentType,
         model: effectiveModel,
@@ -535,9 +554,7 @@ export function buildConversationSummaryDTO(
         maxThinkingTokens: runtimeProvider?.uiCapabilities.supportsMaxThinkingTokens === true,
       },
       options: {
-        agentType: listProviders()
-          .filter((provider) => provider.capabilities.supportsCommanderConversation)
-          .map((provider) => provider.id),
+        agentType: availableAgentTypes,
         model: runtimeModelOptions.map((model) => ({ ...model })),
         effort: supportsEffort
           ? supportedEffortOptions
@@ -559,8 +576,8 @@ export function buildConversationSummaryDTO(
         expiresAt: null,
         refreshAllowedAt: null,
         error: runtimeProvider ? null : `Unknown provider "${effectiveAgentType}"`,
-        credentialPoolId: liveSession?.credentialPoolId ?? conversation.credentialPoolId ?? null,
-        accountId: null,
+        credentialPoolId: runtimeCredentialPoolId ?? null,
+        accountId: runtimeAccountId ?? null,
       },
       supportsCustomModels: runtimeModels?.supportsCustomModels ?? false,
       allowed: runtimeSettingsDisabledReason === null,

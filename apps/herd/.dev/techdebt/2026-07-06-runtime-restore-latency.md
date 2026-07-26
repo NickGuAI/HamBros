@@ -102,5 +102,5 @@ after:  readSqlitePersistedSessionsState = 793ms, RSS = 146MB, heapUsed = 46MB
 - Persisted restore logs or telemetry show bounded restore count, elapsed time,
   and stripped payload count on restart.
 - `VERIFY.md` and this techdebt note agree on the runtime-session restore gate.
-- The production relaunch path either enforces or clearly records the
-  split-shell check result.
+- The production relaunch path verifies the direct Node listener and records
+  the ALB/direct-listener health result.

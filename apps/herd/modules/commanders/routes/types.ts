@@ -17,6 +17,7 @@ import type { WorkspaceResolverCapability } from '../../workspace/capability.js'
 import type { EvalAdapterPreflight } from '../../eval/adapter-preflight.js'
 import type { ChannelMessageIdempotencyLedger } from '../channel-idempotency-ledger.js'
 import type { ChannelReplyStreamDispatch } from '../channel-dispatchers.js'
+import type { ConversationCredentialSelectionModes } from '../conversation-credential-selection.js'
 import type {
   CommanderHeartbeatManager,
   CommanderHeartbeatConfig,
@@ -185,6 +186,7 @@ export interface CommanderConversationRuntimeView {
 
 export type CommanderSessionResponseBase = Omit<CommanderSession, 'remoteOrigin'> & CommanderConversationRuntimeView & {
   name: string
+  credentialSelectionModes: ConversationCredentialSelectionModes
   remoteOrigin?: {
     machineId: string
     label: string

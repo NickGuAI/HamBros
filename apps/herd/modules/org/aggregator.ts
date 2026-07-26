@@ -159,7 +159,10 @@ export async function buildOrgTree({
 
   const [commanders, automations] = await Promise.all([
     commanderSessionStore.list(),
-    automationStore.list(),
+    automationStore.list().catch(() => {
+      console.error('[org] Automation projection unavailable; returning org without automation data.')
+      return []
+    }),
   ])
 
   const commanderNodes = await Promise.all(commanders.map(async (commander) => {

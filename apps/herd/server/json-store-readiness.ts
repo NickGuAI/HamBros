@@ -1,12 +1,33 @@
-import { readdir, readFile, stat } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { constants } from 'node:fs'
+import { access, readdir, readFile, rm, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { resolveHerdDataDir, resolveModuleDataDir } from '../modules/data-dir.js'
 import {
   resolveCommanderDataDir,
   resolveCommanderSessionStorePath,
 } from '../modules/commanders/paths.js'
+import {
+  CommanderSecretsStore,
+  isEncryptedCommanderSecretsFile,
+} from '../modules/commanders/secrets-store.js'
+import { isPersistedCommanderSessionsValid } from '../modules/commanders/store.js'
+import { isPersistedCommanderQuestsValid } from '../modules/commanders/quest-store.js'
+import { parseMachineRegistry } from '../modules/agents/machines.js'
+import {
+  inspectMachineCredentialsEncryptionReadiness,
+  isEncryptedMachineEnvRecord,
+} from '../modules/agents/machine-credentials.js'
+import { isPersistedAutomationValid } from '../modules/automations/store.js'
+import { isPersistedCommanderChannelBindingsValid } from '../modules/channels/store.js'
+import { isPersistedOrgIdentityValid } from '../modules/org-identity/store.js'
+import { isPersistedOperatorValid } from '../modules/operators/store.js'
+import { isPersistedPolicyStoreValid } from '../modules/policies/store.js'
+import { isPersistedPendingSnapshotValid } from '../modules/policies/pending-store.js'
+import { isPersistedAppSettingsValid } from '../modules/settings/store.js'
 import { JSON_STORE_SCHEMA_VERSION, withJsonStoreSchema } from '../modules/json-store-schema.js'
 import { quarantineJsonFile, writeJsonFileAtomically } from '../modules/json-file.js'
+import { ProviderSecretsStore } from './api-keys/provider-secrets-store.js'
 
 export type HerdJsonStoreMigrationStatus =
   | 'ready'
@@ -41,6 +62,9 @@ interface JsonStoreContract {
   filePath: string
   acceptsLegacyPayload: (payload: Record<string, unknown>) => boolean
   corruptPolicy?: 'fail' | 'quarantine'
+  required?: boolean
+  schemaMode?: 'versioned' | 'plain'
+  validateRuntimeInvariant?: () => Promise<string | null>
 }
 
 export class HerdJsonStoresNotReadyError extends Error {
@@ -71,48 +95,362 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function hasArrayField(field: string): (payload: Record<string, unknown>) => boolean {
-  return (payload) => Array.isArray(payload[field])
+function acceptsStringMap(payload: Record<string, unknown>): boolean {
+  return Object.values(payload).every((value) => typeof value === 'string')
 }
 
-function hasObjectField(field: string): (payload: Record<string, unknown>) => boolean {
-  return (payload) => isObject(payload[field])
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0
+}
+
+function acceptsSurfaceBinding(value: unknown): boolean {
+  return (
+    isObject(value)
+    && isNonEmptyString(value.id)
+    && isNonEmptyString(value.provider)
+    && isNonEmptyString(value.accountId)
+    && isNonEmptyString(value.peerId)
+    && isNonEmptyString(value.surfaceKey)
+    && isNonEmptyString(value.commanderId)
+    && isNonEmptyString(value.conversationId)
+    && isNonEmptyString(value.createdAt)
+    && (value.enabled === undefined || typeof value.enabled === 'boolean')
+    && (value.config === undefined || isObject(value.config))
+  )
+}
+
+function acceptsSurfaceBindingsPayload(payload: Record<string, unknown>): boolean {
+  return Array.isArray(payload.bindings)
+    && payload.bindings.every(acceptsSurfaceBinding)
+}
+
+const PROVIDER_AUTH_STORE_VERSION = 1
+const PROVIDER_AUTH_STATUSES = new Set(['ready', 'auth_required', 'unknown'])
+const PROVIDER_AUTH_METHODS = new Set(['oauth', 'api-key', 'login', 'missing'])
+const CREDENTIAL_POOL_PROVIDERS = new Set(['claude', 'codex'])
+const CREDENTIAL_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,79}$/iu
+const CREDENTIAL_REMOTE_HOME_KEY_PATTERN = /^[A-Za-z0-9._-]{1,128}$/u
+const CLAUDE_OAUTH_HASH_PATTERN = /^[a-f0-9]{64}$/u
+
+function acceptsOptionalNonEmptyString(
+  payload: Record<string, unknown>,
+  field: string,
+): boolean {
+  return payload[field] === undefined || isNonEmptyString(payload[field])
+}
+
+function acceptsProviderToken(value: unknown): boolean {
+  if (!isObject(value)) {
+    return false
+  }
+
+  return (
+    isNonEmptyString(value.access)
+    && typeof value.expiresAt === 'number'
+    && Number.isFinite(value.expiresAt)
+    && ['refresh', 'idToken', 'accountId', 'email', 'updatedAt']
+      .every((field) => acceptsOptionalNonEmptyString(value, field))
+  )
+}
+
+function acceptsProviderSnapshot(value: unknown): boolean {
+  if (!isObject(value)) {
+    return false
+  }
+
+  return (
+    isNonEmptyString(value.provider)
+    && isNonEmptyString(value.scopeId)
+    && isNonEmptyString(value.host)
+    && typeof value.status === 'string'
+    && PROVIDER_AUTH_STATUSES.has(value.status)
+    && isNonEmptyString(value.lastCheckedAt)
+    && ['accountId', 'accountEmail', 'detail', 'reauthUrl']
+      .every((field) => acceptsOptionalNonEmptyString(value, field))
+    && (
+      value.authMethod === undefined
+      || (isNonEmptyString(value.authMethod) && PROVIDER_AUTH_METHODS.has(value.authMethod))
+    )
+  )
+}
+
+function acceptsProviderOauthFlow(value: unknown): boolean {
+  if (!isObject(value)) {
+    return false
+  }
+
+  return (
+    ['provider', 'scopeId', 'host', 'state', 'codeVerifier', 'codeChallenge', 'redirectUri']
+      .every((field) => isNonEmptyString(value[field]))
+    && isNonEmptyString(value.createdAt)
+    && Number.isFinite(Date.parse(value.createdAt))
+    && isNonEmptyString(value.expiresAt)
+    && Number.isFinite(Date.parse(value.expiresAt))
+  )
+}
+
+function acceptsCredentialPoolDir(provider: string, credentialId: string, value: unknown): boolean {
+  if (value === undefined) {
+    return true
+  }
+  if (!isNonEmptyString(value) || path.isAbsolute(value)) {
+    return false
+  }
+  const parts = value.replace(/\\/gu, '/').split('/')
+  return (
+    parts.length === 2
+    && parts[0] === provider
+    && parts[1] === credentialId
+    && parts.every((part) => part !== '.' && part !== '..')
+  )
+}
+
+function acceptsOptionalIsoTimestamp(
+  payload: Record<string, unknown>,
+  field: string,
+): boolean {
+  const value = payload[field]
+  return value === undefined || (isNonEmptyString(value) && Number.isFinite(Date.parse(value)))
+}
+
+function acceptsCredentialPoolCredential(
+  provider: string,
+  credentialId: string,
+  value: unknown,
+): boolean {
+  if (!isObject(value)) {
+    return false
+  }
+
+  return (
+    (value.id === undefined || value.id === credentialId)
+    && acceptsOptionalNonEmptyString(value, 'label')
+    && acceptsCredentialPoolDir(provider, credentialId, value.dir)
+    && ['email', 'accountId', 'remoteToken', 'createdAt', 'lastUsedAt', 'authBrokenReason']
+      .every((field) => acceptsOptionalNonEmptyString(value, field))
+    && (
+      value.remoteHomeKey === undefined
+      || (
+        isNonEmptyString(value.remoteHomeKey)
+        && CREDENTIAL_REMOTE_HOME_KEY_PATTERN.test(value.remoteHomeKey)
+      )
+    )
+    && ['exhaustedAt', 'exhaustedUntil', 'authBrokenAt']
+      .every((field) => acceptsOptionalIsoTimestamp(value, field))
+  )
+}
+
+function acceptsCredentialPool(provider: string, value: unknown): boolean {
+  if (!isObject(value) || !isObject(value.credentials)) {
+    return false
+  }
+
+  const credentials = Object.entries(value.credentials)
+  if (
+    credentials.length === 0
+    || !credentials.every(([credentialId, credential]) => (
+      CREDENTIAL_ID_PATTERN.test(credentialId)
+      && acceptsCredentialPoolCredential(provider, credentialId, credential)
+    ))
+  ) {
+    return false
+  }
+
+  const credentialIds = new Set(credentials.map(([credentialId]) => credentialId))
+  if (
+    value.exhausted !== undefined
+    && (
+      !Array.isArray(value.exhausted)
+      || new Set(value.exhausted).size !== value.exhausted.length
+      || !value.exhausted.every((credentialId) => (
+        typeof credentialId === 'string'
+        && CREDENTIAL_ID_PATTERN.test(credentialId)
+        && credentialIds.has(credentialId)
+      ))
+    )
+  ) {
+    return false
+  }
+
+  if (
+    value.active !== undefined
+    && (
+      typeof value.active !== 'string'
+      || !CREDENTIAL_ID_PATTERN.test(value.active)
+      || !credentialIds.has(value.active)
+    )
+  ) {
+    return false
+  }
+
+  if (value.installedGlobalClaude !== undefined) {
+    if (provider !== 'claude' || !isObject(value.installedGlobalClaude)) {
+      return false
+    }
+    const { credentialId, oauthHash } = value.installedGlobalClaude
+    if (
+      typeof credentialId !== 'string'
+      || !credentialIds.has(credentialId)
+      || typeof oauthHash !== 'string'
+      || !CLAUDE_OAUTH_HASH_PATTERN.test(oauthHash)
+    ) {
+      return false
+    }
+  }
+
+  return true
+}
+
+function acceptsProviderAuthPayload(payload: Record<string, unknown>): boolean {
+  if (
+    payload.version !== PROVIDER_AUTH_STORE_VERSION
+    || !isObject(payload.providers)
+    || !isObject(payload.snapshots)
+  ) {
+    return false
+  }
+
+  const validProviders = Object.entries(payload.providers).every(([provider, scopes]) => (
+    isNonEmptyString(provider)
+    && isObject(scopes)
+    && Object.entries(scopes).every(([scopeId, token]) => (
+      isNonEmptyString(scopeId) && acceptsProviderToken(token)
+    ))
+  ))
+  if (!validProviders || !Object.values(payload.snapshots).every(acceptsProviderSnapshot)) {
+    return false
+  }
+
+  if (
+    payload.oauthFlows !== undefined
+    && (
+      !isObject(payload.oauthFlows)
+      || !Object.values(payload.oauthFlows).every(acceptsProviderOauthFlow)
+    )
+  ) {
+    return false
+  }
+
+  if (payload.credentialPools !== undefined) {
+    if (!isObject(payload.credentialPools)) {
+      return false
+    }
+    const validCredentialPools = Object.entries(payload.credentialPools).every(([provider, pool]) => (
+      CREDENTIAL_POOL_PROVIDERS.has(provider) && acceptsCredentialPool(provider, pool)
+    ))
+    if (!validCredentialPools) {
+      return false
+    }
+  }
+
+  return true
+}
+
+const API_KEY_RECORD_SCHEMA_VERSION = 1
+const API_KEY_PURPOSES = new Set(['bootstrap', 'permanent'])
+
+function acceptsApiKeyRecord(value: unknown, allowLegacyPurposeInference: boolean): boolean {
+  if (!isObject(value)) {
+    return false
+  }
+
+  const hasBaseShape = (
+    ['id', 'name', 'keyHash', 'prefix', 'createdBy', 'createdAt']
+      .every((field) => typeof value[field] === 'string')
+    && (
+      value.expiresAt === undefined
+      || value.expiresAt === null
+      || typeof value.expiresAt === 'string'
+    )
+    && (value.lastUsedAt === null || typeof value.lastUsedAt === 'string')
+    && Array.isArray(value.scopes)
+    && value.scopes.every((scope) => typeof scope === 'string')
+  )
+  if (!hasBaseShape) {
+    return false
+  }
+
+  if (typeof value.purpose === 'string' && API_KEY_PURPOSES.has(value.purpose)) {
+    return true
+  }
+  return allowLegacyPurposeInference && value.purpose === undefined
+}
+
+function acceptsApiKeyPayload(payload: Record<string, unknown>): boolean {
+  if (!Array.isArray(payload.keys)) {
+    return false
+  }
+  const recordSchemaVersion = payload.apiKeyRecordSchemaVersion
+  if (
+    recordSchemaVersion !== undefined
+    && recordSchemaVersion !== API_KEY_RECORD_SCHEMA_VERSION
+  ) {
+    return false
+  }
+  if (
+    payload.bootstrapInitializedAt !== undefined
+    && !isNonEmptyString(payload.bootstrapInitializedAt)
+  ) {
+    return false
+  }
+  const allowLegacyPurposeInference = recordSchemaVersion === undefined
+  return payload.keys.every((key) => acceptsApiKeyRecord(key, allowLegacyPurposeInference))
+}
+
+function acceptsEncryptedProviderSecret(value: unknown): boolean {
+  return (
+    isObject(value)
+    && ['iv', 'authTag', 'ciphertext', 'updatedAt']
+      .every((field) => typeof value[field] === 'string' && value[field].length > 0)
+  )
+}
+
+function acceptsProviderSecretsPayload(payload: Record<string, unknown>): boolean {
+  return (
+    isObject(payload.secrets)
+    && Object.values(payload.secrets).every(acceptsEncryptedProviderSecret)
+  )
+}
+
+function acceptsWorkspaceTargetsPayload(payload: Record<string, unknown>): boolean {
+  const targetMap = isObject(payload.targets)
+    ? payload.targets
+    : isObject(payload.conversations)
+      ? payload.conversations
+      : payload
+  return Object.entries(targetMap).every(([key, value]) => {
+    if (key === 'schemaVersion') {
+      return true
+    }
+    if (!isObject(value)) {
+      return false
+    }
+    const machine = value.machine
+    return (
+      isNonEmptyString(value.targetId)
+      && isNonEmptyString(value.label)
+      && isNonEmptyString(value.host)
+      && isNonEmptyString(value.rootPath)
+      && (value.readOnly === undefined || typeof value.readOnly === 'boolean')
+      && (machine === undefined || (
+        isObject(machine)
+        && isNonEmptyString(machine.id)
+        && isNonEmptyString(machine.label)
+        && isNonEmptyString(machine.host)
+      ))
+    )
+  })
+}
+
+function acceptsWorkspacePreferencesPayload(payload: Record<string, unknown>): boolean {
+  return payload.panelDefault === undefined
+    || payload.panelDefault === 'open'
+    || payload.panelDefault === 'closed'
+    || payload.panelDefault === 'last-used'
 }
 
 function hasStringField(payload: Record<string, unknown>, field: string): boolean {
   return typeof payload[field] === 'string' && payload[field].trim().length > 0
-}
-
-function acceptsOperatorPayload(payload: Record<string, unknown>): boolean {
-  return (
-    hasStringField(payload, 'id') &&
-    hasStringField(payload, 'kind') &&
-    hasStringField(payload, 'displayName') &&
-    hasStringField(payload, 'createdAt')
-  )
-}
-
-function acceptsSettingsPayload(payload: Record<string, unknown>): boolean {
-  return (
-    payload.theme !== undefined ||
-    payload.fontScale !== undefined ||
-    payload.composerAbilities !== undefined ||
-    payload.composerSkillSlots !== undefined ||
-    payload.updatedAt !== undefined
-  )
-}
-
-function acceptsPolicyPayload(payload: Record<string, unknown>): boolean {
-  return (
-    payload.version === 1 ||
-    isObject(payload.global) ||
-    isObject(payload.commanders) ||
-    isObject(payload.settings)
-  )
-}
-
-function acceptsPendingPolicyPayload(payload: Record<string, unknown>): boolean {
-  return payload.version === 1 || Array.isArray(payload.approvals) || Array.isArray(payload.pending)
 }
 
 function acceptsConversationPayload(payload: Record<string, unknown>): boolean {
@@ -124,14 +462,13 @@ function acceptsConversationPayload(payload: Record<string, unknown>): boolean {
   )
 }
 
-function acceptsAutomationPayload(payload: Record<string, unknown>): boolean {
-  return (
-    hasStringField(payload, 'id') &&
-    hasStringField(payload, 'name') &&
-    hasStringField(payload, 'trigger') &&
-    hasStringField(payload, 'instruction') &&
-    hasStringField(payload, 'status')
-  )
+function acceptsMachineRegistryPayload(payload: Record<string, unknown>): boolean {
+  try {
+    parseMachineRegistry(payload)
+    return true
+  } catch {
+    return false
+  }
 }
 
 function toReadinessEnv(
@@ -159,10 +496,32 @@ async function pathIsFile(filePath: string): Promise<boolean | 'missing'> {
     const fileStat = await stat(filePath)
     return fileStat.isFile()
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+    if (
+      (error as NodeJS.ErrnoException).code === 'ENOENT'
+      || (error as NodeJS.ErrnoException).code === 'ENOTDIR'
+    ) {
       return 'missing'
     }
     throw error
+  }
+}
+
+async function probeJsonStoreWritable(filePath: string, fileExists: boolean): Promise<void> {
+  if (fileExists) {
+    await access(filePath, constants.W_OK)
+  }
+  const probePath = path.join(
+    path.dirname(filePath),
+    `.${path.basename(filePath)}.readiness-${process.pid}-${randomUUID()}`,
+  )
+  try {
+    await writeJsonFileAtomically(
+      probePath,
+      { readinessProbe: true },
+      { mode: 0o600, trailingNewline: true },
+    )
+  } finally {
+    await rm(probePath, { force: true })
   }
 }
 
@@ -180,6 +539,7 @@ async function addOptionalFile(
 async function addCommanderScopedStores(
   stores: JsonStoreContract[],
   commanderDataDir: string,
+  env: NodeJS.ProcessEnv,
 ): Promise<void> {
   let entries: import('node:fs').Dirent[]
   try {
@@ -200,7 +560,21 @@ async function addCommanderScopedStores(
     await addOptionalFile(stores, {
       id: `commanders.${entry.name}.quests`,
       filePath: path.join(commanderRoot, 'quests.json'),
-      acceptsLegacyPayload: hasArrayField('quests'),
+      acceptsLegacyPayload: isPersistedCommanderQuestsValid,
+    })
+    await addOptionalFile(stores, {
+      id: `commanders.${entry.name}.secrets`,
+      filePath: path.join(commanderRoot, 'secrets.enc'),
+      acceptsLegacyPayload: isEncryptedCommanderSecretsFile,
+      schemaMode: 'plain',
+      validateRuntimeInvariant: async () => {
+        const readiness = await new CommanderSecretsStore({
+          dataDir: commanderDataDir,
+          keyFilePath: path.join(commanderDataDir, 'master.key'),
+          env,
+        }).inspectEncryptionReadiness(entry.name)
+        return readiness.error
+      },
     })
 
     const conversationsDir = path.join(commanderRoot, 'conversations')
@@ -228,6 +602,44 @@ async function addCommanderScopedStores(
   }
 }
 
+async function addMachineCredentialStores(
+  stores: JsonStoreContract[],
+  sourceRoot: string,
+  env: NodeJS.ProcessEnv,
+): Promise<void> {
+  let machines: ReturnType<typeof parseMachineRegistry>
+  try {
+    const parsed = JSON.parse(await readFile(path.join(sourceRoot, 'machines.json'), 'utf8')) as unknown
+    machines = parseMachineRegistry(parsed)
+  } catch {
+    // The machines registry contract reports missing/corrupt registry state.
+    // Credential contracts can only be enumerated after that registry parses.
+    return
+  }
+
+  for (const machine of machines) {
+    const configuredPath = machine.envFile?.trim()
+    if (!configuredPath || !configuredPath.endsWith('.enc')) {
+      continue
+    }
+    const envFilePath = path.resolve(configuredPath)
+    await addOptionalFile(stores, {
+      id: `machines.${machine.id}.credentials`,
+      filePath: envFilePath,
+      acceptsLegacyPayload: isEncryptedMachineEnvRecord,
+      schemaMode: 'plain',
+      validateRuntimeInvariant: async () => {
+        const readiness = await inspectMachineCredentialsEncryptionReadiness(machine, {
+          envFilePath,
+          keyFilePath: path.join(sourceRoot, 'master.key'),
+          env,
+        })
+        return readiness.error
+      },
+    })
+  }
+}
+
 async function addAutomationStores(
   stores: JsonStoreContract[],
   automationDataDir: string,
@@ -249,7 +661,7 @@ async function addAutomationStores(
     stores.push({
       id: `automations.${path.basename(entry.name, '.json')}`,
       filePath: path.join(automationDataDir, entry.name),
-      acceptsLegacyPayload: acceptsAutomationPayload,
+      acceptsLegacyPayload: isPersistedAutomationValid,
       corruptPolicy: 'quarantine',
     })
   }
@@ -269,51 +681,124 @@ async function collectJsonStoreContracts(options: {
   )
   const stores: JsonStoreContract[] = []
 
-  await addOptionalFile(stores, {
+  stores.push({
     id: 'commanders.sessions',
     filePath: resolveCommanderSessionStorePath(commanderDataDir),
-    acceptsLegacyPayload: hasArrayField('sessions'),
+    acceptsLegacyPayload: isPersistedCommanderSessionsValid,
+    required: true,
   })
-  await addCommanderScopedStores(stores, commanderDataDir)
+  stores.push({
+    id: 'commanders.names',
+    filePath: path.join(commanderDataDir, 'names.json'),
+    acceptsLegacyPayload: acceptsStringMap,
+    required: true,
+    schemaMode: 'plain',
+  })
+  await addCommanderScopedStores(stores, commanderDataDir, env)
   await addAutomationStores(stores, automationDataDir)
 
-  await Promise.all([
-    addOptionalFile(stores, {
+  // These singleton stores are owned by factories in the default runtime
+  // mount graph. Missing files are valid first-boot state, but their target
+  // paths must be writable before the process advertises health. Dynamic
+  // commander/automation records are discovered above; caches, JSONL logs,
+  // credential-pool internals, and channel-adapter auth are intentionally not
+  // boot requirements because their owning features are conditional.
+  stores.push(
+    {
+      id: 'agents.provider-auth',
+      filePath: path.join(sourceRoot, 'provider-secrets.json'),
+      acceptsLegacyPayload: acceptsProviderAuthPayload,
+      required: true,
+      schemaMode: 'plain',
+    },
+    {
       id: 'api-keys.keys',
       filePath: path.join(sourceRoot, 'api-keys', 'keys.json'),
-      acceptsLegacyPayload: hasArrayField('keys'),
-    }),
-    addOptionalFile(stores, {
+      acceptsLegacyPayload: acceptsApiKeyPayload,
+      required: true,
+    },
+    {
       id: 'api-keys.provider-secrets',
       filePath: path.join(sourceRoot, 'api-keys', 'provider-secrets.json'),
-      acceptsLegacyPayload: hasObjectField('secrets'),
-    }),
-    addOptionalFile(stores, {
+      acceptsLegacyPayload: acceptsProviderSecretsPayload,
+      required: true,
+      validateRuntimeInvariant: async () => {
+        const readiness = await new ProviderSecretsStore({
+          filePath: path.join(sourceRoot, 'api-keys', 'provider-secrets.json'),
+          keyFilePath: path.join(sourceRoot, 'api-keys', 'provider-secrets.key'),
+          env,
+        }).inspectEncryptionReadiness()
+        return readiness.error
+      },
+    },
+    {
+      id: 'channels.bindings',
+      filePath: path.join(sourceRoot, 'channels.json'),
+      acceptsLegacyPayload: isPersistedCommanderChannelBindingsValid,
+      required: true,
+      schemaMode: 'plain',
+    },
+    {
+      id: 'channels.surface-bindings',
+      filePath: path.join(sourceRoot, 'channels', 'surface-bindings.json'),
+      acceptsLegacyPayload: acceptsSurfaceBindingsPayload,
+      required: true,
+      schemaMode: 'plain',
+    },
+    {
+      id: 'org.identity',
+      filePath: path.join(sourceRoot, 'org.json'),
+      acceptsLegacyPayload: isPersistedOrgIdentityValid,
+      required: true,
+      schemaMode: 'plain',
+    },
+    {
       id: 'policies.policies',
       filePath: path.join(sourceRoot, 'policies', 'policies.json'),
-      acceptsLegacyPayload: acceptsPolicyPayload,
-    }),
-    addOptionalFile(stores, {
+      acceptsLegacyPayload: isPersistedPolicyStoreValid,
+      required: true,
+    },
+    {
       id: 'policies.pending',
       filePath: path.join(sourceRoot, 'policies', 'pending.json'),
-      acceptsLegacyPayload: acceptsPendingPolicyPayload,
-    }),
-    addOptionalFile(stores, {
+      acceptsLegacyPayload: isPersistedPendingSnapshotValid,
+      required: true,
+    },
+    {
       id: 'operators.founder',
       filePath: path.join(sourceRoot, 'operators.json'),
-      acceptsLegacyPayload: acceptsOperatorPayload,
-    }),
-    addOptionalFile(stores, {
+      acceptsLegacyPayload: isPersistedOperatorValid,
+      required: true,
+    },
+    {
       id: 'settings.app',
       filePath: path.join(sourceRoot, 'settings', 'app-settings.json'),
-      acceptsLegacyPayload: acceptsSettingsPayload,
-    }),
-    addOptionalFile(stores, {
+      acceptsLegacyPayload: isPersistedAppSettingsValid,
+      required: true,
+    },
+    {
       id: 'machines.registry',
       filePath: path.join(sourceRoot, 'machines.json'),
-      acceptsLegacyPayload: hasArrayField('machines'),
-    }),
-  ])
+      acceptsLegacyPayload: acceptsMachineRegistryPayload,
+      required: true,
+    },
+    {
+      id: 'workspace.targets',
+      filePath: path.join(sourceRoot, 'workspace', 'conversation-targets.json'),
+      acceptsLegacyPayload: acceptsWorkspaceTargetsPayload,
+      required: true,
+      schemaMode: 'plain',
+    },
+    {
+      id: 'workspace.preferences',
+      filePath: path.join(sourceRoot, 'workspace', 'preferences.json'),
+      acceptsLegacyPayload: acceptsWorkspacePreferencesPayload,
+      required: true,
+      schemaMode: 'plain',
+    },
+  )
+
+  await addMachineCredentialStores(stores, sourceRoot, env)
 
   return stores.sort((left, right) => left.filePath.localeCompare(right.filePath))
 }
@@ -323,6 +808,63 @@ async function inspectStore(
   options: { migrateLegacy: boolean },
 ): Promise<HerdJsonStoreReadinessEntry> {
   const requiredSchemaVersion = JSON_STORE_SCHEMA_VERSION
+  async function runtimeInvariantFailure(
+    schemaVersion: number | null,
+  ): Promise<HerdJsonStoreReadinessEntry | null> {
+    if (!contract.validateRuntimeInvariant) {
+      return null
+    }
+    let error: string | null
+    try {
+      error = await contract.validateRuntimeInvariant()
+    } catch {
+      error = 'JSON store runtime invariant validation failed.'
+    }
+    if (!error) {
+      return null
+    }
+    return {
+      id: contract.id,
+      path: contract.filePath,
+      ready: false,
+      schemaVersion,
+      requiredSchemaVersion,
+      migrationStatus: 'corrupt',
+      error,
+    }
+  }
+
+  async function readyAfterWritableProbe(
+    schemaVersion: number | null,
+    migrationStatus: HerdJsonStoreMigrationStatus = 'ready',
+    fileExists = true,
+  ): Promise<HerdJsonStoreReadinessEntry> {
+    if (contract.required) {
+      try {
+        await probeJsonStoreWritable(contract.filePath, fileExists)
+      } catch (error) {
+        return {
+          id: contract.id,
+          path: contract.filePath,
+          ready: false,
+          schemaVersion,
+          requiredSchemaVersion,
+          migrationStatus: 'unwritable',
+          error: `JSON store write probe failed: ${error instanceof Error ? error.message : String(error)}`,
+        }
+      }
+    }
+    return {
+      id: contract.id,
+      path: contract.filePath,
+      ready: true,
+      schemaVersion,
+      requiredSchemaVersion,
+      migrationStatus,
+      error: null,
+    }
+  }
+
   async function quarantineCorruptStore(reason: string): Promise<HerdJsonStoreReadinessEntry> {
     try {
       const quarantinePath = await quarantineJsonFile(contract.filePath)
@@ -362,23 +904,20 @@ async function inspectStore(
     }
   }
   if (fileStatus === 'missing') {
-    return {
-      id: contract.id,
-      path: contract.filePath,
-      ready: true,
-      schemaVersion: null,
-      requiredSchemaVersion,
-      migrationStatus: 'ready',
-      error: null,
+    const invariantFailure = await runtimeInvariantFailure(null)
+    if (invariantFailure) {
+      return invariantFailure
     }
+    return readyAfterWritableProbe(null, 'ready', false)
   }
 
   let parsed: unknown
   try {
     parsed = JSON.parse(await readFile(contract.filePath, 'utf8')) as unknown
-  } catch (error) {
+  } catch {
+    const parseFailure = 'JSON parse failed; raw store bytes were preserved.'
     if (contract.corruptPolicy === 'quarantine') {
-      return quarantineCorruptStore(`JSON parse failed: ${error instanceof Error ? error.message : String(error)}`)
+      return quarantineCorruptStore(parseFailure)
     }
     return {
       id: contract.id,
@@ -387,7 +926,7 @@ async function inspectStore(
       schemaVersion: null,
       requiredSchemaVersion,
       migrationStatus: 'corrupt',
-      error: `JSON parse failed: ${error instanceof Error ? error.message : String(error)}`,
+      error: parseFailure,
     }
   }
 
@@ -406,6 +945,25 @@ async function inspectStore(
     }
   }
 
+  if (contract.schemaMode === 'plain') {
+    if (!contract.acceptsLegacyPayload(parsed)) {
+      return {
+        id: contract.id,
+        path: contract.filePath,
+        ready: false,
+        schemaVersion: null,
+        requiredSchemaVersion,
+        migrationStatus: 'corrupt',
+        error: 'JSON store does not match the expected store shape.',
+      }
+    }
+    const invariantFailure = await runtimeInvariantFailure(null)
+    if (invariantFailure) {
+      return invariantFailure
+    }
+    return readyAfterWritableProbe(null)
+  }
+
   const schemaVersion = parsed.schemaVersion
   if (schemaVersion !== undefined) {
     if (schemaVersion !== requiredSchemaVersion) {
@@ -416,7 +974,7 @@ async function inspectStore(
         schemaVersion: typeof schemaVersion === 'number' ? schemaVersion : null,
         requiredSchemaVersion,
         migrationStatus: 'stale',
-        error: `schemaVersion mismatch: found ${String(schemaVersion)}, required ${requiredSchemaVersion}.`,
+        error: 'JSON store schemaVersion does not match the required version.',
       }
     }
     if (!contract.acceptsLegacyPayload(parsed)) {
@@ -433,15 +991,11 @@ async function inspectStore(
         error: 'JSON store has the current schemaVersion but does not match the expected store shape.',
       }
     }
-    return {
-      id: contract.id,
-      path: contract.filePath,
-      ready: true,
-      schemaVersion: requiredSchemaVersion,
-      requiredSchemaVersion,
-      migrationStatus: 'ready',
-      error: null,
+    const invariantFailure = await runtimeInvariantFailure(requiredSchemaVersion)
+    if (invariantFailure) {
+      return invariantFailure
     }
+    return readyAfterWritableProbe(requiredSchemaVersion)
   }
 
   if (!contract.acceptsLegacyPayload(parsed)) {
@@ -457,6 +1011,11 @@ async function inspectStore(
       migrationStatus: 'corrupt',
       error: 'JSON store is missing schemaVersion and does not match a known legacy shape.',
     }
+  }
+
+  const invariantFailure = await runtimeInvariantFailure(null)
+  if (invariantFailure) {
+    return invariantFailure
   }
 
   if (!options.migrateLegacy) {
@@ -475,7 +1034,7 @@ async function inspectStore(
     await writeJsonFileAtomically(
       contract.filePath,
       withJsonStoreSchema(parsed),
-      { trailingNewline: true },
+      { backup: true, trailingNewline: true },
     )
   } catch (error) {
     return {
@@ -523,11 +1082,17 @@ export async function inspectHerdJsonStoreReadiness(options: {
   const env = options.env ?? process.env
   const sourceRoot = resolveSourceRoot({ sourceRoot: options.sourceRoot, env })
   const contracts = await collectJsonStoreContracts({ sourceRoot, env })
-  const stores = await Promise.all(
-    contracts.map((contract) => inspectStore(contract, {
-      migrateLegacy: options.migrateLegacy !== false,
-    })),
-  )
+  const stores: HerdJsonStoreReadinessEntry[] = []
+  let migrationAllowed = options.migrateLegacy !== false
+  for (const contract of contracts) {
+    const entry = await inspectStore(contract, { migrateLegacy: migrationAllowed })
+    stores.push(entry)
+    if (!entry.ready) {
+      // Contracts are path-sorted. Once one store fails closed, later stores
+      // are inspected but not mutated, avoiding nondeterministic partial work.
+      migrationAllowed = false
+    }
+  }
   const migrationStatus = aggregateStatus(stores)
   const ready = stores.every((entry) => entry.ready)
   const firstError = stores.find((entry) => !entry.ready)?.error ?? null

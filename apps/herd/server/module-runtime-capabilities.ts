@@ -23,6 +23,7 @@ import type { PolicyStore } from '../modules/policies/store.js'
 import type { AppSettingsStore } from '../modules/settings/store.js'
 import type { TelemetryHub, TelemetryRouterResult } from '../modules/telemetry/routes.js'
 import type { ProviderAdapter } from '../modules/agents/providers/provider-adapter.js'
+import type { ProviderExecutionCapability } from '../modules/agents/provider-execution-mode.js'
 import type {
   WorkspaceMachineDescriptorCapability,
   WorkspaceResolverCapability,
@@ -49,6 +50,7 @@ export interface HerdRuntimeCapabilities {
   'agents.approval-sessions-interface': ApprovalSessionsInterface
   'agents.session-websocket': AgentsRouterResult['handleUpgrade']
   'agents.machine-command-executor': MachineCommandExecutor
+  'agents.provider-execution': ProviderExecutionCapability
   'agents.runtime': AgentsRouterResult
 
   'eval.adapter-preflight': EvalAdapterPreflight

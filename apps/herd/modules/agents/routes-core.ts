@@ -3,16 +3,10 @@ import type { IncomingMessage } from 'node:http'
 import * as path from 'node:path'
 import type { Duplex } from 'node:stream'
 import { DEFAULT_COMMANDER_MAX_TURNS } from '../commanders/store.js'
-import { loadCommanderRuntimeConfig } from '../commanders/runtime-config.js'
 import type { PlanApprovalDecision } from '../../src/types/herd-events.js'
 import { secureTokenEqual } from '../../server/middleware/secure-compare.js'
 import { createAgentsAuthContext } from './router-context.js'
-import {
-  DEFAULT_AGENT_PRUNER_ENABLED,
-  DEFAULT_AGENT_PRUNER_EXITED_SESSION_TTL_MS,
-  DEFAULT_AGENT_PRUNER_STALE_SESSION_TTL_MS,
-  DEFAULT_AGENT_PRUNER_SWEEP_INTERVAL_MS,
-} from './constants.js'
+import { resolveSessionPrunerRuntimeConfig } from './session/pruner-config.js'
 import {
   parseAutoRotateEntryThreshold,
   parseCodexTurnWatchdogTimeoutMs,
@@ -43,7 +37,6 @@ import {
   createCodexApprovalQueueRuntime,
   type CodexApprovalQueueRuntime,
 } from './session/approval-queue.js'
-import { createMachineLaunchRuntime } from './session/machine-launch.js'
 import { createMachineLaunchVerifier } from './session/machine-launch-verification.js'
 import {
   createProviderSessionRuntime,
@@ -57,6 +50,7 @@ import { createStreamEventAppender } from './session/stream-events.js'
 import { createSessionResumeRuntime } from './session/resume-source.js'
 import { createCommanderWorkerDispatcher } from './session/commander-worker-dispatch.js'
 import { createCommanderSessionsInterface } from './commander-interface.js'
+import { resolveCommanderDataDir } from '../commanders/paths.js'
 import { approvalBridgeDeps, createApprovalSessionsInterface } from './approval-interface.js'
 import {
   buildPlanApprovalAutoResolvedSystemEvent,
@@ -78,6 +72,7 @@ import { registerSessionControlRoutes } from './routes/session-control-routes.js
 import { registerSessionQueryRoutes } from './routes/session-query-routes.js'
 import { registerSessionSweepRoutes } from './routes/session-sweep-routes.js'
 import { parseCodexApprovalId } from './codex-approval.js'
+import { createProviderExecutionWiring } from './provider-execution-wiring.js'
 import type {
   AgentsRouterOptions,
   AgentsRouterResult,
@@ -118,6 +113,7 @@ export function createAgentsRouter(options: AgentsRouterOptions): AgentsRouterRe
   if (!options.sqliteDb) {
     throw new Error('SQLite runtime-session database is required for agents routes')
   }
+  const commanderDataDir = path.resolve(options.commanderDataDir ?? resolveCommanderDataDir())
 
   const router = Router()
   const sessions = new Map<string, AnySession>()
@@ -151,13 +147,12 @@ export function createAgentsRouter(options: AgentsRouterOptions): AgentsRouterRe
   const sqliteDb = options.sqliteDb
   const { machineRegistry, daemonRegistry, machineCommandExecutor } = createMachineRuntime(machinesFilePath)
   const providerAuthStore = options.providerAuthStore ?? new ProviderAuthStore()
-  const runtimeConfig = loadCommanderRuntimeConfig()
-  const prunerConfig = {
-    enabled: options.enableSessionPruner ?? runtimeConfig.agents?.pruner?.enabled ?? DEFAULT_AGENT_PRUNER_ENABLED,
-    sweepIntervalMs: runtimeConfig.agents?.pruner?.sweepIntervalMs ?? DEFAULT_AGENT_PRUNER_SWEEP_INTERVAL_MS,
-    staleSessionTtlMs: runtimeConfig.agents?.pruner?.staleSessionTtlMs ?? DEFAULT_AGENT_PRUNER_STALE_SESSION_TTL_MS,
-    exitedSessionTtlMs: runtimeConfig.agents?.pruner?.exitedSessionTtlMs ?? DEFAULT_AGENT_PRUNER_EXITED_SESSION_TTL_MS,
-  }
+  const { providerExecutionMode, machineLaunchRuntime, providerExecution, allowsMachine } = createProviderExecutionWiring({
+    daemonRegistry,
+    providerAuthStore,
+    readMachineRegistry,
+  })
+  const prunerConfig = resolveSessionPrunerRuntimeConfig(options.enableSessionPruner)
   const codexApprovalQueueSubscribers = new Set<(event: CodexApprovalQueueEvent) => void>()
 
   let spawner: PtySpawner | null = options.ptySpawner ?? null
@@ -387,6 +382,7 @@ export function createAgentsRouter(options: AgentsRouterOptions): AgentsRouterRe
   })
 
   providerRuntime = createProviderSessionRuntime({
+    commanderDataDir,
     sessions,
     completedSessions,
     exitedStreamSessions,
@@ -394,6 +390,7 @@ export function createAgentsRouter(options: AgentsRouterOptions): AgentsRouterRe
     providerAuthStore,
     questStore: options.questStore,
     daemonRegistry,
+    providerExecutionMode,
     approvalQueue: approvalRuntime,
     wsKeepAliveIntervalMs,
     codexTurnWatchdogTimeoutMs,
@@ -434,16 +431,12 @@ export function createAgentsRouter(options: AgentsRouterOptions): AgentsRouterRe
     exitedStreamSessions,
     applyStreamUsageEvent,
     restoreProviderSession: (...args) => requireProviderRuntime().restoreProviderStreamSession(...args),
+    commanderLifecycleScope: commanderDataDir,
+    shouldAutoRestoreSession: (_entry, machine) => allowsMachine(machine),
     restoreCredentialPoolRecovery: (...args) => requireProviderRuntime().restoreCredentialPoolRecovery(...args),
     teardownProviderSession: (...args) => requireProviderRuntime().teardownProviderSession(...args).then(() => undefined),
     isExitedSessionResumeAvailable: resumeRuntime.isExitedSessionResumeAvailable,
     isLiveSessionResumeAvailable: resumeRuntime.isLiveSessionResumeAvailable,
-  })
-
-  const machineLaunchRuntime = createMachineLaunchRuntime({
-    daemonRegistry,
-    providerAuthStore,
-    readMachineRegistry,
   })
 
   autoRotationRuntime = createSessionAutoRotationRuntime({
@@ -621,7 +614,7 @@ export function createAgentsRouter(options: AgentsRouterOptions): AgentsRouterRe
     sessionEventHandlers,
     clearCodexResumeMetadata: resumeRuntime.clearCodexResumeMetadata,
     createProviderStreamSession: (...args) => requireProviderRuntime().createProviderStreamSession(...args),
-    readMachineRegistry,
+    resolveProviderLaunchMachine: machineLaunchRuntime.resolveProviderLaunchMachine,
     readPersistedSessionsState: () => requirePersistenceHelpers().readPersistedSessionsState(),
     resolveResumableSessionSource: resumeRuntime.resolveResumableSessionSource,
     archivePersistedSession: (...args) => requirePersistenceHelpers().archivePersistedSession(...args),
@@ -648,6 +641,7 @@ export function createAgentsRouter(options: AgentsRouterOptions): AgentsRouterRe
   })
 
   registerSessionCreateRoutes({
+    commanderLifecycleScope: commanderDataDir,
     router,
     requireWriteAccess,
     sessions,
@@ -661,18 +655,17 @@ export function createAgentsRouter(options: AgentsRouterOptions): AgentsRouterRe
     readPersistedSessionsState: () => requirePersistenceHelpers().readPersistedSessionsState(),
     resolveResumableSessionSource: resumeRuntime.resolveResumableSessionSource,
     clearCodexResumeMetadata: resumeRuntime.clearCodexResumeMetadata,
-    resolveLaunchMachine: machineLaunchRuntime.resolveLaunchMachine,
-    resolveDaemonLaunchReadiness: machineLaunchRuntime.resolveDaemonLaunchReadiness,
+    resolveProviderLaunchMachine: machineLaunchRuntime.resolveProviderLaunchMachine,
     createProviderStreamSession: (...args) => requireProviderRuntime().createProviderStreamSession(...args),
     retireLiveSessionForResume: resumeRuntime.retireLiveSessionForResume,
     schedulePersistedSessionsWrite,
   })
 
   const dispatchWorkerForCommander = createCommanderWorkerDispatcher({
+    commanderLifecycleScope: commanderDataDir,
     maxSessions,
     sessions,
-    resolveLaunchMachine: machineLaunchRuntime.resolveLaunchMachine,
-    resolveDaemonLaunchReadiness: machineLaunchRuntime.resolveDaemonLaunchReadiness,
+    resolveProviderLaunchMachine: machineLaunchRuntime.resolveProviderLaunchMachine,
     createProviderStreamSession: (...args) => requireProviderRuntime().createProviderStreamSession(...args),
     teardownProviderSession: (...args) => requireProviderRuntime().teardownProviderSession(...args).then(() => undefined),
     schedulePersistedSessionsWrite,
@@ -713,12 +706,14 @@ export function createAgentsRouter(options: AgentsRouterOptions): AgentsRouterRe
     sessionEventHandlers,
     schedulePersistedSessionsWrite,
     createProviderStreamSession: (...args) => requireProviderRuntime().createProviderStreamSession(...args),
+    resolveProviderLaunchMachine: machineLaunchRuntime.resolveProviderLaunchMachine,
     createQueuedMessage: (...args) => requireQueueRuntime().createQueuedMessage(...args),
     enqueueQueuedMessage: (...args) => requireQueueRuntime().enqueueQueuedMessage(...args),
     scheduleQueuedMessageDrain: (...args) => requireQueueRuntime().scheduleQueuedMessageDrain(...args),
     sendImmediateTextToStreamSession: (...args) => requireQueueRuntime().sendImmediateTextToStreamSession(...args),
     teardownProviderSession: (...args) => requireProviderRuntime().teardownProviderSession(...args).then(() => undefined),
     shutdownProviderRuntimes: (...args) => requireProviderRuntime().shutdownProviderRuntimes(...args),
+    commanderDataDir,
     getCredentialRecoveryRequest(sessionName) {
       return credentialRecoveryRequests.get(sessionName)
     },
@@ -793,5 +788,5 @@ export function createAgentsRouter(options: AgentsRouterOptions): AgentsRouterRe
     },
   }
 
-  return { router, handleUpgrade, sessionsInterface: shutdownSessionsInterface, approvalSessionsInterface, machineCommandExecutor }
+  return { router, handleUpgrade, sessionsInterface: shutdownSessionsInterface, approvalSessionsInterface, machineCommandExecutor, providerExecution }
 }

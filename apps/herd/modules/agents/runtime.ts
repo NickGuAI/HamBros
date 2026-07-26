@@ -31,6 +31,7 @@ export function createAgentsRuntime(context: ModuleRuntimeContext): ModuleRouteR
     approvalBridgeSigningSecret,
     machineEnrollmentSigningSecret,
     commanderSessionStore: capabilities.consume('commanders.store', 'agents'),
+    commanderDataDir: capabilities.consume('commanders.data-dir', 'agents'),
     commanderConversationStore: capabilities.consume('commanders.conversations', 'agents'),
     buildCommanderSessionSeed: capabilities.consume('commanders.session-seed-builder', 'agents'),
     commanderTranscriptAppender: capabilities.consume('commanders.transcripts', 'agents'),
@@ -43,6 +44,7 @@ export function createAgentsRuntime(context: ModuleRuntimeContext): ModuleRouteR
   capabilities.provide('agents.approval-sessions-interface', 'agents', agents.approvalSessionsInterface)
   capabilities.provide('agents.session-websocket', 'agents', agents.handleUpgrade)
   capabilities.provide('agents.machine-command-executor', 'agents', agents.machineCommandExecutor)
+  capabilities.provide('agents.provider-execution', 'agents', agents.providerExecution)
   capabilities.provide('agents.runtime', 'agents', agents)
 
   return {

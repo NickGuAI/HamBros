@@ -90,7 +90,7 @@ the same conversation turn through every critical piece below.
 | Provider adapter/runtime | `modules/channels/<provider>/adapter.ts`, `modules/channels/runtime-manager.ts` | Account startup, inbound normalization, outbound `send`, failure reporting, provider-specific threading/peer identity. |
 | Channel binding | `modules/channels/store.ts`, `modules/channels/descriptors.ts`, `modules/channels/page.tsx` | Enabled state, default commander, account config, UI save/read behavior. |
 | Surface binding | `modules/channels/resolver.ts`, `modules/channels/surface-binding-store.ts`, `modules/channels/surface-key.ts` | `sessionKey`, peer identity, conversation reuse, `lastRoute`. |
-| Channel ingest route | `modules/commanders/routes/channel-message-routes.ts`, `modules/commanders/routes/register-conversations.ts` | Idempotency, conversation creation, resume/start behavior, channel metadata. |
+| Channel ingest route | `modules/commanders/routes/register-channels.ts`, `modules/commanders/routes/register-conversations.ts` | Idempotency, conversation creation, resume/start behavior, channel metadata. |
 | Conversation runtime | `modules/commanders/routes/conversation-runtime.ts`, `modules/commanders/routes/context.ts` | Create/resume/send, queue behavior, live-session recovery, channel reply forwarders. |
 | Runtime session state | `modules/agents/session/*`, `modules/agents/routes/session-*`, `server/db/schema.ts` | Backend-owned state/actions, launch reset, active/no-live recovery, provider context. |
 | Provider adapters | `modules/agents/adapters/*`, `modules/agents/providers/*` | Actual event schema emitted by Claude/Codex/etc., auth, model defaults, resume handles. |

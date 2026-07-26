@@ -5,6 +5,7 @@ import { FOUNDER_PROFILE_QUERY_KEY } from '@modules/operators/hooks/useFounderPr
 import type {
   FounderOrgSetupRequest,
   FounderOrgSetupResponse,
+  FinishOnboardingResponse,
   OnboardingStatus,
   SeedGaiaOnboardingResponse,
   SeedStarterWorkforceOnboardingResponse,
@@ -45,6 +46,24 @@ async function seedStarterWorkforce(): Promise<SeedStarterWorkforceOnboardingRes
 
 async function skipStarterWorkforce(): Promise<SkipStarterWorkforceOnboardingResponse> {
   return fetchJson<SkipStarterWorkforceOnboardingResponse>('/api/onboarding/actions/skip-starter-workforce', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({}),
+  })
+}
+
+export async function verifyPermanentApiKey(rawKey: string): Promise<OnboardingStatus> {
+  const status = await fetchJson<OnboardingStatus>('/api/onboarding/status', {
+    headers: { 'x-herd-api-key': rawKey },
+  })
+  if (status.credentials.authenticatedAs !== 'permanent') {
+    throw new Error('The new credential was not verified as a permanent API key.')
+  }
+  return status
+}
+
+async function finishOnboarding(): Promise<FinishOnboardingResponse> {
+  return fetchJson<FinishOnboardingResponse>('/api/onboarding/actions/finish', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({}),
@@ -106,6 +125,17 @@ export function useSkipStarterWorkforce() {
     onSuccess: async (result) => {
       queryClient.setQueryData(ONBOARDING_STATUS_QUERY_KEY, result.status)
       await queryClient.invalidateQueries({ queryKey: ORG_QUERY_KEY })
+    },
+  })
+}
+
+export function useFinishOnboarding() {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: finishOnboarding,
+    onSuccess: (result) => {
+      queryClient.setQueryData(ONBOARDING_STATUS_QUERY_KEY, result.status)
     },
   })
 }

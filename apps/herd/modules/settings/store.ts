@@ -6,6 +6,7 @@ import type { AppSettings, AppTheme } from './types.js'
 import {
   cloneComposerAbilitySettings,
   getDefaultComposerAbilitySettings,
+  isPersistedComposerAbilitySettingsValid,
   mergeComposerAbilitySettingsPatch,
   normalizePersistedComposerAbilitySettings,
   type ComposerAbilitySettingsPatch,
@@ -13,6 +14,7 @@ import {
 import {
   cloneComposerSkillSlotSettings,
   getDefaultComposerSkillSlotSettings,
+  isPersistedComposerSkillSlotSettingsValid,
   mergeComposerSkillSlotSettingsPatch,
   normalizePersistedComposerSkillSlotSettings,
   type ComposerSkillSlotSettingsPatch,
@@ -89,6 +91,36 @@ function parsePersistedSettings(raw: unknown, now: () => Date): AppSettings {
       ? raw.updatedAt.trim()
       : fallback.updatedAt,
   }
+}
+
+export function isPersistedAppSettingsValid(raw: unknown): boolean {
+  if (!isRecord(raw)) {
+    return false
+  }
+  const knownFieldPresent = [
+    'theme',
+    'fontScale',
+    'composerAbilities',
+    'composerSkillSlots',
+    'updatedAt',
+  ].some((field) => Object.prototype.hasOwnProperty.call(raw, field))
+  if (!knownFieldPresent) {
+    return false
+  }
+  return (raw.theme === undefined || normalizeAppTheme(raw.theme) !== null)
+    && (raw.fontScale === undefined || normalizeAppFontScale(raw.fontScale) !== null)
+    && (
+      raw.composerAbilities === undefined
+      || isPersistedComposerAbilitySettingsValid(raw.composerAbilities)
+    )
+    && (
+      raw.composerSkillSlots === undefined
+      || isPersistedComposerSkillSlotSettingsValid(raw.composerSkillSlots)
+    )
+    && (
+      raw.updatedAt === undefined
+      || (typeof raw.updatedAt === 'string' && raw.updatedAt.trim().length > 0)
+    )
 }
 
 export function defaultAppSettingsStorePath(env: NodeJS.ProcessEnv = process.env): string {

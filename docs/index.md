@@ -21,11 +21,13 @@ Use these docs in this order when you are setting up or operating the product.
    for worker execution.
 4. [Hardening](operate/hardening.md): put Herd behind TLS, keep the raw app
    port private, and rotate credentials.
-5. [Enterprise EC2](operate/enterprise-ec2.md): run the direct-ALB systemd
+5. [Railway](operate/railway.md): run Herd as a hosted control plane with
+   provider execution delegated to connected daemons.
+6. [Enterprise EC2](operate/enterprise-ec2.md): run the direct-ALB systemd
    deployment path on port `20001`.
-6. [Troubleshooting](troubleshoot.md): recover from missing CLIs, stale API
+7. [Troubleshooting](troubleshoot.md): recover from missing CLIs, stale API
    keys, unavailable machines, and docs/install drift.
-7. [llms.txt](llms.txt): compact agent-readable map of the public docs.
+8. [llms.txt](llms.txt): compact agent-readable map of the public docs.
 
 ## Core Concepts
 
@@ -45,6 +47,7 @@ Use these docs in this order when you are setting up or operating the product.
 - [Credential pools](operate/credential-pools.md)
 - [Machines and workers](operate/machines.md)
 - [Hardening](operate/hardening.md)
+- [Railway hosted control plane](operate/railway.md)
 - [Enterprise EC2](operate/enterprise-ec2.md)
 - [Uninstall](operate/uninstall.md)
 - [Workspace](operate/workspace.md)

@@ -1,5 +1,6 @@
 import type { CSSProperties } from 'react'
 import type { AgentType } from '@/types'
+import type { ConversationCredentialSelectionMode } from '@modules/commanders/conversation-credential-selection.js'
 import {
   credentialPoolCredentialOptionLabel,
   isCredentialPoolCredentialSelectable,
@@ -7,23 +8,9 @@ import {
   useCredentialPool,
 } from '@/hooks/use-credential-pools'
 
-export function canSelectConversationCredential(
-  provider: AgentType | null | undefined,
-  host?: string | null,
-): boolean {
-  if (!isCredentialPoolProvider(provider)) {
-    return false
-  }
-  if (provider !== 'claude') {
-    return true
-  }
-  const targetHost = host?.trim()
-  return Boolean(targetHost && targetHost !== 'local')
-}
-
 export function CredentialPoolSelect({
   provider,
-  host,
+  credentialSelectionMode,
   value,
   currentCredentialPoolId,
   onChange,
@@ -33,7 +20,7 @@ export function CredentialPoolSelect({
   style,
 }: {
   provider: AgentType | null | undefined
-  host?: string | null
+  credentialSelectionMode: ConversationCredentialSelectionMode
   value: string | null
   currentCredentialPoolId?: string | null
   onChange: (credentialPoolId: string | null) => void
@@ -42,10 +29,16 @@ export function CredentialPoolSelect({
   className?: string
   style?: CSSProperties
 }) {
-  const poolQuery = useCredentialPool(provider)
-  if (!canSelectConversationCredential(provider, host)) {
+  const poolQuery = useCredentialPool(
+    credentialSelectionMode === 'per-conversation' ? provider : null,
+  )
+  if (
+    credentialSelectionMode !== 'per-conversation'
+    || !isCredentialPoolProvider(provider)
+  ) {
     return null
   }
+  const readinessHost = provider === 'claude' ? 'remote' : undefined
 
   const credentials = poolQuery.data?.credentials ?? []
   const knownIds = new Set(credentials.map((credential) => credential.id))
@@ -82,9 +75,9 @@ export function CredentialPoolSelect({
         <option
           key={credential.id}
           value={credential.id}
-          disabled={!isCredentialPoolCredentialSelectable(provider, credential, host)}
+          disabled={!isCredentialPoolCredentialSelectable(provider, credential, readinessHost)}
         >
-          {credentialPoolCredentialOptionLabel(provider, credential, host)}
+          {credentialPoolCredentialOptionLabel(provider, credential, readinessHost)}
         </option>
       ))}
     </select>

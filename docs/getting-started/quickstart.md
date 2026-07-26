@@ -21,8 +21,8 @@ Verification:
 
 - The command exits successfully.
 - The output includes a local URL and bootstrap key or sign-in instructions.
-  Treat the bootstrap key as temporary recovery material: use it for first
-  sign-in, create a permanent API key in Settings, then rotate or revoke the
+  Treat the bootstrap key as one-time first-sign-in material: create and
+  preserve a non-expiring permanent admin API key in Settings, then revoke the
   bootstrap key before its 24-hour expiry.
 - The Herd process exposes `/api/health`.
 - `/api/health` reports `database.ready: true`.
@@ -39,7 +39,8 @@ Verification:
 - The first-run screen appears, or the main Command Room appears if setup was
   already completed.
 - If the browser reports a stale API key, clear the stored key from the landing
-  page and use the current bootstrap key from the installer output.
+  page and use a preserved permanent admin key. The original installer
+  bootstrap value works only while that same first-boot key remains active.
 
 ## 3. Complete First Run
 

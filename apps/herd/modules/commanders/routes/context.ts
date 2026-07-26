@@ -6,7 +6,7 @@ import { generateGeminiImage } from '../../../server/image-generation/gemini-cli
 import { combinedAuth } from '../../../server/middleware/combined-auth.js'
 import { authUserHasRequiredPermissions } from '../../../server/middleware/auth0.js'
 import { appendClaudeReasoningPolicy } from '../../agents/adapters/claude/reasoning-policy.js'
-import { resolveDefaultProviderId } from '../../agents/providers/registry.js'
+import { listProviderIds, resolveDefaultProviderId } from '../../agents/providers/registry.js'
 import { HEARTBEAT_USER_EVENT_SUBTYPE } from '../../agents/user-event-subtypes.js'
 import {
   findExpiredPendingPlanApproval,
@@ -60,6 +60,7 @@ import {
   type CommanderLastRoute,
   type CommanderSession,
 } from '../store.js'
+import { buildConversationCredentialSelectionModes } from '../conversation-credential-selection.js'
 import { GhTasks } from '../tools/gh-tasks.js'
 import {
   defaultCommanderRuntimeConfigPath,
@@ -581,6 +582,10 @@ export async function toCommanderSessionResponse(
   return {
     ...base,
     name: session.host,
+    credentialSelectionModes: buildConversationCredentialSelectionModes(
+      listProviderIds(),
+      session.executionMachineId,
+    ),
     questCount: stats.questCount,
     scheduleCount: stats.scheduleCount,
     contextConfig: {
@@ -738,21 +743,33 @@ export function buildCommandersContext(
   const surfaceBindingStore = options.surfaceBindingStore
     ?? new ChannelSurfaceBindingStore(channelSurfaceBindingStorePathForDataRoot(surfaceBindingDataRoot))
   const channelBindingStore = options.channelBindingStore
-    ?? new CommanderChannelBindingStore(path.join(surfaceBindingDataRoot, 'channels.json'))
+    ?? new CommanderChannelBindingStore(
+      path.join(surfaceBindingDataRoot, 'channels.json'),
+      { lifecycleScope: commanderDataDir },
+    )
   const channelMessageIdempotencyLedger = options.channelMessageIdempotencyLedger
     ?? new ChannelMessageIdempotencyLedger({
       rootDir: channelMessageIdempotencyLedgerPathForDataRoot(surfaceBindingDataRoot),
     })
   const sessionStore = options.sessionStore
-    ?? new CommanderSessionStore(options.sessionStorePath, { runtimeConfig })
+    ?? new CommanderSessionStore(options.sessionStorePath, {
+      runtimeConfig,
+      lifecycleScope: commanderDataDir,
+    })
   const questStore = options.questStore ?? (
     options.questStoreDataDir
-      ? new QuestStore(options.questStoreDataDir)
+      ? new QuestStore({
+        dataDir: options.questStoreDataDir,
+        lifecycleScope: commanderDataDir,
+      })
       : options.sessionStorePath
-        ? new QuestStore(path.dirname(path.resolve(options.sessionStorePath)))
-        : new QuestStore()
+        ? new QuestStore({
+          dataDir: path.dirname(path.resolve(options.sessionStorePath)),
+          lifecycleScope: commanderDataDir,
+        })
+        : new QuestStore({ lifecycleScope: commanderDataDir })
   )
-  const automationStore = options.automationStore ?? new AutomationStore()
+  const automationStore = options.automationStore ?? new AutomationStore({ commanderDataDir })
   const ghTasksFactory = options.ghTasksFactory ?? ((repo: string) => new GhTasks({ repo }))
   const automationScheduler = options.automationScheduler
   const automationSchedulerInitialized = automationScheduler
@@ -779,7 +796,9 @@ export function buildCommandersContext(
 
   const heartbeatDataDir = parseMessage(options.heartbeatBasePath) ?? parseMessage(commanderBasePath)
   const heartbeatLog = options.heartbeatLog ?? new HeartbeatLog(
-    heartbeatDataDir ? { dataDir: heartbeatDataDir } : undefined,
+    heartbeatDataDir
+      ? { dataDir: heartbeatDataDir, lifecycleScope: commanderDataDir }
+      : { lifecycleScope: commanderDataDir },
   )
   const sessionsInterface = options.sessionsInterface
   const runtimes = new Map<string, CommanderRuntime>()

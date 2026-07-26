@@ -18,6 +18,8 @@ import {
 } from '../../policies/approval-bridge-token.js'
 import { appendToBuffer, broadcastOutput } from '../session/helpers.js'
 import { ProviderAuthRequiredError } from '../provider-auth.js'
+import { ProviderExecutionModeError } from '../provider-execution-mode.js'
+import type { MachineLaunchRuntime } from '../session/machine-launch.js'
 import {
   getAgentEffortLevels,
   getAgentModelEffortCapability,
@@ -50,6 +52,7 @@ import {
   countMachineEnvSendKeys,
   isDaemonMachine,
   isRemoteMachine,
+  prepareDaemonMachineLaunchEnvironment,
   prepareMachineLaunchEnvironment,
 } from '../machines.js'
 import { MachineDaemonRegistry } from '../daemon/registry.js'
@@ -58,7 +61,7 @@ import {
   parseClaudeAdaptiveThinking,
   parseClaudeMaxThinkingTokens,
   parseCwd,
-  parseOptionalHost,
+  parseMachinePlacement,
   parseOptionalClaudePermissionMode,
   parseOptionalModel,
   parseOptionalSessionName,
@@ -88,6 +91,7 @@ import {
   launchProviderWorkerSession,
   parseWorkerLaunchRequest,
 } from '../worker-launch.js'
+import { withCommanderRuntimeLaunch } from '../../commanders/package-lifecycle-state.js'
 
 type ProviderStreamSessionOptions = Omit<
   ProviderCreateOptions,
@@ -108,6 +112,7 @@ function buildSessionCreateWorkerLaunchBody(rawBody: unknown): Record<string, un
 }
 
 interface SessionCreateRouteDeps {
+  commanderLifecycleScope?: string
   router: Router
   requireWriteAccess: RequestHandler
   sessions: Map<string, AnySession>
@@ -124,16 +129,7 @@ interface SessionCreateRouteDeps {
     persistedState: PersistedSessionsState,
   ): { source?: ResolvedResumableSessionSource; error?: { status: number; message: string } }
   clearCodexResumeMetadata(sessionName: string): void
-  resolveLaunchMachine(
-    requestedHost: string | undefined,
-  ): Promise<
-    | { ok: true; machine: MachineConfig | undefined }
-    | { ok: false; status: number; error: string }
-  >
-  resolveDaemonLaunchReadiness(
-    machine: MachineConfig | undefined,
-    agentType: AgentType,
-  ): Promise<{ ok: true } | { ok: false; status: number; error: string }>
+  resolveProviderLaunchMachine: MachineLaunchRuntime['resolveProviderLaunchMachine']
   createProviderStreamSession(
     sessionName: string,
     mode: ClaudePermissionMode,
@@ -184,9 +180,9 @@ export function registerSessionCreateRoutes(deps: SessionCreateRouteDeps): void 
       return
     }
 
-    const parsedHost = parseOptionalHost(req.body?.host)
-    if (parsedHost === null) {
-      res.status(400).json({ error: 'Invalid host: expected machine ID string' })
+    const placement = parseMachinePlacement(req.body?.machineId, req.body?.host)
+    if (!placement.ok) {
+      res.status(400).json({ error: placement.error })
       return
     }
 
@@ -197,7 +193,7 @@ export function registerSessionCreateRoutes(deps: SessionCreateRouteDeps): void 
       currentSkillInvocationNull: 'clear',
       fallbackCwd: sourceSession.cwd ?? process.env.HOME ?? '/tmp',
       generatedName,
-      preferMachineCwd: parsedHost !== undefined,
+      preferMachineCwd: placement.machineId !== undefined,
       rawBody: req.body,
       requireName: false,
       routeLabel: '/api/agents/sessions/:name/workers',
@@ -222,16 +218,18 @@ export function registerSessionCreateRoutes(deps: SessionCreateRouteDeps): void 
 
     const launched = await launchProviderWorkerSession(
       {
+        commanderLifecycleScope: deps.commanderLifecycleScope,
         createProviderStreamSession: deps.createProviderStreamSession,
         maxSessions,
-        resolveDaemonLaunchReadiness: deps.resolveDaemonLaunchReadiness,
-        resolveMachine: deps.resolveLaunchMachine,
+        resolveMachine: (requestedMachineId) => (
+          deps.resolveProviderLaunchMachine(requestedMachineId, parsed.request.agentType)
+        ),
         schedulePersistedSessionsWrite: deps.schedulePersistedSessionsWrite,
         sessions,
       },
       parsed.request,
       {
-        missingCwdError: `Source session "${sourceSessionName}" has no cwd; provide cwd or host when dispatching a worker`,
+        missingCwdError: `Source session "${sourceSessionName}" has no cwd; provide cwd or machineId when dispatching a worker`,
       },
     )
     if (!launched.ok) {
@@ -486,11 +484,14 @@ export function registerSessionCreateRoutes(deps: SessionCreateRouteDeps): void 
       })
       return
     }
-    const requestedHost = resumeSource?.source.host ?? parseOptionalHost(req.body?.host)
-    if (requestedHost === null) {
-      res.status(400).json({ error: 'Invalid host: expected machine ID string' })
+    const placement = resumeSource
+      ? { ok: true as const, machineId: resumeSource.source.host }
+      : parseMachinePlacement(req.body?.machineId, req.body?.host)
+    if (!placement.ok) {
+      res.status(400).json({ error: placement.error })
       return
     }
+    const requestedHost = placement.machineId
 
     const resumeProvider = resumeSource ? getProvider(resumeSource.source.agentType) : undefined
     const resumeProviderId = resumeSource
@@ -530,16 +531,18 @@ export function registerSessionCreateRoutes(deps: SessionCreateRouteDeps): void 
 
       const launched = await launchProviderWorkerSession(
         {
+          commanderLifecycleScope: deps.commanderLifecycleScope,
           createProviderStreamSession: deps.createProviderStreamSession,
           maxSessions,
-          resolveDaemonLaunchReadiness: deps.resolveDaemonLaunchReadiness,
-          resolveMachine: deps.resolveLaunchMachine,
+          resolveMachine: (requestedMachineId) => (
+            deps.resolveProviderLaunchMachine(requestedMachineId, parsed.request.agentType)
+          ),
           schedulePersistedSessionsWrite: deps.schedulePersistedSessionsWrite,
           sessions,
         },
         parsed.request,
         {
-          missingCwdError: 'Provide cwd or host when creating a worker stream session',
+          missingCwdError: 'Provide cwd or machineId when creating a worker stream session',
         },
       )
       if (!launched.ok) {
@@ -560,17 +563,15 @@ export function registerSessionCreateRoutes(deps: SessionCreateRouteDeps): void 
       return
     }
 
-    const resolvedMachine = await deps.resolveLaunchMachine(requestedHost)
+    const resolvedMachine = await deps.resolveProviderLaunchMachine(requestedHost, agentType)
     if (!resolvedMachine.ok) {
-      res.status(resolvedMachine.status).json({ error: resolvedMachine.error })
+      res.status(resolvedMachine.status).json({
+        ...(resolvedMachine.code ? { code: resolvedMachine.code } : {}),
+        error: resolvedMachine.error,
+      })
       return
     }
     const machine = resolvedMachine.machine
-    const daemonReadiness = await deps.resolveDaemonLaunchReadiness(machine, agentType)
-    if (!daemonReadiness.ok) {
-      res.status(daemonReadiness.status).json({ error: daemonReadiness.error })
-      return
-    }
 
     const requestedMachineCwd = cwd ?? machine?.cwd
     const sessionCwd = requestedMachineCwd ?? process.env.HOME ?? '/tmp'
@@ -631,20 +632,26 @@ export function registerSessionCreateRoutes(deps: SessionCreateRouteDeps): void 
           sendProviderAuthRequiredResponse(res, err)
           return
         }
+        if (err instanceof ProviderExecutionModeError) {
+          res.status(err.statusCode).json({ code: err.code, error: err.message })
+          return
+        }
         const message = err instanceof Error ? err.message : 'Failed to create stream session'
         res.status(500).json({ error: message })
       }
       return
     }
 
-    try {
+    const launchPtySession = async (): Promise<void> => {
       const ptyEffort = effort ?? providerDefaults.effort ?? getDefaultAgentEffort(agentType)
       const claudeEffort = isClaudeEffortLevel(ptyEffort)
         ? ptyEffort
         : DEFAULT_CLAUDE_EFFORT_LEVEL
       const ptySpawner = daemonMachine ? null : await deps.getSpawner()
       const localSpawnCwd = process.env.HOME || '/tmp'
-      const preparedLaunch = prepareMachineLaunchEnvironment(machine, process.env)
+      const preparedLaunch = daemonMachine
+        ? prepareDaemonMachineLaunchEnvironment(daemonMachine)
+        : prepareMachineLaunchEnvironment(machine, process.env)
       const providerPtyEnv = provider.preparePtyEnv?.({ mode, effort: ptyEffort }) ?? {}
       const requiresApprovalBridge = provider.uiCapabilities.supportsAdaptiveThinking
       const approvalBridgeNonce = requiresApprovalBridge ? createApprovalBridgeNonce() : undefined
@@ -660,7 +667,7 @@ export function registerSessionCreateRoutes(deps: SessionCreateRouteDeps): void 
       const remoteShellCommand = buildLoginShellCommand(
         'exec "${SHELL:-/bin/bash}" -l',
         requestedMachineCwd,
-        remoteMachine ? preparedLaunch.sourcedEnvFile : undefined,
+        remoteMachine || daemonMachine ? preparedLaunch.sourcedEnvFile : undefined,
         remoteMachine ? countMachineEnvSendKeys(preparedLaunch.sshSendEnvKeys) : 0,
       )
       const remoteApprovalBridge = remoteMachine && requiresApprovalBridge
@@ -670,7 +677,7 @@ export function registerSessionCreateRoutes(deps: SessionCreateRouteDeps): void 
             baseUrl: approvalBaseUrl,
           }
         : undefined
-      const ptyCommand = remoteMachine ? 'ssh' : 'bash'
+      const ptyCommand = remoteMachine ? 'ssh' : daemonMachine ? 'sh' : 'bash'
       const ptyArgs = remoteMachine
         ? buildSshArgs(
           remoteMachine,
@@ -679,7 +686,9 @@ export function registerSessionCreateRoutes(deps: SessionCreateRouteDeps): void 
           remoteApprovalBridge,
           preparedLaunch.sshSendEnvKeys,
         )
-        : ['-l']
+        : daemonMachine
+          ? ['-lc', remoteShellCommand]
+          : ['-l']
       const ptyEnv = requiresApprovalBridge
         ? {
             ...preparedLaunch.env,
@@ -780,6 +789,19 @@ export function registerSessionCreateRoutes(deps: SessionCreateRouteDeps): void 
         host: session.host,
         created: true,
       })
+    }
+
+    try {
+      const commanderId = creator.kind === 'commander' ? creator.id?.trim() : undefined
+      if (commanderId) {
+        await withCommanderRuntimeLaunch(
+          commanderId,
+          deps.commanderLifecycleScope,
+          launchPtySession,
+        )
+      } else {
+        await launchPtySession()
+      }
     } catch (err) {
       if (remoteMachine) {
         const message = err instanceof Error ? err.message : 'SSH connection failed'

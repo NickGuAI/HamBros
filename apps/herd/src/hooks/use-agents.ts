@@ -167,7 +167,7 @@ function isLikelyConnectionEndpoint(value: string): boolean {
 
 function buildCreateSessionPayload(input: CreateSessionInput): Record<string, unknown> {
   const rawMachineId = input.machineId ?? input.host
-  let host: string | undefined
+  let machineId: string | undefined
   if (rawMachineId !== undefined && rawMachineId !== null && rawMachineId !== '') {
     if (typeof rawMachineId !== 'string') {
       throw new Error('Create session requires a registered machine ID string, not a machine object.')
@@ -180,13 +180,13 @@ function buildCreateSessionPayload(input: CreateSessionInput): Record<string, un
           : 'Create session requires a registered machine ID string.',
       )
     }
-    host = trimmed
+    machineId = trimmed
   }
 
   const { machineId: _machineId, host: _host, ...rest } = input
   return {
     ...rest,
-    ...(host ? { host } : {}),
+    ...(machineId ? { machineId } : {}),
     transportType: input.transportType ?? 'stream',
   }
 }

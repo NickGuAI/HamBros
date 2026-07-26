@@ -25,6 +25,7 @@ export function createOnboardingRuntime(context: ModuleRuntimeContext): ModuleRo
       automationSchedulerInitialized: capabilities.consume('automations.scheduler-initialized', 'onboarding'),
       commanderDataDir: capabilities.consume('commanders.data-dir', 'onboarding'),
       providerRegistry: capabilities.consume('agents.provider-registry', 'onboarding'),
+      providerExecution: capabilities.consume('agents.provider-execution', 'onboarding'),
     }),
   }
 }

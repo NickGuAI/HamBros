@@ -58,6 +58,20 @@ export function findForbiddenRootReferenceLabels({
     'scripts',
     'check-public-artifact.sh',
   )
+  const canonicalSchemaMigrationImports = [
+    {
+      filePath: path.join(appRoot, 'server', 'db', 'index.ts'),
+      pattern: /from\s+['"][.]\/migrations[.]js['"]/u,
+    },
+    {
+      filePath: path.join(appRoot, 'server', 'db', 'readiness.ts'),
+      pattern: /from\s+['"][.]\/migrations[.]js['"]/u,
+    },
+    {
+      filePath: path.join(appRoot, 'server', '__tests__', 'sqlite-readiness.test.ts'),
+      pattern: /from\s+['"][.][.]\/db\/migrations[.]js['"]/u,
+    },
+  ] as const
   const rules: readonly ForbiddenRootRule[] = [
     {
       pattern: new RegExp(
@@ -83,6 +97,10 @@ export function findForbiddenRootReferenceLabels({
     {
       pattern: /from\s+['"][^'"]*migrations/u,
       label: 'migration import',
+      // Supported schema upgrades are owned by the canonical readiness module.
+      // Keep every other runtime migration import visible so one-off legacy
+      // conversion code cannot grow a second production rail.
+      allowedDeclarations: canonicalSchemaMigrationImports,
     },
     {
       pattern: /\.\/scripts\//u,

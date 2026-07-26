@@ -55,13 +55,14 @@ interface CreateOptions {
   source?: string
   githubIssueUrl?: string
   note?: string
+  artifacts?: QuestArtifact[]
 }
 
 function printUsage(stdout: Writable): void {
   stdout.write('Usage:\n')
   stdout.write('  herd quests list [--commander <id>] [--conversation <id>]\n')
   stdout.write(
-    '  herd quests create [--commander <id>] (--instruction "<text>" | --issue <url>) [--cwd <path>] [--mode <mode>] [--agent <type>] [--skills <s1,s2>] [--source <source>] [--note "<text>"]\n',
+    '  herd quests create [--commander <id>] (--instruction "<text>" | --issue <url>) [--cwd <path>] [--mode <mode>] [--agent <type>] [--skills <s1,s2>] [--source <source>] [--note "<text>"] [--artifact-type <type> --artifact-label <label> --artifact-href <href>]\n',
   )
   stdout.write('  herd quests delete <id> [--commander <id>]\n')
   stdout.write('  herd quests claim <id> [--commander <id>] [--conversation <id>]\n')
@@ -197,6 +198,42 @@ function parseQuestArtifactType(value: unknown): QuestArtifactType | null {
   return null
 }
 
+function isValidQuestArtifactHref(type: QuestArtifactType, href: string): boolean {
+  if (type === 'file') {
+    return href.trim().length > 0
+  }
+
+  let parsed: URL
+  try {
+    parsed = new URL(href)
+  } catch {
+    return false
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return false
+  }
+
+  if (type === 'url') {
+    return true
+  }
+
+  if (!['github.com', 'www.github.com'].includes(parsed.hostname.toLowerCase())) {
+    return false
+  }
+
+  const [owner, repo, resource, number, ...remainder] = parsed.pathname
+    .split('/')
+    .filter(Boolean)
+  if (!owner || !repo || remainder.length > 0 || !/^[1-9]\d*$/u.test(number ?? '')) {
+    return false
+  }
+
+  return type === 'github_issue'
+    ? resource === 'issues'
+    : resource === 'pull'
+}
+
 function parseArtifactAddOptions(
   args: readonly string[],
 ): { type: QuestArtifactType; label: string; href: string } | null {
@@ -239,6 +276,9 @@ function parseArtifactAddOptions(
   }
 
   if (!type || !label || !href) {
+    return null
+  }
+  if (!isValidQuestArtifactHref(type, href)) {
     return null
   }
 
@@ -332,6 +372,19 @@ function extractClaimHolder(payload: unknown): string | null {
     }
   }
 
+  return null
+}
+
+function extractClaimedQuest(payload: unknown): Record<string, unknown> | null {
+  if (!isObject(payload)) {
+    return null
+  }
+  if (isObject(payload.quest)) {
+    return payload.quest
+  }
+  if (typeof payload.id === 'string') {
+    return payload
+  }
   return null
 }
 
@@ -434,6 +487,10 @@ function parseQuestArtifacts(payload: unknown): QuestArtifact[] {
   }
 
   return artifacts
+}
+
+function safeQuestArtifactsForReplacement(artifacts: readonly QuestArtifact[]): QuestArtifact[] {
+  return artifacts.filter((artifact) => isValidQuestArtifactHref(artifact.type, artifact.href))
 }
 
 function parseQuestListPayload(payload: unknown): QuestSummary[] {
@@ -579,6 +636,9 @@ function parseCreateOptions(args: readonly string[]): CreateOptions | null {
   let source: string | undefined
   let githubIssueUrl: string | undefined
   let note: string | undefined
+  let artifactType: QuestArtifactType | null = null
+  let artifactLabel: string | null = null
+  let artifactHref: string | null = null
 
   for (let index = 0; index < args.length; index += 1) {
     const flag = args[index]
@@ -592,7 +652,10 @@ function parseCreateOptions(args: readonly string[]): CreateOptions | null {
       flag !== '--skills' &&
       flag !== '--source' &&
       flag !== '--issue' &&
-      flag !== '--note'
+      flag !== '--note' &&
+      flag !== '--artifact-type' &&
+      flag !== '--artifact-label' &&
+      flag !== '--artifact-href'
     ) {
       return null
     }
@@ -621,6 +684,15 @@ function parseCreateOptions(args: readonly string[]): CreateOptions | null {
       githubIssueUrl = value
     } else if (flag === '--note') {
       note = value
+    } else if (flag === '--artifact-type') {
+      artifactType = parseQuestArtifactType(value)
+      if (!artifactType) {
+        return null
+      }
+    } else if (flag === '--artifact-label') {
+      artifactLabel = value
+    } else if (flag === '--artifact-href') {
+      artifactHref = value
     }
 
     index += 1
@@ -642,6 +714,15 @@ function parseCreateOptions(args: readonly string[]): CreateOptions | null {
   }
   if (note) {
     options.note = note
+  }
+  if (artifactType || artifactLabel || artifactHref) {
+    if (!artifactType || !artifactLabel || !artifactHref) {
+      return null
+    }
+    if (!isValidQuestArtifactHref(artifactType, artifactHref)) {
+      return null
+    }
+    options.artifacts = [{ type: artifactType, label: artifactLabel, href: artifactHref }]
   }
 
   if (hasContractOverride) {
@@ -695,6 +776,9 @@ async function runCreate(
   }
   if (options.note) {
     payload.note = options.note
+  }
+  if (options.artifacts) {
+    payload.artifacts = options.artifacts
   }
 
   const result = await fetchJson(fetchImpl, url, {
@@ -875,6 +959,14 @@ async function runClaim(
   }
 
   stdout.write(`Quest ${questId} claimed.\n`)
+  const claimedQuest = extractClaimedQuest(result.data)
+  if (claimedQuest) {
+    stdout.write(`QUEST_CLAIM_HANDOFF ${JSON.stringify({
+      questId,
+      conversationId,
+      artifacts: parseQuestArtifacts(claimedQuest.artifacts),
+    })}\n`)
+  }
   return 0
 }
 
@@ -944,6 +1036,10 @@ async function patchQuestArtifacts(
   artifacts: QuestArtifact[],
   stderr: Writable,
 ): Promise<boolean> {
+  if (artifacts.some((artifact) => !isValidQuestArtifactHref(artifact.type, artifact.href))) {
+    stderr.write('Cannot update quest artifacts: an artifact href is invalid for its type.\n')
+    return false
+  }
   const url = buildApiUrl(
     context.config.endpoint,
     `/api/commanders/${encodeURIComponent(context.commanderId)}/quests/${encodeURIComponent(
@@ -977,7 +1073,7 @@ async function runArtifactAdd(
     return 1
   }
 
-  const nextArtifacts = [...quest.artifacts, artifact]
+  const nextArtifacts = [...safeQuestArtifactsForReplacement(quest.artifacts), artifact]
   const patched = await patchQuestArtifacts(context, fetchImpl, questId, nextArtifacts, stderr)
   if (!patched) {
     return 1
@@ -1001,12 +1097,13 @@ async function runArtifactRemove(
   }
 
   const normalizedHref = href.trim()
-  const nextArtifacts = quest.artifacts.filter((artifact) => artifact.href !== normalizedHref)
-  if (nextArtifacts.length === quest.artifacts.length) {
+  const remainingArtifacts = quest.artifacts.filter((artifact) => artifact.href !== normalizedHref)
+  if (remainingArtifacts.length === quest.artifacts.length) {
     stderr.write(`No artifact found for href "${normalizedHref}".\n`)
     return 1
   }
 
+  const nextArtifacts = safeQuestArtifactsForReplacement(remainingArtifacts)
   const patched = await patchQuestArtifacts(context, fetchImpl, questId, nextArtifacts, stderr)
   if (!patched) {
     return 1

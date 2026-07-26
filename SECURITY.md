@@ -62,19 +62,26 @@ Legend:
 
 ### Bootstrap Key
 
-The bootstrap key protects first sign-in and recovery for a fresh or empty key
-store. It is a full-scope temporary API key, expires after 24 hours, and is
-intended only to let the operator finish onboarding and create permanent keys.
+The bootstrap key protects first sign-in for a never-initialized key store. It
+is a full-scope temporary API key, expires after 24 hours, and is intended only
+to let the operator finish onboarding and create a non-expiring permanent
+admin key. A restart, an empty active-key list, or a lost credential never
+creates another bootstrap key after the store has been initialized.
 
 After first sign-in:
 
-1. Create a permanent API key in Settings.
+1. Create and preserve a non-expiring permanent admin API key in Settings.
 2. Revoke or rotate the bootstrap key.
 3. Remove the bootstrap key from shell history, notes, screenshots, and shared
    logs.
 
 Anyone with a live bootstrap key can act as the operator until the key expires
 or is revoked.
+
+If every permanent admin key is lost, restore a known-good persistent-volume
+backup together with its preserved key. Without either, recovery requires an
+explicit operator-authorized reset of the deployment's durable identity; do
+not delete the key store to force bootstrap access.
 
 ### Agent Execution
 

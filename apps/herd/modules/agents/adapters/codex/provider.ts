@@ -18,7 +18,6 @@ import type {
 import { codexMachineProvider } from './machine-adapter.js'
 import { codexApprovalAdapter } from './approval-adapter.js'
 import { clearCodexTurnWatchdog } from './helpers.js'
-import { DEFAULT_CODEX_EFFORT_LEVEL } from '../../effort.js'
 import { availableModels } from './models.js'
 import { discoverCodexModels } from './model-discovery.js'
 import {
@@ -128,10 +127,7 @@ export const codexProvider: ProviderAdapter = registerProvider({
   modelDiscovery: {
     discover: discoverCodexModels,
     catalogScope: 'provider',
-    includeUnmatchedCuratedModels: true,
-  },
-  defaults: {
-    effort: DEFAULT_CODEX_EFFORT_LEVEL,
+    authoritativeDynamicModels: true,
   },
   machineAuth: codexMachineProvider,
   uiCapabilities: {
@@ -183,7 +179,7 @@ export const codexProvider: ProviderAdapter = registerProvider({
         resumeSessionId: options.resumeSessionId,
         systemPrompt: options.systemPrompt,
         model: options.model,
-        effort: options.effort ?? DEFAULT_CODEX_EFFORT_LEVEL,
+        effort: options.effort,
         createdAt: options.createdAt,
         spawnedBy: options.spawnedBy,
         spawnedWorkers: options.spawnedWorkers,

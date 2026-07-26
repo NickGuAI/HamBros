@@ -3,8 +3,8 @@
 1. Identify which path changed:
    - local/public installer: `apps/herd/install.sh`
    - EC2 install: `operations/deploy/ec2/install-ec2.sh`
-   - EC2 proxy/service: `operations/deploy/ec2/Caddyfile`,
-     `operations/deploy/ec2/hervald.service`
+   - EC2 topology/service: `operations/deploy/ec2/README.md`,
+     `operations/deploy/ec2/herd.service`
    - managed launch: `operations/scripts/launch_herd.sh`
    - public release sync: `operations/sops/SOP-15-release-herd.md`
 
@@ -22,7 +22,7 @@
 
 ```bash
 pnpm --filter @gehirn/herd-cli test
-  node --test operations/scripts/__tests__/launch_herd.test.mjs
+node --test operations/scripts/__tests__/launch_herd.test.mjs
 pnpm --filter herd exec vitest run \
   server/routes/__tests__/install-script.test.ts \
   server/__tests__/release-runtime-contract.test.ts \

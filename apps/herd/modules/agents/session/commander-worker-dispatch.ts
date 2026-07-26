@@ -1,8 +1,12 @@
 import type { ProviderCreateOptions, ProviderTeardownOptions } from '../providers/provider-adapter.js'
+import type { MachineLaunchRuntime } from './machine-launch.js'
+import { withCommanderRuntimeLaunch } from '../../commanders/package-lifecycle-state.js'
+import { resolveCommanderDataDir } from '../../commanders/paths.js'
 import {
   COMMANDER_WORKER_LAUNCH_BODY_KEYS,
   launchProviderWorkerSession,
   parseWorkerLaunchRequest,
+  type WorkerLaunchSessionResult,
 } from '../worker-launch.js'
 import type {
   AgentType,
@@ -19,18 +23,10 @@ type ProviderStreamSessionOptions = Omit<
 >
 
 interface CommanderWorkerDispatcherDeps {
+  commanderLifecycleScope?: string
   maxSessions: number
   sessions: Map<string, AnySession>
-  resolveLaunchMachine(
-    requestedHost: string | undefined,
-  ): Promise<
-    | { ok: true; machine: MachineConfig | undefined }
-    | { ok: false; status: number; error: string }
-  >
-  resolveDaemonLaunchReadiness(
-    machine: MachineConfig | undefined,
-    agentType: AgentType,
-  ): Promise<{ ok: true } | { ok: false; status: number; error: string }>
+  resolveProviderLaunchMachine: MachineLaunchRuntime['resolveProviderLaunchMachine']
   createProviderStreamSession(
     sessionName: string,
     mode: ClaudePermissionMode,
@@ -45,6 +41,7 @@ interface CommanderWorkerDispatcherDeps {
 }
 
 export function createCommanderWorkerDispatcher(deps: CommanderWorkerDispatcherDeps) {
+  const commanderLifecycleScope = deps.commanderLifecycleScope ?? resolveCommanderDataDir()
   return async function dispatchWorkerForCommander({
     commanderId,
     abortSignal,
@@ -70,21 +67,27 @@ export function createCommanderWorkerDispatcher(deps: CommanderWorkerDispatcherD
       return { status: parsed.status, body: parsed.body }
     }
 
-    const launched = await launchProviderWorkerSession(
-      {
-        createProviderStreamSession: deps.createProviderStreamSession,
-        maxSessions: deps.maxSessions,
-        resolveDaemonLaunchReadiness: deps.resolveDaemonLaunchReadiness,
-        resolveMachine: deps.resolveLaunchMachine,
-        schedulePersistedSessionsWrite: deps.schedulePersistedSessionsWrite,
-        sessions: deps.sessions,
-        teardownProviderSession: deps.teardownProviderSession,
-      },
-      parsed.request,
-      {
-        abortSignal,
-        missingCwdError: 'Provide cwd or host when dispatching a commander worker',
-      },
+    const launched: WorkerLaunchSessionResult = await withCommanderRuntimeLaunch(
+      commanderId,
+      commanderLifecycleScope,
+      () => launchProviderWorkerSession(
+        {
+          commanderLifecycleScope,
+          createProviderStreamSession: deps.createProviderStreamSession,
+          maxSessions: deps.maxSessions,
+          resolveMachine: (requestedMachineId) => (
+            deps.resolveProviderLaunchMachine(requestedMachineId, parsed.request.agentType)
+          ),
+          schedulePersistedSessionsWrite: deps.schedulePersistedSessionsWrite,
+          sessions: deps.sessions,
+          teardownProviderSession: deps.teardownProviderSession,
+        },
+        parsed.request,
+        {
+          abortSignal,
+          missingCwdError: 'Provide cwd or machineId when dispatching a commander worker',
+        },
+      ),
     )
     if (!launched.ok) {
       return { status: launched.status, body: launched.body }

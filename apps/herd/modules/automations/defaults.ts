@@ -14,7 +14,7 @@ type DefaultOperatorAutomation = Omit<CreateAutomationInput, 'operatorId' | 'wor
   name: DefaultOperatorAutomationName
 }
 
-const DEFAULT_OPERATOR_AUTOMATIONS: DefaultOperatorAutomation[] = [
+export const DEFAULT_OPERATOR_AUTOMATIONS: DefaultOperatorAutomation[] = [
   {
     name: 'memory-consolidation',
     trigger: 'schedule',
@@ -58,7 +58,7 @@ const DEFAULT_OPERATOR_AUTOMATIONS: DefaultOperatorAutomation[] = [
 export interface EnsureDefaultOperatorAutomationsOptions {
   operatorId: string
   store: Pick<AutomationStore, 'list' | 'create'>
-  scheduler?: Pick<AutomationScheduler, 'createAutomation'>
+  scheduler?: Pick<AutomationScheduler, 'createAutomation' | 'ensureAutomationScheduled'>
   workDir?: string
 }
 
@@ -80,7 +80,7 @@ export async function ensureDefaultOperatorAutomations(
   }
 
   const existing = await options.store.list({ parentCommanderId: null })
-  const existingNames = new Set(existing.map((automation) => automation.name))
+  const existingByName = new Map(existing.map((automation) => [automation.name, automation]))
   const created: Automation[] = []
   const createAutomation = options.scheduler
     ? options.scheduler.createAutomation.bind(options.scheduler)
@@ -88,7 +88,9 @@ export async function ensureDefaultOperatorAutomations(
   const workDir = resolveDefaultWorkDir(options.workDir)
 
   for (const automation of DEFAULT_OPERATOR_AUTOMATIONS) {
-    if (existingNames.has(automation.name)) {
+    const existingAutomation = existingByName.get(automation.name)
+    if (existingAutomation) {
+      await options.scheduler?.ensureAutomationScheduled(existingAutomation.id)
       continue
     }
 
@@ -99,7 +101,7 @@ export async function ensureDefaultOperatorAutomations(
       workDir,
     })
     created.push(next)
-    existingNames.add(next.name)
+    existingByName.set(next.name, next)
   }
 
   return created

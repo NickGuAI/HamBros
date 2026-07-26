@@ -1,5 +1,7 @@
 import path from 'node:path'
 import { resolveModuleDataDir } from '../data-dir.js'
+import { withCommanderMutation } from '../commanders/child-mutation-coordinator.js'
+import { resolveCommanderDataDir } from '../commanders/paths.js'
 import {
   getActiveStandingApprovalEmails,
   normalizeStandingApprovalEntries,
@@ -22,6 +24,7 @@ import {
   writeJsonFile,
 } from './shared.js'
 import {
+  ACTION_POLICY_VALUES,
   FALLBACK_ACTION_POLICY_ID,
   isCommanderActionPolicyScope,
   type ActionCategoryDefinition,
@@ -50,8 +53,98 @@ interface PersistedPolicyStore {
   settings: ActionPolicySettings
 }
 
+const ACTION_POLICY_VALUE_SET = new Set<string>(ACTION_POLICY_VALUES)
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0
+}
+
+function isStrictStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every(isNonEmptyString)
+}
+
+function isStandingApprovalEntry(value: unknown): boolean {
+  if (!isRecord(value)) {
+    return false
+  }
+  return ['email', 'added_at', 'added_by', 'reason'].every((field) => isNonEmptyString(value[field]))
+    && (value.expires_at === undefined || isNonEmptyString(value.expires_at))
+    && (value.permanent === undefined || typeof value.permanent === 'boolean')
+}
+
+function isStoredPolicyRecord(value: unknown): boolean {
+  if (!isRecord(value)) {
+    return false
+  }
+  return isNonEmptyString(value.actionId)
+    && typeof value.policy === 'string'
+    && ACTION_POLICY_VALUE_SET.has(value.policy)
+    && isStrictStringArray(value.allowlist)
+    && isStrictStringArray(value.blocklist)
+    && (
+      value.standing_approval === undefined
+      || (
+        Array.isArray(value.standing_approval)
+        && value.standing_approval.every(isStandingApprovalEntry)
+      )
+    )
+    && (value.updatedAt === undefined || isNonEmptyString(value.updatedAt))
+    && (value.updatedBy === undefined || isNonEmptyString(value.updatedBy))
+}
+
+function isStoredPolicyScope(value: unknown): boolean {
+  if (!isRecord(value) || !Array.isArray(value.records)) {
+    return false
+  }
+  if (
+    value.fallbackPolicy !== undefined
+    && (
+      typeof value.fallbackPolicy !== 'string'
+      || !ACTION_POLICY_VALUE_SET.has(value.fallbackPolicy)
+    )
+  ) {
+    return false
+  }
+  const actionIds = value.records
+    .filter(isRecord)
+    .map((record) => record.actionId)
+  return value.records.every(isStoredPolicyRecord)
+    && actionIds.length === new Set(actionIds).size
+}
+
+function isStoredPolicySettings(value: unknown): boolean {
+  if (!isRecord(value)) {
+    return false
+  }
+  return typeof value.timeoutMinutes === 'number'
+    && Number.isFinite(value.timeoutMinutes)
+    && value.timeoutMinutes > 0
+    && (value.timeoutAction === 'auto' || value.timeoutAction === 'block')
+    && typeof value.standingApprovalExpiryDays === 'number'
+    && Number.isFinite(value.standingApprovalExpiryDays)
+    && value.standingApprovalExpiryDays > 0
+}
+
+export function isPersistedPolicyStoreValid(raw: unknown): boolean {
+  if (
+    !isRecord(raw)
+    || raw.version !== 1
+    || !isNonEmptyString(raw.updatedAt)
+    || !Number.isFinite(Date.parse(raw.updatedAt))
+    || !isStoredPolicyScope(raw.global)
+    || !isRecord(raw.commanders)
+    || !isStoredPolicySettings(raw.settings)
+  ) {
+    return false
+  }
+  return Object.entries(raw.commanders).every(([commanderId, scope]) => (
+    isNonEmptyString(commanderId) && isStoredPolicyScope(scope)
+  ))
+}
+
 export interface PolicyStoreOptions {
   filePath?: string
+  commanderDataDir?: string
   builtInActions?: ActionCategoryDefinition[]
   defaultPolicy?: ActionPolicyValue
   now?: () => Date
@@ -263,6 +356,8 @@ function mergeScopeRecords(
 export class PolicyStore {
   private readonly filePath: string
 
+  private readonly commanderDataDir: string
+
   private readonly builtInActions: ActionCategoryDefinition[]
 
   private readonly defaultPolicy: ActionPolicyValue
@@ -275,6 +370,7 @@ export class PolicyStore {
     this.filePath = options.filePath
       ? path.resolve(options.filePath)
       : resolveDefaultPolicyStorePath()
+    this.commanderDataDir = path.resolve(options.commanderDataDir ?? resolveCommanderDataDir())
     this.builtInActions = options.builtInActions ?? BUILT_IN_ACTIONS
     this.defaultPolicy = options.defaultPolicy ?? 'review'
     this.now = options.now ?? (() => new Date())
@@ -386,10 +482,17 @@ export class PolicyStore {
       updatedBy: record.updatedBy,
     }
 
-    return this.serializeMutation(async () => {
+    const commanderId = isCommanderActionPolicyScope(scope)
+      ? scope.commanderId.trim()
+      : null
+    if (commanderId !== null && !commanderId) {
+      throw new Error('commanderId is required for commander policy scope')
+    }
+
+    const persistPolicy = () => this.serializeMutation(async () => {
       const store = await this.readStore()
-      const targetScope = isCommanderActionPolicyScope(scope)
-        ? (store.commanders[scope.commanderId] ?? emptyStoredScope())
+      const targetScope = commanderId !== null
+        ? (store.commanders[commanderId] ?? emptyStoredScope())
         : store.global
       const existingRecord = targetScope.records.find((entry) => entry.actionId === trimmedActionId)
 
@@ -422,8 +525,8 @@ export class PolicyStore {
         targetScope.records = sortRecords(nextRecords, this.builtInActions)
       }
 
-      if (isCommanderActionPolicyScope(scope)) {
-        store.commanders[scope.commanderId] = targetScope
+      if (commanderId !== null) {
+        store.commanders[commanderId] = targetScope
       } else {
         store.global = targetScope
       }
@@ -433,6 +536,10 @@ export class PolicyStore {
 
       return trimmedActionId === FALLBACK_ACTION_POLICY_ID ? null : normalizedRecord
     })
+
+    return commanderId === null
+      ? persistPolicy()
+      : withCommanderMutation(commanderId, this.commanderDataDir, persistPolicy)
   }
 
   private buildView(scope: ActionPolicyScope, storedScope: StoredPolicyScope): EffectiveActionPolicyView {

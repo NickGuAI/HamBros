@@ -54,6 +54,11 @@ import {
 import { getProvider } from '../providers/registry.js'
 import { ProviderAuthRequiredError } from '../provider-auth.js'
 import { isTranscriptEnvelope } from '../../../src/types/transcript-envelope.js'
+import {
+  isCommanderPackageRemovalPending,
+  withCommanderRuntimeLaunch,
+} from '../../commanders/package-lifecycle-state.js'
+import { resolveCommanderDataDir } from '../../commanders/paths.js'
 
 export interface PersistedSessionsWriteDeps {
   sessions: Map<string, AnySession>
@@ -72,6 +77,14 @@ export interface PersistedRestoreDeps {
     entry: PersistedStreamSession,
     machine?: MachineConfig,
   ) => StreamSession | Promise<StreamSession>
+  commanderLifecycleScope?: string
+  shouldRestoreSession?(
+    entry: PersistedStreamSession,
+  ): boolean | Promise<boolean>
+  shouldAutoRestoreSession?(
+    entry: PersistedStreamSession,
+    machine?: MachineConfig,
+  ): boolean
   restoreCredentialPoolRecovery?(session: StreamSession): void
 }
 
@@ -380,6 +393,19 @@ export async function restorePersistedSessions(
 
     try {
       const { entry, events } = await resolveRestoredReplaySource(rawEntry)
+      const restoreEntry = async (): Promise<void> => {
+        const commanderId = entry.creator?.kind === 'commander'
+          ? entry.creator.id?.trim()
+          : undefined
+        if (commanderId && await isCommanderPackageRemovalPending(
+          commanderId,
+          deps.commanderLifecycleScope ?? resolveCommanderDataDir(),
+        )) {
+          return
+        }
+        if (deps.shouldRestoreSession && !await deps.shouldRestoreSession(entry)) {
+          return
+        }
 
       if (entry.sessionState === 'exited') {
         if (!entry.sessionType || !entry.creator) {
@@ -414,7 +440,7 @@ export async function restorePersistedSessions(
           credentialPoolRecovery: entry.credentialPoolRecovery,
           activeTurnId: entry.activeTurnId,
           effort: supportsEffort && asClaudeProviderContext(entry.providerContext)?.omitEffort !== true
-            ? entry.effort ?? DEFAULT_CLAUDE_EFFORT_LEVEL
+            ? entry.effort ?? (entry.agentType === 'claude' ? DEFAULT_CLAUDE_EFFORT_LEVEL : undefined)
             : undefined,
           adaptiveThinking: supportsAdaptiveThinking
             ? entry.adaptiveThinking ?? DEFAULT_CLAUDE_ADAPTIVE_THINKING_MODE
@@ -478,12 +504,16 @@ export async function restorePersistedSessions(
         }
       }
 
+      if (deps.shouldAutoRestoreSession && !deps.shouldAutoRestoreSession(entry, machine)) {
+        return
+      }
+
       if (remainingLiveSlots <= 0) {
         return
       }
       remainingLiveSlots -= 1
 
-      try {
+        try {
         let session = buildPendingCredentialRecoverySession(entry, events)
         if (!session) {
           try {
@@ -546,9 +576,22 @@ export async function restorePersistedSessions(
         if (session.credentialPoolRecovery) {
           deps.restoreCredentialPoolRecovery?.(session)
         }
-      } catch (error) {
-        remainingLiveSlots += 1
-        throw error
+        } catch (error) {
+          remainingLiveSlots += 1
+          throw error
+        }
+      }
+      const commanderId = entry.creator?.kind === 'commander'
+        ? entry.creator.id?.trim()
+        : undefined
+      if (commanderId) {
+        await withCommanderRuntimeLaunch(
+          commanderId,
+          deps.commanderLifecycleScope ?? resolveCommanderDataDir(),
+          restoreEntry,
+        )
+      } else {
+        await restoreEntry()
       }
     } catch (error) {
       console.warn(

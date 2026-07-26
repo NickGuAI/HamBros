@@ -9,6 +9,11 @@ import {
   readAppliedHerdSchemaVersions,
 } from './schema.js'
 import {
+  canMigrateHerdSqliteV1,
+  HERD_SQLITE_V1_SCHEMA_VERSION,
+  migrateHerdSqliteV1ToCurrent,
+} from './migrations.js'
+import {
   openHerdSqliteDatabase,
   probeHerdSqliteWritable,
   resolveHerdDbPath,
@@ -17,6 +22,8 @@ import {
 export type HerdDatabaseMigrationStatus =
   | 'ready'
   | 'fresh-initialized'
+  | 'migrated'
+  | 'migration-failed'
   | 'missing'
   | 'stale'
   | 'corrupt'
@@ -122,7 +129,56 @@ export async function inspectHerdDatabaseReadiness(options: {
     db = openHerdSqliteDatabase(dbPath)
     const versions = readAppliedHerdSchemaVersions(db)
     const schemaVersion = versions.length > 0 ? versions[versions.length - 1] : null
+    const knownVersions = new Set([
+      HERD_SQLITE_V1_SCHEMA_VERSION,
+      HERD_SQLITE_SCHEMA_VERSION,
+    ])
+    const unsupportedVersions = versions.filter((version) => !knownVersions.has(version))
+    if (unsupportedVersions.length > 0) {
+      return {
+        ready: false,
+        dbPath,
+        sourceRoot,
+        schemaVersion: null,
+        requiredSchemaVersion: HERD_SQLITE_SCHEMA_VERSION,
+        migrationStatus: 'stale',
+        error: 'SQLite schema contains unsupported migration version markers.',
+      }
+    }
+
     if (!isHerdSqliteSchemaCurrent(db)) {
+      if (canMigrateHerdSqliteV1(db)) {
+        try {
+          await migrateHerdSqliteV1ToCurrent(db, dbPath)
+          db.close()
+          db = null
+          db = openHerdSqliteDatabase(dbPath)
+          if (!isHerdSqliteSchemaCurrent(db)) {
+            throw new Error('SQLite schema remained stale after the supported migration completed.')
+          }
+          probeHerdSqliteWritable(db)
+          return {
+            ready: true,
+            dbPath,
+            sourceRoot,
+            schemaVersion: HERD_SQLITE_SCHEMA_VERSION,
+            requiredSchemaVersion: HERD_SQLITE_SCHEMA_VERSION,
+            migrationStatus: 'migrated',
+            error: null,
+          }
+        } catch (error) {
+          return {
+            ready: false,
+            dbPath,
+            sourceRoot,
+            schemaVersion,
+            requiredSchemaVersion: HERD_SQLITE_SCHEMA_VERSION,
+            migrationStatus: 'migration-failed',
+            error: error instanceof Error ? error.message : String(error),
+          }
+        }
+      }
+
       return {
         ready: false,
         dbPath,

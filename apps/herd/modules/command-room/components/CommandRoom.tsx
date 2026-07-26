@@ -201,6 +201,25 @@ const GLOBAL_COMMANDER_ROW: Commander = {
   isVirtual: true,
 }
 
+function mapCommanderSessionToCommander(commander: CommanderSession): Commander {
+  return {
+    id: commander.id,
+    name: commander.displayName?.trim() || commander.host,
+    archived: commander.archived === true,
+    // Preserve the raw identity fields so <AgentAvatar /> can derive the
+    // initial-letter fallback from the same source the row title uses.
+    displayName: commander.displayName,
+    host: commander.host,
+    credentialSelectionModes: commander.credentialSelectionModes,
+    status: commander.state,
+    description: commander.currentTask?.title,
+    // Wire the backend-supplied avatar route so every Commander surface
+    // renders the same profile image without per-commander color identity.
+    avatarUrl: commander.avatarUrl ?? null,
+    ui: commander.ui ?? null,
+  }
+}
+
 function resolvePanelTab(panel: string | null): string {
   if (panel === 'cron' || panel === 'automation') {
     return 'automation'
@@ -1087,23 +1106,14 @@ function CommandRoomContent() {
     hasOlderConversationMessages,
     loadingOlderConversationMessages,
   ])
+  const commanderIdentities = useMemo(
+    () => commanderState.commanders.map(mapCommanderSessionToCommander),
+    [commanderState.commanders],
+  )
   const sessionCommanders: Commander[] = useMemo(() => [
     GLOBAL_COMMANDER_ROW,
-    ...commanderState.commanders.map((commander) => ({
-      id: commander.id,
-      name: commander.displayName?.trim() || commander.host,
-      // Preserve the raw identity fields so <AgentAvatar /> can derive the
-      // initial-letter fallback from the same source the row title uses.
-      displayName: commander.displayName,
-      host: commander.host,
-      status: commander.state,
-      description: commander.currentTask?.title,
-      // Wire the backend-supplied avatar route so every Commander surface
-      // renders the same profile image without per-commander color identity.
-      avatarUrl: commander.avatarUrl ?? null,
-      ui: commander.ui ?? null,
-    })),
-  ], [commanderState.commanders])
+    ...commanderIdentities.filter((commander) => commander.archived !== true),
+  ], [commanderIdentities])
   const mobileCommanders = useMemo(
     () => sessionCommanders.filter((commander) => !commander.isVirtual),
     [sessionCommanders],
@@ -2635,6 +2645,7 @@ function CommandRoomContent() {
     if (activeTab === 'automation') {
       return (
         <AutomationPanel
+          presentation="single-pane"
           scope={
             !isGlobalScope && selectedCommander
               ? { kind: 'commander', commander: { id: selectedCommander.id } }
@@ -2724,6 +2735,7 @@ function CommandRoomContent() {
     return (
       <MobileCommandRoom
         commanders={mobileCommanders}
+        commanderIdentities={commanderIdentities}
         commanderSessions={commanderState.commanders}
         conversationResolutionPending={conversationResolutionPending}
         workers={workers}

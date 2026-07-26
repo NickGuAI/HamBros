@@ -28,17 +28,24 @@ export interface WorkspaceMachineDescriptorCapability {
 }
 
 export interface WorkspaceResolverCapability {
-  open(input: {
-    conversationId?: string | null
-    sessionName?: string | null
-    commanderId?: string | null
-    authorizationConversationId?: string | null
-    authorizationSessionName?: string | null
-    authorizationCommanderId?: string | null
-    hostHint?: string | null
-    pathHint?: string | null
-  }): Promise<WorkspaceTargetDescriptor>
+  open(input: WorkspaceOpenOptions): Promise<WorkspaceTargetDescriptor>
   resolveTarget(targetId: string): Promise<ResolvedWorkspaceTarget>
+}
+
+export interface WorkspaceOpenOptions {
+  conversationId?: string | null
+  sessionName?: string | null
+  commanderId?: string | null
+  authorizationConversationId?: string | null
+  authorizationSessionName?: string | null
+  authorizationCommanderId?: string | null
+  hostHint?: string | null
+  pathHint?: string | null
+  /** Trusted server-only roots; request payloads must never populate this field. */
+  authorizationRootHints?: readonly string[] | null
+  locationScoped?: boolean | null
+  persistTarget?: boolean | null
+  readOnly?: boolean | null
 }
 
 export interface AuthorizedHostEntry {
@@ -218,11 +225,32 @@ export interface WorkspaceResolverOptions {
   conversationStore: ConversationStore
   commanderStore: CommanderSessionStore
   sessionsInterface?: CommanderSessionsInterface
+  ephemeralTargetTtlMs?: number
+  maxEphemeralTargets?: number
+  now?: () => number
+}
+
+interface EphemeralWorkspaceTarget {
+  target: WorkspaceTargetDescriptor
+  expiresAtMs: number
+}
+
+const DEFAULT_EPHEMERAL_TARGET_TTL_MS = 30 * 60 * 1000
+const DEFAULT_MAX_EPHEMERAL_TARGETS = 512
+
+function positiveIntegerOrDefault(value: number | undefined, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : fallback
 }
 
 export class WorkspaceResolver implements WorkspaceResolverCapability {
   private readonly targetStore: WorkspaceTargetStore
   private readonly hostRegistry: AuthorizedHostRegistry
+  private readonly ephemeralTargets = new Map<string, EphemeralWorkspaceTarget>()
+  private readonly ephemeralTargetTtlMs: number
+  private readonly maxEphemeralTargets: number
+  private readonly now: () => number
 
   constructor(private readonly options: WorkspaceResolverOptions) {
     this.targetStore = options.targetStore ?? new WorkspaceTargetStore()
@@ -231,23 +259,26 @@ export class WorkspaceResolver implements WorkspaceResolverCapability {
       options.conversationStore,
       options.sessionsInterface,
     )
+    this.ephemeralTargetTtlMs = positiveIntegerOrDefault(
+      options.ephemeralTargetTtlMs,
+      DEFAULT_EPHEMERAL_TARGET_TTL_MS,
+    )
+    this.maxEphemeralTargets = positiveIntegerOrDefault(
+      options.maxEphemeralTargets,
+      DEFAULT_MAX_EPHEMERAL_TARGETS,
+    )
+    this.now = options.now ?? Date.now
   }
 
-  async open(input: {
-    conversationId?: string | null
-    sessionName?: string | null
-    commanderId?: string | null
-    authorizationConversationId?: string | null
-    authorizationSessionName?: string | null
-    authorizationCommanderId?: string | null
-    hostHint?: string | null
-    pathHint?: string | null
-  }): Promise<WorkspaceTargetDescriptor> {
+  async open(input: WorkspaceOpenOptions): Promise<WorkspaceTargetDescriptor> {
     const sourceKey = this.resolveSourceKey(input)
     const sourceContext = this.resolveSourceContext(input)
+    const ownerCommanderId = await this.resolveOwnerCommanderId(input)
     const authorizationConversationId = this.resolveAuthorizationConversationId(input)
+    const persistTarget = input.persistTarget !== false
+    const readOnly = input.readOnly === true
 
-    const existing = await this.targetStore.getByKey(sourceKey)
+    const existing = persistTarget ? await this.targetStore.getByKey(sourceKey) : null
     if (existing && !input.hostHint && !input.pathHint) {
       return this.withRedactedLabel(existing)
     }
@@ -255,9 +286,15 @@ export class WorkspaceResolver implements WorkspaceResolverCapability {
     const fallback = await this.resolveFallbackTarget(input)
     const host = normalizeHost(input.hostHint ?? fallback.host)
     const rootPath = this.resolveOpenRootPath(input.pathHint, fallback.rootPath)
-    const additionalRoots = fallback.authorizesRoot
-      ? [{ host: fallback.host, rootPath: fallback.rootPath }]
-      : []
+    const additionalRoots = [
+      ...(fallback.authorizesRoot
+        ? [{ host: fallback.host, rootPath: fallback.rootPath }]
+        : []),
+      ...(input.authorizationRootHints ?? [])
+        .map(normalizeConfiguredRootPrefix)
+        .filter((rootPath): rootPath is string => Boolean(rootPath))
+        .map((rootPath) => ({ host, rootPath })),
+    ]
     const authorized = await this.hostRegistry.authorize(
       authorizationConversationId || null,
       host,
@@ -265,18 +302,24 @@ export class WorkspaceResolver implements WorkspaceResolverCapability {
       additionalRoots,
     )
     const target: WorkspaceTargetDescriptor = {
-      targetId: existing?.targetId ?? createTargetId(),
+      targetId: persistTarget && existing ? existing.targetId : createTargetId(),
       ...(sourceContext.conversationId ? { conversationId: sourceContext.conversationId } : {}),
       ...(sourceContext.sessionName ? { sessionName: sourceContext.sessionName } : {}),
-      ...(sourceContext.commanderId ? { commanderId: sourceContext.commanderId } : {}),
+      ...(ownerCommanderId ? { commanderId: ownerCommanderId } : {}),
       label: buildRedactedTargetLabel(host, authorized),
       host,
       rootPath: authorized.rootPath,
-      readOnly: false,
+      readOnly,
       ...(authorized.machine ? { machine: authorized.machine } : {}),
     }
 
-    return this.targetStore.saveForKey(sourceKey, target)
+    if (!persistTarget) {
+      const displayTarget = this.withRedactedLabel(target)
+      this.storeEphemeralTarget(displayTarget)
+      return { ...displayTarget }
+    }
+
+    return this.targetStore.saveForKey(sourceKey, target, { ownerCommanderId })
   }
 
   async resolveTarget(targetId: string): Promise<ResolvedWorkspaceTarget> {
@@ -284,7 +327,8 @@ export class WorkspaceResolver implements WorkspaceResolverCapability {
     if (!normalizedTargetId) {
       throw new WorkspaceError(400, 'targetId query parameter is required')
     }
-    const target = await this.targetStore.getByTargetId(normalizedTargetId)
+    const target = this.resolveEphemeralTarget(normalizedTargetId)
+      ?? await this.targetStore.getByTargetId(normalizedTargetId)
     if (!target) {
       throw new WorkspaceError(404, 'Workspace target not found')
     }
@@ -336,13 +380,65 @@ export class WorkspaceResolver implements WorkspaceResolverCapability {
     }
   }
 
+  private pruneExpiredEphemeralTargets(nowMs: number): void {
+    for (const [targetId, entry] of this.ephemeralTargets) {
+      if (entry.expiresAtMs <= nowMs) {
+        this.ephemeralTargets.delete(targetId)
+      }
+    }
+  }
+
+  private storeEphemeralTarget(target: WorkspaceTargetDescriptor): void {
+    const nowMs = this.now()
+    this.pruneExpiredEphemeralTargets(nowMs)
+    this.ephemeralTargets.delete(target.targetId)
+    while (this.ephemeralTargets.size >= this.maxEphemeralTargets) {
+      const oldestTargetId = this.ephemeralTargets.keys().next().value
+      if (typeof oldestTargetId !== 'string') {
+        break
+      }
+      this.ephemeralTargets.delete(oldestTargetId)
+    }
+    this.ephemeralTargets.set(target.targetId, {
+      target,
+      expiresAtMs: nowMs + this.ephemeralTargetTtlMs,
+    })
+  }
+
+  private resolveEphemeralTarget(targetId: string): WorkspaceTargetDescriptor | null {
+    const nowMs = this.now()
+    this.pruneExpiredEphemeralTargets(nowMs)
+    const entry = this.ephemeralTargets.get(targetId)
+    if (!entry) {
+      return null
+    }
+    this.ephemeralTargets.delete(targetId)
+    this.ephemeralTargets.set(targetId, {
+      target: entry.target,
+      expiresAtMs: nowMs + this.ephemeralTargetTtlMs,
+    })
+    return entry.target
+  }
+
   private resolveSourceKey(input: {
     conversationId?: string | null
     sessionName?: string | null
     commanderId?: string | null
     hostHint?: string | null
     pathHint?: string | null
+    locationScoped?: boolean | null
   }): string {
+    const locationScoped = input.locationScoped === true
+    const hostHint = typeof input.hostHint === 'string' ? input.hostHint.trim() : ''
+    const pathHint = typeof input.pathHint === 'string' ? input.pathHint.trim() : ''
+    if (locationScoped && (hostHint || pathHint)) {
+      const authKey = [
+        typeof input.conversationId === 'string' ? input.conversationId.trim() : '',
+        typeof input.sessionName === 'string' ? input.sessionName.trim() : '',
+        typeof input.commanderId === 'string' ? input.commanderId.trim() : '',
+      ].join(':')
+      return `location:${authKey}:${normalizeHost(hostHint)}:${pathHint || '.'}`
+    }
     const conversationId = typeof input.conversationId === 'string' ? input.conversationId.trim() : ''
     if (conversationId) {
       return `conversation:${conversationId}`
@@ -355,12 +451,44 @@ export class WorkspaceResolver implements WorkspaceResolverCapability {
     if (commanderId) {
       return `commander:${commanderId}`
     }
-    const hostHint = typeof input.hostHint === 'string' ? input.hostHint.trim() : ''
-    const pathHint = typeof input.pathHint === 'string' ? input.pathHint.trim() : ''
     if (hostHint || pathHint) {
       return `location:${normalizeHost(hostHint)}:${pathHint || '.'}`
     }
     throw new WorkspaceError(400, 'conversationId, sessionName, commanderId, or workspace location is required')
+  }
+
+  private async resolveOwnerCommanderId(input: {
+    conversationId?: string | null
+    sessionName?: string | null
+    commanderId?: string | null
+  }): Promise<string | null> {
+    const commanderId = typeof input.commanderId === 'string' ? input.commanderId.trim() : ''
+    if (commanderId) {
+      return commanderId
+    }
+
+    const conversationId = typeof input.conversationId === 'string'
+      ? input.conversationId.trim()
+      : ''
+    if (conversationId) {
+      const conversation = await this.options.conversationStore.get(conversationId)
+      if (conversation?.commanderId) {
+        return conversation.commanderId
+      }
+    }
+
+    const sessionName = typeof input.sessionName === 'string' ? input.sessionName.trim() : ''
+    if (sessionName) {
+      const creator = this.options.sessionsInterface?.getSession(sessionName)?.creator
+      const creatorCommanderId = creator?.kind === 'commander' && typeof creator.id === 'string'
+        ? creator.id.trim()
+        : ''
+      if (creatorCommanderId) {
+        return creatorCommanderId
+      }
+    }
+
+    return null
   }
 
   private resolveSourceContext(input: {

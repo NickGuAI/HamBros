@@ -6,6 +6,7 @@ import { appendFileDurably } from '../durable-file.js'
 import { extractTranscriptUsageUpdate } from '../agents/transcript-records.js'
 import type { StreamJsonEvent } from '../agents/types.js'
 import type { CommanderSessionStore } from './store.js'
+import { withCommanderMutation } from './child-mutation-coordinator.js'
 
 export const COMMANDER_COST_CAP_WINDOW = 'calendar_month_utc'
 const COST_LEDGER_FILE = 'cost-ledger.jsonl'
@@ -171,7 +172,9 @@ export async function appendCommanderCostRecord(
   }
 
   const filePath = resolveCommanderCostLedgerPath(context.commanderDataDir, record.commanderId)
-  await appendFileDurably(filePath, `${JSON.stringify(record)}\n`)
+  await withCommanderMutation(record.commanderId, context.commanderDataDir, () => (
+    appendFileDurably(filePath, `${JSON.stringify(record)}\n`)
+  ))
 }
 
 export function computeLiveSessionMonthlySpendUsd(

@@ -12,16 +12,24 @@
 
 3. If composer, queue, or transcript behavior changes, inspect:
    - `apps/herd/modules/agents/components/SessionComposer.tsx`
+   - `apps/herd/modules/agents/page-shell/use-session-draft.ts`
    - `apps/herd/modules/agents/queue-state.ts`
    - `apps/herd/modules/agents/queue-mutation.ts`
    - `apps/herd/modules/command-room/components/transcript.ts`
 
 4. If mobile behavior changes, inspect:
    - `apps/herd/modules/command-room/components/mobile/MobileCommandRoom.tsx`
-   - `apps/herd/modules/agents/components/MobileSessionShell.tsx`
+   - `apps/herd/modules/agents/page-shell/MobileSessionShell.tsx`
    - `apps/herd/modules/approvals/MobileInbox.tsx`
 
-5. Verify:
+5. If automation or quest/task-artifact behavior changes, inspect:
+   - `apps/herd/modules/commanders/components/AutomationPanel.tsx`
+   - `apps/herd/modules/commanders/components/QuestBoard.tsx`
+   - `apps/herd/modules/workspace/routes.ts`
+   - the Automations or Quest artifacts and task lifecycle bundle in
+     `apps/herd/.dev/VERIFY.md`.
+
+6. Verify:
 
 ```bash
 pnpm --filter herd exec vitest run \
@@ -34,5 +42,5 @@ pnpm --filter herd exec vitest run \
   modules/agents/__tests__/MobileSessionShell.test.tsx
 ```
 
-6. Contrarian check: any new UI state that gates send/start/resume/pause/archive
+7. Contrarian check: any new UI state that gates send/start/resume/pause/archive
    must map to backend `allowedActions` or read-model fields.

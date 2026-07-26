@@ -642,6 +642,7 @@ export interface AgentsRouterResult {
   sessionsInterface: CommanderSessionsInterface
   approvalSessionsInterface: ApprovalSessionsInterface
   machineCommandExecutor: import('./machine-command-executor.js').MachineCommandExecutor
+  providerExecution: import('./provider-execution-mode.js').ProviderExecutionCapability
 }
 
 export interface ActiveSkillInvocation {
@@ -799,6 +800,7 @@ export interface CommanderSessionsInterface {
     adaptiveThinking?: ClaudeAdaptiveThinkingMode
     maxThinkingTokens?: ClaudeMaxThinkingTokens
     cwd?: string
+    machineId?: string
     resumeProviderContext?: ProviderSessionContext
     credentialPoolId?: string
     credentialPoolMode?: CredentialPoolRuntimeMode
@@ -818,6 +820,7 @@ export interface CommanderSessionsInterface {
     adaptiveThinking?: ClaudeAdaptiveThinkingMode
     maxThinkingTokens?: ClaudeMaxThinkingTokens
     cwd?: string
+    machineId?: string
     resumeProviderContext?: ProviderSessionContext
     credentialPoolId?: string
     credentialPoolMode?: CredentialPoolRuntimeMode

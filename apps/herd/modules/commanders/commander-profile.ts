@@ -2,6 +2,7 @@ import { access, mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { resolveCommanderPaths } from './paths.js'
 import { ensureCommanderVisualProfile } from './commander-visual-profile.js'
+import { withCommanderMutation } from './child-mutation-coordinator.js'
 import {
   DEFAULT_COMMANDER_PORTRAIT_STYLE_ID,
   parseCommanderPortraitStyleId,
@@ -197,11 +198,49 @@ export async function writeCommanderUiProfile(
   commanderId: string,
   basePath: string,
   profile: CommanderUiProfile,
+  lifecycleScope: string,
 ): Promise<void> {
-  const { memoryRoot } = resolveCommanderPaths(commanderId, basePath)
-  await mkdir(memoryRoot, { recursive: true })
-  const filePath = path.join(memoryRoot, COMMANDER_PROFILE_FILE)
-  await writeFile(filePath, JSON.stringify(profile, null, 2), 'utf8')
+  await withCommanderMutation(commanderId, lifecycleScope, async () => {
+    const { memoryRoot } = resolveCommanderPaths(commanderId, basePath)
+    await mkdir(memoryRoot, { recursive: true })
+    const filePath = path.join(memoryRoot, COMMANDER_PROFILE_FILE)
+    await writeFile(filePath, JSON.stringify(profile, null, 2), 'utf8')
+  })
+}
+
+function avatarExtensionForMimeType(mimeType: string): string {
+  const extMap: Record<string, string> = {
+    'image/jpeg': '.jpg',
+    'image/png': '.png',
+    'image/webp': '.webp',
+    'image/gif': '.gif',
+  }
+
+  return extMap[mimeType] ?? '.bin'
+}
+
+/** Writes the avatar and profile reference as one commander mutation. */
+export async function writeCommanderAvatarBytes(
+  commanderId: string,
+  basePath: string,
+  bytes: Uint8Array,
+  mimeType: string,
+  profilePatch: Partial<CommanderUiProfile> = {},
+  lifecycleScope = basePath,
+): Promise<void> {
+  await withCommanderMutation(commanderId, lifecycleScope, async () => {
+    const avatarFileName = `avatar${avatarExtensionForMimeType(mimeType)}`
+    const { commanderRoot } = resolveCommanderPaths(commanderId, basePath)
+    await mkdir(commanderRoot, { recursive: true })
+    await writeFile(path.join(commanderRoot, avatarFileName), bytes)
+
+    const existing = await readCommanderUiProfile(commanderId, basePath)
+    await writeCommanderUiProfile(commanderId, basePath, {
+      ...ensureCommanderVisualProfile(existing),
+      ...profilePatch,
+      avatar: avatarFileName,
+    } satisfies CommanderUiProfile, lifecycleScope)
+  })
 }
 
 export function mimeTypeForAvatarFile(filePath: string): string {

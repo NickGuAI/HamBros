@@ -103,6 +103,7 @@ Open the Marketplace page or complete first-run onboarding to install the starte
 | Shape | Use it when | Docs |
 | --- | --- | --- |
 | **Linux web host** | You want the supported self-hosted control plane behind your own reverse proxy or load balancer. | [Hardening](./docs/operate/hardening.md) |
+| **Railway** | You want a hosted control plane while provider CLIs stay on a connected daemon you control. | [Railway hosted control plane](./docs/operate/railway.md) |
 | **iOS client** | You want a supported mobile client connected to your Herd instance. | [Platform support](./docs/reference/platforms.md) |
 | **macOS / Windows** | Unsupported for v1 self-hosted control-plane deployment. | [Platform support](./docs/reference/platforms.md) |
 
@@ -112,6 +113,7 @@ Full documentation lives under [`docs/`](./docs/index.md):
 
 - [Quickstart](./docs/getting-started/quickstart.md)
 - [Hardening](./docs/operate/hardening.md)
+- [Railway hosted control plane](./docs/operate/railway.md)
 - [Provider auth](./docs/operate/provider-auth.md)
 - [Credential pools](./docs/operate/credential-pools.md)
 - [Machines and workers](./docs/operate/machines.md)

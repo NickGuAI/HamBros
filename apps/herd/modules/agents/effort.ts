@@ -4,24 +4,15 @@ import {
   type ClaudeEffortLevel,
 } from '../claude-effort.js'
 
-export const CODEX_EFFORT_LEVELS = ['low', 'medium', 'high', 'max', 'ultra'] as const
-
-export type CodexEffortLevel = (typeof CODEX_EFFORT_LEVELS)[number]
+// Codex reports an ordered effort vocabulary per model through app-server
+// model/list. Keep the value opaque so a Codex upgrade does not require a
+// matching Herd release.
+export type CodexEffortLevel = string
 export type AgentEffortLevel = ClaudeEffortLevel | CodexEffortLevel
-
-export const DEFAULT_CODEX_EFFORT_LEVEL: CodexEffortLevel = 'max'
-
-const LEGACY_CODEX_EFFORT_ALIASES = {
-  minimal: 'low',
-  xhigh: 'max',
-} as const satisfies Record<string, CodexEffortLevel>
 
 export function getAgentEffortLevels(agentType: string): readonly AgentEffortLevel[] {
   if (agentType === 'claude') {
     return CLAUDE_EFFORT_LEVELS
-  }
-  if (agentType === 'codex') {
-    return CODEX_EFFORT_LEVELS
   }
   return []
 }
@@ -46,8 +37,28 @@ export function getAgentModelEffortCapability(
   supportsEffort: boolean
   supportedEffortLevels: AgentEffortLevel[]
 } {
+  if (model?.supportsEffort === false) {
+    return { supportsEffort: false, supportedEffortLevels: [] }
+  }
+
+  if (agentType === 'codex') {
+    const supportedEffortLevels = [...new Set(
+      (model?.supportedEffortLevels ?? []).flatMap((level) => {
+        if (typeof level !== 'string') {
+          return []
+        }
+        const normalized = level.trim()
+        return normalized ? [normalized] : []
+      }),
+    )]
+    return {
+      supportsEffort: supportedEffortLevels.length > 0,
+      supportedEffortLevels,
+    }
+  }
+
   const providerLevels = getAgentEffortLevels(agentType)
-  if (providerLevels.length === 0 || model?.supportsEffort === false) {
+  if (providerLevels.length === 0) {
     return { supportsEffort: false, supportedEffortLevels: [] }
   }
   const modelLevels = (model?.supportedEffortLevels ?? [])
@@ -58,9 +69,7 @@ export function getAgentModelEffortCapability(
       supportedEffortLevels: modelLevels,
     }
   }
-  const supportedEffortLevels = agentType === 'codex'
-    ? providerLevels.filter((level) => level !== 'ultra')
-    : [...providerLevels]
+  const supportedEffortLevels = [...providerLevels]
   return {
     supportsEffort: supportedEffortLevels.length > 0,
     supportedEffortLevels,
@@ -74,6 +83,7 @@ export function getDefaultAgentEffortForModel(
     supportedEffortLevels?: readonly string[]
     defaultEffort?: string
   } | null | undefined,
+  providerDefault: unknown = getDefaultAgentEffort(agentType),
 ): AgentEffortLevel | undefined {
   const supportedEffortLevels = getAgentEffortLevelsForModel(agentType, model)
   if (supportedEffortLevels.length === 0) {
@@ -83,18 +93,16 @@ export function getDefaultAgentEffortForModel(
   if (modelDefault && supportedEffortLevels.includes(modelDefault)) {
     return modelDefault
   }
-  const providerDefault = getDefaultAgentEffort(agentType)
-  return providerDefault && supportedEffortLevels.includes(providerDefault)
-    ? providerDefault
-    : supportedEffortLevels[0]
+  const parsedProviderDefault = parseOptionalAgentEffort(agentType, providerDefault)
+  if (parsedProviderDefault && supportedEffortLevels.includes(parsedProviderDefault)) {
+    return parsedProviderDefault
+  }
+  return agentType === 'codex' ? undefined : supportedEffortLevels[0]
 }
 
 export function getDefaultAgentEffort(agentType: string): AgentEffortLevel | undefined {
   if (agentType === 'claude') {
     return DEFAULT_CLAUDE_EFFORT_LEVEL
-  }
-  if (agentType === 'codex') {
-    return DEFAULT_CODEX_EFFORT_LEVEL
   }
   return undefined
 }
@@ -106,12 +114,19 @@ export function parseOptionalAgentEffort(
   if (value === undefined || value === null || value === '') {
     return undefined
   }
+  if (agentType === 'codex') {
+    if (typeof value !== 'string') {
+      return null
+    }
+    const normalized = value.trim()
+    return normalized || null
+  }
   return getAgentEffortLevels(agentType).includes(value as AgentEffortLevel)
     ? value as AgentEffortLevel
     : null
 }
 
-/** Parse persisted runtime state, including retired Codex names. Never use for request validation. */
+/** Parse persisted runtime state without rewriting provider-owned values. */
 export function parseStoredAgentEffort(
   agentType: string,
   value: unknown,
@@ -119,11 +134,6 @@ export function parseStoredAgentEffort(
   const parsed = parseOptionalAgentEffort(agentType, value)
   if (parsed) {
     return parsed
-  }
-  if (agentType === 'codex' && typeof value === 'string') {
-    return LEGACY_CODEX_EFFORT_ALIASES[
-      value.trim() as keyof typeof LEGACY_CODEX_EFFORT_ALIASES
-    ]
   }
   return undefined
 }

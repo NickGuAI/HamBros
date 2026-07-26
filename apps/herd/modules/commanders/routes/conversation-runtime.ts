@@ -14,6 +14,7 @@ import type {
 } from '../../agents/types.js'
 import {
   getAgentModelEffortCapability,
+  getDefaultAgentEffortForModel,
   parseOptionalAgentEffort,
   parseStoredAgentEffort,
   type AgentEffortLevel,
@@ -57,23 +58,12 @@ import {
 } from '../cost-control.js'
 import { getConversationRuntimeOverlay } from './conversation-runtime-state.js'
 import { CommanderSessionReplacementConflictError } from '../../agents/commander-interface.js'
+import { isProviderLaunchError } from '../../agents/session/machine-launch.js'
+import { withCommanderRuntimeLaunch } from '../package-lifecycle-state.js'
+import { resolveConversationCredentialSelectionMode } from '../conversation-credential-selection.js'
 
 export function buildConversationSessionName(conversation: Conversation): string {
   return `commander-${conversation.commanderId}-conversation-${conversation.id}`
-}
-
-export function canConversationSelectCredentialPool(
-  agentType: AgentType,
-  host?: string | null,
-): boolean {
-  if (agentType === 'codex') {
-    return true
-  }
-  if (agentType !== 'claude') {
-    return false
-  }
-  const targetHost = host?.trim()
-  return Boolean(targetHost && targetHost !== 'local')
 }
 
 export function getLiveConversationSession(
@@ -600,7 +590,7 @@ interface PreparedConversationSession {
     adaptiveThinking?: ClaudeAdaptiveThinkingMode
     maxThinkingTokens?: ClaudeMaxThinkingTokens
     cwd?: string
-    host?: string
+    machineId?: string
     resumeProviderContext?: Conversation['providerContext']
     credentialPoolId?: string
     maxTurns?: number
@@ -676,6 +666,7 @@ export async function buildGaiaOpsEnvWithMetadata(
   const created = await context.apiKeyStore.createKey({
     name: `Gaia ops ${conversation.id}`,
     scopes: GAIA_OPS_API_KEY_SCOPES,
+    purpose: 'permanent',
     createdBy: `gaia:${commander.id}`,
     now,
     expiresAt,
@@ -930,7 +921,7 @@ async function prepareConversationSession(
   const agentType = spawnOptions?.agentType ?? conversation.agentType ?? commanderAgentType
   const provider = getProvider(agentType)
   const cwd = commander.cwd ?? undefined
-  const host = commander.host ?? undefined
+  const machineId = commander.executionMachineId
   const sessionName = buildConversationSessionName(conversation)
   const liveSession = context.sessionsInterface.getSession(sessionName)
   const queuedCredentialRecovery = context.sessionsInterface.getCredentialRecoveryRequest?.(sessionName)
@@ -943,7 +934,10 @@ async function prepareConversationSession(
   const credentialPoolId = spawnOptions?.credentialPoolId
     ?? credentialRecovery?.credentialPoolId
     ?? (
-      canConversationSelectCredentialPool(agentType, liveSession?.host ?? host)
+      resolveConversationCredentialSelectionMode(
+        agentType,
+        liveSession?.host ?? machineId,
+      ) === 'per-conversation'
       && conversation.agentType === agentType
         ? conversation.credentialPoolId
         : undefined
@@ -1039,13 +1033,11 @@ async function prepareConversationSession(
   const supportedEffortLevels = modelEffortCapability.supportedEffortLevels
   const modelSupportsEffort = provider?.uiCapabilities.supportsEffort === true
     && modelEffortCapability.supportsEffort
-  const modelDefaultEffort = parseOptionalAgentEffort(agentType, modelOption?.defaultEffort)
-  const providerDefaultEffort = parseOptionalAgentEffort(agentType, providerDefaults?.effort)
-  const defaultEffort = modelDefaultEffort && supportedEffortLevels.includes(modelDefaultEffort)
-    ? modelDefaultEffort
-    : providerDefaultEffort && supportedEffortLevels.includes(providerDefaultEffort)
-      ? providerDefaultEffort
-      : supportedEffortLevels[0]
+  const defaultEffort = getDefaultAgentEffortForModel(
+    agentType,
+    modelOption,
+    providerDefaults?.effort,
+  )
   const inheritedEffort = hasSpawnEffort
     ? spawnOptions?.effort
     : conversationProviderEffort
@@ -1132,7 +1124,7 @@ async function prepareConversationSession(
       adaptiveThinking,
       maxThinkingTokens,
       cwd,
-      host,
+      machineId,
       resumeProviderContext,
       credentialPoolId,
       maxTurns: built.maxTurns,
@@ -1149,12 +1141,12 @@ function applyLiveSessionState(
   liveSession: StreamSession | null,
   nextAgentType: AgentType,
   nextStatus: Conversation['status'],
-  targetHost?: string | null,
+  targetMachineId?: string | null,
 ): Conversation {
-  const persistCredentialPoolId = canConversationSelectCredentialPool(
+  const persistCredentialPoolId = resolveConversationCredentialSelectionMode(
     nextAgentType,
-    liveSession?.host ?? targetHost,
-  )
+    liveSession?.host ?? targetMachineId,
+  ) === 'per-conversation'
   return {
     ...current,
     agentType: nextAgentType,
@@ -1257,6 +1249,10 @@ function isCompatibleLiveConversationSession(
   return liveSession.agentType === createSessionInput.agentType
     && liveSession.model === createSessionInput.model
     && liveSession.cwd === expectedCwd
+    && (
+      createSessionInput.machineId === undefined
+      || (liveSession.host ?? 'local') === createSessionInput.machineId
+    )
     && runtimeSettingsMatch
     && isDeepStrictEqual(
       withoutRuntimeSettings(liveProviderContext),
@@ -1333,56 +1329,98 @@ export async function startConversationSession(
   const conversationForStart = prepared.resumeNotFoundRecoveryApplied
     ? await clearConversationProviderContextForResumeRecovery(context, conversation)
     : conversation
-  const existingSession = sessionsInterface.getSession(sessionName)
-  const reusingLiveSession = isCompatibleLiveConversationSession(existingSession, createSessionInput, {
-    gaiaOpsEnvRequired: prepared.gaiaOpsEnvRequired,
-    now: context.now(),
-  })
-  const replacingForCredentialRecovery = Boolean(
-    existingSession && !reusingLiveSession && prepared.credentialRecoveryApplied,
-  )
-  const replacingForGaiaOpsEnvRefresh = Boolean(
-    existingSession && !reusingLiveSession && prepared.gaiaOpsEnvRequired && sessionsInterface.replaceCommanderSession,
-  )
-  if (reusingLiveSession) {
-    refreshLiveConversationSessionPrompt(existingSession, createSessionInput)
-  } else if (!replacingForCredentialRecovery && !replacingForGaiaOpsEnvRefresh) {
-    removeChannelReplyForwarder(context, sessionName, conversationForStart)
-    sessionsInterface.deleteSession(sessionName)
-  }
-
-  if (!reusingLiveSession && prepared.gaiaOpsEnvRequired) {
-    const gaiaOpsEnv = await buildGaiaOpsEnvWithMetadata(context, prepared.commander, conversationForStart)
-    if (gaiaOpsEnv) {
-      createSessionInput = {
-        ...createSessionInput,
-        env: gaiaOpsEnv.env,
-        gaiaOpsApiKeyExpiresAt: gaiaOpsEnv.apiKeyExpiresAt,
-      }
-    }
-  }
-
+  let reusingLiveSession = false
   let liveSession: StreamSession
+  let updated: Conversation | null
   try {
-    if (reusingLiveSession) {
-      liveSession = existingSession
-    } else if (
-      (replacingForCredentialRecovery || replacingForGaiaOpsEnvRefresh)
-      && sessionsInterface.replaceCommanderSession
-    ) {
-      liveSession = await sessionsInterface.replaceCommanderSession(createSessionInput)
-      if (prepared.credentialRecoveryApplied) {
-        sessionsInterface.clearCredentialRecoveryRequest?.(sessionName)
-      }
-    } else {
-      liveSession = await sessionsInterface.createCommanderSession(createSessionInput)
-      if (prepared.credentialRecoveryApplied) {
-        sessionsInterface.clearCredentialRecoveryRequest?.(sessionName)
-      }
+    const launch = await withCommanderRuntimeLaunch(
+      commanderId,
+      context.commanderDataDir,
+      async () => {
+        try {
+          const existingSession = sessionsInterface.getSession(sessionName)
+          reusingLiveSession = isCompatibleLiveConversationSession(existingSession, createSessionInput, {
+            gaiaOpsEnvRequired: prepared.gaiaOpsEnvRequired,
+            now: context.now(),
+          })
+          const replacingForCredentialRecovery = Boolean(
+            existingSession && !reusingLiveSession && prepared.credentialRecoveryApplied,
+          )
+          const replacingForGaiaOpsEnvRefresh = Boolean(
+            existingSession
+            && !reusingLiveSession
+            && prepared.gaiaOpsEnvRequired
+            && sessionsInterface.replaceCommanderSession,
+          )
+          if (reusingLiveSession && existingSession) {
+            refreshLiveConversationSessionPrompt(existingSession, createSessionInput)
+          } else if (!replacingForCredentialRecovery && !replacingForGaiaOpsEnvRefresh) {
+            removeChannelReplyForwarder(context, sessionName, conversationForStart)
+            sessionsInterface.deleteSession(sessionName)
+          }
+
+          if (!reusingLiveSession && prepared.gaiaOpsEnvRequired) {
+            const gaiaOpsEnv = await buildGaiaOpsEnvWithMetadata(
+              context,
+              prepared.commander,
+              conversationForStart,
+            )
+            if (gaiaOpsEnv) {
+              createSessionInput = {
+                ...createSessionInput,
+                env: gaiaOpsEnv.env,
+                gaiaOpsApiKeyExpiresAt: gaiaOpsEnv.apiKeyExpiresAt,
+              }
+            }
+          }
+
+          let launchedSession: StreamSession
+          if (reusingLiveSession && existingSession) {
+            launchedSession = existingSession
+          } else if (
+            (replacingForCredentialRecovery || replacingForGaiaOpsEnvRefresh)
+            && sessionsInterface.replaceCommanderSession
+          ) {
+            launchedSession = await sessionsInterface.replaceCommanderSession(createSessionInput)
+            if (prepared.credentialRecoveryApplied) {
+              sessionsInterface.clearCredentialRecoveryRequest?.(sessionName)
+            }
+          } else {
+            launchedSession = await sessionsInterface.createCommanderSession(createSessionInput)
+            if (prepared.credentialRecoveryApplied) {
+              sessionsInterface.clearCredentialRecoveryRequest?.(sessionName)
+            }
+          }
+          if (!reusingLiveSession && createSessionInput.gaiaOpsApiKeyExpiresAt) {
+            launchedSession.gaiaOpsApiKeyExpiresAt = createSessionInput.gaiaOpsApiKeyExpiresAt
+          }
+
+          const activated = await context.conversationStore.update(
+            conversationForStart.id,
+            (current) => ({
+              ...applyLiveSessionState(
+                current,
+                launchedSession,
+                createSessionInput.agentType,
+                'active',
+                createSessionInput.machineId,
+              ),
+            }),
+          )
+          return { ok: true as const, liveSession: launchedSession, updated: activated }
+        } catch (error) {
+          // Provider launch/replace can cross a process boundary before throwing.
+          // Advance the generation before surfacing the error so a stale package
+          // receipt cannot delete the parent around an uncertain live runtime.
+          return { ok: false as const, error }
+        }
+      },
+    )
+    if (!launch.ok) {
+      throw launch.error
     }
-    if (!reusingLiveSession && createSessionInput.gaiaOpsApiKeyExpiresAt) {
-      liveSession.gaiaOpsApiKeyExpiresAt = createSessionInput.gaiaOpsApiKeyExpiresAt
-    }
+    liveSession = launch.liveSession
+    updated = launch.updated
   } catch (error) {
     if (
       !recoveryAlreadyAttempted &&
@@ -1409,16 +1447,6 @@ export async function startConversationSession(
     }
     throw error
   }
-
-  const updated = await context.conversationStore.update(conversationForStart.id, (current) => ({
-    ...applyLiveSessionState(
-      current,
-      liveSession,
-      createSessionInput.agentType,
-      'active',
-      createSessionInput.host,
-    ),
-  }))
   lifecycleCallbacks?.onConversationActivated?.(updated ?? conversationForStart)
   await updateCommanderDerivedState(context, commanderId)
   const heartbeatConversation = updated ?? conversationForStart
@@ -1509,11 +1537,11 @@ export async function updateConversationRuntimeSettings(
 ): Promise<Conversation> {
   const liveSession = getLiveConversationSession(context, conversation)
   const commander = await context.sessionStore?.get(conversation.commanderId)
-  const targetHost = liveSession?.host ?? commander?.host
-  const credentialSelectionAllowed = canConversationSelectCredentialPool(
+  const targetMachineId = liveSession?.host ?? commander?.executionMachineId
+  const credentialSelectionAllowed = resolveConversationCredentialSelectionMode(
     settings.agentType,
-    targetHost,
-  )
+    targetMachineId,
+  ) === 'per-conversation'
   const effectiveSettings = !credentialSelectionAllowed
     ? { ...settings, credentialPoolId: undefined }
     : settings.credentialPoolId === undefined
@@ -1558,7 +1586,7 @@ export async function updateConversationRuntimeSettings(
         updatedSession,
         effectiveSettings.agentType,
         'active',
-        targetHost,
+        targetMachineId,
       )
     ))
     return updated ?? conversation
@@ -1607,7 +1635,7 @@ export async function updateConversationRuntimeSettings(
       replacement,
       effectiveSettings.agentType,
       'active',
-      prepared.createSessionInput.host,
+      prepared.createSessionInput.machineId,
     ),
   }))
   await updateCommanderDerivedState(context, conversation.commanderId)
@@ -2015,7 +2043,9 @@ async function launchDeepThinkingWorkers(input: {
         agentType: input.liveSession.agentType,
         ...(input.liveSession.model !== undefined ? { model: input.liveSession.model } : {}),
         ...(input.commander.cwd !== undefined ? { cwd: input.commander.cwd } : {}),
-        ...(input.commander.host !== undefined ? { host: input.commander.host } : {}),
+        ...(input.liveSession.host ?? input.commander.executionMachineId
+          ? { host: input.liveSession.host ?? input.commander.executionMachineId }
+          : {}),
         ...(input.liveSession.effort !== undefined ? { effort: input.liveSession.effort } : {}),
         ...(input.liveSession.adaptiveThinking !== undefined ? { adaptiveThinking: input.liveSession.adaptiveThinking } : {}),
         ...(input.liveSession.maxThinkingTokens !== undefined ? { maxThinkingTokens: input.liveSession.maxThinkingTokens } : {}),
@@ -3954,16 +3984,29 @@ async function deliverConversationMessageUnchecked(
           error: costCap.body.error,
         }
       }
-      const started = await startConversationSession(
-        context,
-        conversation.commanderId,
-        conversation,
-        shouldSendAutoStartSeed ? null : '',
-        options.startSpawnOptions,
-        { intent: 'interrupt' },
-        options.dispatchChannelReplies === true,
-        shouldSendAutoStartSeed ? 1 : 0,
-      )
+      let started: Awaited<ReturnType<typeof startConversationSession>>
+      try {
+        started = await startConversationSession(
+          context,
+          conversation.commanderId,
+          conversation,
+          shouldSendAutoStartSeed ? null : '',
+          options.startSpawnOptions,
+          { intent: 'interrupt' },
+          options.dispatchChannelReplies === true,
+          shouldSendAutoStartSeed ? 1 : 0,
+        )
+      } catch (error) {
+        if (isProviderLaunchError(error)) {
+          return {
+            ok: false,
+            status: error.statusCode,
+            error: error.message,
+            ...(error.code ? { code: error.code } : {}),
+          }
+        }
+        throw error
+      }
       if (!started.sent) {
         return {
           ok: false,
@@ -4045,16 +4088,29 @@ async function deliverConversationMessageUnchecked(
           error: costCap.body.error,
         }
       }
-      const restarted = await startConversationSession(
-        context,
-        conversation.commanderId,
-        conversation,
-        null,
-        options?.startSpawnOptions,
-        { intent: 'interrupt' },
-        options?.dispatchChannelReplies === true,
-        options?.dispatchChannelReplies === true ? 1 : 0,
-      )
+      let restarted: Awaited<ReturnType<typeof startConversationSession>>
+      try {
+        restarted = await startConversationSession(
+          context,
+          conversation.commanderId,
+          conversation,
+          null,
+          options?.startSpawnOptions,
+          { intent: 'interrupt' },
+          options?.dispatchChannelReplies === true,
+          options?.dispatchChannelReplies === true ? 1 : 0,
+        )
+      } catch (error) {
+        if (isProviderLaunchError(error)) {
+          return {
+            ok: false,
+            status: error.statusCode,
+            error: error.message,
+            ...(error.code ? { code: error.code } : {}),
+          }
+        }
+        throw error
+      }
       if (!restarted.sent) {
         return {
           ok: false,

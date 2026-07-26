@@ -1,5 +1,7 @@
 import { getChannelAdapter } from './registry.js'
 import type { CommanderChannelBindingStore } from './store.js'
+import { withCommanderRuntimeLaunch } from '../commanders/package-lifecycle-state.js'
+import { resolveCommanderDataDir } from '../commanders/paths.js'
 import type {
   ChannelRuntime,
   CommanderChannelBinding,
@@ -12,14 +14,17 @@ interface ManagedRuntime {
 
 export class ChannelAdapterRuntimeManager {
   private readonly bindingStore: CommanderChannelBindingStore
+  private readonly commanderDataDir: string
   private readonly logger: Pick<Console, 'error' | 'warn'>
   private readonly runtimesByScope = new Map<string, ManagedRuntime>()
 
   constructor(options: {
     bindingStore: CommanderChannelBindingStore
+    commanderDataDir?: string
     logger?: Pick<Console, 'error' | 'warn'>
   }) {
     this.bindingStore = options.bindingStore
+    this.commanderDataDir = options.commanderDataDir ?? resolveCommanderDataDir()
     this.logger = options.logger ?? console
   }
 
@@ -50,7 +55,11 @@ export class ChannelAdapterRuntimeManager {
       if (existing) {
         await this.stopScope(scope)
       }
-      const runtime = await adapter.start(binding)
+      const runtime = await withCommanderRuntimeLaunch(
+        binding.commanderId,
+        this.commanderDataDir,
+        () => adapter.start(binding),
+      )
       this.runtimesByScope.set(scope, { binding, runtime })
     } catch (error) {
       this.logger.warn(

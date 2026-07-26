@@ -6,6 +6,7 @@ import type {
   WorkspaceGitStatus,
   WorkspaceGitStatusEntry,
 } from './types.js'
+import { requireWritableWorkspace } from './resolver.js'
 
 const execFileAsync = promisify(execFile)
 const WORKSPACE_EXEC_MAX_BUFFER_BYTES = 16 * 1024 * 1024
@@ -193,6 +194,7 @@ export async function initWorkspaceGit(
   workspace: ResolvedWorkspace,
   runner?: WorkspaceCommandRunner,
 ): Promise<string> {
+  requireWritableWorkspace(workspace)
   const commandRunner = resolveWorkspaceCommandRunner(workspace, runner)
   const { stdout } = await commandRunner.exec('git', ['init'], { cwd: workspace.rootPath })
   return stdout.trim()

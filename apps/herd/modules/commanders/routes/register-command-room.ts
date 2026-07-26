@@ -1,4 +1,5 @@
-import cron from 'node-cron'
+import { validateAutomationCronExpression } from '../../automations/cron-validation.server.js'
+import { InvalidAutomationCronExpressionError } from '../../automations/scheduler.js'
 import {
   getProvider,
   parseProviderId,
@@ -386,7 +387,7 @@ export function registerCommandRoomRoutes(
       res.status(400).json({ error: 'schedule is required when trigger=schedule' })
       return
     }
-    if (schedule && !cron.validate(schedule)) {
+    if (schedule && !validateAutomationCronExpression(schedule)) {
       res.status(400).json({ error: 'Invalid cron expression' })
       return
     }
@@ -504,7 +505,11 @@ export function registerCommandRoomRoutes(
       await context.automationSchedulerInitialized
       const created = await context.automationScheduler!.createAutomation(createInput)
       res.status(201).json(toCommanderAutomationResponse(created, context))
-    } catch {
+    } catch (error) {
+      if (error instanceof InvalidAutomationCronExpressionError) {
+        res.status(400).json({ error: 'Invalid cron expression' })
+        return
+      }
       res.status(500).json({ error: 'Failed to create automation' })
     }
   })
@@ -531,7 +536,7 @@ export function registerCommandRoomRoutes(
         res.status(400).json({ error: 'schedule must be a non-empty string' })
         return
       }
-      if (!cron.validate(schedule)) {
+      if (!validateAutomationCronExpression(schedule)) {
         res.status(400).json({ error: 'Invalid cron expression' })
         return
       }
@@ -725,7 +730,11 @@ export function registerCommandRoomRoutes(
         return
       }
       res.json(toCommanderAutomationResponse(updated, context))
-    } catch {
+    } catch (error) {
+      if (error instanceof InvalidAutomationCronExpressionError) {
+        res.status(400).json({ error: 'Invalid cron expression' })
+        return
+      }
       res.status(500).json({ error: 'Failed to update automation' })
     }
   })

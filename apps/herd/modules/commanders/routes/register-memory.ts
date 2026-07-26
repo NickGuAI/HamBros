@@ -68,6 +68,7 @@ export function registerMemoryRoutes(
         {
         now: context.now,
         },
+        context.commanderDataDir,
       )
       res.status(201).json({ content: nextContent })
     } catch (error) {
@@ -92,7 +93,7 @@ export function registerMemoryRoutes(
     try {
       await clearWorkingMemory(commanderId, context.commanderBasePath, {
         now: context.now,
-      })
+      }, context.commanderDataDir)
       res.status(204).send()
     } catch (error) {
       res.status(500).json({
@@ -139,6 +140,7 @@ export function registerMemoryRoutes(
         baseRevision,
         memoryMd,
         context.commanderBasePath,
+        context.commanderDataDir,
       )
       if (result.status === 'conflict') {
         res.status(409).json({
@@ -209,7 +211,12 @@ export function registerMemoryRoutes(
     }
 
     try {
-      res.json(await saveFacts(commanderId, facts, context.commanderBasePath))
+      res.json(await saveFacts(
+        commanderId,
+        facts,
+        context.commanderBasePath,
+        context.commanderDataDir,
+      ))
     } catch (error) {
       res.status(500).json({
         error: error instanceof Error ? error.message : 'Failed to save facts',

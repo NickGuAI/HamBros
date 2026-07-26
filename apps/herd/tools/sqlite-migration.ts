@@ -11,7 +11,7 @@ import type { PersistedSessionsState, PersistedStreamSession } from '../modules/
 import { getProvider, parseProviderId } from '../modules/agents/providers/registry.js'
 import {
   applyHerdSqliteSchema,
-  hasCurrentHerdSqliteSchemaColumns,
+  hasCurrentHerdSqliteSchema,
   HERD_SQLITE_SCHEMA_VERSION,
 } from '../server/db/schema.js'
 import {
@@ -316,7 +316,7 @@ function countExistingNonArchivedRuntimeSessions(db: DatabaseSync): number {
 function assertCanWriteTargetWithoutReplace(dbPath: string): void {
   const db = openHerdSqliteDatabase(dbPath)
   try {
-    if (hasAgentRuntimeSessionsTable(db) && !hasCurrentHerdSqliteSchemaColumns(db)) {
+    if (hasAgentRuntimeSessionsTable(db) && !hasCurrentHerdSqliteSchema(db)) {
       throw new Error(
         `[sqlite] Refusing to migrate into existing SQLite database with stale schema: ${dbPath}. `
         + 'Rerun with --replace after confirming the target can be rebuilt.',

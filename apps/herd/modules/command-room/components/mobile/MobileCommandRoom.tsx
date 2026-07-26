@@ -71,7 +71,10 @@ function resolveMobileTab(pathname: string, metadata: CommandRoomRouteMetadata):
 }
 
 export interface MobileCommandRoomProps {
+  /** Active commanders shown in mobile navigation. */
   commanders: Commander[]
+  /** All known identities, including archived commanders addressable by URL. */
+  commanderIdentities?: Commander[]
   commanderSessions: CommanderSession[]
   /**
    * Per issue 1878: true while the client is still resolving commander/
@@ -147,6 +150,7 @@ export interface MobileCommandRoomProps {
 
 export function MobileCommandRoom({
   commanders,
+  commanderIdentities = commanders,
   commanderSessions,
   conversationResolutionPending = false,
   workers,
@@ -274,9 +278,12 @@ export function MobileCommandRoom({
     setContextDirectoryPaths([])
   }, [workspaceSelectionKey])
 
-  const selectedCommander = commanders.find((commander) => commander.id === selectedCommanderId) ?? commanders[0] ?? null
+  const selectedCommander = commanderIdentities.find((commander) => commander.id === selectedCommanderId)
+    ?? commanders[0]
+    ?? null
   const activeCommanderId = commanderId ?? selectedCommander?.id ?? null
-  const activeCommander = commanders.find((commander) => commander.id === activeCommanderId) ?? selectedCommander
+  const activeCommander = commanderIdentities.find((commander) => commander.id === activeCommanderId)
+    ?? selectedCommander
   // Per issue 1878: the chat shell mounts keyed on the commander URL param.
   // While the shared commanders cache is still resolving (cold arrival), a
   // minimal identity built from the URL param keeps the shell painting in the

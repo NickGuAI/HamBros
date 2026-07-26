@@ -2,6 +2,7 @@ import { createReadStream } from 'node:fs'
 import { realpath, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { Router, type Request, type Response } from 'express'
 import { combinedAuth } from '../../server/middleware/combined-auth.js'
 import type { Auth0TokenVerifier } from '../../server/middleware/auth0.js'
@@ -23,6 +24,7 @@ import {
   readWorkspaceGitStatus,
   resolveWorkspacePathSelection,
   renameWorkspaceEntry,
+  requireWritableWorkspace,
   resolveWorkspacePath,
   resolveWorkspaceUploadDestination,
   saveWorkspaceTextFile,
@@ -49,7 +51,14 @@ export interface WorkspaceRouterOptions {
   verifyAuth0Token?: Auth0TokenVerifier
   resolver: WorkspaceResolverCapability
   preferencesStore?: WorkspacePreferencesStore
+  /** Trusted lifecycle roots available to resolve-reference retries. */
+  lifecycleTaskRoots?: readonly string[]
 }
+
+const DEFAULT_LIFECYCLE_TASK_ROOTS = [
+  '~/tasks',
+  '~/PKMS/insights/tasks',
+] as const
 
 function sendWorkspaceError(res: Response, error: unknown): void {
   const workspaceError = toWorkspaceError(error)
@@ -69,6 +78,15 @@ function readTargetId(query: Record<string, unknown>): string {
     throw new WorkspaceError(400, 'targetId query parameter is required')
   }
   return targetId
+}
+
+async function resolveWritableWorkspaceTarget(
+  options: WorkspaceRouterOptions,
+  query: Record<string, unknown>,
+): Promise<ResolvedWorkspaceTarget> {
+  const resolved = await options.resolver.resolveTarget(readTargetId(query))
+  requireWritableWorkspace(resolved.workspace)
+  return resolved
 }
 
 function readPath(query: Record<string, unknown>): string {
@@ -142,6 +160,11 @@ function readRequiredBodyString(body: unknown, key: string): string {
   return value
 }
 
+function readOptionalBodyString(body: unknown, key: string): string | undefined {
+  const value = readBodyString(body, key).trim()
+  return value || undefined
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
 }
@@ -210,6 +233,34 @@ function expandLocalAbsoluteWorkspaceReference(requestedPath: string): string | 
     return trimmedPath
   }
   return null
+}
+
+function normalizeWorkspaceReferencePath(requestedPath: string): string {
+  const trimmedPath = requestedPath.trim()
+  if (!trimmedPath) {
+    throw new WorkspaceError(400, 'path body field is required')
+  }
+  if (!/^[A-Za-z][A-Za-z0-9+.-]*:/u.test(trimmedPath)) {
+    return trimmedPath
+  }
+
+  let parsed: URL
+  try {
+    parsed = new URL(trimmedPath)
+  } catch {
+    throw new WorkspaceError(400, 'Invalid workspace reference URI')
+  }
+  if (parsed.protocol !== 'file:') {
+    throw new WorkspaceError(400, 'Unsupported workspace reference URI')
+  }
+  if (parsed.hostname && parsed.hostname !== 'localhost') {
+    throw new WorkspaceError(400, 'Unsupported non-local file URI authority')
+  }
+  try {
+    return fileURLToPath(parsed)
+  } catch {
+    throw new WorkspaceError(400, 'Invalid file workspace reference URI')
+  }
 }
 
 function isWorkspaceRootEscape(error: unknown): error is WorkspaceError {
@@ -289,6 +340,7 @@ async function resolveExternalLocalWorkspaceReference(
     authorizationCommanderId: resolved.target.commanderId,
     hostHint: resolved.target.host,
     pathHint: targetRootPath,
+    readOnly: resolved.target.readOnly,
   })
   const retargeted = await options.resolver.resolveTarget(target.targetId)
   const selection = await resolveWorkspacePathSelection(
@@ -303,6 +355,113 @@ async function resolveExternalLocalWorkspaceReference(
     targetLabel: redactWorkspaceLabel(target.label, target.host, target.rootPath),
     targetReadOnly: target.readOnly,
   }
+}
+
+async function openWorkspaceReferenceTarget(
+  options: WorkspaceRouterOptions,
+  input: {
+    requestedPath: string
+    commanderId?: string
+    conversationId?: string
+    sessionName?: string
+    hostHint?: string
+    pathHint?: string
+  },
+  initialTildeRunner?: WorkspaceCommandRunner,
+): Promise<WorkspacePathResolution> {
+  const requestedPath = normalizeWorkspaceReferencePath(input.requestedPath)
+  const normalizedSlashPath = requestedPath.replaceAll('\\', '/')
+  const derivedRoot = path.posix.dirname(normalizedSlashPath)
+  const candidateRoots: Array<{
+    rootPath: string | undefined
+    authorizeLifecycleRoots: boolean
+  }> = []
+  if (input.pathHint?.trim()) {
+    candidateRoots.push({ rootPath: input.pathHint, authorizeLifecycleRoots: false })
+  }
+  candidateRoots.push({ rootPath: undefined, authorizeLifecycleRoots: false })
+  if (path.posix.isAbsolute(normalizedSlashPath) || normalizedSlashPath.startsWith('~/')) {
+    candidateRoots.push({ rootPath: derivedRoot, authorizeLifecycleRoots: true })
+  }
+
+  let lastError: unknown = null
+  let tildeRunner = initialTildeRunner
+  for (const candidate of candidateRoots) {
+    try {
+      const pathHint = await expandWorkspaceBoundaryTildeReference(candidate.rootPath, tildeRunner)
+      const authorizationRootHints = candidate.authorizeLifecycleRoots
+        ? (await Promise.all(
+          (options.lifecycleTaskRoots ?? DEFAULT_LIFECYCLE_TASK_ROOTS)
+            .map((rootPath) => expandWorkspaceBoundaryTildeReference(rootPath, tildeRunner)),
+        )).filter((rootPath): rootPath is string => Boolean(rootPath))
+        : undefined
+      const target = await options.resolver.open({
+        conversationId: input.conversationId,
+        sessionName: input.sessionName,
+        commanderId: input.commanderId,
+        hostHint: input.hostHint,
+        pathHint,
+        authorizationRootHints,
+        locationScoped: Boolean(pathHint),
+        persistTarget: false,
+        readOnly: true,
+      })
+      const resolved = await options.resolver.resolveTarget(target.targetId)
+      if (
+        !initialTildeRunner
+        && input.pathHint?.trim().startsWith('~/')
+        && resolved.commandRunner
+      ) {
+        return openWorkspaceReferenceTarget(options, input, resolved.commandRunner)
+      }
+      tildeRunner = resolved.commandRunner
+      const targetPath = await expandWorkspaceBoundaryTildeReference(requestedPath, resolved.commandRunner)
+      const selectionPath = candidate.authorizeLifecycleRoots
+        ? path.posix.relative(candidate.rootPath ?? derivedRoot, normalizedSlashPath)
+        : targetPath
+      const selection = await resolveWorkspacePathSelection(
+        resolved.workspace,
+        selectionPath,
+        resolved.commandRunner,
+      )
+      return {
+        ...selection,
+        targetId: target.targetId,
+        targetLabel: redactWorkspaceLabel(target.label, target.host, target.rootPath),
+        targetReadOnly: target.readOnly,
+      }
+    } catch (error) {
+      lastError = error
+    }
+  }
+
+  throw lastError ?? new WorkspaceError(404, 'Workspace path not found')
+}
+
+async function expandWorkspaceBoundaryTildeReference(
+  requestedPath: string | undefined,
+  runner?: WorkspaceCommandRunner,
+): Promise<string | undefined> {
+  if (!requestedPath?.startsWith('~/')) {
+    return requestedPath
+  }
+  if (runner) {
+    return expandRemoteTildeReference(requestedPath, runner)
+  }
+  return path.join(homedir(), requestedPath.slice(2))
+}
+
+async function expandRemoteTildeReference(
+  requestedPath: string,
+  runner?: WorkspaceCommandRunner,
+): Promise<string> {
+  if (!runner || !requestedPath.startsWith('~/')) {
+    return requestedPath
+  }
+  const script = 'printf "%s\\n" "$HOME/${1#\\~/}"'
+  const { stdout } = await runner.exec('bash', ['-lc', script, '--', requestedPath])
+  const expanded = stdout.trim()
+  return expanded || requestedPath
 }
 
 async function readRemoteRawFile(
@@ -451,6 +610,21 @@ export function createWorkspaceRouter(options: WorkspaceRouterOptions): Router {
     }
   })
 
+  router.post('/resolve-reference', requireReadAccess, async (req, res) => {
+    try {
+      res.json(toPublicWorkspaceResponse(await openWorkspaceReferenceTarget(options, {
+        requestedPath: readRequiredBodyString(req.body, 'path'),
+        commanderId: readOptionalBodyString(req.body, 'commanderId'),
+        conversationId: readOptionalBodyString(req.body, 'conversationId'),
+        sessionName: readOptionalBodyString(req.body, 'sessionName'),
+        hostHint: readOptionalBodyString(req.body, 'hostHint'),
+        pathHint: readOptionalBodyString(req.body, 'pathHint'),
+      })))
+    } catch (error) {
+      sendWorkspaceError(res, error)
+    }
+  })
+
   router.get('/file', requireReadAccess, async (req, res) => {
     try {
       const resolved = await options.resolver.resolveTarget(readTargetId(req.query))
@@ -551,7 +725,7 @@ export function createWorkspaceRouter(options: WorkspaceRouterOptions): Router {
 
   router.put('/file', requireWriteAccess, async (req, res) => {
     try {
-      const resolved = await options.resolver.resolveTarget(readTargetId(req.query))
+      const resolved = await resolveWritableWorkspaceTarget(options, req.query)
       res.json(toPublicWorkspaceResponse(await saveWorkspaceTextFile(
         resolved.workspace,
         readRequiredBodyPath(req.body),
@@ -564,7 +738,7 @@ export function createWorkspaceRouter(options: WorkspaceRouterOptions): Router {
 
   router.post('/new-file', requireWriteAccess, async (req, res) => {
     try {
-      const resolved = await options.resolver.resolveTarget(readTargetId(req.query))
+      const resolved = await resolveWritableWorkspaceTarget(options, req.query)
       res.json(toPublicWorkspaceResponse(
         await createWorkspaceFile(resolved.workspace, readRequiredBodyPath(req.body)),
       ))
@@ -575,7 +749,7 @@ export function createWorkspaceRouter(options: WorkspaceRouterOptions): Router {
 
   router.post('/new-folder', requireWriteAccess, async (req, res) => {
     try {
-      const resolved = await options.resolver.resolveTarget(readTargetId(req.query))
+      const resolved = await resolveWritableWorkspaceTarget(options, req.query)
       res.json(toPublicWorkspaceResponse(
         await createWorkspaceFolder(resolved.workspace, readRequiredBodyPath(req.body)),
       ))
@@ -586,7 +760,7 @@ export function createWorkspaceRouter(options: WorkspaceRouterOptions): Router {
 
   router.post('/rename', requireWriteAccess, async (req, res) => {
     try {
-      const resolved = await options.resolver.resolveTarget(readTargetId(req.query))
+      const resolved = await resolveWritableWorkspaceTarget(options, req.query)
       res.json(toPublicWorkspaceResponse(await renameWorkspaceEntry(
         resolved.workspace,
         readRequiredBodyPath(req.body, 'fromPath'),
@@ -599,7 +773,7 @@ export function createWorkspaceRouter(options: WorkspaceRouterOptions): Router {
 
   router.delete('/path', requireWriteAccess, async (req, res) => {
     try {
-      const resolved = await options.resolver.resolveTarget(readTargetId(req.query))
+      const resolved = await resolveWritableWorkspaceTarget(options, req.query)
       res.json(toPublicWorkspaceResponse(
         await deleteWorkspaceEntry(resolved.workspace, readRequiredPath(req.query)),
       ))
@@ -610,7 +784,7 @@ export function createWorkspaceRouter(options: WorkspaceRouterOptions): Router {
 
   router.post('/upload', requireWriteAccess, async (req, res) => {
     try {
-      const resolved = await options.resolver.resolveTarget(readTargetId(req.query))
+      const resolved = await resolveWritableWorkspaceTarget(options, req.query)
       const destination = await resolveWorkspaceUploadDestination(
         resolved.workspace,
         readPath(req.query),
@@ -625,7 +799,7 @@ export function createWorkspaceRouter(options: WorkspaceRouterOptions): Router {
 
   router.post('/git/init', requireWriteAccess, async (req, res) => {
     try {
-      const resolved = await options.resolver.resolveTarget(readTargetId(req.query))
+      const resolved = await resolveWritableWorkspaceTarget(options, req.query)
       res.json({ output: await initWorkspaceGit(resolved.workspace, resolved.commandRunner) })
     } catch (error) {
       sendWorkspaceError(res, error)

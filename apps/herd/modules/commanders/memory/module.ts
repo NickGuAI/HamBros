@@ -1,5 +1,6 @@
 import { mkdir } from 'node:fs/promises'
-import { resolveCommanderPaths } from '../paths.js'
+import { resolveCommanderDataDir, resolveCommanderPaths } from '../paths.js'
+import { withCommanderMutation } from '../child-mutation-coordinator.js'
 import { MemoryMdWriter } from './memory-md-writer.js'
 import { withCommanderMemoryMutationLock } from './mutation-lock.js'
 import {
@@ -49,35 +50,44 @@ export async function appendWorkingMemory(
   content: string,
   basePath?: string,
   options: WorkingMemoryOperationOptions = {},
+  lifecycleScope = basePath ?? resolveCommanderDataDir(),
 ): Promise<string> {
-  const workingMemory = createWorkingMemory(commanderId, basePath, options)
-  await workingMemory.append(content)
-  return workingMemory.read()
+  return withCommanderMutation(commanderId, lifecycleScope, async () => {
+    const workingMemory = createWorkingMemory(commanderId, basePath, options)
+    await workingMemory.append(content)
+    return workingMemory.read()
+  })
 }
 
 export async function clearWorkingMemory(
   commanderId: string,
   basePath?: string,
   options: WorkingMemoryOperationOptions = {},
+  lifecycleScope = basePath ?? resolveCommanderDataDir(),
 ): Promise<void> {
-  await createWorkingMemory(commanderId, basePath, options).clear()
+  await withCommanderMutation(commanderId, lifecycleScope, () => (
+    createWorkingMemory(commanderId, basePath, options).clear()
+  ))
 }
 
 export async function saveFacts(
   commanderId: string,
   facts: string[],
   basePath?: string,
+  lifecycleScope = basePath ?? resolveCommanderDataDir(),
 ): Promise<{ factsAdded: number; lineCount: number }> {
   const memoryRoot = resolveCommanderPaths(commanderId, basePath).memoryRoot
-  return withCommanderMemoryMutationLock(commanderId, async () => {
-    await mkdir(memoryRoot, { recursive: true })
-    const writer = new MemoryMdWriter(memoryRoot)
-    const next = await writer.updateFacts(facts)
-    if (next.factsAdded > 0) {
-      await advanceRemoteSyncRevision(memoryRoot)
-    }
-    return next
-  })
+  return withCommanderMutation(commanderId, lifecycleScope, () => (
+    withCommanderMemoryMutationLock(commanderId, async () => {
+      await mkdir(memoryRoot, { recursive: true })
+      const writer = new MemoryMdWriter(memoryRoot)
+      const next = await writer.updateFacts(facts)
+      if (next.factsAdded > 0) {
+        await advanceRemoteSyncRevision(memoryRoot)
+      }
+      return next
+    })
+  ))
 }
 
 export async function exportRemoteMemorySnapshot(
@@ -93,8 +103,11 @@ export async function applyRemoteMemorySnapshot(
   baseRevision: number,
   memoryMd: string | undefined,
   basePath?: string,
+  lifecycleScope = basePath ?? resolveCommanderDataDir(),
 ): Promise<RemoteMemorySnapshotApplyResult> {
   const memoryRoot = resolveCommanderPaths(commanderId, basePath).memoryRoot
-  return withCommanderMemoryMutationLock(commanderId, async () =>
-    applySnapshot(memoryRoot, baseRevision, memoryMd))
+  return withCommanderMutation(commanderId, lifecycleScope, () => (
+    withCommanderMemoryMutationLock(commanderId, async () =>
+      applySnapshot(memoryRoot, baseRevision, memoryMd))
+  ))
 }

@@ -66,5 +66,24 @@ Installation creates a normal commander session, default conversation, display
 name, profile, `COMMANDER.md` identity section, and an inspectable `.package/`
 snapshot under the installed commander's data directory.
 
+Package writes are serialized by commander data directory, including direct
+package installs and onboarding workforce batches. Installation writes
+`.package/install-state.json` atomically as its final commit marker. Read-side
+installed status requires the package session, deterministic default
+conversation, exact package-owned preset automations, matching package
+snapshot, and a complete matching marker. A structurally complete legacy
+install without a marker remains readable and adopts a marker on the next
+explicit install; partial legacy state is reconciled and rebuilt. User changes
+to preset automation runtime status do not invalidate an otherwise complete
+install.
+
+If installation fails after creation begins, rollback removes preset
+automations, the default conversation, display-name metadata, the commander
+session, and commander files. Cleanup failures are reported with their failed
+operation instead of being silently discarded. Cleanup validates the package
+and install IDs before mutation and never sweeps non-package automations or
+user-created conversations; unrelated child state blocks destructive parent
+cleanup.
+
 The backend resolves duplicate hosts and display names before creation. The UI
 does not assemble identity, skills, memory, or package rules.

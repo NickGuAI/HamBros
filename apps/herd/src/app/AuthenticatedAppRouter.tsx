@@ -52,7 +52,8 @@ function requiresInitialOnboardingGate(status: OnboardingStatus): boolean {
   return (
     !status.founderSetup.setupComplete ||
     !status.gaia.exists ||
-    !status.starterWorkforce.complete
+    !status.starterWorkforce.complete ||
+    !status.credentials.ready
   )
 }
 

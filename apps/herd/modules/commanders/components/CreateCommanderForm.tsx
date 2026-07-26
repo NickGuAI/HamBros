@@ -1,7 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import {
   findProviderEntry,
-  getProviderControlDefaults,
   resolveDefaultProviderId,
   useProviderRegistry,
 } from '@/hooks/use-providers'
@@ -50,7 +49,7 @@ export function CreateCommanderForm({
   const [displayName, setDisplayName] = useState('')
   const [agentType, setAgentType] = useState<AgentType>('')
   const [model, setModel] = useState<string | null>(null)
-  const [effort, setEffort] = useState<AgentEffortLevel>(getProviderControlDefaults(null).effort)
+  const [effort, setEffort] = useState<AgentEffortLevel | ''>('')
   const { data: providers = [], defaultProviderId } = useProviderRegistry()
   const defaultAgentType = resolveDefaultProviderId(providers, defaultProviderId)
   const currentProvider = findProviderEntry(providers, agentType)
@@ -58,6 +57,11 @@ export function CreateCommanderForm({
   const activeModel = availableModels.find((option) => option.id === model)
     ?? (model === null ? availableModels.find((option) => option.default) ?? availableModels[0] : undefined)
   const effortOptions = getAgentEffortLevelsForModel(agentType, activeModel)
+  const defaultEffort = getDefaultAgentEffortForModel(
+    agentType,
+    activeModel,
+    currentProvider?.defaults?.effort,
+  )
   const supportsEffort = currentProvider?.uiCapabilities.supportsEffort === true
     && effortOptions.length > 0
 
@@ -102,11 +106,8 @@ export function CreateCommanderForm({
     if (!currentProvider) {
       return
     }
-    setEffort(
-      getDefaultAgentEffortForModel(agentType, activeModel)
-      ?? getProviderControlDefaults(currentProvider).effort,
-    )
-  }, [activeModel, agentType, currentProvider])
+    setEffort(defaultEffort ?? '')
+  }, [currentProvider, defaultEffort])
 
   useEffect(() => {
     if (model && !availableModels.some((option) => option.id === model)) {
@@ -167,11 +168,7 @@ export function CreateCommanderForm({
         displayName: displayName.trim() || undefined,
         agentType,
         model,
-        ...(supportsEffort
-          ? { effort: effortOptions.includes(effort)
-              ? effort
-              : getDefaultAgentEffortForModel(agentType, activeModel) }
-          : {}),
+        ...(supportsEffort && effort && effortOptions.includes(effort) ? { effort } : {}),
         cwd: trimmedCwd,
         identityOperatingStyle: trimmedIdentityOperatingStyle,
         avatarSeed: avatarSeed.trim() || undefined,
@@ -203,7 +200,7 @@ export function CreateCommanderForm({
         setAgentType(defaultAgentType)
       }
       setModel(null)
-      setEffort(getProviderControlDefaults(currentProvider).effort)
+      setEffort('')
       setCwd('')
       setIdentityOperatingStyle('')
       setAvatarSeed('')
@@ -245,14 +242,13 @@ export function CreateCommanderForm({
       : undefined
 
   function handleAgentTypeChange(nextAgentType: AgentType): void {
-    const nextProvider = findProviderEntry(providers, nextAgentType)
     const nextModels = resolveProviderModelOptions(providers, nextAgentType)
     const nextModel = nextModels.find((option) => option.default) ?? nextModels[0]
     setAgentType(nextAgentType)
     setModel(null)
     setEffort(
       getDefaultAgentEffortForModel(nextAgentType, nextModel)
-      ?? getProviderControlDefaults(nextProvider).effort,
+      ?? '',
     )
   }
 
@@ -262,12 +258,12 @@ export function CreateCommanderForm({
       : availableModels.find((option) => option.default) ?? availableModels[0]
     setModel(nextModelId)
     const nextDefaultEffort = getDefaultAgentEffortForModel(agentType, nextModel)
-    if (nextDefaultEffort) {
-      setEffort((current) => {
-        const nextLevels = getAgentEffortLevelsForModel(agentType, nextModel)
-        return nextLevels.includes(current) ? current : nextDefaultEffort
-      })
-    }
+    setEffort((current) => {
+      const nextLevels = getAgentEffortLevelsForModel(agentType, nextModel)
+      return nextDefaultEffort && current && nextLevels.includes(current)
+        ? current
+        : nextDefaultEffort ?? ''
+    })
   }
 
   return (
@@ -335,9 +331,10 @@ export function CreateCommanderForm({
             <select
               data-testid="create-commander-effort-select"
               value={effort}
-              onChange={(event) => setEffort(event.target.value as AgentEffortLevel)}
+              onChange={(event) => setEffort(event.target.value as AgentEffortLevel | '')}
               className={INPUT_CLASS}
             >
+              {!defaultEffort ? <option value="">Provider default</option> : null}
               {effortOptions.map((level) => (
                 <option key={level} value={level}>{level}</option>
               ))}
@@ -479,7 +476,7 @@ export function CreateCommanderForm({
             cwd={cwd || undefined}
             identityOperatingStyle={identityOperatingStyle || undefined}
             agentType={agentType}
-            effort={supportsEffort ? effort : undefined}
+            effort={supportsEffort && effort ? effort : undefined}
             heartbeatIntervalMs={Number.isFinite(parsedHeartbeatMs) ? parsedHeartbeatMs : undefined}
             heartbeatMessage={messageTemplate || undefined}
             fatPinInterval={parsedFatPin && parsedFatPin >= 1 ? parsedFatPin : undefined}

@@ -23,6 +23,18 @@ export interface AtomicFileWriteOptions {
 
 export interface FileLockOptions {
   staleMs?: number
+  handoff?: FileLockHandoffOptions
+}
+
+export interface FileLockHandoffScope {
+  namespace: string
+  resourceId: string
+  instanceId: string
+}
+
+export interface FileLockHandoffOptions {
+  scope: FileLockHandoffScope
+  reclaimLegacyForeignHost?: boolean
 }
 
 export interface HeldFileLock {
@@ -36,7 +48,13 @@ interface LockMetadata {
   pid: number
   hostname: string
   acquiredAt: string
+  handoffScope?: FileLockHandoffScope
 }
+
+type LockMetadataReadResult =
+  | { kind: 'valid'; metadata: LockMetadata }
+  | { kind: 'invalid' }
+  | { kind: 'invalid-handoff-scope' }
 
 export class FileLockConflictError extends Error {
   readonly code = 'ELOCKED'
@@ -59,12 +77,13 @@ function isErrnoCode(error: unknown, code: string): boolean {
   return (error as NodeJS.ErrnoException | null)?.code === code
 }
 
-function buildLockMetadata(token: string): LockMetadata {
+function buildLockMetadata(token: string, options: FileLockOptions): LockMetadata {
   return {
     token,
     pid: process.pid,
     hostname: hostname(),
     acquiredAt: new Date().toISOString(),
+    ...(options.handoff ? { handoffScope: options.handoff.scope } : {}),
   }
 }
 
@@ -80,32 +99,106 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
-async function readLockMetadata(lockPath: string): Promise<LockMetadata | null> {
-  try {
-    const parsed = JSON.parse(await readFile(lockPath, 'utf8')) as unknown
-    if (
-      typeof parsed === 'object' &&
-      parsed !== null &&
-      typeof (parsed as LockMetadata).token === 'string' &&
-      typeof (parsed as LockMetadata).pid === 'number' &&
-      typeof (parsed as LockMetadata).hostname === 'string' &&
-      typeof (parsed as LockMetadata).acquiredAt === 'string'
-    ) {
-      return parsed as LockMetadata
-    }
-  } catch {
-    return null
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0
+}
+
+function isValidFileLockHandoffScope(value: unknown): value is FileLockHandoffScope {
+  if (typeof value !== 'object' || value === null) {
+    return false
   }
-  return null
+  const scope = value as Record<string, unknown>
+  return (
+    isNonEmptyString(scope.namespace) &&
+    isNonEmptyString(scope.resourceId) &&
+    isNonEmptyString(scope.instanceId)
+  )
+}
+
+async function readLockMetadata(lockPath: string): Promise<LockMetadataReadResult> {
+  let rawMetadata: string
+  try {
+    rawMetadata = await readFile(lockPath, 'utf8')
+  } catch {
+    return { kind: 'invalid' }
+  }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(rawMetadata) as unknown
+  } catch {
+    // A partially written scoped record must never fall through to the aged
+    // legacy-lock recovery path. False positives here deliberately fail safe.
+    return /"handoffScope"\s*:/.test(rawMetadata)
+      ? { kind: 'invalid-handoff-scope' }
+      : { kind: 'invalid' }
+  }
+
+  if (typeof parsed !== 'object' || parsed === null) {
+    return { kind: 'invalid' }
+  }
+
+  const metadataRecord = parsed as Record<string, unknown>
+  const hasValidBaseMetadata =
+    typeof metadataRecord.token === 'string' &&
+    typeof metadataRecord.pid === 'number' &&
+    typeof metadataRecord.hostname === 'string' &&
+    typeof metadataRecord.acquiredAt === 'string'
+
+  if (Object.hasOwn(metadataRecord, 'handoffScope')) {
+    const handoffScope = metadataRecord.handoffScope
+    if (
+      !hasValidBaseMetadata ||
+      !isValidFileLockHandoffScope(handoffScope)
+    ) {
+      return { kind: 'invalid-handoff-scope' }
+    }
+  }
+
+  if (hasValidBaseMetadata) {
+    return { kind: 'valid', metadata: metadataRecord as unknown as LockMetadata }
+  }
+
+  return { kind: 'invalid' }
+}
+
+function canReclaimForeignHostLock(
+  metadata: LockMetadata,
+  options: FileLockOptions,
+): boolean {
+  const handoff = options.handoff
+  if (!handoff) {
+    return false
+  }
+
+  const holderScope = metadata.handoffScope
+  if (!holderScope) {
+    return handoff.reclaimLegacyForeignHost === true
+  }
+
+  return (
+    holderScope.namespace === handoff.scope.namespace &&
+    holderScope.resourceId === handoff.scope.resourceId
+  )
 }
 
 async function shouldBreakLock(lockPath: string, options: FileLockOptions): Promise<boolean> {
-  const metadata = await readLockMetadata(lockPath)
-  if (metadata && !isPidAlive(metadata.pid)) {
-    return true
+  const result = await readLockMetadata(lockPath)
+  if (result.kind === 'valid') {
+    const { metadata } = result
+    // Handoff scope governs cross-host recovery only. On this host, the OS PID
+    // is authoritative even when the contender has no matching handoff scope.
+    if (metadata.hostname === hostname()) {
+      return !isPidAlive(metadata.pid)
+    }
+    return canReclaimForeignHostLock(metadata, options)
   }
 
-  if (!metadata && options.staleMs !== undefined) {
+  if (result.kind === 'invalid-handoff-scope') {
+    return false
+  }
+
+  if (options.staleMs !== undefined) {
     try {
       const lockStat = await stat(lockPath)
       return Date.now() - lockStat.mtimeMs > options.staleMs
@@ -119,8 +212,8 @@ async function shouldBreakLock(lockPath: string, options: FileLockOptions): Prom
 
 async function removeLockIfOwned(lockPath: string, token: string): Promise<void> {
   try {
-    const metadata = await readLockMetadata(lockPath)
-    if (metadata?.token !== token) {
+    const result = await readLockMetadata(lockPath)
+    if (result.kind !== 'valid' || result.metadata.token !== token) {
       return
     }
     await rm(lockPath, { force: true })
@@ -224,7 +317,7 @@ export async function acquireFileLock(
       await handle.close().catch(() => undefined)
     }
     try {
-      const metadata = buildLockMetadata(token)
+      const metadata = buildLockMetadata(token, options)
       await handle.writeFile(`${JSON.stringify(metadata)}\n`, 'utf8')
       await handle.sync()
       await closeHandle()
@@ -273,7 +366,11 @@ export async function acquireFileLock(
     }
   }
 
-  throw new FileLockConflictError(lockPath, await readLockMetadata(lockPath))
+  const holderResult = await readLockMetadata(lockPath)
+  throw new FileLockConflictError(
+    lockPath,
+    holderResult.kind === 'valid' ? holderResult.metadata : null,
+  )
 }
 
 export async function withFileMutationLock<T>(

@@ -1,12 +1,21 @@
 import { type FormEvent, useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ChevronUp, Plus, X } from 'lucide-react'
+import { ChevronUp, FileText, Folder, Loader2, Plus, Trash2, X } from 'lucide-react'
 import { cn, timeAgo } from '@/lib/utils'
 import { fetchJson, fetchVoid } from '@/lib/api'
 import { ConfirmModal } from '@modules/components/ConfirmModal'
 import { Toast } from '@modules/components/Toast'
 import type { CommanderSession } from '../hooks/useCommander'
 import { ModalFormContainer } from '../../components/ModalFormContainer'
+import {
+  fetchWorkspaceTree,
+  resolveWorkspaceReference,
+  useWorkspaceFilePreview,
+  type WorkspaceSource,
+} from '../../workspace/use-workspace'
+import { WorkspaceFilePreviewModal } from '../../workspace/components/WorkspaceFilePreviewModal'
+import type { WorkspaceTreeNode } from '../../workspace/types'
+import { isValidQuestArtifactHref } from '../quest-artifact-href'
 import {
   type QuestAgentType,
   type QuestArtifact,
@@ -70,6 +79,12 @@ interface CreateQuestInput {
 interface DeleteQuestInput {
   commanderId: string
   questId: string
+}
+
+interface UpdateQuestArtifactsInput {
+  commanderId: string
+  questId: string
+  artifacts: QuestArtifact[]
 }
 
 type QuestBoardCommander = Pick<CommanderSession, 'id' | 'host'>
@@ -212,6 +227,21 @@ function parseQuestArtifacts(raw: unknown): QuestArtifact[] {
   }
 
   return artifacts
+}
+
+function safeQuestArtifactsForReplacement(raw: unknown): QuestArtifact[] {
+  return parseQuestArtifacts(raw).filter(
+    (artifact) => isValidQuestArtifactHref(artifact.type, artifact.href),
+  )
+}
+
+function assertValidQuestArtifactHrefs(artifacts: readonly QuestArtifact[]): void {
+  const invalidArtifact = artifacts.find(
+    (artifact) => !isValidQuestArtifactHref(artifact.type, artifact.href),
+  )
+  if (invalidArtifact) {
+    throw new Error(`Artifact href is invalid for type "${invalidArtifact.type}".`)
+  }
 }
 
 function parseQuestSource(value: unknown): QuestSource {
@@ -370,6 +400,7 @@ async function fetchAllCommanderQuests(): Promise<CommanderQuest[]> {
 }
 
 async function createCommanderQuest(input: CreateQuestInput): Promise<CommanderQuest> {
+  assertValidQuestArtifactHrefs(input.artifacts ?? [])
   return fetchJson<CommanderQuest>(`/api/commanders/${encodeURIComponent(input.commanderId)}/quests`, {
     method: 'POST',
     headers: {
@@ -389,6 +420,18 @@ async function deleteCommanderQuest(input: DeleteQuestInput): Promise<void> {
   await fetchVoid(
     `/api/commanders/${encodeURIComponent(input.commanderId)}/quests/${encodeURIComponent(input.questId)}`,
     { method: 'DELETE' },
+  )
+}
+
+async function updateCommanderQuestArtifacts(input: UpdateQuestArtifactsInput): Promise<CommanderQuest> {
+  assertValidQuestArtifactHrefs(input.artifacts)
+  return fetchJson<CommanderQuest>(
+    `/api/commanders/${encodeURIComponent(input.commanderId)}/quests/${encodeURIComponent(input.questId)}`,
+    {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ artifacts: input.artifacts }),
+    },
   )
 }
 
@@ -466,14 +509,42 @@ function QuestCard({
   commanderLabel,
   expanded,
   onToggleExpanded,
+  addingArtifact,
+  artifactType,
+  artifactLabel,
+  artifactHref,
+  artifactError,
+  artifactPending,
   isDeleting,
+  onRequestAddArtifact,
+  onArtifactTypeChange,
+  onArtifactLabelChange,
+  onArtifactHrefChange,
+  onSubmitArtifact,
+  onCancelArtifact,
+  onRemoveArtifact,
+  onOpenArtifact,
   onDelete,
 }: {
   quest: CommanderQuest
   commanderLabel: string | null
   expanded: boolean
   onToggleExpanded: (questId: string) => void
+  addingArtifact: boolean
+  artifactType: QuestArtifactType
+  artifactLabel: string
+  artifactHref: string
+  artifactError: string | null
+  artifactPending: boolean
   isDeleting: boolean
+  onRequestAddArtifact: (quest: CommanderQuest) => void
+  onArtifactTypeChange: (value: QuestArtifactType) => void
+  onArtifactLabelChange: (value: string) => void
+  onArtifactHrefChange: (value: string) => void
+  onSubmitArtifact: (quest: CommanderQuest) => Promise<void>
+  onCancelArtifact: () => void
+  onRemoveArtifact: (quest: CommanderQuest, artifactIndex: number) => Promise<void>
+  onOpenArtifact: (quest: CommanderQuest, artifact: QuestArtifact) => Promise<void>
   onDelete: (quest: CommanderQuest) => Promise<void>
 }) {
   const status = normalizeStatus(quest.status)
@@ -510,11 +581,15 @@ function QuestCard({
           </div>
         </button>
         <div className="flex shrink-0 items-center gap-2">
-          {expanded && questArtifacts.length > 0 && (
-            <span className="badge-sumi badge-idle">
-              {questArtifacts.length} {questArtifacts.length === 1 ? 'artifact' : 'artifacts'}
-            </span>
-          )}
+          <button
+            type="button"
+            onClick={() => onRequestAddArtifact(quest)}
+            title="Add artifact"
+            aria-label={`Add artifact to ${quest.instruction}`}
+            className="inline-flex min-h-[32px] min-w-[32px] items-center justify-center rounded border border-ink-border text-sumi-diluted hover:border-ink-border-hover hover:text-sumi-black transition-colors"
+          >
+            <Plus size={12} />
+          </button>
           <span className={cn('badge-sumi', statusMeta.badgeClassName)}>
             {statusMeta.label}
           </span>
@@ -551,31 +626,195 @@ function QuestCard({
         </p>
       )}
 
-      {expanded && questArtifacts.length > 0 && (
-        <div className="mt-2 rounded-md border border-ink-border bg-washi-aged/40 p-2">
-          <p className="text-whisper uppercase tracking-wide text-sumi-diluted">Artifacts</p>
-          <div className="mt-1.5 flex flex-wrap gap-1.5">
-            {questArtifacts.map((artifact, index) => {
-              const isHttp = /^https?:\/\//i.test(artifact.href)
-              return (
-                <a
-                  key={`${quest.id}-${artifact.type}-${artifact.href}-${index}`}
-                  href={artifact.href}
-                  target={isHttp ? '_blank' : undefined}
-                  rel={isHttp ? 'noreferrer' : undefined}
-                  className="inline-flex max-w-full items-center rounded border border-ink-border bg-washi-white px-2 py-0.5 text-whisper text-sumi-diluted hover:border-ink-border-hover hover:text-sumi-black transition-colors"
-                  title={artifact.href}
-                >
-                  <span className="truncate">
-                    [{QUEST_ARTIFACT_PREFIX[artifact.type]}] {artifactDisplayLabel(artifact)}
+      {(questArtifacts.length > 0 || addingArtifact) && (
+        <div className="mt-2 space-y-2">
+          {questArtifacts.length > 0 && (
+            <div className="flex flex-wrap gap-1.5">
+              {questArtifacts.map((artifact, index) => {
+                const chipClassName = 'inline-flex min-h-[32px] max-w-full items-center gap-1 rounded border border-ink-border bg-washi-aged/45 px-2 py-0.5 text-whisper text-sumi-diluted hover:border-ink-border-hover hover:text-sumi-black focus:outline-none focus:ring-1 focus:ring-sumi-black/10 transition-colors'
+                const inertChipClassName = 'inline-flex min-h-[32px] max-w-full items-center gap-1 rounded border border-ink-border bg-washi-aged/45 px-2 py-0.5 text-whisper text-sumi-diluted'
+                const chipLabel = `[${QUEST_ARTIFACT_PREFIX[artifact.type]}] ${artifactDisplayLabel(artifact)}`
+                const safeLinkedArtifact = artifact.type !== 'file'
+                  && isValidQuestArtifactHref(artifact.type, artifact.href)
+                return (
+                  <span
+                    key={`${quest.id}-${artifact.type}-${artifact.href}-${index}`}
+                    className="inline-flex max-w-full items-center"
+                  >
+                    {artifact.type === 'file' ? (
+                      <button
+                        type="button"
+                        onClick={() => void onOpenArtifact(quest, artifact)}
+                        className={chipClassName}
+                        title={artifact.href}
+                      >
+                        <span className="truncate">{chipLabel}</span>
+                      </button>
+                    ) : safeLinkedArtifact ? (
+                      <a
+                        href={artifact.href}
+                        target="_blank"
+                        rel="noreferrer"
+                        className={chipClassName}
+                        title={artifact.href}
+                      >
+                        <span className="truncate">{chipLabel}</span>
+                      </a>
+                    ) : (
+                      <span
+                        className={inertChipClassName}
+                        title={artifact.href}
+                        aria-label={`${chipLabel} (invalid link)`}
+                      >
+                        <span className="truncate">{chipLabel}</span>
+                      </span>
+                    )}
+                    {expanded && (
+                      <button
+                        type="button"
+                        onClick={() => void onRemoveArtifact(quest, index)}
+                        disabled={artifactPending}
+                        title={`Remove ${artifact.label}`}
+                        aria-label={`Remove ${artifact.label}`}
+                        className="-ml-px inline-flex min-h-[32px] min-w-[28px] items-center justify-center rounded-r border border-ink-border bg-washi-white text-sumi-diluted hover:text-accent-vermillion disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        <Trash2 size={11} />
+                      </button>
+                    )}
                   </span>
-                </a>
-              )
-            })}
-          </div>
+                )
+              })}
+            </div>
+          )}
+
+          {addingArtifact && (
+            <div className="rounded-md border border-ink-border bg-washi-aged/50 p-2">
+              <div className="grid grid-cols-1 gap-2 md:grid-cols-[9rem_minmax(0,1fr)_minmax(0,1.4fr)]">
+                <select
+                  value={artifactType}
+                  onChange={(event) => onArtifactTypeChange(event.target.value as QuestArtifactType)}
+                  className="w-full rounded border border-ink-border bg-washi-white px-2 py-1.5 text-[16px] md:text-xs focus:outline-none focus:border-ink-border-hover"
+                  aria-label="Artifact type"
+                >
+                  <option value="github_issue">github_issue</option>
+                  <option value="github_pr">github_pr</option>
+                  <option value="url">url</option>
+                  <option value="file">file</option>
+                </select>
+                <input
+                  value={artifactLabel}
+                  onChange={(event) => onArtifactLabelChange(event.target.value)}
+                  placeholder="Label"
+                  className="w-full rounded border border-ink-border bg-washi-white px-2 py-1.5 text-[16px] md:text-xs focus:outline-none focus:border-ink-border-hover"
+                  aria-label="Artifact label"
+                />
+                <input
+                  value={artifactHref}
+                  onChange={(event) => onArtifactHrefChange(event.target.value)}
+                  placeholder="URL or file path"
+                  className="w-full rounded border border-ink-border bg-washi-white px-2 py-1.5 text-[16px] md:text-xs focus:outline-none focus:border-ink-border-hover"
+                  aria-label="Artifact href"
+                />
+              </div>
+              {artifactError && (
+                <p className="mt-2 text-xs text-accent-vermillion">{artifactError}</p>
+              )}
+              <div className="mt-2 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={onCancelArtifact}
+                  disabled={artifactPending}
+                  className="rounded border border-ink-border px-2 py-1 text-xs hover:bg-ink-wash disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void onSubmitArtifact(quest)}
+                  disabled={artifactPending}
+                  className="inline-flex items-center gap-1 rounded border border-ink-border bg-washi-white px-2 py-1 text-xs hover:bg-ink-wash disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {artifactPending && <Loader2 size={11} className="animate-spin" />}
+                  Add
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </article>
+  )
+}
+
+function WorkspaceDirectoryModal({
+  path,
+  nodes,
+  loading,
+  onClose,
+  onOpenNode,
+}: {
+  path: string
+  nodes: WorkspaceTreeNode[]
+  loading: boolean
+  onClose: () => void
+  onOpenNode: (node: WorkspaceTreeNode) => void
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center bg-sumi-black/40 p-0 md:items-center md:p-4">
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="Workspace directory"
+        className="flex h-[78dvh] w-full flex-col overflow-hidden rounded-t-xl border border-ink-border bg-washi-white shadow-xl md:h-[70dvh] md:max-w-3xl md:rounded-xl"
+      >
+        <div className="flex min-w-0 items-center justify-between gap-3 border-b border-ink-border px-4 py-3">
+          <div className="min-w-0">
+            <p className="text-whisper uppercase tracking-wide text-sumi-diluted">
+              Workspace directory
+            </p>
+            <p className="truncate font-mono text-sm text-sumi-black">{path || '.'}</p>
+          </div>
+          <button
+            type="button"
+            className="rounded-md p-1.5 text-sumi-diluted hover:bg-ink-wash"
+            onClick={onClose}
+            aria-label="Close directory"
+          >
+            <X size={16} />
+          </button>
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto p-3">
+          {loading && (
+            <div className="flex h-full items-center justify-center">
+              <Loader2 size={16} className="animate-spin text-sumi-diluted" />
+            </div>
+          )}
+          {!loading && nodes.length === 0 && (
+            <p className="rounded-lg border border-dashed border-ink-border px-3 py-2 text-sm text-sumi-diluted">
+              Directory is empty.
+            </p>
+          )}
+          {!loading && nodes.length > 0 && (
+            <div className="space-y-1">
+              {nodes.map((node) => (
+                <button
+                  key={node.path}
+                  type="button"
+                  className="flex w-full min-w-0 items-center gap-2 rounded-md px-3 py-2 text-left text-sm hover:bg-ink-wash"
+                  onClick={() => onOpenNode(node)}
+                >
+                  {node.type === 'directory'
+                    ? <Folder size={15} className="shrink-0 text-sumi-diluted" />
+                    : <FileText size={15} className="shrink-0 text-sumi-diluted" />}
+                  <span className="min-w-0 flex-1 truncate font-mono">{node.name}</span>
+                  <span className="text-whisper text-sumi-diluted">{node.type}</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
   )
 }
 
@@ -601,6 +840,16 @@ export function QuestBoard({
   const [artifactType, setArtifactType] = useState<QuestArtifactType>('url')
   const [artifactLabel, setArtifactLabel] = useState('')
   const [artifactHref, setArtifactHref] = useState('')
+  const [activeArtifactQuestId, setActiveArtifactQuestId] = useState<string | null>(null)
+  const [cardArtifactType, setCardArtifactType] = useState<QuestArtifactType>('file')
+  const [cardArtifactLabel, setCardArtifactLabel] = useState('')
+  const [cardArtifactHref, setCardArtifactHref] = useState('')
+  const [cardArtifactError, setCardArtifactError] = useState<string | null>(null)
+  const [previewSource, setPreviewSource] = useState<WorkspaceSource | null>(null)
+  const [previewPath, setPreviewPath] = useState<string | null>(null)
+  const [previewError, setPreviewError] = useState<string | null>(null)
+  const [directorySource, setDirectorySource] = useState<WorkspaceSource | null>(null)
+  const [directoryPath, setDirectoryPath] = useState<string | null>(null)
   const [formError, setFormError] = useState<string | null>(null)
   const [fetchingIssue, setFetchingIssue] = useState(false)
   const [deletingQuestId, setDeletingQuestId] = useState<string | null>(null)
@@ -767,6 +1016,38 @@ export function QuestBoard({
     },
   })
 
+  const updateArtifactsMutation = useMutation({
+    mutationFn: updateCommanderQuestArtifacts,
+    onSuccess: async (_updatedQuest, input) => {
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ['commanders', 'quests', input.commanderId],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ['commanders', 'quests', 'all'],
+        }),
+      ])
+    },
+  })
+
+  const activePreviewSource = previewSource ?? { kind: 'target' as const, targetId: '__inactive__' }
+  const previewQuery = useWorkspaceFilePreview(
+    activePreviewSource,
+    previewPath,
+    Boolean(previewSource && previewPath),
+  )
+  const activeDirectorySource = directorySource ?? { kind: 'target' as const, targetId: '__inactive__' }
+  const directoryQuery = useQuery({
+    queryKey: [
+      'workspace',
+      activeDirectorySource.targetId,
+      'artifact-directory',
+      directoryPath ?? '',
+    ],
+    queryFn: () => fetchWorkspaceTree(activeDirectorySource, directoryPath ?? ''),
+    enabled: Boolean(directorySource),
+  })
+
   async function handleFetchIssue(): Promise<void> {
     const parsed = parseGitHubIssueUrlParts(githubIssueUrl)
     if (!parsed) {
@@ -814,6 +1095,150 @@ export function QuestBoard({
     setArtifactLabel('')
     setArtifactHref('')
     setFormError(null)
+  }
+
+  function resetCardArtifactDraft(): void {
+    setActiveArtifactQuestId(null)
+    setCardArtifactType('file')
+    setCardArtifactLabel('')
+    setCardArtifactHref('')
+    setCardArtifactError(null)
+  }
+
+  function handleRequestAddCardArtifact(quest: CommanderQuest): void {
+    setActiveArtifactQuestId(quest.id)
+    setCardArtifactType('file')
+    setCardArtifactLabel('')
+    setCardArtifactHref('')
+    setCardArtifactError(null)
+    setExpandedQuestIds((current) => current.includes(quest.id) ? current : [...current, quest.id])
+  }
+
+  function resolveQuestCommanderId(quest: CommanderQuest): string | null {
+    return quest.commanderId ?? selectedCommander?.id ?? null
+  }
+
+  async function handleSubmitCardArtifact(quest: CommanderQuest): Promise<void> {
+    const commanderId = resolveQuestCommanderId(quest)
+    if (!commanderId) {
+      setCardArtifactError('Commander is required to update artifacts.')
+      return
+    }
+    const label = cardArtifactLabel.trim()
+    const href = cardArtifactHref.trim()
+    if (!label || !href) {
+      setCardArtifactError('Artifact label and href are required.')
+      return
+    }
+    if (!isValidQuestArtifactHref(cardArtifactType, href)) {
+      setCardArtifactError(`Artifact href is invalid for type "${cardArtifactType}".`)
+      return
+    }
+
+    setCardArtifactError(null)
+    try {
+      await updateArtifactsMutation.mutateAsync({
+        commanderId,
+        questId: quest.id,
+        artifacts: [
+          ...safeQuestArtifactsForReplacement(quest.artifacts),
+          { type: cardArtifactType, label, href },
+        ],
+      })
+      resetCardArtifactDraft()
+      setToastMessage('Artifact added.')
+    } catch (error) {
+      setCardArtifactError(toErrorMessage(error) ?? 'Failed to add artifact.')
+    }
+  }
+
+  async function handleRemoveCardArtifact(quest: CommanderQuest, artifactIndex: number): Promise<void> {
+    const commanderId = resolveQuestCommanderId(quest)
+    if (!commanderId) {
+      setCardArtifactError('Commander is required to update artifacts.')
+      return
+    }
+    const currentArtifacts = parseQuestArtifacts(quest.artifacts)
+    if (artifactIndex < 0 || artifactIndex >= currentArtifacts.length) {
+      setCardArtifactError('Artifact no longer exists.')
+      return
+    }
+
+    setCardArtifactError(null)
+    try {
+      await updateArtifactsMutation.mutateAsync({
+        commanderId,
+        questId: quest.id,
+        artifacts: currentArtifacts
+          .filter((_artifact, index) => index !== artifactIndex)
+          .filter((artifact) => isValidQuestArtifactHref(artifact.type, artifact.href)),
+      })
+      setToastMessage('Artifact removed.')
+    } catch (error) {
+      setActiveArtifactQuestId(quest.id)
+      setCardArtifactError(toErrorMessage(error) ?? 'Failed to remove artifact.')
+    }
+  }
+
+  async function handleOpenArtifact(quest: CommanderQuest, artifact: QuestArtifact): Promise<void> {
+    if (artifact.type !== 'file') {
+      return
+    }
+    const commanderId = resolveQuestCommanderId(quest)
+    setPreviewError(null)
+    try {
+      const resolution = await resolveWorkspaceReference({
+        path: artifact.href,
+        commanderId,
+        pathHint: nonEmpty(quest.contract?.cwd) ?? undefined,
+      })
+      if (!resolution.targetId) {
+        setPreviewError('Workspace resolver did not return a target.')
+        return
+      }
+      if (resolution.type === 'directory') {
+        setDirectorySource({
+          kind: 'target',
+          targetId: resolution.targetId,
+          label: resolution.targetLabel,
+          readOnly: true,
+        })
+        setDirectoryPath(resolution.path)
+        return
+      }
+      setPreviewSource({
+        kind: 'target',
+        targetId: resolution.targetId,
+        label: resolution.targetLabel,
+        readOnly: true,
+      })
+      setPreviewPath(resolution.path)
+    } catch (error) {
+      setPreviewError(toErrorMessage(error) ?? 'Failed to open file artifact.')
+    }
+  }
+
+  function closePreview(): void {
+    setPreviewSource(null)
+    setPreviewPath(null)
+    setPreviewError(null)
+  }
+
+  function closeDirectory(): void {
+    setDirectorySource(null)
+    setDirectoryPath(null)
+  }
+
+  function handleDirectoryNodeOpen(node: WorkspaceTreeNode): void {
+    if (!directorySource) {
+      return
+    }
+    if (node.type === 'directory') {
+      setDirectoryPath(node.path)
+      return
+    }
+    setPreviewSource(directorySource)
+    setPreviewPath(node.path)
   }
 
   function handleRequestCloseForm(): void {
@@ -880,6 +1305,10 @@ export function QuestBoard({
       setFormError('Artifact label and href are required.')
       return
     }
+    if (!isValidQuestArtifactHref(artifactType, href)) {
+      setFormError(`Artifact href is invalid for type "${artifactType}".`)
+      return
+    }
 
     setArtifacts((current) => [...current, { type: artifactType, label, href }])
     setArtifactType('url')
@@ -942,6 +1371,7 @@ export function QuestBoard({
     return completedTimestamp === null || completedTimestamp < doneHistoryBoundary
   })
   const apiError = toErrorMessage(questsQuery.error) ?? toErrorMessage(createQuestMutation.error)
+  const footerError = apiError ?? previewError ?? toErrorMessage(directoryQuery.error)
 
   function renderQuestCard(quest: CommanderQuest) {
     return (
@@ -951,7 +1381,21 @@ export function QuestBoard({
         commanderLabel={commanderLabels.get(quest.commanderId ?? '') ?? null}
         expanded={expandedQuestIds.includes(quest.id)}
         onToggleExpanded={toggleQuestExpanded}
+        addingArtifact={activeArtifactQuestId === quest.id}
+        artifactType={cardArtifactType}
+        artifactLabel={cardArtifactLabel}
+        artifactHref={cardArtifactHref}
+        artifactError={activeArtifactQuestId === quest.id ? cardArtifactError : null}
+        artifactPending={updateArtifactsMutation.isPending}
         isDeleting={deleteQuestMutation.isPending || deletingQuestId === quest.id}
+        onRequestAddArtifact={handleRequestAddCardArtifact}
+        onArtifactTypeChange={setCardArtifactType}
+        onArtifactLabelChange={setCardArtifactLabel}
+        onArtifactHrefChange={setCardArtifactHref}
+        onSubmitArtifact={handleSubmitCardArtifact}
+        onCancelArtifact={resetCardArtifactDraft}
+        onRemoveArtifact={handleRemoveCardArtifact}
+        onOpenArtifact={handleOpenArtifact}
         onDelete={handleDelete}
       />
     )
@@ -1125,11 +1569,34 @@ export function QuestBoard({
         )}
       </div>
 
-      {apiError && (
+      {footerError && (
         <p className="border-t border-ink-border px-4 py-2 text-sm text-accent-vermillion">
-          {apiError}
+          {footerError}
         </p>
       )}
+      {directorySource && (
+        <WorkspaceDirectoryModal
+          path={directoryPath ?? ''}
+          nodes={directoryQuery.data?.nodes ?? []}
+          loading={directoryQuery.isLoading}
+          onClose={closeDirectory}
+          onOpenNode={handleDirectoryNodeOpen}
+        />
+      )}
+      <WorkspaceFilePreviewModal
+        open={Boolean(previewSource && previewPath)}
+        selectedPath={previewPath}
+        preview={previewQuery.data ?? null}
+        draftContent={previewQuery.data?.content ?? ''}
+        loading={previewQuery.isLoading}
+        refreshing={previewQuery.isFetching && !previewQuery.isLoading}
+        error={toErrorMessage(previewQuery.error)}
+        readOnly={previewSource?.readOnly ?? true}
+        onClose={closePreview}
+        onRefresh={() => {
+          void previewQuery.refetch()
+        }}
+      />
       <Toast open={Boolean(toastMessage)} message={toastMessage ?? ''} />
     </section>
   )

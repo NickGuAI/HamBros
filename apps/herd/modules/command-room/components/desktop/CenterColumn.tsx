@@ -377,7 +377,7 @@ export function CenterColumn({
       return (
         <CreateConversationPanel
           commanderName={commander.name}
-          commanderHost={commander.host}
+          credentialSelectionModes={commander.credentialSelectionModes}
           onCreateChat={onCreateChat}
           createChatPending={createChatPending}
           defaultAgentType={defaultCreateAgentType ?? commander.agentType}
@@ -421,6 +421,7 @@ export function CenterColumn({
     <section
       data-testid="command-room-center-column"
       data-test-id="command-room-center-column"
+      data-composer-resize-root="desktop-chat-pane"
       style={{
         display: 'flex',
         flexDirection: 'column',
