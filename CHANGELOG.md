@@ -8,6 +8,16 @@ continues to be the GitHub release body; this file ships in the public artifact.
 
 - No unreleased changes.
 
+## v0.0.14-beta — 2026-07-26
+
+- Made graceful shutdown a non-destructive persistence checkpoint. Existing
+  SQLite runtime-session rows are frozen before provider teardown begins, so
+  concurrent systemd signals and provider exit handlers cannot interpret
+  teardown-time map absence as an operator deletion.
+- Added a shutdown-race regression that queues an authoritative runtime write,
+  removes the provider runtime at the SIGTERM boundary, and verifies the
+  fallback row remains available to the replacement service process.
+
 ## v0.0.13-beta — 2026-07-26
 
 - Prevented restored credential-recovery placeholders from claiming

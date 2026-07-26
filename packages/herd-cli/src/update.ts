@@ -192,7 +192,7 @@ function printUpdateUsage(write: (chunk: string) => void): void {
   write('  Upgrade the installed Herd checkout in place.\n')
   write('\n')
   write('Options:\n')
-  write('  --tag <release-tag>  Release tag to install, for example v0.0.13-beta\n')
+  write('  --tag <release-tag>  Release tag to install, for example v0.0.14-beta\n')
   write('  --repo <git-url>     Override the checkout origin before fetching\n')
   write('  --no-restart         Update and verify without restarting the service\n')
   write('  -h, --help           Show this help\n')

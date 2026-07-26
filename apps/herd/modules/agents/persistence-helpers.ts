@@ -124,6 +124,7 @@ export interface SessionPruneCandidate {
 export interface PersistenceHelpers {
   schedulePersistedSessionsWrite: () => void
   flushPersistedSessionsWrite: () => Promise<void>
+  flushPersistedSessionsForShutdown: () => Promise<void>
   readPersistedSessionsState: () => Promise<PersistedSessionsState>
   restorePersistedSessions: () => Promise<void>
   archivePersistedSession: (sessionName: string, entry?: PersistedStreamSession) => boolean
@@ -166,6 +167,7 @@ export function createPersistenceHelpers(
   // poisoning every subsequent call.
   let persistSessionStateQueue: Promise<void> = Promise.resolve()
   let transcriptPruneQueue: Promise<void> = Promise.resolve()
+  let shutdownPreservedSessionNames: Set<string> | null = null
   const persistedSessionNamesAwaitingDurableSnapshot = new Set(
     readSqlitePersistedSessionsState(sqliteDb).sessions.map((entry) => entry.name),
   )
@@ -246,11 +248,15 @@ export function createPersistenceHelpers(
       )
   }
 
-  function schedulePersistedSessionsWrite(): void {
-    // Capture ownership at the lifecycle event, rather than only when the
-    // queued write eventually runs. This keeps a rapid create/delete sequence
-    // from reviving the pre-restore row.
-    claimCurrentDurableRuntimeIdentities()
+  function preservedSessionNamesForWrite(): Set<string> {
+    const preserved = new Set(persistedSessionNamesAwaitingDurableSnapshot)
+    for (const sessionName of shutdownPreservedSessionNames ?? []) {
+      preserved.add(sessionName)
+    }
+    return preserved
+  }
+
+  function enqueuePersistedSessionsWrite(): void {
     persistSessionStateQueue = persistSessionStateQueue
       .catch(() => undefined)
       .then(async () => {
@@ -258,7 +264,7 @@ export function createPersistenceHelpers(
           const state = serializePersistedSessionsStateForStore({ sessions, exitedStreamSessions })
           claimDurablySnapshottedPersistedSessions(state)
           writeSqlitePersistedSessionsState(sqliteDb, state, undefined, {
-            preserveSessionNames: persistedSessionNamesAwaitingDurableSnapshot,
+            preserveSessionNames: preservedSessionNamesForWrite(),
           })
         } catch (error) {
           // Test teardown and process shutdown can remove ephemeral data dirs
@@ -271,11 +277,37 @@ export function createPersistenceHelpers(
       })
   }
 
+  function schedulePersistedSessionsWrite(): void {
+    if (shutdownPreservedSessionNames) {
+      return
+    }
+    // Capture ownership at the lifecycle event, rather than only when the
+    // queued write eventually runs. This keeps a rapid create/delete sequence
+    // from reviving the pre-restore row.
+    claimCurrentDurableRuntimeIdentities()
+    enqueuePersistedSessionsWrite()
+  }
+
   async function flushPersistedSessionsWrite(): Promise<void> {
     await Promise.all([
       persistSessionStateQueue.catch(() => undefined),
       transcriptPruneQueue.catch(() => undefined),
     ])
+  }
+
+  async function flushPersistedSessionsForShutdown(): Promise<void> {
+    if (!shutdownPreservedSessionNames) {
+      // SIGTERM is a process-lifecycle boundary, not a user deletion. systemd
+      // can signal provider children at the same time as Herd, so exit handlers
+      // may empty or replace the in-memory maps while an already-queued
+      // snapshot is draining. Freeze every durable row that exists at shutdown
+      // entry and make all pending/final writes non-destructive.
+      shutdownPreservedSessionNames = new Set(
+        readSqlitePersistedSessionsState(sqliteDb).sessions.map((entry) => entry.name),
+      )
+    }
+    enqueuePersistedSessionsWrite()
+    await flushPersistedSessionsWrite()
   }
 
   async function readPersistedSessionsState(): Promise<PersistedSessionsState> {
@@ -542,6 +574,7 @@ export function createPersistenceHelpers(
   return {
     schedulePersistedSessionsWrite,
     flushPersistedSessionsWrite,
+    flushPersistedSessionsForShutdown,
     readPersistedSessionsState,
     restorePersistedSessions,
     archivePersistedSession,

@@ -1,6 +1,6 @@
 {
   "name": "herd",
-  "version": "0.0.13-beta",
+  "version": "0.0.14-beta",
   "private": true,
   "license": "AGPL-3.0-only",
   "type": "module",
