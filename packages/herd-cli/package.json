@@ -41,6 +41,6 @@
     "vitest": "^2.1.0"
   },
   "dependencies": {
-    "smol-toml": "^1.6.0"
+    "smol-toml": "^1.6.1"
   }
 }
