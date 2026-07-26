@@ -166,6 +166,24 @@ export function createPersistenceHelpers(
   // poisoning every subsequent call.
   let persistSessionStateQueue: Promise<void> = Promise.resolve()
   let transcriptPruneQueue: Promise<void> = Promise.resolve()
+  const unclaimedPersistedSessionNames = new Set(
+    readSqlitePersistedSessionsState(sqliteDb).sessions.map((entry) => entry.name),
+  )
+
+  /**
+   * A persisted row only becomes part of the authoritative in-memory snapshot
+   * after it has been hydrated into one of the runtime maps. Until then it may
+   * be awaiting provider startup, intentionally dormant on this execution
+   * mode, or temporarily unresumable. Such rows must survive snapshot writes.
+   */
+  function claimHydratedPersistedSessions(): void {
+    for (const sessionName of sessions.keys()) {
+      unclaimedPersistedSessionNames.delete(sessionName)
+    }
+    for (const sessionName of exitedStreamSessions.keys()) {
+      unclaimedPersistedSessionNames.delete(sessionName)
+    }
+  }
 
   function isBenignPersistedSessionWriteError(error: unknown): boolean {
     const maybeNodeError = error as NodeJS.ErrnoException | null
@@ -178,12 +196,19 @@ export function createPersistenceHelpers(
   }
 
   function schedulePersistedSessionsWrite(): void {
+    // Capture ownership at the lifecycle event, rather than only when the
+    // queued write eventually runs. This keeps a rapid create/delete sequence
+    // from reviving the pre-restore row.
+    claimHydratedPersistedSessions()
     persistSessionStateQueue = persistSessionStateQueue
       .catch(() => undefined)
       .then(async () => {
         try {
+          claimHydratedPersistedSessions()
           const state = serializePersistedSessionsStateForStore({ sessions, exitedStreamSessions })
-          writeSqlitePersistedSessionsState(sqliteDb, state)
+          writeSqlitePersistedSessionsState(sqliteDb, state, undefined, {
+            preserveSessionNames: unclaimedPersistedSessionNames,
+          })
         } catch (error) {
           // Test teardown and process shutdown can remove ephemeral data dirs
           // before this queued write drains. Treat that as a benign stop case.
@@ -208,6 +233,11 @@ export function createPersistenceHelpers(
 
   async function restorePersistedSessions(): Promise<void> {
     const persisted = readSqlitePersistedSessionsState(sqliteDb)
+    for (const entry of persisted.sessions) {
+      if (!sessions.has(entry.name) && !exitedStreamSessions.has(entry.name)) {
+        unclaimedPersistedSessionNames.add(entry.name)
+      }
+    }
 
     await restorePersistedSessionsFromStore({
       sessions,
@@ -223,10 +253,18 @@ export function createPersistenceHelpers(
       shouldAutoRestoreSession,
       restoreCredentialPoolRecovery,
     })
+
+    claimHydratedPersistedSessions()
+    schedulePersistedSessionsWrite()
+    await persistSessionStateQueue
   }
 
   function archivePersistedSession(sessionName: string, entry?: PersistedStreamSession): boolean {
-    return archiveSqliteRuntimeSession(sqliteDb, sessionName, entry)
+    const archived = archiveSqliteRuntimeSession(sqliteDb, sessionName, entry)
+    if (archived) {
+      unclaimedPersistedSessionNames.delete(sessionName)
+    }
+    return archived
   }
 
   function scheduleTranscriptPrune(sessionName: string): void {

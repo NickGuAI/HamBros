@@ -638,6 +638,7 @@ export interface CommanderTranscriptAppender {
 
 export interface AgentsRouterResult {
   router: Router
+  ready: Promise<void>
   handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void
   sessionsInterface: CommanderSessionsInterface
   approvalSessionsInterface: ApprovalSessionsInterface

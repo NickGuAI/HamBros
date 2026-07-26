@@ -781,12 +781,19 @@ export function createAgentsRouter(options: AgentsRouterOptions): AgentsRouterRe
       if (providerAuthProbeTimer) {
         process.off('SIGTERM', handleProviderAuthProbeSigterm)
       }
+      await restorePersistedSessionsReady.catch((error) => {
+        console.warn('[agents][restore] Startup restoration did not settle cleanly before shutdown', error)
+      })
       claudeGlobalRuntime.shutdown()
       daemonRegistry.shutdown()
+      requirePersistenceHelpers().schedulePersistedSessionsWrite()
       await requirePersistenceHelpers().flushPersistedSessionsWrite()
       await sessionsInterface.shutdown?.()
     },
   }
 
-  return { router, handleUpgrade, sessionsInterface: shutdownSessionsInterface, approvalSessionsInterface, machineCommandExecutor, providerExecution }
+  return {
+    router, ready: restorePersistedSessionsReady, handleUpgrade, sessionsInterface: shutdownSessionsInterface,
+    approvalSessionsInterface, machineCommandExecutor, providerExecution,
+  }
 }

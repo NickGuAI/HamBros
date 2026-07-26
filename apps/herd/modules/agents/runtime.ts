@@ -51,6 +51,7 @@ export function createAgentsRuntime(context: ModuleRuntimeContext): ModuleRouteR
     name: 'agents',
     routeIds: ['agents.api'],
     router: agents.router,
+    ready: agents.ready,
     handleUpgrade: agents.handleUpgrade,
     shutdown: agents.sessionsInterface.shutdown,
   }

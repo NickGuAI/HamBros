@@ -489,6 +489,14 @@ export function writeSqlitePersistedSessionsState(
   db: DatabaseSync,
   payload: PersistedSessionsState,
   now: string = new Date().toISOString(),
+  options: {
+    /**
+     * Rows that are durable but not represented by the caller's authoritative
+     * in-memory snapshot yet. They remain untouched until the runtime claims
+     * them or explicitly archives them.
+     */
+    preserveSessionNames?: Iterable<string>
+  } = {},
 ): void {
   const names = new Set<string>()
   db.exec('BEGIN IMMEDIATE')
@@ -550,6 +558,12 @@ export function writeSqlitePersistedSessionsState(
         entry.createdAt,
         now,
       )
+    }
+
+    for (const sessionName of options.preserveSessionNames ?? []) {
+      if (sessionName.trim()) {
+        names.add(sessionName)
+      }
     }
 
     if (names.size === 0) {

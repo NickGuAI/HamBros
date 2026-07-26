@@ -1182,9 +1182,25 @@ db.exec(`
   INSERT INTO agent_runtime_sessions (
     name, session_type, creator_kind, state, provider,
     provider_resume_json, cwd, created_at, updated_at
-  ) VALUES (
-    'railway-upgrade-fixture', 'commander', 'human', 'paused', 'codex',
+  ) VALUES
+  (
+    'railway-upgrade-fixture-1', 'commander', 'human', 'paused', 'codex',
     '{"providerId":"codex","threadId":"railway-v1"}', '/workspace',
+    '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+  ),
+  (
+    'railway-upgrade-fixture-2', 'commander', 'human', 'paused', 'codex',
+    '{"providerId":"codex","threadId":"railway-v2"}', '/workspace',
+    '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+  ),
+  (
+    'railway-upgrade-fixture-3', 'commander', 'human', 'paused', 'codex',
+    '{"providerId":"codex","threadId":"railway-v3"}', '/workspace',
+    '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+  ),
+  (
+    'railway-upgrade-fixture-4', 'commander', 'human', 'paused', 'codex',
+    '{"providerId":"codex","threadId":"railway-v4"}', '/workspace',
     '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
   );
 `)
@@ -1229,13 +1245,24 @@ assert.deepEqual(liveVersions, [
   '001_agent_runtime_sessions',
   '002_agent_runtime_session_payload',
 ])
-const row = live.prepare(`
-  SELECT provider_resume_json, runtime_state_json
+const rows = live.prepare(`
+  SELECT name, provider_resume_json, runtime_state_json
   FROM agent_runtime_sessions
-  WHERE name = 'railway-upgrade-fixture'
-`).get()
-assert.equal(row.provider_resume_json, '{"providerId":"codex","threadId":"railway-v1"}')
-assert.equal(row.runtime_state_json, '{}')
+  WHERE name LIKE 'railway-upgrade-fixture-%'
+  ORDER BY name
+`).all()
+assert.equal(rows.length, 4, 'startup restoration must preserve every migrated runtime row')
+for (const [index, row] of rows.entries()) {
+  assert.equal(row.name, `railway-upgrade-fixture-${index + 1}`)
+  assert.deepEqual(
+    JSON.parse(row.provider_resume_json),
+    { providerId: 'codex', threadId: `railway-v${index + 1}` },
+  )
+  assert.deepEqual(
+    JSON.parse(row.runtime_state_json),
+    { mode: 'default', hadResult: false, conversationEntryCount: 0 },
+  )
+}
 live.close()
 NODE
 

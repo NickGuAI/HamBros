@@ -8,6 +8,19 @@ continues to be the GitHub release body; this file ships in the public artifact.
 
 - No unreleased changes.
 
+## v0.0.10-beta — 2026-07-26
+
+- Made runtime-session restoration part of server readiness. Health now remains
+  non-ready until persisted agent sessions have finished their startup restore,
+  so installer and deployment handoffs cannot terminate a partially restored
+  first boot.
+- Preserved durable SQLite rows that have not yet been claimed by an in-memory
+  runtime, including sessions that are dormant for the current execution mode
+  or temporarily cannot resume. Once hydrated, rows return to normal
+  authoritative lifecycle deletion.
+- Made graceful shutdown wait for startup restoration and flush a complete
+  final runtime snapshot before provider teardown.
+
 ## v0.0.9-beta — 2026-07-26
 
 - Added a two-mode session composer. Quick mode keeps Enter-to-send, while

@@ -8,6 +8,7 @@ import { bootstrapDefaultMasterKey } from './api-keys/bootstrap.js'
 import { ProviderSecretsStore } from './api-keys/provider-secrets-store.js'
 import { ApiKeyJsonStore } from './api-keys/store.js'
 import { createModules } from './module-registry.js'
+import { createModuleReadinessTracker } from './module-runtime.js'
 import { mountDeclaredBodyParsers } from './module-http-mount.js'
 import { createWebSocketUpgradeResolver } from './websocket-upgrade-resolver.js'
 import { HerdModuleLoaderError } from './module-loader.js'
@@ -172,6 +173,10 @@ const { modules, otelRouter, moduleGraph } = createModules({
   initializeAutomationScheduler: backgroundRuntimesEnabled,
   initializeChannelRuntimes: backgroundRuntimesEnabled,
 })
+const moduleReadiness = createModuleReadinessTracker(modules)
+void moduleReadiness.ready.catch((error) => {
+  logError(`[modules] Runtime readiness failed\n${formatError(error)}`)
+})
 
 app.use(
   cors({
@@ -195,8 +200,9 @@ app.use(createInstallScriptRouter())
 // Health check
 app.get('/api/health', (_req, res) => {
   const memory = process.memoryUsage()
-  res.json({
-    status: 'ok',
+  const runtimeReady = moduleReadiness.isReady()
+  res.status(runtimeReady ? 200 : 503).json({
+    status: runtimeReady ? 'ok' : 'starting',
     uptime: Math.floor((Date.now() - startedAt) / 1000),
     version: buildVersion,
     backgroundRuntimes: backgroundRuntimesEnabled ? 'enabled' : 'disabled',

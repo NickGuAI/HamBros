@@ -326,7 +326,7 @@ clone_and_exec_installer() {
   fi
 
   REPO_URL="${HERD_REPO_URL:-${HERVALD_REPO_URL:-https://github.com/NickGuAI/Herd.git}}"
-  REPO_REF="${HERD_REPO_REF:-${HERVALD_REPO_REF:-v0.0.9-beta}}"
+  REPO_REF="${HERD_REPO_REF:-${HERVALD_REPO_REF:-v0.0.10-beta}}"
   checkout_override="${HERD_CHECKOUT_DIR:-${HERVALD_CHECKOUT_DIR:-}}"
   CHECKOUT_DIR="${checkout_override:-$default_checkout}"
   ARCHIVE_URL="$(repo_archive_url "$REPO_URL" "$REPO_REF" || true)"

@@ -23,6 +23,7 @@ export interface HerdModule {
   label: string
   routePrefix: string
   router: Router
+  ready?: Promise<void>
   handleUpgrade?: (req: IncomingMessage, socket: Duplex, head: Buffer) => void
   shutdown?: () => Promise<void> | void
 }
@@ -72,6 +73,7 @@ export interface ModuleRouteRegistration {
   router: Router
   label?: string
   mountStrategy?: ModuleMountStrategy
+  ready?: HerdModule['ready']
   handleUpgrade?: HerdModule['handleUpgrade']
   shutdown?: HerdModule['shutdown']
 }
@@ -214,6 +216,7 @@ export function createManifestMountedModules(
       label: registration.label ?? primaryManifest.graph.label,
       routePrefix,
       router: registration.router,
+      ...(registration.ready ? { ready: registration.ready } : {}),
       ...(registration.handleUpgrade ? { handleUpgrade: registration.handleUpgrade } : {}),
       ...(registration.shutdown ? { shutdown: registration.shutdown } : {}),
     }
@@ -222,6 +225,31 @@ export function createManifestMountedModules(
   validateDeclaredWebSocketHandlers(moduleGraph, modules)
 
   return modules
+}
+
+export interface ModuleReadinessTracker {
+  ready: Promise<void>
+  isReady(): boolean
+}
+
+/**
+ * Track asynchronous module startup without preventing the HTTP server from
+ * accepting dependency connections (for example, machine-daemon WebSockets).
+ * Health remains non-ready until every declared module startup barrier settles.
+ */
+export function createModuleReadinessTracker(
+  modules: readonly HerdModule[],
+): ModuleReadinessTracker {
+  const barriers = modules.flatMap((module) => module.ready ? [module.ready] : [])
+  let ready = barriers.length === 0
+  const completion = Promise.all(barriers).then(() => {
+    ready = true
+  })
+
+  return {
+    ready: completion,
+    isReady: () => ready,
+  }
 }
 
 function validateDeclaredWebSocketHandlers(
