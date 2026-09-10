@@ -64,7 +64,7 @@
     "mailparser": "^3.9.8",
     "multer": "1.4.5-lts.2",
     "node-cron": "^4.2.1",
-    "nodemailer": "^8.0.7",
+    "nodemailer": "^9.1.1",
     "pixi.js": "^8.16.0",
     "qrcode": "1.5.4",
     "react": "^19.0.0",
